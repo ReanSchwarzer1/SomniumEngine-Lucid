@@ -315,6 +315,10 @@ impl RenderContext {
                 info!("Indirect draw validation off (SOMNIUM_INDIRECT_VALIDATION=0)");
             }
         }
+        if let Some(salt) = crate::shaders::salt() {
+            info!(salt, "SOMNIUM_SHADER_SALT: debug SPIR-V and salted shaders, so every composed pipeline compiles cold");
+            descriptor.flags |= wgpu::InstanceFlags::DEBUG;
+        }
         let instance = wgpu::Instance::new(descriptor);
 
         // Create the surface from the window.
