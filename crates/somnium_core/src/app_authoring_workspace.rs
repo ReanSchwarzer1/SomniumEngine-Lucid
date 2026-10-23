@@ -21,7 +21,7 @@ const FOLIAGE: &[(&str, F, f32, f32)] = &[
     ("density", F::Density, 0., 40.),
     ("radius", F::Radius, 0.25, 200.),
     ("max_slope", F::MaxSlope, 0., 90.),
-    ("kind", F::Kind, 0., 255.),
+    ("kind", F::Kind, 0., (crate::foliage_palette::FOLIAGE_KINDS - 1) as f32),
     ("scale_min", F::ScaleMin, 0.01, 1000.),
     ("scale_max", F::ScaleMax, 0.01, 1000.),
     ("min_layer_weight", F::MinLayerWeight, 0., 1.),
@@ -59,8 +59,10 @@ impl<G: GameApp> Engine<G> {
     pub(super) fn query_authoring_controls(&self, p: &Value) -> Result<Value, String> {
         if p["kind"] == "foliage_settings" || p["action"] == "foliage_settings" {
             let b = self.foliage_brush;
+            // The kind runs to the palette's last id, a project's kinds included (a gap in its ids is refused).
+            let top_kind = self.project_foliage.keys().next_back().copied().unwrap_or(FOLIAGE_PALETTE.len() as u16 - 1);
             return Ok(
-                json!({"ok":true,"values":{"density":b.density,"radius":b.radius,"max_slope":b.max_slope_deg,"kind":b.kind,"scale_min":b.scale_min,"scale_max":b.scale_max,"min_layer_weight":b.min_layer_weight},"fields":FOLIAGE.iter().map(|(id,_,min,max)|json!({"id":id,"min":min,"max":if *id=="kind"{(FOLIAGE_PALETTE.len()-1) as f32}else{*max}})).collect::<Vec<_>>(),"scope":"session brush settings; pass previous_value to restore"}),
+                json!({"ok":true,"values":{"density":b.density,"radius":b.radius,"max_slope":b.max_slope_deg,"kind":b.kind,"scale_min":b.scale_min,"scale_max":b.scale_max,"min_layer_weight":b.min_layer_weight},"fields":FOLIAGE.iter().map(|(id,_,min,max)|json!({"id":id,"min":min,"max":if *id=="kind"{f32::from(top_kind)}else{*max}})).collect::<Vec<_>>(),"scope":"session brush settings; pass previous_value to restore"}),
             );
         }
         let e = somnium_ecs::PersistentId::parse_hex(required(p, "entity")?)
