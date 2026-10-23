@@ -61,6 +61,22 @@ pub(crate) fn zone(
     }
 }
 
+/// Whether the scene asks for voxel terrain: an entity with a `VoxelTerrainComponent`. Only the archetypes that hold
+/// one are visited, not every entity (a streamed world has tens of thousands).
+fn wants_voxel_terrain(world: &somnium_ecs::World) -> bool {
+    world.iter_with::<somnium_core::VoxelTerrainComponent>().next().is_some()
+}
+
+/// The scene's first enabled UI canvas, its transform and whether the Outliner's eye hides it, in the world's order
+/// (the first a walk of every entity would find), visiting only the archetypes that hold a canvas.
+fn first_canvas(world: &somnium_ecs::World) -> Option<(UiCanvasComponent, Transform, bool)> {
+    world.iter_with::<UiCanvasComponent>().find_map(|(entity, canvas)| {
+        let transform = world.get::<Transform>(entity).copied().unwrap_or_default();
+        let hidden = world.get::<EditorFlags>(entity).copied().unwrap_or_default().hidden;
+        canvas.enabled.then_some((*canvas, transform, hidden))
+    })
+}
+
 // â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
 // Components
 // â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
@@ -1238,11 +1254,7 @@ impl HelloGame {
     /// entities (they stream constantly), so the driver lives here in game code
     /// and is built/torn down to follow that single entity.
     fn sync_voxel_terrain(&mut self, ctx: &mut EngineContext) {
-        let wants_voxel = ctx.world.entities().any(|e| {
-            ctx.world
-                .get::<somnium_core::VoxelTerrainComponent>(e)
-                .is_some()
-        });
+        let wants_voxel = wants_voxel_terrain(ctx.world);
 
         match (wants_voxel, self.voxel_terrain.is_some()) {
             // Entity appeared â€” spin up the streaming driver.
@@ -2348,21 +2360,7 @@ impl GameApp for HelloGame {
         // authoring state — *"not submitted for drawing"* — not an unload: a
         // hidden canvas still owns its document, and a script writing to that
         // document must not start failing because somebody clicked an eye.
-        let authored_canvas = ctx.world.entities().find_map(|entity| {
-            let canvas = ctx.world.get::<UiCanvasComponent>(entity).copied()?;
-            let transform = ctx
-                .world
-                .get::<Transform>(entity)
-                .copied()
-                .unwrap_or_default();
-            let hidden = ctx
-                .world
-                .get::<EditorFlags>(entity)
-                .copied()
-                .unwrap_or_default()
-                .hidden;
-            canvas.enabled.then_some((canvas, transform, hidden))
-        });
+        let authored_canvas = first_canvas(ctx.world);
         // The Outliner's eye applies to a canvas like it applies to a mesh: a
         // canvas that ignored it would be the one thing in the scene the eye
         // could not turn off, which reads as the eye being broken rather than
@@ -3698,6 +3696,57 @@ mod audit_harness_tests {
         assert_eq!(parse("1920X1080"), Some((1920, 1080)));
         assert_eq!(parse("0x1080"), None);
         assert_eq!(parse("wide"), None);
+    }
+}
+
+#[cfg(test)]
+mod scene_scan_tests {
+    use super::*;
+    use somnium_core::VoxelTerrainComponent;
+    use somnium_ecs::World;
+
+    /// SIM_LOD_PLAN step 1: the shell's per-frame lookups by query take what the old walks of every entity took.
+    /// Canvases over three archetypes: a disabled one first, then an enabled one hidden by the eye, then one with no
+    /// Transform and one more enabled, so the first enabled is picked as before; voxel terrain found or not.
+    #[test]
+    fn the_shells_lookups_by_query_take_what_the_whole_world_walks_took() {
+        // The walks `on_render` and `sync_voxel_terrain` made before, kept as the oracles.
+        let old_canvas = |world: &World| {
+            world.entities().find_map(|entity| {
+                let canvas = world.get::<UiCanvasComponent>(entity).copied()?;
+                let transform = world.get::<Transform>(entity).copied().unwrap_or_default();
+                let hidden = world.get::<EditorFlags>(entity).copied().unwrap_or_default().hidden;
+                canvas.enabled.then_some((canvas, transform, hidden))
+            })
+        };
+        let old_voxel = |world: &World| world.entities().any(|e| world.get::<VoxelTerrainComponent>(e).is_some());
+        // Transform has no PartialEq: compare its parts.
+        let bits = |c: Option<(UiCanvasComponent, Transform, bool)>| {
+            c.map(|(c, t, h)| (c, [t.translation, t.scale], t.rotation, h))
+        };
+        let mut world = World::new();
+        for i in 0..40 {
+            world.spawn((Name::new(&format!("Prop {i}")), Transform::from_translation(Vec3::X * i as f32)));
+        }
+        assert_eq!(bits(first_canvas(&world)), None);
+        assert!(!wants_voxel_terrain(&world) && !old_voxel(&world));
+        let canvas = |layer: i64, enabled: bool| UiCanvasComponent {
+            enabled,
+            layer,
+            ..Default::default()
+        };
+        world.spawn((Transform::default(), canvas(1, false)));
+        world.spawn((Transform::from_translation(Vec3::Y), canvas(2, true), EditorFlags { hidden: true, locked: false }));
+        world.spawn((canvas(3, true),));
+        let fourth = world.spawn((Transform::default(), canvas(4, true)));
+        assert_eq!(bits(first_canvas(&world)), bits(old_canvas(&world)));
+        // The world's order is by archetype: the last canvas shares the first one's, so it comes before the hidden.
+        assert_eq!(first_canvas(&world).map(|c| (c.0.layer, c.2)), Some((4, false)), "the first enabled");
+        world.despawn(fourth);
+        assert_eq!(bits(first_canvas(&world)), bits(old_canvas(&world)));
+        assert_eq!(first_canvas(&world).map(|c| (c.0.layer, c.2)), Some((2, true)), "then the hidden one");
+        world.spawn((Name::new("Voxels"), VoxelTerrainComponent::default()));
+        assert!(wants_voxel_terrain(&world) && old_voxel(&world));
     }
 }
 

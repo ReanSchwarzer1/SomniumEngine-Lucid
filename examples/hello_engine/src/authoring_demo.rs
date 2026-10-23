@@ -102,6 +102,28 @@ fn spawn(world: &mut World, args: &Value) -> Result<Vec<Entity>, String> {
     Ok(entities)
 }
 
+/// The interactable the eye takes this step: one asking for a preview, or (on a request) one within its reach
+/// looked at, the nearest first. Only the archetypes holding an [`Interactable`] are visited, in the world's order,
+/// so the pick is the one a walk of every entity made.
+fn pick(
+    world: &World,
+    eye: Vec3,
+    forward: Vec3,
+    request: bool,
+) -> Option<(Entity, Interactable, Transform, f32)> {
+    world
+        .iter_with::<Interactable>()
+        .filter_map(|(e, config)| {
+            let transform = *world.get::<Transform>(e)?;
+            let delta = transform.translation + config.anchor - eye;
+            let distance = delta.length();
+            (config.preview_requested
+                || (request && distance <= config.reach && delta.normalize_or_zero().dot(forward) > 0.8))
+                .then_some((e, config.clone(), transform, distance))
+        })
+        .min_by(|a, b| a.3.total_cmp(&b.3))
+}
+
 pub struct InteractionDemo {
     session: InteractionSession,
     target: Option<(Entity, Interactable, Transform)>,
@@ -176,21 +198,7 @@ impl InteractionDemo {
     pub fn tick(&mut self, ctx: &mut EngineContext, eye: Vec3, forward: Vec3) {
         if !self.session.busy() {
             let request = std::mem::take(&mut self.request);
-            let target = ctx
-                .world
-                .entities()
-                .filter_map(|e| {
-                    let config = ctx.world.get::<Interactable>(e)?;
-                    let transform = *ctx.world.get::<Transform>(e)?;
-                    let delta = transform.translation + config.anchor - eye;
-                    let distance = delta.length();
-                    (config.preview_requested
-                        || (request
-                            && distance <= config.reach
-                            && delta.normalize_or_zero().dot(forward) > 0.8))
-                        .then_some((e, config.clone(), transform, distance))
-                })
-                .min_by(|a, b| a.3.total_cmp(&b.3));
+            let target = pick(ctx.world, eye, forward, request);
             if let Some((entity, config, transform, _)) = target {
                 if let Some(c) = ctx.world.get_mut::<Interactable>(entity) {
                     c.preview_requested = false;
@@ -279,5 +287,66 @@ mod tests {
             assert_eq!(world.get::<Interactable>(e).unwrap().kind, kind as u32);
             assert!(world.get::<MeshKind>(e).is_some());
         }
+    }
+
+    /// SIM_LOD_PLAN step 1: the pick visits only the interactables' archetypes yet takes what the old walk of
+    /// every entity took, the first of equals included: interactables over three archetypes (a light on one, a
+    /// mesh on others, one with no Transform), ties in distance, previews and requests.
+    #[test]
+    fn the_pick_by_query_takes_what_the_whole_world_walk_took() {
+        // The walk `tick` made before, kept as the oracle.
+        let old = |world: &World, eye: Vec3, forward: Vec3, request: bool| {
+            world
+                .entities()
+                .filter_map(|e| {
+                    let config = world.get::<Interactable>(e)?;
+                    let transform = *world.get::<Transform>(e)?;
+                    let delta = transform.translation + config.anchor - eye;
+                    let distance = delta.length();
+                    (config.preview_requested
+                        || (request && distance <= config.reach && delta.normalize_or_zero().dot(forward) > 0.8))
+                        .then_some((e, config.clone(), transform, distance))
+                })
+                .min_by(|a, b| a.3.total_cmp(&b.3))
+                .map(bits)
+        };
+        // Transform has no PartialEq: compare its parts.
+        fn bits(p: (Entity, Interactable, Transform, f32)) -> (Entity, Interactable, [Vec3; 2], Quat, f32) {
+            (p.0, p.1, [p.2.translation, p.2.scale], p.2.rotation, p.3)
+        }
+        let pick = |world: &World, eye: Vec3, forward: Vec3, request: bool| pick(world, eye, forward, request).map(bits);
+        let mut world = World::new();
+        // Plenty of entities that are not interactable, in archetypes of their own.
+        for i in 0..50 {
+            world.spawn((Name::new(&format!("Prop {i}")), Transform::from_translation(Vec3::X * i as f32)));
+            world.spawn((Transform::default(), WorldTransform::identity(), MeshKind::Sphere));
+        }
+        let interactable = |reach: f32, preview: bool| Interactable {
+            reach,
+            preview_requested: preview,
+            ..Default::default()
+        };
+        // Two at the same distance in front of the eye (a tie), in different archetypes.
+        let at = |x: f32, z: f32| Transform::from_translation(Vec3::new(x, 0.0, z));
+        let a = world.spawn((at(0.5, 2.0), interactable(3.0, false), MeshKind::Cube));
+        world.spawn((at(-0.5, 2.0), interactable(3.0, false), LightComponent::point(0.0, 4.0)));
+        world.spawn((at(0.0, 2.5), interactable(3.0, false), MeshKind::Cube, Name::new("Behind")));
+        world.spawn((at(0.0, 1.0), interactable(0.5, false)));
+        // No Transform: never picked.
+        world.spawn((interactable(9.0, true),));
+        let eye = Vec3::ZERO;
+        let forward = Vec3::Z;
+        for request in [false, true] {
+            let new = pick(&world, eye, forward, request);
+            assert_eq!(new, old(&world, eye, forward, request), "request {request}");
+        }
+        assert_eq!(pick(&world, eye, forward, true).map(|p| p.0), Some(a), "the first of equals");
+        // A preview far off wins over nothing, and ties with another preview go to the first.
+        world.spawn((at(40.0, -40.0), interactable(1.0, true), MeshKind::Cube));
+        world.spawn((at(-40.0, -40.0), interactable(1.0, true)));
+        for request in [false, true] {
+            assert_eq!(pick(&world, eye, forward, request), old(&world, eye, forward, request));
+        }
+        assert!(pick(&world, eye, forward, false).is_some_and(|p| p.1.preview_requested));
     }
 }

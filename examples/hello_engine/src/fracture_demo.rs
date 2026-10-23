@@ -105,6 +105,14 @@ fn spawn_mirror(world: &mut World, args: &Value) -> Result<Vec<Entity>, String> 
     )));
     Ok(entities)
 }
+/// Every mirror part with a parent: its entity, role and the mirror over it, in the world's order, visiting only
+/// the archetypes that hold a [`MirrorPart`] (not every entity in the world, once a frame).
+fn mirror_parts(world: &World) -> Vec<(Entity, u32, Entity)> {
+    world
+        .iter_with::<MirrorPart>()
+        .filter_map(|(e, part)| Some((e, part.role, world.get::<Parent>(e)?.entity)))
+        .collect()
+}
 #[derive(Default)]
 pub struct Demo {
     held: bool,
@@ -151,17 +159,7 @@ impl Demo {
         }
     }
     pub fn sync(world: &mut World) {
-        let parts: Vec<_> = world
-            .entities()
-            .filter_map(|e| {
-                Some((
-                    e,
-                    world.get::<MirrorPart>(e)?.role,
-                    world.get::<Parent>(e)?.entity,
-                ))
-            })
-            .collect();
-        for (e, role, parent) in parts {
+        for (e, role, parent) in mirror_parts(world) {
             if let Some(m) = world.get::<StagedMirror>(parent).copied() {
                 if let Some((_, p, s)) = alcove_boxes(m).get(role as usize) {
                     if let Some(t) = world.get_mut::<Transform>(e) {
@@ -182,4 +180,31 @@ fn spawn_dream_lens(world: &mut World, _args: &Value) -> Result<Vec<Entity>, Str
     pp.dream_strength = 0.35;
     pp.dream_speed = 0.65;
     Ok(vec![entity])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// SIM_LOD_PLAN step 1: the parts `sync` places, found by query, are the ones (in the same order) the old walk
+    /// of every entity found: two mirrors' parts over their archetypes, a part with no parent left out.
+    #[test]
+    fn mirror_parts_by_query_are_the_whole_world_walks() {
+        let mut world = World::new();
+        for i in 0..30 {
+            world.spawn((Name::new(&format!("Prop {i}")), Transform::default()));
+        }
+        spawn_mirror(&mut world, &json!({"position": [0, 1, 0]})).unwrap();
+        world.spawn((MirrorPart { role: 1 },));
+        world.spawn((Transform::default(), MeshKind::Sphere));
+        spawn_mirror(&mut world, &json!({"position": [5, 1, 0]})).unwrap();
+        let root = world.spawn((Name::new("Loose"), Transform::default()));
+        world.spawn((Parent { entity: root }, MirrorPart { role: 0 }, Name::new("Loose part")));
+        let old: Vec<(Entity, u32, Entity)> = world
+            .entities()
+            .filter_map(|e| Some((e, world.get::<MirrorPart>(e)?.role, world.get::<Parent>(e)?.entity)))
+            .collect();
+        assert!(old.len() > 2, "parts to place: {}", old.len());
+        assert_eq!(mirror_parts(&world), old);
+    }
 }
