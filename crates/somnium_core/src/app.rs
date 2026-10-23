@@ -2903,6 +2903,9 @@ impl<G: GameApp> Engine<G> {
         let mut terrains: Vec<_> = self
             .world
             .entities()
+            // A streamed tile's terrain belongs to the cell streamer (`app_cell_streaming.rs`), not to the scene's
+            // sidecars.
+            .filter(|&entity| self.world.get::<crate::cell_streaming::Streamed>(entity).is_none())
             .filter_map(|entity| {
                 self.world
                     .get::<TerrainComponent>(entity)
@@ -2922,40 +2925,13 @@ impl<G: GameApp> Engine<G> {
             let runtime_id = if let Some(&id) = terrain_ids.get(&component.terrain_id) {
                 id
             } else {
-                let desc = somnium_renderer::terrain::TerrainDescriptor {
-                    chunk_cells: component.chunk_cells,
-                    grid_size: [component.grid_x, component.grid_z],
-                    cell_size: component.cell_size,
-                    height_scale: component.height_scale,
-                    virtual_texturing: component.virtual_texturing,
-                    ..Default::default()
-                };
-                let valid_axis = |chunks: u32| {
-                    chunks > 0
-                        && chunks
-                            .checked_mul(desc.chunk_cells)
-                            .and_then(|cells| cells.checked_add(1))
-                            .is_some()
-                };
-                if !desc.chunk_cells.is_power_of_two()
-                    || desc.chunk_cells < (1 << somnium_renderer::terrain::mesh::MAX_TERRAIN_LOD)
-                    || !valid_axis(component.grid_x)
-                    || !valid_axis(component.grid_z)
-                    || !desc.cell_size.is_finite()
-                    || desc.cell_size <= 0.0
-                    || !desc.height_scale.is_finite()
-                    || desc.height_scale <= 0.0
-                    || desc
-                        .total_vertices_x()
-                        .checked_mul(desc.total_vertices_z())
-                        .is_none()
-                {
+                let Some(desc) = crate::cell_streaming::terrain_descriptor(&component) else {
                     warn!(
                         terrain_id = component.terrain_id,
                         "invalid saved terrain descriptor"
                     );
                     continue;
-                }
+                };
                 // Prefab reconstruction also calls this method without resetting
                 // the scene. Its existing terrain must retain sculpted data.
                 let existed = renderer.terrain(component.terrain_id).is_some();
@@ -12011,9 +11987,11 @@ impl<G: GameApp> Engine<G> {
                 }
                 // Phase 14F-3: heightmap + splatmap sidecars, one per terrain.
                 if let Some(r) = &self.renderer {
+                    // Streamed tiles have their own sidecars beside their cells; Save never writes them.
                     let terrain_ids: Vec<u32> = self
                         .world
                         .entities()
+                        .filter(|&e| self.world.get::<crate::cell_streaming::Streamed>(e).is_none())
                         .filter_map(|e| {
                             self.world
                                 .get::<TerrainComponent>(e)

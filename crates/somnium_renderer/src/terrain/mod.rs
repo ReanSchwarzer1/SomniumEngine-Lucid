@@ -45,7 +45,7 @@ use textures::{
 
 /// Static terrain configuration (Phase 14A-1). The matching ECS component
 /// `somnium_core::TerrainComponent` stores a copy of these plus the terrain id.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TerrainDescriptor {
     /// Cells (quads) per chunk edge. Must be a power of two ≥ `1 << MAX_TERRAIN_LOD`.
     pub chunk_cells: u32,

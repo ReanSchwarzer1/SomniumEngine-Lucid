@@ -325,7 +325,28 @@ pub(crate) enum Piece {
         scene: somnium_asset::LoadedScene,
         prepared: somnium_renderer::PreparedScene,
     },
-    Cell(Result<serde_json::Value, String>),
+    /// The parsed cell, then each of its terrains' sidecars by saved id, read and baked (none when it is not drawn).
+    Cell(Result<serde_json::Value, String>, Vec<(u32, Result<somnium_renderer::terrain::TerrainSidecar, String>)>),
+}
+
+/// A renderer terrain a streamed tile holds or held, with what another tile must match to reuse it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TerrainSlot {
+    /// The renderer's terrain id.
+    pub(crate) id: u32,
+    pub(crate) desc: somnium_renderer::terrain::TerrainDescriptor,
+    /// Where its ground layers were loaded from.
+    pub(crate) asset_dir: PathBuf,
+}
+
+/// Take a retired slot made for `desc` with `asset_dir`'s ground layers, the most recently retired first.
+pub(crate) fn take_free_slot(
+    free: &mut Vec<TerrainSlot>,
+    desc: &somnium_renderer::terrain::TerrainDescriptor,
+    asset_dir: &Path,
+) -> Option<TerrainSlot> {
+    let at = free.iter().rposition(|slot| slot.desc == *desc && slot.asset_dir == asset_dir)?;
+    Some(free.remove(at))
 }
 
 /// The streamer's state, owned by the app.
@@ -348,6 +369,12 @@ pub struct CellStreamer {
     pub(crate) cold: HashMap<PathBuf, std::time::Instant>,
     /// When cold sources were last released (batched: each release waits for the GPU).
     pub(crate) last_eviction: Option<std::time::Instant>,
+    /// Cell index -> the renderer terrains its tiles hold.
+    pub(crate) cell_terrains: HashMap<usize, Vec<TerrainSlot>>,
+    /// Terrains retired with their cells, kept for the next tile of the same shape.
+    pub(crate) free_terrains: Vec<TerrainSlot>,
+    /// The renderer's `scene_resets` the two above belong to: a scene reset drops every terrain by itself.
+    pub(crate) terrain_resets: u64,
 }
 
 /// How long a streamed mesh no loaded cell uses stays uploaded (coming back soon costs nothing).
@@ -371,6 +398,89 @@ pub fn sources_of(document: &serde_json::Value) -> BTreeMap<String, HashSet<usiz
         }
     }
     sources
+}
+
+/// A terrain a cell holds, as its document saves it: what its reader needs to read and bake its sidecar.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerrainCell {
+    /// The id it was saved under, which names its sidecar (`{cell}.terrain{id}.bin`).
+    pub saved_id: u32,
+    /// What `read_sidecar` expects: vertices along X and Z, then splat texels along X and Z.
+    pub dims: [u32; 4],
+    /// Metres between neighbouring heights.
+    pub cell_size: f32,
+    /// Multiplier on the raw heights.
+    pub height_scale: f32,
+}
+
+/// Each terrain (`somnium.Terrain`) a scene document holds, once per saved id. Fields it leaves out take the
+/// component's defaults, as a scene load gives them. A terrain the renderer could not make is left out; its install
+/// reports it.
+#[must_use]
+pub fn terrains_of(document: &serde_json::Value) -> Vec<TerrainCell> {
+    let mut terrains: Vec<TerrainCell> = Vec::new();
+    for entity in document.get("entities").and_then(serde_json::Value::as_array).into_iter().flatten() {
+        let Some(fields) = entity.pointer("/components/somnium.Terrain/fields") else {
+            continue;
+        };
+        let whole = |name: &str, default: u32| {
+            fields.get(name).and_then(serde_json::Value::as_u64).and_then(|v| u32::try_from(v).ok()).unwrap_or(default)
+        };
+        let real =
+            |name: &str, default: f32| fields.get(name).and_then(serde_json::Value::as_f64).map_or(default, |v| v as f32);
+        let defaults = crate::TerrainComponent::default();
+        let component = crate::TerrainComponent {
+            terrain_id: whole("terrain_id", defaults.terrain_id),
+            chunk_cells: whole("chunk_cells", defaults.chunk_cells),
+            grid_x: whole("grid_x", defaults.grid_x),
+            grid_z: whole("grid_z", defaults.grid_z),
+            cell_size: real("cell_size", defaults.cell_size),
+            height_scale: real("height_scale", defaults.height_scale),
+            ..defaults
+        };
+        let Some(desc) = terrain_descriptor(&component) else {
+            continue;
+        };
+        if terrains.iter().any(|terrain| terrain.saved_id == component.terrain_id) {
+            continue;
+        }
+        let [grid_x, grid_z] = desc.grid_size;
+        terrains.push(TerrainCell {
+            saved_id: component.terrain_id,
+            dims: [desc.total_vertices_x(), desc.total_vertices_z(), grid_x * desc.chunk_cells, grid_z * desc.chunk_cells],
+            cell_size: desc.cell_size,
+            height_scale: desc.height_scale,
+        });
+    }
+    terrains
+}
+
+/// The renderer descriptor a saved terrain asks for, or `None` when the renderer could not make it: a chunk size the
+/// LOD scheme cannot split, a zero or overflowing grid, or a cell size or height scale that is not a positive number.
+pub(crate) fn terrain_descriptor(
+    component: &crate::TerrainComponent,
+) -> Option<somnium_renderer::terrain::TerrainDescriptor> {
+    let desc = somnium_renderer::terrain::TerrainDescriptor {
+        chunk_cells: component.chunk_cells,
+        grid_size: [component.grid_x, component.grid_z],
+        cell_size: component.cell_size,
+        height_scale: component.height_scale,
+        virtual_texturing: component.virtual_texturing,
+        ..Default::default()
+    };
+    let valid_axis = |chunks: u32| {
+        chunks > 0 && chunks.checked_mul(desc.chunk_cells).and_then(|cells| cells.checked_add(1)).is_some()
+    };
+    let valid = desc.chunk_cells.is_power_of_two()
+        && desc.chunk_cells >= (1 << somnium_renderer::terrain::mesh::MAX_TERRAIN_LOD)
+        && valid_axis(component.grid_x)
+        && valid_axis(component.grid_z)
+        && desc.cell_size.is_finite()
+        && desc.cell_size > 0.0
+        && desc.height_scale.is_finite()
+        && desc.height_scale > 0.0
+        && desc.total_vertices_x().checked_mul(desc.total_vertices_z()).is_some();
+    valid.then_some(desc)
 }
 
 impl CellStreamer {
@@ -477,6 +587,49 @@ mod tests {
         assert_eq!(sources.len(), 2);
         assert_eq!(sources["a.gltf"], HashSet::from([2, 5]));
         assert_eq!(sources["b.gltf"], HashSet::from([0]));
+    }
+
+    #[test]
+    fn a_cell_names_each_terrain_once_with_the_sidecar_size_it_reads() {
+        let document = serde_json::json!({"version": 4, "entities": [
+            {"components": {"somnium.Terrain": {"version": 2, "fields": {
+                "terrain_id": 0, "chunk_cells": 64, "grid_x": 8, "grid_z": 8, "cell_size": 2.0, "height_scale": 1.0}}}},
+            // The same saved id again: one terrain, as a scene open makes it.
+            {"components": {"somnium.Terrain": {"version": 2, "fields": {"terrain_id": 0, "grid_x": 8, "grid_z": 8}}}},
+            // Missing fields take the component's defaults: 64-cell chunks, one chunk along Z, 1 m cells.
+            {"components": {"somnium.Terrain": {"version": 1, "fields": {"terrain_id": 3, "grid_x": 2}}}},
+            // Twelve cells per chunk is no power of two: the renderer could not make it.
+            {"components": {"somnium.Terrain": {"version": 2, "fields": {"terrain_id": 5, "chunk_cells": 12}}}},
+            {"components": {"somnium.Name": {"fields": {"value": "no terrain"}}}},
+        ]});
+        assert_eq!(
+            terrains_of(&document),
+            vec![
+                TerrainCell { saved_id: 0, dims: [513, 513, 512, 512], cell_size: 2.0, height_scale: 1.0 },
+                TerrainCell { saved_id: 3, dims: [129, 65, 128, 64], cell_size: 1.0, height_scale: 1.0 },
+            ]
+        );
+        assert!(terrains_of(&serde_json::json!({"version": 4, "entities": []})).is_empty());
+    }
+
+    #[test]
+    fn a_retired_slot_goes_only_to_a_tile_of_the_same_shape_and_ground() {
+        use somnium_renderer::terrain::TerrainDescriptor;
+        let tile = TerrainDescriptor { chunk_cells: 64, grid_size: [8, 8], cell_size: 2.0, ..Default::default() };
+        let slot = |id, desc, dir: &str| TerrainSlot { id, desc, asset_dir: PathBuf::from(dir) };
+        let mut free = vec![
+            slot(1, tile, "assets/terrain"),
+            slot(2, TerrainDescriptor { height_scale: 2.0, ..tile }, "assets/terrain"),
+            slot(3, tile, "assets/terrain_verglas"),
+            slot(4, tile, "assets/terrain"),
+        ];
+        let ground = Path::new("assets/terrain");
+        assert_eq!(take_free_slot(&mut free, &tile, ground).map(|s| s.id), Some(4), "the last retired first");
+        assert_eq!(take_free_slot(&mut free, &tile, ground).map(|s| s.id), Some(1));
+        assert_eq!(take_free_slot(&mut free, &tile, ground), None, "another height scale or ground is no match");
+        let wider = TerrainDescriptor { grid_size: [16, 8], ..tile };
+        assert_eq!(take_free_slot(&mut free, &wider, ground), None);
+        assert_eq!(free.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2, 3], "what did not match stays");
     }
 
     #[test]
