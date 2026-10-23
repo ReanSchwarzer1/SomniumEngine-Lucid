@@ -42,6 +42,7 @@ use crate::{
 };
 use somnium_ecs::{Entity, World};
 use somnium_renderer::terrain::brush::{BrushMode, TerrainBrush, apply_paint, apply_sculpt};
+use crate::foliage_palette::FOLIAGE_KINDS;
 
 /// Maintain the scene-wide post-process component as an actual singleton.
 ///
@@ -705,8 +706,10 @@ impl FoliageEntry {
 /// TSUSHIMA-I).
 ///
 /// Legacy built-in kinds retain their saved indices. A project's
-/// `foliage.palette.json` extends the picker with explicit stable IDs 128..255
-/// and authored source/primitive selections; see `foliage_palette` for its schema.
+/// `foliage.palette.json` extends the picker with explicit stable IDs
+/// 25..FOLIAGE_KINDS-1 (projects began at 128..255, then 25..127, and those
+/// keep their meanings) and authored source/primitive selections; see
+/// `foliage_palette` for its schema.
 ///
 /// All CC0 from Poly Haven — see ATTRIBUTION.md. `tools/fetch_foliage.sh`
 /// downloads every one of them and verifies it against the publisher's MD5;
@@ -1188,12 +1191,12 @@ pub struct Engine<G: GameApp> {
     /// `(entity index, value before the drag)`.
     /// Uploaded geometry per palette entry, filled in the first time each one
     /// is painted — loading four scanned models up front would add seconds to
-    /// startup for meshes the user may never place.
-    foliage_meshes: [Option<Vec<FoliagePart>>; 256],
-    foliage_lod_meshes: [Option<Vec<FoliagePart>>; 256],
+    /// startup for meshes the user may never place. `FOLIAGE_KINDS` long, by kind.
+    foliage_meshes: Vec<Option<Vec<FoliagePart>>>,
+    foliage_lod_meshes: Vec<Option<Vec<FoliagePart>>>,
     /// Palette entries whose import failed, so we stop retrying them.
-    foliage_failed: [bool; 256],
-    project_foliage: std::collections::BTreeMap<u8, crate::foliage_palette::ProjectEntry>,
+    foliage_failed: Vec<bool>,
+    project_foliage: std::collections::BTreeMap<u16, crate::foliage_palette::ProjectEntry>,
     project_foliage_sources: std::collections::HashMap<std::path::PathBuf, Vec<FoliagePart>>,
     /// Phase 17F: the foliage brush.
     foliage_brush: somnium_renderer::terrain::foliage_paint::FoliageBrush,
@@ -1800,9 +1803,9 @@ impl<G: GameApp + 'static> Engine<G> {
             viewport_size_hint: initial_vp,
             gizmo_drag: None,
             marquee: None,
-            foliage_meshes: std::array::from_fn(|_| None),
-            foliage_lod_meshes: std::array::from_fn(|_| None),
-            foliage_failed: [false; 256],
+            foliage_meshes: vec![None; FOLIAGE_KINDS],
+            foliage_lod_meshes: vec![None; FOLIAGE_KINDS],
+            foliage_failed: vec![false; FOLIAGE_KINDS],
             project_foliage,
             project_foliage_sources: std::collections::HashMap::new(),
             foliage_brush: somnium_renderer::terrain::foliage_paint::FoliageBrush::default(),
@@ -2640,7 +2643,7 @@ impl<G: GameApp> Engine<G> {
             .chain(self.foliage_meshes.iter_mut().filter_map(Option::take).flatten())
             .chain(self.foliage_lod_meshes.iter_mut().filter_map(Option::take).flatten())
             .collect::<Vec<_>>();
-        self.foliage_failed = [false; 256];
+        self.foliage_failed.fill(false);
         self.ground_cover.clear();
         for part in foliage {
             if part.index_count > 0 && !retained.contains(&part.vertex_offset) {
@@ -3993,9 +3996,9 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 self.render_ctx = Some(render_ctx);
                 self.imported_uploads.clear();
                 self.project_foliage_sources.clear();
-                self.foliage_meshes = std::array::from_fn(|_| None);
-                self.foliage_lod_meshes = std::array::from_fn(|_| None);
-                self.foliage_failed = [false; 256];
+                self.foliage_meshes.fill(None);
+                self.foliage_lod_meshes.fill(None);
+                self.foliage_failed.fill(false);
                 // A new renderer holds no batches.
                 self.foliage_batches = Default::default();
                 self.prop_sets.reset_gpu();
@@ -9011,7 +9014,7 @@ impl<G: GameApp> Engine<G> {
             // Which palette entries this terrain actually uses, so nothing is
             // loaded for a kind that has never been painted. Kept by the
             // terrain's grid, which rebuilds only when its foliage changes.
-            let kinds: Vec<u8> = {
+            let kinds: Vec<u16> = {
                 let Some(t) = self.renderer.as_ref().and_then(|r| r.terrain(terrain_id)) else {
                     continue;
                 };
@@ -9020,7 +9023,7 @@ impl<G: GameApp> Engine<G> {
                 grid.kinds.clone()
             };
             // Kinds generated round the camera need their meshes as painted ones do.
-            let cover_kinds: Vec<u8> =
+            let cover_kinds: Vec<u16> =
                 self.project_foliage.iter().filter(|(_, e)| e.ground_cover.is_some()).map(|(k, _)| *k).collect();
             for kind in kinds.iter().chain(&cover_kinds) {
                 self.ensure_palette_mesh(*kind);
@@ -9044,11 +9047,13 @@ impl<G: GameApp> Engine<G> {
             // Per kind (WS1-6): a palette entry's own draw and shadow distances,
             // else the component's; its LOD distance, looked up here once
             // rather than per instance. A kind with no overrides is tested
-            // exactly as before.
-            let mut kind_cull = [cull_sq; 256];
-            let mut kind_shadow = [shadow_sq; 256];
-            let mut kind_lod = [f32::INFINITY; 256];
-            let mut kind_reach = [cull_distance; 256];
+            // exactly as before. One slot per id up to the palette's last: no
+            // kind past it has a mesh.
+            let span = self.project_foliage.keys().next_back().map_or(0, |&k| usize::from(k) + 1).max(FOLIAGE_PALETTE.len());
+            let mut kind_cull = vec![cull_sq; span];
+            let mut kind_shadow = vec![shadow_sq; span];
+            let mut kind_lod = vec![f32::INFINITY; span];
+            let mut kind_reach = vec![cull_distance; span];
             for (kind, entry) in &self.project_foliage {
                 let k = *kind as usize;
                 // Ground cover draws as far as it is generated unless told otherwise.
@@ -9076,9 +9081,8 @@ impl<G: GameApp> Engine<G> {
                     local: p.local,
                     is_leaf: p.is_leaf,
                 };
-                let mut parts: [Option<Vec<somnium_renderer::instance_batch::BatchPart>>; 256] =
-                    std::array::from_fn(|_| None);
-                for &kind in &kinds {
+                let mut parts: Vec<Option<Vec<somnium_renderer::instance_batch::BatchPart>>> = vec![None; span];
+                for &kind in kinds.iter().filter(|&&kind| usize::from(kind) < span) {
                     let k = kind as usize;
                     let Some(Some(near)) = self.foliage_meshes.get(k) else {
                         continue;
@@ -9109,7 +9113,7 @@ impl<G: GameApp> Engine<G> {
                 counts.submitted_instances = counts.submitted_instances.saturating_add(copies);
             }
             // Only the ground cells within the farthest kind's reach are visited.
-            let reach_sq = kinds.iter().map(|k| kind_cull[*k as usize]).fold(0.0_f32, f32::max);
+            let reach_sq = kinds.iter().filter_map(|k| kind_cull.get(usize::from(*k))).fold(0.0_f32, |a, &b| a.max(b));
             let reach = if reach_sq >= f32::MAX { f32::INFINITY } else { reach_sq.sqrt() };
             self.foliage_visit.clear();
             if let Some(grid) = self.foliage_grids.get(&terrain_id).filter(|_| !painted_batched) {
@@ -9128,6 +9132,11 @@ impl<G: GameApp> Engine<G> {
             for (inst, cover_rotation) in painted.chain(cover) {
                 let k = inst.kind as usize;
                 counts.candidates = counts.candidates.saturating_add(1);
+                // Past the palette's last id: no mesh and no distances.
+                if k >= span {
+                    counts.unavailable_mesh = counts.unavailable_mesh.saturating_add(1);
+                    continue;
+                }
                 // Generated cover is measured from where it grows round; painted kinds from the camera, as before.
                 let d = inst.position - if cover_rotation.is_some() { focus_local } else { camera_local };
                 // Horizontal distance: flying up should not make ground cover
@@ -9341,7 +9350,7 @@ impl<G: GameApp> Engine<G> {
     }
 
     /// Load and upload one palette entry, the first time it is painted.
-    fn ensure_palette_mesh(&mut self, kind: u8) {
+    fn ensure_palette_mesh(&mut self, kind: u16) {
         if crate::foliage_palette::is_project_kind(kind) {
             self.ensure_project_palette_mesh(kind);
             return;
@@ -11935,7 +11944,7 @@ impl<G: GameApp> Engine<G> {
                     FB::Radius => brush.radius = value.clamp(0.25, 200.0),
                     FB::MaxSlope => brush.max_slope_deg = value.clamp(0.0, 90.0),
                     FB::Kind => {
-                        let kind = value.round().clamp(0.0, 255.0) as u8;
+                        let kind = value.round().clamp(0.0, (FOLIAGE_KINDS - 1) as f32) as u16;
                         if (kind as usize) < FOLIAGE_PALETTE.len()
                             || self.project_foliage.contains_key(&kind)
                         {

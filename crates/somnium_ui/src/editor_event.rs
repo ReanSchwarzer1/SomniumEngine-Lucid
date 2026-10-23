@@ -541,7 +541,7 @@ pub enum EditorEvent {
     /// Place one instance per click instead of a spread — how trees go down.
     ToggleFoliageSingle,
     /// Pick which palette entry the foliage brush paints (Phase 17F).
-    SelectFoliageKind(u8),
+    SelectFoliageKind(u16),
     /// Set a post-processing effect on the selected Post Processing entity.
     /// Carrying the checkbox value makes UI synchronization idempotent.
     /// Cycle the tone-mapping curve (AgX → ACES → Reinhard).

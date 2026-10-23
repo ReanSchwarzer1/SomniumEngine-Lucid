@@ -2,7 +2,10 @@
 
 A project can extend the native foliage palette with `<content_root>/foliage.palette.json`.
 The file is loaded once when the project opens. Reopen after editing the descriptor.
-Legacy built-in kinds 0–24 keep their meanings; project kinds use stable IDs 128–255.
+Legacy built-in kinds 0–24 keep their meanings; project kinds use stable IDs 25–8191
+(`FOLIAGE_KINDS` - 1). IDs 128–255, then 25–127, were the first given out and keep their meanings.
+A palette holds at most 8,167 entries, and a palette or sidecar naming a kind of 8192 or more is refused.
+Files stay version 1: a kind is a plain JSON integer either way.
 Missing IDs remain missing instead of silently becoming a different plant.
 
 ```json

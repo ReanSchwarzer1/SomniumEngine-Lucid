@@ -1012,8 +1012,8 @@ pub struct UiManager {
     create_popup_items: Vec<(NodeHandle, &'static str)>,
     /// Palette entry currently shown on the picker button, so a click can
     /// advance to the next one.
-    foliage_kind_shown: u8,
-    foliage_palette_kinds: Vec<u8>,
+    foliage_kind_shown: u16,
+    foliage_palette_kinds: Vec<u16>,
     // File menu (Phase 19B): Import
     file_button: NodeHandle,
     file_popup: NodeHandle,
@@ -1898,7 +1898,7 @@ impl UiManager {
             create_popup_open: false,
             create_popup_items: layout.create_popup_items,
             foliage_kind_shown: 0,
-            foliage_palette_kinds: (0..FOLIAGE_KIND_NAMES.len() as u8).collect(),
+            foliage_palette_kinds: (0..FOLIAGE_KIND_NAMES.len() as u16).collect(),
             file_button: layout.file_button,
             file_popup: layout.file_popup,
             file_menu_stack: layout.file_menu_stack,
@@ -8353,7 +8353,7 @@ impl UiManager {
     /// Show the stable authoring subset of a first-class water body.
 
     /// Replace the palette display model while retaining stable saved kind IDs.
-    pub fn set_foliage_palette(&mut self, entries: &[(u8, String)]) {
+    pub fn set_foliage_palette(&mut self, entries: &[(u16, String)]) {
         self.foliage_palette_kinds = entries.iter().map(|(kind, _)| *kind).collect();
         let names: Vec<String> = entries.iter().map(|(_, name)| name.clone()).collect();
         for handle in [
@@ -8398,7 +8398,7 @@ impl UiManager {
                     self.native_ui
                         .send(CheckBoxMessage::set_checked(*handle, *on));
                 }
-                let kind = v[3].round().clamp(0.0, 255.0) as u8;
+                let kind = v[3].round().clamp(0.0, f32::from(u16::MAX)) as u16;
                 let row = self
                     .foliage_palette_kinds
                     .iter()
