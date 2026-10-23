@@ -538,6 +538,12 @@ struct Beast {
 /// - `frostwarg`: a Named rime wolf the size of a horse, one, Morrowdeep and the Pale Courts;
 /// - `hollowwolves`: Hollows in a wolf's shape, three; they hunt by soul-sight, so the dark hides no one from them.
 ///
+/// And the south's later ones (rb-folk-south, 23 Oct), each in its own body:
+/// - `labyrinthsentinels`: the Mirage's Warden kin with a sun-collector disc, two, heavy and slow to stop;
+/// - `templeserpent`: a 9 m constrictor of the Delta's drowned temples, one;
+/// - `whistlesnakes`: the Steppe's venomous grass snakes, two, small;
+/// - `greylions`: a pride of three from the Lion Rocks, fast.
+///
 /// A kind may be written with underscores (`glass_scorpions`), as rb-pois' and rb-pois-south's files have them.
 fn beast_of(kind: &str) -> Option<Beast> {
     Some(match kind.trim().to_ascii_lowercase().replace('_', "").as_str() {
@@ -720,6 +726,54 @@ fn beast_of(kind: &str) -> Option<Beast> {
             speed: 7.0,
             body: Some("creatures/hollow_wolf/hollow_wolf"),
             blind: true,
+        },
+        "labyrinthsentinels" => Beast {
+            name: "Labyrinth sentinel",
+            count: 2,
+            size: Vec3::new(1.9, 1.7, 2.0),
+            mat: "stone",
+            health: 260.0,
+            poise: 120.0,
+            armor: 6.0,
+            speed: 4.2,
+            body: Some("creatures/labyrinth_sentinel/labyrinth_sentinel"),
+            blind: false,
+        },
+        "templeserpent" => Beast {
+            name: "Temple serpent",
+            count: 1,
+            size: Vec3::new(0.6, 0.5, 8.5),
+            mat: "dark",
+            health: 320.0,
+            poise: 140.0,
+            armor: 2.0,
+            speed: 2.6,
+            body: Some("creatures/temple_serpent/temple_serpent"),
+            blind: false,
+        },
+        "whistlesnakes" => Beast {
+            name: "Whistle snake",
+            count: 2,
+            size: Vec3::new(0.15, 0.1, 2.1),
+            mat: "ash",
+            health: 30.0,
+            poise: 5.0,
+            armor: 0.0,
+            speed: 2.1,
+            body: Some("creatures/whistle_snake/whistle_snake"),
+            blind: false,
+        },
+        "greylions" => Beast {
+            name: "Grey lion",
+            count: 3,
+            size: Vec3::new(0.8, 1.5, 2.4),
+            mat: "ash",
+            health: 180.0,
+            poise: 70.0,
+            armor: 1.0,
+            speed: 8.0,
+            body: Some("creatures/grey_lion/grey_lion"),
+            blind: false,
         },
         _ => return None,
     })
@@ -2110,7 +2164,7 @@ fn register_encounter(registry: &mut somnium_ecs::reflect::TypeRegistry) {
         CombatEncounterComponent as "somnium.CombatEncounter", display "Combat Encounter", version 1,
         fields {
             enabled { doc: "Built on Play at this entity's position, taken away on Stop." },
-            kind { doc: "wilds: a horse, a rime wolf pack and a bandit camp, none of them aware yet; wolves: the pack alone; bandits: the camp alone; harrowcat: one, hunting alone; harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger, barrowcrows, glassscorpions, miragehounds, boilcrabs, nhalspawn, frostwarg, hollowwolves: the bestiary's; lampmen [red, white, amber, green, blue]: a Lamp crew on a street; watch, lance, knights: the law's; ledger_engine: Act VI's climax, the vault-keeper and the Engine's three glyph-boards." },
+            kind { doc: "wilds: a horse, a rime wolf pack and a bandit camp, none of them aware yet; wolves: the pack alone; bandits: the camp alone; harrowcat: one, hunting alone; harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger, barrowcrows, glassscorpions, miragehounds, boilcrabs, nhalspawn, frostwarg, hollowwolves, labyrinthsentinels, templeserpent, whistlesnakes, greylions: the bestiary's; lampmen [red, white, amber, green, blue]: a Lamp crew on a street; watch, lance, knights: the law's; ledger_engine: Act VI's climax, the vault-keeper and the Engine's three glyph-boards." },
             floor { doc: "Bring its own flat ground; off stands everyone on the ground here." },
         }
     });
@@ -2181,7 +2235,7 @@ fn build_encounter(
         band if band_of(band).is_some() => args["only"] = json!(band),
         other => {
             return Err(format!(
-                "no kind {other:?} (try wilds, wolves, bandits, harrowcat, harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger, barrowcrows, glassscorpions, miragehounds, boilcrabs, nhalspawn, frostwarg, hollowwolves, lampmen [red|white|amber|green|blue], watch, lance, knights or ledger_engine)"
+                "no kind {other:?} (try wilds, wolves, bandits, harrowcat, harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger, barrowcrows, glassscorpions, miragehounds, boilcrabs, nhalspawn, frostwarg, hollowwolves, labyrinthsentinels, templeserpent, whistlesnakes, greylions, lampmen [red|white|amber|green|blue], watch, lance, knights or ledger_engine)"
             ));
         }
     }
@@ -7146,7 +7200,8 @@ mod tests {
         for stem in ["iron_mole/iron_mole", "seal_wolf/seal_wolf", "smog_wraith/smog_wraith", "warden_guard/warden_guard",
                      "hunger/hunger", "barrow_crow/barrow_crow", "glass_scorpion/glass_scorpion",
                      "mirage_hound/mirage_hound", "boil_crab/boil_crab", "nhal_spawn/nhal_spawn",
-                     "frost_warg/frost_warg", "hollow_wolf/hollow_wolf"] {
+                     "frost_warg/frost_warg", "hollow_wolf/hollow_wolf", "labyrinth_sentinel/labyrinth_sentinel",
+                     "temple_serpent/temple_serpent", "whistle_snake/whistle_snake", "grey_lion/grey_lion"] {
             let file = content.join(format!("creatures/{stem}.glb"));
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(&file, b"").unwrap();
@@ -7157,7 +7212,9 @@ mod tests {
                                     ("hunger", "hunger", 1), ("barrowcrows", "barrow_crow", 5),
                                     ("glassscorpions", "glass_scorpion", 2), ("miragehounds", "mirage_hound", 5),
                                     ("boilcrabs", "boil_crab", 4), ("nhalspawn", "nhal_spawn", 4),
-                                    ("frostwarg", "frost_warg", 1), ("hollowwolves", "hollow_wolf", 3)] {
+                                    ("frostwarg", "frost_warg", 1), ("hollowwolves", "hollow_wolf", 3),
+                                    ("labyrinthsentinels", "labyrinth_sentinel", 2), ("templeserpent", "temple_serpent", 1),
+                                    ("whistlesnakes", "whistle_snake", 2), ("greylions", "grey_lion", 3)] {
             let made = build_encounter(&mut world, kind, Vec3::ZERO, Vec3::X, false, Some(&content)).expect(kind);
             let sources: Vec<AssetId> = made.iter().filter_map(|e| world.get::<SkinnedBody>(*e)).map(|b| b.source).collect();
             let want = AssetId::from_relative_path(format!("creatures/{stem}/{stem}.glb"));
