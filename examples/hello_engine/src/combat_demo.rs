@@ -530,8 +530,8 @@ struct Beast {
 /// The south's (WS3, ECOLOGY 5.6 and the Sunscar bible 3.6), each in its own WS3 body:
 /// - `glassscorpions`: the Sunscar's glass scorpions, two, big and armoured, slow (they wait unseen and strike);
 /// - `miragehounds`: desert dogs that hide in mirages, a pack of five on the pans, fast;
-/// - `boilcrabs` (or `wreckcrabs` until wreck crabs have bodies of their own): the Cauldron's crimson crabs of the
-///   hot pools, four, small and shelled.
+/// - `boilcrabs`: the Cauldron's crimson crabs of the hot pools, four, small and shelled;
+/// - `wreckcrabs`: the wreck crabs of Lisle's and the Delta's shores, three, slow and shelled.
 ///
 /// The Nightside's (WS3, ECOLOGY 5.3), each in its own WS3 body:
 /// - `nhalspawn`: Nhal's spawn, frost-black things with too many limbs, a pack of four;
@@ -679,7 +679,7 @@ fn beast_of(kind: &str) -> Option<Beast> {
             body: Some("creatures/mirage_hound/mirage_hound"),
             blind: false,
         },
-        "boilcrabs" | "wreckcrabs" => Beast {
+        "boilcrabs" => Beast {
             name: "Boil-crab",
             count: 4,
             size: Vec3::new(0.6, 0.3, 0.5),
@@ -689,6 +689,18 @@ fn beast_of(kind: &str) -> Option<Beast> {
             armor: 4.0,
             speed: 3.0,
             body: Some("creatures/boil_crab/boil_crab"),
+            blind: false,
+        },
+        "wreckcrabs" => Beast {
+            name: "Wreck crab",
+            count: 3,
+            size: Vec3::new(0.6, 0.3, 0.5),
+            mat: "stone",
+            health: 60.0,
+            poise: 30.0,
+            armor: 4.0,
+            speed: 1.0,
+            body: Some("creatures/wreck_crab/wreck_crab"),
             blind: false,
         },
         "nhalspawn" => Beast {
@@ -771,7 +783,7 @@ fn beast_of(kind: &str) -> Option<Beast> {
             health: 180.0,
             poise: 70.0,
             armor: 1.0,
-            speed: 8.0,
+            speed: 7.5,
             body: Some("creatures/grey_lion/grey_lion"),
             blind: false,
         },
@@ -2164,7 +2176,7 @@ fn register_encounter(registry: &mut somnium_ecs::reflect::TypeRegistry) {
         CombatEncounterComponent as "somnium.CombatEncounter", display "Combat Encounter", version 1,
         fields {
             enabled { doc: "Built on Play at this entity's position, taken away on Stop." },
-            kind { doc: "wilds: a horse, a rime wolf pack and a bandit camp, none of them aware yet; wolves: the pack alone; bandits: the camp alone; harrowcat: one, hunting alone; harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger, barrowcrows, glassscorpions, miragehounds, boilcrabs, nhalspawn, frostwarg, hollowwolves, labyrinthsentinels, templeserpent, whistlesnakes, greylions: the bestiary's; lampmen [red, white, amber, green, blue]: a Lamp crew on a street; watch, lance, knights: the law's; ledger_engine: Act VI's climax, the vault-keeper and the Engine's three glyph-boards." },
+            kind { doc: "wilds: a horse, a rime wolf pack and a bandit camp, none of them aware yet; wolves: the pack alone; bandits: the camp alone; harrowcat: one, hunting alone; harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger, barrowcrows, glassscorpions, miragehounds, boilcrabs, wreckcrabs, nhalspawn, frostwarg, hollowwolves, labyrinthsentinels, templeserpent, whistlesnakes, greylions: the bestiary's; lampmen [red, white, amber, green, blue]: a Lamp crew on a street; watch, lance, knights: the law's; ledger_engine: Act VI's climax, the vault-keeper and the Engine's three glyph-boards." },
             floor { doc: "Bring its own flat ground; off stands everyone on the ground here." },
         }
     });
@@ -2235,7 +2247,7 @@ fn build_encounter(
         band if band_of(band).is_some() => args["only"] = json!(band),
         other => {
             return Err(format!(
-                "no kind {other:?} (try wilds, wolves, bandits, harrowcat, harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger, barrowcrows, glassscorpions, miragehounds, boilcrabs, nhalspawn, frostwarg, hollowwolves, labyrinthsentinels, templeserpent, whistlesnakes, greylions, lampmen [red|white|amber|green|blue], watch, lance, knights or ledger_engine)"
+                "no kind {other:?} (try wilds, wolves, bandits, harrowcat, harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger, barrowcrows, glassscorpions, miragehounds, boilcrabs, wreckcrabs, nhalspawn, frostwarg, hollowwolves, labyrinthsentinels, templeserpent, whistlesnakes, greylions, lampmen [red|white|amber|green|blue], watch, lance, knights or ledger_engine)"
             ));
         }
     }
@@ -7199,7 +7211,7 @@ mod tests {
         assert_eq!((bodies, worn), (5, 5));
         for stem in ["iron_mole/iron_mole", "seal_wolf/seal_wolf", "smog_wraith/smog_wraith", "warden_guard/warden_guard",
                      "hunger/hunger", "barrow_crow/barrow_crow", "glass_scorpion/glass_scorpion",
-                     "mirage_hound/mirage_hound", "boil_crab/boil_crab", "nhal_spawn/nhal_spawn",
+                     "mirage_hound/mirage_hound", "boil_crab/boil_crab", "wreck_crab/wreck_crab", "nhal_spawn/nhal_spawn",
                      "frost_warg/frost_warg", "hollow_wolf/hollow_wolf", "labyrinth_sentinel/labyrinth_sentinel",
                      "temple_serpent/temple_serpent", "whistle_snake/whistle_snake", "grey_lion/grey_lion"] {
             let file = content.join(format!("creatures/{stem}.glb"));
@@ -7211,7 +7223,7 @@ mod tests {
                                     ("smogwraiths", "smog_wraith", 2), ("wardenguard", "warden_guard", 1),
                                     ("hunger", "hunger", 1), ("barrowcrows", "barrow_crow", 5),
                                     ("glassscorpions", "glass_scorpion", 2), ("miragehounds", "mirage_hound", 5),
-                                    ("boilcrabs", "boil_crab", 4), ("nhalspawn", "nhal_spawn", 4),
+                                    ("boilcrabs", "boil_crab", 4), ("wreckcrabs", "wreck_crab", 3), ("nhalspawn", "nhal_spawn", 4),
                                     ("frostwarg", "frost_warg", 1), ("hollowwolves", "hollow_wolf", 3),
                                     ("labyrinthsentinels", "labyrinth_sentinel", 2), ("templeserpent", "temple_serpent", 1),
                                     ("whistlesnakes", "whistle_snake", 2), ("greylions", "grey_lion", 3)] {
