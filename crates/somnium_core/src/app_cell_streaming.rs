@@ -105,6 +105,7 @@ impl<G: GameApp> Engine<G> {
         }
 
         self.evict_cold_sources();
+        self.rewear_retired_slot();
 
         let streamer = &self.cell_streamer;
         let (loaded, pending, entities) = (
@@ -352,8 +353,9 @@ impl<G: GameApp> Engine<G> {
         Ok(())
     }
 
-    /// Give each terrain a cell installed a renderer terrain holding its ground: a retired one of the same shape and
-    /// ground layers when there is one, else a new streamed terrain. Its runtime id goes into its `TerrainComponent`.
+    /// Give each terrain a cell installed a renderer terrain holding its ground: a retired one of the same shape when
+    /// there is one (wearing the same ground layers if it can, else re-dressed in them), else a new streamed terrain.
+    /// Its runtime id goes into its `TerrainComponent`.
     /// With no renderer, or no ground for it, that id is `u32::MAX`, which drawing, colliders and foliage all skip.
     fn adopt_cell_terrains(&mut self, index: usize, entities: &[Entity], mut sidecars: HashMap<u32, TerrainSidecar>) {
         let asset_dir = self.config.content_root.join("terrain");
@@ -406,12 +408,22 @@ impl<G: GameApp> Engine<G> {
         let streaming = self.world.get::<cells::TerrainStreamingComponent>(entity);
         // Always streamed: a retired slot takes its chunks back only through `stream_geometry`.
         let distance = streaming.map(|s| s.geometry_distance).filter(|distance| *distance > 0.0).unwrap_or(800.0);
-        // A region's own ground layers (WS1-24), else the project's; a slot is reused only on the same ground.
+        // A region's own ground layers (WS1-24), else the project's. A retired slot wearing them is taken first, else
+        // one wearing another region's, re-dressed in these.
         let layers = streaming.map_or_else(|| asset_dir.to_path_buf(), |s| s.layer_dir(asset_dir));
         let asset_dir = layers.as_path();
         let room = renderer.terrain_material_room();
         let (slot, kind) = match cells::choose_slot(&mut self.cell_streamer.free_terrains, &desc, asset_dir, room) {
             SlotChoice::Reuse(slot) => (slot, "reused"),
+            SlotChoice::Swap(mut slot) => {
+                if !renderer.set_terrain_layers(ctx, slot.id, asset_dir) {
+                    // Not a terrain this renderer can re-dress (none such is ever offered): it is not offered again.
+                    warn!(slot = slot.id, cell = index, "retired terrain slot cannot wear this ground; tile not drawn");
+                    return None;
+                }
+                slot.asset_dir = asset_dir.to_path_buf();
+                (slot, "reused, ground layers swapped")
+            }
             SlotChoice::New => {
                 let id = renderer.create_streamed_terrain_with_asset_dir(ctx, desc, asset_dir, distance);
                 (TerrainSlot { id, desc, asset_dir: asset_dir.to_path_buf() }, "new")
@@ -440,6 +452,30 @@ impl<G: GameApp> Engine<G> {
         }
         info!("Terrain tile {}: slot {} ({kind})", self.cell_streamer.cells[index].file.display(), slot.id);
         Some(slot)
+    }
+
+    /// Dress one retired terrain slot a frame whose ground set no live tile wears in the set most live tiles wear
+    /// ([`cells::next_rewear`]), so a region's layer arrays are freed once its last tile has gone, rather than kept
+    /// by slots waiting for a tile of that region. One a frame keeps it to one bind-group rebuild a frame.
+    fn rewear_retired_slot(&mut self) {
+        let next = {
+            let live: Vec<&TerrainSlot> = self.cell_streamer.cell_terrains.values().flatten().collect();
+            cells::next_rewear(&live, &self.cell_streamer.free_terrains)
+        };
+        let Some((index, layers)) = next else {
+            return;
+        };
+        let Some((renderer, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref()) else {
+            return;
+        };
+        let slot = &mut self.cell_streamer.free_terrains[index];
+        if renderer.set_terrain_layers(ctx, slot.id, &layers) {
+            slot.asset_dir = layers;
+        } else {
+            // Not a terrain this renderer can re-dress: never offered again, here or to a tile.
+            let slot = self.cell_streamer.free_terrains.remove(index);
+            warn!(slot = slot.id, "retired terrain slot cannot change its ground layers; no longer reused");
+        }
     }
 
     /// Despawn a cell's entities (or drop its reader). Its meshes stay cached for the next cell that uses them, and

@@ -590,6 +590,10 @@ pub struct TerrainData {
     /// mean a full pass over the terrain per frame. Comparing a counter is the
     /// cheap way to tell "nothing has changed" from "everything has".
     pub edit_revision: u64,
+
+    /// The folder `layer_textures` were loaded from: the one the terrain was made with, or the last
+    /// [`Self::set_layer_dir`]'s (a streamed tile's slot taking another region's ground).
+    pub layer_dir: std::path::PathBuf,
 }
 
 /// Map one physical clipmap dirty interval through its toroidal origin into at
@@ -935,6 +939,7 @@ impl TerrainData {
             brush_cursor: [0.0; 4],
             painted_foliage: Vec::new(),
             edit_revision: 0,
+            layer_dir: asset_dir.to_path_buf(),
         }
     }
 
@@ -2042,6 +2047,78 @@ impl TerrainData {
         self.release_pool_spans(pool);
         self.painted_foliage = Vec::new();
         resident
+    }
+
+    /// Wear the ground layers in `asset_dir` (a region's own set) instead of the ones worn now, so a retired
+    /// streamed tile's slot can take a tile of another region. The layer arrays are swapped for the set's shared
+    /// ones (loaded when no other terrain wears it), each layer's tiling is read from that folder's
+    /// `layer_tiling.json`, and the macro map is made again on the next rebuild, from the new layers' colours. The
+    /// arrays worn before go with their last wearer. The caller points the terrain's bindless slots at the new
+    /// arrays ([`Self::layer_views`]). The folder worn already changes nothing. False, changing nothing, for a
+    /// virtual-textured terrain, whose page atlas is its own.
+    pub fn set_layer_dir(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        bc_supported: bool,
+        asset_dir: &std::path::Path,
+    ) -> bool {
+        if self.layer_textures.virtual_texture.is_some() {
+            return false;
+        }
+        if self.layer_dir.as_path() == asset_dir {
+            return true;
+        }
+        self.layer_textures = shared_layer_textures(device, queue, bc_supported, false, asset_dir);
+        self.layer_dir = asset_dir.to_path_buf();
+        let tiling = textures::layer_tiling_at(asset_dir);
+        for (layer, tiling) in self.layers.iter_mut().zip(tiling) {
+            layer.tiling = tiling;
+        }
+        self.macro_dirty = true;
+        true
+    }
+
+    /// Single-layer views of ground layer `layer` in the arrays this terrain wears (albedo and height, then surface),
+    /// as its bindless slots hold them. `None` past the last layer, for a virtual-textured terrain (whose layers reach
+    /// the screen through its page atlas), and for the extra bank of a terrain that binds the hero bank only.
+    #[must_use]
+    pub fn layer_views(&self, layer: usize) -> Option<(wgpu::TextureView, wgpu::TextureView)> {
+        let arrays = &self.layer_textures;
+        let hero = TERRAIN_HERO_LAYERS as usize;
+        if arrays.virtual_texture.is_some()
+            || layer >= TERRAIN_LAYER_COUNT as usize
+            || (self.hero_bank_only && layer >= hero)
+        {
+            return None;
+        }
+        // The labels and descriptors `create_terrain` publishes the layers with.
+        let (albedo, surface, index, labels) = if layer < hero {
+            (&arrays.albedo, &arrays.surface, layer, ["Terrain Layer Albedo+Height", "Terrain Layer Surface"])
+        } else {
+            (
+                &arrays.albedo_extra,
+                &arrays.surface_extra,
+                layer - hero,
+                ["Terrain Layer Albedo+Height Extra", "Terrain Layer Surface Extra"],
+            )
+        };
+        let view = |texture: &wgpu::Texture, label: &str| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                label: Some(label),
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: index as u32,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        };
+        Some((view(albedo, labels[0]), view(surface, labels[1])))
+    }
+
+    /// Whether the macro map is to be made again on the next rebuild (a new heightfield, splat or ground layers).
+    #[must_use]
+    pub fn macro_dirty(&self) -> bool {
+        self.macro_dirty
     }
 }
 

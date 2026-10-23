@@ -3482,8 +3482,12 @@ impl SomniumRenderer {
         geometry_distance: f32,
     ) -> u32 {
         self.streamed_terrain_distance = geometry_distance.max(0.0);
+        let started = std::time::Instant::now();
         let id = self.create_terrain_inner(ctx, desc, false, asset_dir);
         self.streamed_terrain_distance = 0.0;
+        if let Some(terrain) = self.terrains.get(id as usize) {
+            log_layer_set_loaded(terrain, started);
+        }
         id
     }
 
@@ -3717,6 +3721,35 @@ impl SomniumRenderer {
             self.raytrace_pass.unregister_mesh(offset);
         }
         set_splat_resident(terrain, &mut self.texture_pool, &mut self.global_pool, &ctx.device, false);
+    }
+
+    /// Dress terrain `terrain_id` in the ground layers of `asset_dir` (a region's own set, WS1-24) in place of the
+    /// ones it wears, so a retired streamed tile's slot can take a tile of any region rather than only its own: the
+    /// layer arrays are swapped and the tiling read again ([`crate::terrain::TerrainData::set_layer_dir`]), the
+    /// macro map is made again on its next rebuild, and the slot's 64 layer bindless slots point at the new arrays,
+    /// keeping their numbers, with one bind-group rebuild. A set no terrain wears any more is freed here. A set logs
+    /// once as it loads, and once as a swap here frees it (a scene reset frees every set without a word). The folder
+    /// worn already changes nothing. False, changing nothing, for an id that does not exist or a virtual-textured
+    /// terrain, whose page atlas is its own.
+    pub fn set_terrain_layers(&mut self, ctx: &RenderContext, terrain_id: u32, asset_dir: &std::path::Path) -> bool {
+        let Some(terrain) = self.terrains.get_mut(terrain_id as usize) else {
+            return false;
+        };
+        let started = std::time::Instant::now();
+        let (worn, worn_dir) = (std::sync::Arc::clone(&terrain.layer_textures), terrain.layer_dir.clone());
+        if !terrain.set_layer_dir(&ctx.device, &ctx.queue, ctx.supports_bc_compression(), asset_dir) {
+            return false;
+        }
+        if std::sync::Arc::ptr_eq(&worn, &terrain.layer_textures) {
+            return true;
+        }
+        log_layer_set_loaded(terrain, started);
+        point_layer_slots(terrain, &mut self.texture_pool, &mut self.global_pool, &ctx.device);
+        // Held here alone: no terrain wears the old set, and no bindless slot or bind group holds its views now.
+        if std::sync::Arc::strong_count(&worn) == 1 {
+            tracing::info!(set = %worn_dir.display(), "terrain ground layers freed: no terrain wears them");
+        }
+        true
     }
 
     /// Terrain material entries a new terrain can still take. A terrain made with none left shares entry 0 with
@@ -7609,6 +7642,47 @@ fn set_splat_resident(
         global_pool.set_slot(slot, view);
     }
     global_pool.update_textures(device);
+}
+
+/// Point a terrain's layer bindless slots at the arrays it wears now ([`crate::terrain::TerrainData::layer_views`]),
+/// after [`SomniumRenderer::set_terrain_layers`] swapped them. The slots keep their numbers, so the terrain's material
+/// entry stays as it is; the views of the arrays worn before leave the pool and the bind group. A slot given the
+/// pool's shared fallback (the pool was full when the terrain was made) is not this terrain's to point elsewhere. One
+/// bind-group rebuild.
+fn point_layer_slots(
+    terrain: &crate::terrain::TerrainData,
+    texture_pool: &mut TexturePool,
+    global_pool: &mut GlobalResourcePool,
+    device: &wgpu::Device,
+) {
+    let fallback = crate::texture_pool::fallback_slot() as usize;
+    for layer in 0..terrain.texture_ids.albedo.len() {
+        let Some((albedo, surface)) = terrain.layer_views(layer) else { continue };
+        let ids = &terrain.texture_ids;
+        for (slot, view) in [(ids.albedo[layer], albedo), (ids.surface[layer], surface)] {
+            let Ok(slot) = usize::try_from(slot) else { continue };
+            if slot == fallback {
+                continue;
+            }
+            if let Some(owned) = texture_pool.views.get_mut(slot) {
+                *owned = view.clone();
+            }
+            global_pool.set_slot(slot, view);
+        }
+    }
+    global_pool.update_textures(device);
+}
+
+/// A streamed terrain's ground layer set, logged once as it loads: when the terrain is its only wearer, so it was
+/// read from disk just now rather than shared (`started`: when the work that loaded it began).
+fn log_layer_set_loaded(terrain: &crate::terrain::TerrainData, started: std::time::Instant) {
+    if terrain.layer_textures.virtual_texture.is_none() && std::sync::Arc::strong_count(&terrain.layer_textures) == 1 {
+        tracing::info!(
+            set = %terrain.layer_dir.display(),
+            ms = format!("{:.0}", started.elapsed().as_secs_f64() * 1000.0),
+            "terrain ground layers loaded"
+        );
+    }
 }
 
 /// Frames counted by the clipmap trace, so a log line can be placed in time.

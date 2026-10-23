@@ -40,6 +40,10 @@ A 4 km terrain at 2 m cells takes about 210 MB of the 512 MB vertex pool, so a w
 
 Where windows overlap (Rimeborn's are 4,096 m on a 4,000 m grid), give each window's **Own Area**: x0, z0, x1, z1 in terrain-local metres, splitting each overlap down its middle. Generated ground cover grows only inside it, so the overlap is not covered twice. All zero means the whole terrain. Rimeborn's composer fills it in.
 
+**Layer Set** gives a region its own ground layers: the folder `terrain/sets/<name>` under the content root, holding the same 32 file stems, `bc7/` and `layer_tiling.json` as `terrain` does. Empty means the project's `terrain`. A name with `..`, a drive or a root is refused with a warning, and the project's layers are used instead.
+
+Streamed terrain tiles of one shape share renderer slots whatever their set. A tile takes a retired slot already wearing its set if there is one, else any retired slot, whose layers are swapped for the tile's. A set loads the first time a tile wears it, and the log says how long that took. Once no tile wears it, the retired slots of that region take the ground of the region the view is in, one slot a frame, and the set is freed, which the log also says. So the slots made, and the terrain material entries they take, number only the most tiles live at once, however many regions there are: 9 round the view and 4 round each of the 2 places a game can hold, 17 in all, well inside the 32 entries Rimeborn asks for with `SOMNIUM_TERRAIN_MATERIALS`.
+
 The vertex pool is 512 MB unless the environment variable `SOMNIUM_GEOMETRY_POOL_MB` asks for more, up to the device's limit. Rimeborn asks for 1,536 MB.
 
 ## Ground cover

@@ -99,14 +99,38 @@ pub struct TerrainStreamingComponent {
 }
 
 impl TerrainStreamingComponent {
-    /// The folder this terrain's ground layers load from, under `terrain_root` (the content root's `terrain`).
+    /// The folder this terrain's ground layers load from, under `terrain_root` (the content root's `terrain`): its
+    /// [`layer_set_dir`]. A set name that would reach outside the sets folder is logged and the project's own layers
+    /// are used.
     #[must_use]
     pub fn layer_dir(&self, terrain_root: &std::path::Path) -> std::path::PathBuf {
-        match self.layer_set.trim() {
-            "" => terrain_root.to_path_buf(),
-            set => terrain_root.join("sets").join(set),
-        }
+        layer_set_dir(terrain_root, &self.layer_set).unwrap_or_else(|error| {
+            tracing::warn!(%error, "terrain layer set refused; the project's ground layers are used");
+            terrain_root.to_path_buf()
+        })
     }
+}
+
+/// The folder of ground layer set `layer_set` under `terrain_root`: `terrain_root/sets/<layer_set>`, or `terrain_root`
+/// itself for an empty name. A set is named inside the sets folder, so an absolute path, a drive, or a `..` (each of
+/// which would reach outside it) is refused with the reason.
+pub fn layer_set_dir(terrain_root: &Path, layer_set: &str) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let set = layer_set.trim();
+    if set.is_empty() {
+        return Ok(terrain_root.to_path_buf());
+    }
+    let path = Path::new(set);
+    let outside = path.is_absolute()
+        || path.has_root()
+        || set.starts_with(['/', '\\'])
+        || set.contains(':')
+        || set.split(['/', '\\']).any(|part| part == "..")
+        || path.components().any(|part| !matches!(part, Component::Normal(_) | Component::CurDir));
+    if outside {
+        return Err(format!("layer set {set:?} is not a folder name inside terrain/sets"));
+    }
+    Ok(terrain_root.join("sets").join(set))
 }
 
 impl Component for TerrainStreamingComponent {}
@@ -350,17 +374,23 @@ pub(crate) struct TerrainSlot {
     /// The renderer's terrain id.
     pub(crate) id: u32,
     pub(crate) desc: somnium_renderer::terrain::TerrainDescriptor,
-    /// Where its ground layers were loaded from.
+    /// The ground layer set it wears now: the folder it was made with, or the last one
+    /// `SomniumRenderer::set_terrain_layers` dressed it in.
     pub(crate) asset_dir: PathBuf,
 }
 
-/// Take a retired slot made for `desc` with `asset_dir`'s ground layers, the most recently retired first.
+/// Take a retired slot made for `desc`, the most recently retired first: one already wearing `asset_dir`'s ground
+/// layers when there is one, else one wearing another set's, whose layers the caller swaps (it then compares the
+/// slot's `asset_dir`). A virtual-textured slot keeps the set it was made with, so it goes only to its own set.
 pub(crate) fn take_free_slot(
     free: &mut Vec<TerrainSlot>,
     desc: &somnium_renderer::terrain::TerrainDescriptor,
     asset_dir: &Path,
 ) -> Option<TerrainSlot> {
-    let at = free.iter().rposition(|slot| slot.desc == *desc && slot.asset_dir == asset_dir)?;
+    let at = free
+        .iter()
+        .rposition(|slot| slot.desc == *desc && slot.asset_dir == asset_dir)
+        .or_else(|| free.iter().rposition(|slot| slot.desc == *desc && !desc.virtual_texturing))?;
     Some(free.remove(at))
 }
 
@@ -369,6 +399,9 @@ pub(crate) fn take_free_slot(
 pub(crate) enum SlotChoice {
     /// A retired slot of its shape and ground.
     Reuse(TerrainSlot),
+    /// A retired slot of its shape wearing another set's ground layers: they are swapped for the tile's
+    /// (`SomniumRenderer::set_terrain_layers`) before it adopts the tile.
+    Swap(TerrainSlot),
     /// A new renderer terrain.
     New,
     /// Nowhere: no retired slot fits and the renderer's terrain material pool is full. A new terrain would share
@@ -376,8 +409,10 @@ pub(crate) enum SlotChoice {
     Full,
 }
 
-/// A retired slot of `desc`'s shape and `asset_dir`'s ground ([`take_free_slot`]), else a new terrain while the
-/// terrain material pool has `material_room` entries left for it, else none.
+/// A retired slot of `desc`'s shape ([`take_free_slot`]), wearing `asset_dir`'s ground or, failing that, another
+/// set's; else a new terrain while the terrain material pool has `material_room` entries left for it; else none.
+/// Since any retired slot of the shape will do, the slots made only ever number the most tiles live at once, however
+/// many sets the world wears.
 pub(crate) fn choose_slot(
     free: &mut Vec<TerrainSlot>,
     desc: &somnium_renderer::terrain::TerrainDescriptor,
@@ -385,10 +420,28 @@ pub(crate) fn choose_slot(
     material_room: u32,
 ) -> SlotChoice {
     match take_free_slot(free, desc, asset_dir) {
-        Some(slot) => SlotChoice::Reuse(slot),
+        Some(slot) if slot.asset_dir == asset_dir => SlotChoice::Reuse(slot),
+        Some(slot) => SlotChoice::Swap(slot),
         None if material_room > 0 => SlotChoice::New,
         None => SlotChoice::Full,
     }
+}
+
+/// The next retired slot to dress in a live ground set, and that set. A retired slot wearing a set no live slot
+/// wears would keep that set's layer arrays (about 213 MiB of BC7 a region) in memory while it waits, and a region
+/// left behind may never take it back, so it takes the set the most live slots wear (the region the view is in;
+/// the first folder of those that tie), ready for that region's next tile. `None` while every retired slot wears a
+/// live set, or while no slot is live to say which (a teleport's first frames: its first tile takes a retired slot
+/// of any set, and the rest follow). A virtual-textured slot cannot change its ground and is left.
+pub(crate) fn next_rewear(live: &[&TerrainSlot], free: &[TerrainSlot]) -> Option<(usize, PathBuf)> {
+    let mut worn: BTreeMap<&Path, usize> = BTreeMap::new();
+    for slot in live {
+        *worn.entry(slot.asset_dir.as_path()).or_default() += 1;
+    }
+    let target = worn.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))?.0;
+    let index =
+        free.iter().rposition(|slot| !slot.desc.virtual_texturing && !worn.contains_key(slot.asset_dir.as_path()))?;
+    Some((index, target.to_path_buf()))
 }
 
 /// Why `entity` may not be sculpted, painted or foliage-painted in place, or `None`. A streamed cell's entity is
@@ -723,36 +776,110 @@ mod tests {
     }
 
     #[test]
-    fn a_retired_slot_goes_only_to_a_tile_of_the_same_shape_and_ground() {
-        use somnium_renderer::terrain::TerrainDescriptor;
-        let tile = TerrainDescriptor { chunk_cells: 64, grid_size: [8, 8], cell_size: 2.0, ..Default::default() };
-        let slot = |id, desc, dir: &str| TerrainSlot { id, desc, asset_dir: PathBuf::from(dir) };
-        let mut free = vec![
-            slot(1, tile, "assets/terrain"),
-            slot(2, TerrainDescriptor { height_scale: 2.0, ..tile }, "assets/terrain"),
-            slot(3, tile, "assets/terrain_verglas"),
-            slot(4, tile, "assets/terrain"),
+    fn a_layer_set_is_a_folder_name_inside_the_sets_folder() {
+        let root = Path::new("assets/terrain");
+        assert_eq!(layer_set_dir(root, ""), Ok(root.to_path_buf()), "the project's own layers");
+        assert_eq!(layer_set_dir(root, " \t"), Ok(root.to_path_buf()));
+        assert_eq!(layer_set_dir(root, "verglas_south"), Ok(root.join("sets").join("verglas_south")));
+        assert_eq!(layer_set_dir(root, " verglas "), Ok(root.join("sets").join("verglas")), "trimmed");
+        assert_eq!(layer_set_dir(root, "south/mirage"), Ok(root.join("sets").join("south/mirage")), "a folder within");
+        let outside = [
+            "..",
+            "../terrain_verglas",
+            "south/../../..",
+            "south\\..\\..\\secrets",
+            "/etc",
+            "\\Windows",
+            "C:/Windows",
+            "C:relative",
+            "\\\\server\\share",
         ];
-        let ground = Path::new("assets/terrain");
-        assert_eq!(take_free_slot(&mut free, &tile, ground).map(|s| s.id), Some(4), "the last retired first");
-        assert_eq!(take_free_slot(&mut free, &tile, ground).map(|s| s.id), Some(1));
-        assert_eq!(take_free_slot(&mut free, &tile, ground), None, "another height scale or ground is no match");
-        let wider = TerrainDescriptor { grid_size: [16, 8], ..tile };
-        assert_eq!(take_free_slot(&mut free, &wider, ground), None);
-        assert_eq!(free.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2, 3], "what did not match stays");
+        for set in outside {
+            let refused = layer_set_dir(root, set);
+            assert!(refused.as_ref().is_err_and(|e| e.contains("terrain/sets")), "{set:?}: {refused:?}");
+        }
+        // A window naming one wears the project's layers instead, rather than reading from anywhere.
+        let window = TerrainStreamingComponent { layer_set: "../../../elsewhere".into(), ..Default::default() };
+        assert_eq!(window.layer_dir(root), root);
     }
 
     #[test]
-    fn a_tile_gets_a_new_terrain_only_while_the_material_pool_has_room() {
+    fn a_retired_slot_goes_to_its_own_set_first_then_to_any_set_of_its_shape() {
+        use somnium_renderer::terrain::TerrainDescriptor;
+        let tile = TerrainDescriptor { chunk_cells: 64, grid_size: [8, 8], cell_size: 2.0, ..Default::default() };
+        let slot = |id, desc, dir: &str| TerrainSlot { id, desc, asset_dir: PathBuf::from(dir) };
+        let (ground, verglas) = ("assets/terrain", "assets/terrain/sets/verglas");
+        let mut free = vec![
+            slot(1, tile, ground),
+            slot(2, TerrainDescriptor { height_scale: 2.0, ..tile }, ground),
+            slot(3, tile, verglas),
+            slot(4, tile, ground),
+            slot(5, tile, verglas),
+        ];
+        let take = |free: &mut Vec<TerrainSlot>, desc: &TerrainDescriptor, dir: &str| {
+            take_free_slot(free, desc, Path::new(dir)).map(|s| (s.id, s.asset_dir.to_string_lossy().into_owned()))
+        };
+        assert_eq!(take(&mut free, &tile, ground), Some((4, ground.into())), "its own set, the last retired first");
+        assert_eq!(take(&mut free, &tile, ground), Some((1, ground.into())));
+        assert_eq!(take(&mut free, &tile, ground), Some((5, verglas.into())), "then another set's, to be re-dressed");
+        assert_eq!(take(&mut free, &tile, verglas), Some((3, verglas.into())));
+        assert_eq!(take(&mut free, &tile, ground), None, "another height scale is no match");
+        assert_eq!(take(&mut free, &TerrainDescriptor { grid_size: [16, 8], ..tile }, ground), None);
+        assert_eq!(free.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2], "what did not match stays");
+
+        // A virtual-textured slot's page atlas is its own: it goes to its own set only.
+        let paged = TerrainDescriptor { virtual_texturing: true, ..tile };
+        let mut free = vec![slot(6, paged, verglas)];
+        assert_eq!(take(&mut free, &paged, ground), None);
+        assert_eq!(take(&mut free, &paged, verglas), Some((6, verglas.into())));
+    }
+
+    #[test]
+    fn a_tile_gets_a_new_terrain_only_while_no_retired_slot_fits_and_the_material_pool_has_room() {
         use somnium_renderer::terrain::TerrainDescriptor;
         let tile = TerrainDescriptor { chunk_cells: 64, grid_size: [8, 8], cell_size: 2.0, ..Default::default() };
         let ground = Path::new("assets/terrain");
+        let verglas = Path::new("assets/terrain/sets/verglas");
         let mut free = vec![TerrainSlot { id: 7, desc: tile, asset_dir: ground.to_path_buf() }];
         let reused = choose_slot(&mut free, &tile, ground, 0);
         assert_eq!(reused, SlotChoice::Reuse(free_slot(7, tile)), "a retired slot needs no entry");
         assert_eq!(choose_slot(&mut free, &tile, ground, 1), SlotChoice::New);
         // The seventeenth live slot with the default sixteen entries: a new terrain would shade with entry 0's ground.
         assert_eq!(choose_slot(&mut free, &tile, ground, 0), SlotChoice::Full);
+        // A slot of another region's set is taken before a new terrain, with or without room, and swapped.
+        for room in [0, 5] {
+            let mut free = vec![free_slot(8, tile)];
+            assert_eq!(choose_slot(&mut free, &tile, verglas, room), SlotChoice::Swap(free_slot(8, tile)));
+            assert!(free.is_empty());
+        }
+        let mut free = vec![free_slot(8, tile), TerrainSlot { id: 9, desc: tile, asset_dir: verglas.to_path_buf() }];
+        assert_eq!(choose_slot(&mut free, &tile, ground, 0), SlotChoice::Reuse(free_slot(8, tile)), "own set first");
+    }
+
+    #[test]
+    fn a_retired_slot_of_a_region_left_behind_takes_the_live_regions_ground() {
+        use somnium_renderer::terrain::TerrainDescriptor;
+        let tile = TerrainDescriptor { chunk_cells: 64, grid_size: [8, 8], cell_size: 2.0, ..Default::default() };
+        let slot = |id, dir: &str| TerrainSlot { id, desc: tile, asset_dir: PathBuf::from(dir) };
+        let (tyffir, verglas, south) = ("assets/terrain", "assets/terrain/sets/verglas", "assets/terrain/sets/south");
+        let live = [slot(1, verglas), slot(2, verglas), slot(3, tyffir)];
+        let live: Vec<&TerrainSlot> = live.iter().collect();
+        // Every retired slot wears a live set: nothing to do.
+        assert_eq!(next_rewear(&live, &[slot(4, tyffir), slot(5, verglas)]), None);
+        // The south was left behind: its retired slots take Verglas's ground (worn by the most live tiles), the last
+        // retired first.
+        let free = [slot(4, south), slot(5, tyffir), slot(6, south)];
+        assert_eq!(next_rewear(&live, &free), Some((2, PathBuf::from(verglas))));
+        assert_eq!(next_rewear(&live, &free[..2]), Some((0, PathBuf::from(verglas))));
+        // No live tile (a teleport's first frames): no set to take yet.
+        assert_eq!(next_rewear(&[], &free), None);
+        // Sets worn by as many live tiles: the first folder of them.
+        let even = [slot(1, verglas), slot(3, tyffir)];
+        let even: Vec<&TerrainSlot> = even.iter().collect();
+        assert_eq!(next_rewear(&even, &free), Some((2, PathBuf::from(tyffir))));
+        // A virtual-textured slot keeps its own.
+        let paged = TerrainSlot { desc: TerrainDescriptor { virtual_texturing: true, ..tile }, ..slot(7, south) };
+        assert_eq!(next_rewear(&live, &[paged]), None);
     }
 
     fn free_slot(id: u32, desc: somnium_renderer::terrain::TerrainDescriptor) -> TerrainSlot {
@@ -821,6 +948,21 @@ mod tests {
             ["terrain_material_room()", "choose_slot(", "SlotChoice::Full"].iter().all(|code| adopt.contains(code)),
             "a tile past the pool's last entry would be given entry 0 and shade with another tile's ground"
         );
+    }
+
+    #[test]
+    fn a_slot_of_another_set_is_re_dressed_and_a_region_left_behind_lets_its_ground_go() {
+        let source = include_str!("app_cell_streaming.rs");
+        let adopt = method(source, "adopt_terrain");
+        let swap = adopt.split_once("SlotChoice::Swap(").expect("a retired slot of another set is taken").1;
+        let swap = &swap[..swap.find("SlotChoice::New").unwrap_or(swap.len())];
+        assert!(swap.contains("set_terrain_layers("), "a tile would shade with the ground its slot wore last");
+        assert!(
+            method(source, "update_cell_streaming").contains("self.rewear_retired_slot()"),
+            "retired slots would keep a region's layer arrays after its last tile went"
+        );
+        let rewear = method(source, "rewear_retired_slot");
+        assert!(rewear.contains("next_rewear(") && rewear.contains("set_terrain_layers("));
     }
 
     #[test]
