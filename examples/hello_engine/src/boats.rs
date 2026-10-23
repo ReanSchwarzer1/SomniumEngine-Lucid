@@ -152,6 +152,10 @@ pub fn kind_of(name: &str) -> Kind {
 pub const CURRENT: f32 = 0.6;
 /// How far from its hull a boat can be boarded.
 const REACH: f32 = 1.5;
+/// A moored boat's pull back to its mooring (per metre off, per kilogram) and its damping: about 2.5 rad/s, just
+/// under critically damped.
+const MOORING_HOLD: f32 = 6.0;
+const MOORING_DAMP: f32 = 4.5;
 
 /// The capture hook boards the nearest boat afloat this close to its point (metres).
 const BOARD_REACH: f32 = 40.0;
@@ -503,11 +507,12 @@ pub fn float(
     let couple = torque / (2.0 * h.z);
     physics.add_force_at_position(body, side * couple, position + flat * h.z);
     physics.add_force_at_position(body, -side * couple, position - flat * h.z);
-    // Left alone it holds to its mooring (with the river's pull taken off).
+    // Left alone it holds to its mooring (with the river's pull taken off), firmly: a softer hold let the
+    // protagonist's capsule shove an empty rowboat 3 m off before it balanced, out of his reach (rb-ui, 23 Oct).
     if let Some(home) = moored {
         let off = Vec3::new(home.x - position.x, 0.0, home.z - position.z);
         let still = Vec3::new(velocity.x, 0.0, velocity.z) - current / wet;
-        physics.add_force(body, (off * 1.5 - still * 2.5) * mass * share);
+        physics.add_force(body, (off * MOORING_HOLD - still * MOORING_DAMP) * mass * share);
     }
     wet
 }
@@ -806,7 +811,11 @@ impl BoatHost {
             let local = Mat4::from_rotation_translation(physics.get_rotation(a.body), physics.get_position(a.body))
                 .inverse()
                 .transform_point3(feet);
-            local.x.abs() <= a.kind.half.x + REACH && local.z.abs() <= a.kind.half.z + REACH
+            // A moored boat can also be boarded from where it is tied up, if it has bobbed or been nudged off.
+            let at_mooring = a.moored.is_some_and(|home| {
+                Vec2::new(feet.x - home.x, feet.z - home.z).length() <= a.kind.half.z + REACH
+            });
+            (local.x.abs() <= a.kind.half.x + REACH && local.z.abs() <= a.kind.half.z + REACH) || at_mooring
         })
     }
 
@@ -1125,6 +1134,30 @@ mod tests {
         let out = (physics.get_position(body), physics.get_rotation(body));
         physics.destroy_body(body);
         out
+    }
+
+    /// Moored and shoved from the side as hard as the protagonist's capsule shoved the Aldermere rowboat (3 m off
+    /// against the old, softer hold), it stays within a metre of its mooring, so he can still board it.
+    #[test]
+    fn a_moored_boat_holds_when_shoved() {
+        let _jolt = JOLT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut physics = PhysicsWorld::new(PhysicsConfig::default());
+        let kind = kind_of("rowboat");
+        let water = map();
+        let home = Vec3::new(0.0, 10.1, 0.0);
+        let body = hull_body(&mut physics, &kind, home, Quat::IDENTITY);
+        let mass = 8.0 * kind.half.x * kind.half.y * kind.half.z * DENSITY;
+        for _ in 0..(8.0 * 60.0) as usize {
+            float(&mut physics, body, &kind, &water, Oars::default(), Some(home));
+            physics.add_force(body, Vec3::X * 4.5 * mass);
+            physics.step(1.0 / 60.0);
+        }
+        let at = physics.get_position(body);
+        physics.destroy_body(body);
+        let off = Vec2::new(at.x - home.x, at.z - home.z).length();
+        assert!(off > 0.05 && off < 1.0, "nudged, not shoved out of reach: {off} m");
     }
 
     /// Dropped onto the lake it settles afloat, level, a little in the water.

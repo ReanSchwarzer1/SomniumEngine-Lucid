@@ -66,6 +66,7 @@ pub(crate) fn register(registry: &mut TypeRegistry) {
         fields {
             geometry_distance { min: 0.0, soft_max: 8192.0, unit: "m", group: "Streaming", doc: "An open world's terrain window: its geometry is resident only while the camera is within this distance of the terrain's edge. 0 keeps it resident. Read when the terrain is created." },
             own_area { group: "Streaming", doc: "The part of the window that is its own where neighbouring windows overlap: x0, z0, x1, z1 in terrain-local metres. Generated ground cover grows only inside it, so an overlap is not covered twice. All zero: the whole terrain." },
+            layer_set { group: "Streaming", doc: "The region's own ground layers: the folder `terrain/sets/<name>` under the content root, in place of `terrain`. Empty: the project's layers. Read when the terrain is created." },
         }
     });
     registry.register(component_schema! {
@@ -92,13 +93,27 @@ pub struct TerrainStreamingComponent {
     pub geometry_distance: f32,
     /// Terrain-local x0, z0, x1, z1 of the window's own ground; zero is the whole terrain.
     pub own_area: glam::Vec4,
+    /// A region's own ground layers, `terrain/sets/<name>` under the content root; empty is the project's `terrain`
+    /// (WS1-24: Verglas wears its own ground, not Tyffir's).
+    pub layer_set: String,
+}
+
+impl TerrainStreamingComponent {
+    /// The folder this terrain's ground layers load from, under `terrain_root` (the content root's `terrain`).
+    #[must_use]
+    pub fn layer_dir(&self, terrain_root: &std::path::Path) -> std::path::PathBuf {
+        match self.layer_set.trim() {
+            "" => terrain_root.to_path_buf(),
+            set => terrain_root.join("sets").join(set),
+        }
+    }
 }
 
 impl Component for TerrainStreamingComponent {}
 
 impl Default for TerrainStreamingComponent {
     fn default() -> Self {
-        Self { geometry_distance: 800.0, own_area: glam::Vec4::ZERO }
+        Self { geometry_distance: 800.0, own_area: glam::Vec4::ZERO, layer_set: String::new() }
     }
 }
 
@@ -384,6 +399,17 @@ impl CellStreamer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_window_names_its_regions_ground_layers() {
+        let root = std::path::Path::new("assets/terrain");
+        let mut window = TerrainStreamingComponent::default();
+        assert_eq!(window.layer_dir(root), root, "the project's layers by default");
+        window.layer_set = "verglas".into();
+        assert_eq!(window.layer_dir(root), root.join("sets").join("verglas"));
+        window.layer_set = "  ".into();
+        assert_eq!(window.layer_dir(root), root);
+    }
 
     fn cell(min: [f32; 2], max: [f32; 2], reach: Option<f32>) -> CellEntry {
         CellEntry { file: PathBuf::from("c.json"), min, max, reach }

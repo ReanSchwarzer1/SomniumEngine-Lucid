@@ -2959,17 +2959,16 @@ impl<G: GameApp> Engine<G> {
                 // Prefab reconstruction also calls this method without resetting
                 // the scene. Its existing terrain must retain sculpted data.
                 let existed = renderer.terrain(component.terrain_id).is_some();
-                let streamed = self
-                    .world
-                    .get::<crate::cell_streaming::TerrainStreamingComponent>(entity)
-                    .map(|s| s.geometry_distance)
-                    .filter(|d| *d > 0.0);
+                let streaming = self.world.get::<crate::cell_streaming::TerrainStreamingComponent>(entity);
+                let streamed = streaming.map(|s| s.geometry_distance).filter(|d| *d > 0.0);
+                // A region's own ground layers (WS1-24), else the project's.
+                let layers = streaming.map_or_else(|| asset_dir.clone(), |s| s.layer_dir(&asset_dir));
                 let id = if existed {
                     component.terrain_id
                 } else if let Some(distance) = streamed {
-                    renderer.create_streamed_terrain_with_asset_dir(ctx, desc, &asset_dir, distance)
+                    renderer.create_streamed_terrain_with_asset_dir(ctx, desc, &layers, distance)
                 } else {
-                    renderer.create_terrain_with_asset_dir(ctx, desc, &asset_dir)
+                    renderer.create_terrain_with_asset_dir(ctx, desc, &layers)
                 };
                 let sidecar = format!("{path}.terrain{}.bin", component.terrain_id);
                 if (!existed || std::path::Path::new(&sidecar).is_file())

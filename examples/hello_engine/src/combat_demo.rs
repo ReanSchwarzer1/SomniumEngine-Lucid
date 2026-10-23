@@ -517,6 +517,14 @@ struct Beast {
 ///   WS3's delta_crocodile;
 /// - `icecrawlers`: many-legged, blind and pale, from the glacier crevasses,
 ///   the Rimewall's commonest enemy (5.3), three, in WS3's ice_crawler.
+///
+/// Verglas's (WS3, 23 Oct), each in its own WS3 body:
+/// - `ironmoles`: an iron-crusted burrower under the Iron Fells, one, slow and
+///   armoured;
+/// - `sealwolves`: the fjord's seal-wolves, a fluke for a tail, three;
+/// - `smogwraiths`: Unspooled of crystal smoke over the slag, two, light;
+/// - `wardenguard`: the Kettle's machine warden with foreleg blades, one, heavy;
+/// - `hunger`: the Unspooled "cold fog with a face", one.
 fn beast_of(kind: &str) -> Option<Beast> {
     Some(match kind.trim().to_ascii_lowercase().as_str() {
         "harrowdogs" => Beast {
@@ -528,7 +536,7 @@ fn beast_of(kind: &str) -> Option<Beast> {
             poise: 20.0,
             armor: 0.0,
             speed: 5.5,
-            body: Some("creatures/sheepdog/sheepdog"),
+            body: Some("creatures/harrow_dog/harrow_dog"),
             blind: false,
         },
         "crocodile" => Beast {
@@ -554,6 +562,66 @@ fn beast_of(kind: &str) -> Option<Beast> {
             speed: 4.6,
             body: Some("creatures/ice_crawler/ice_crawler"),
             blind: true,
+        },
+        "ironmoles" => Beast {
+            name: "Iron-mole",
+            count: 1,
+            size: Vec3::new(1.4, 1.2, 2.4),
+            mat: "stone",
+            health: 340.0,
+            poise: 150.0,
+            armor: 9.0,
+            speed: 3.0,
+            body: Some("creatures/iron_mole/iron_mole"),
+            blind: true,
+        },
+        "sealwolves" => Beast {
+            name: "Seal-wolf",
+            count: 3,
+            size: Vec3::new(0.7, 0.9, 2.3),
+            mat: "dark",
+            health: 110.0,
+            poise: 40.0,
+            armor: 1.0,
+            speed: 5.2,
+            body: Some("creatures/seal_wolf/seal_wolf"),
+            blind: false,
+        },
+        "smogwraiths" => Beast {
+            name: "Smog-wraith",
+            count: 2,
+            size: Vec3::new(0.8, 2.0, 0.8),
+            mat: "ash",
+            health: 80.0,
+            poise: 10.0,
+            armor: 0.0,
+            speed: 4.4,
+            body: Some("creatures/smog_wraith/smog_wraith"),
+            blind: false,
+        },
+        "wardenguard" => Beast {
+            name: "Warden guard",
+            count: 1,
+            size: Vec3::new(1.6, 2.2, 2.4),
+            mat: "stone",
+            health: 520.0,
+            poise: 220.0,
+            armor: 10.0,
+            speed: 3.4,
+            body: Some("creatures/warden_guard/warden_guard"),
+            blind: false,
+        },
+        "hunger" => Beast {
+            name: "The Hunger",
+            count: 1,
+            size: Vec3::new(1.2, 2.2, 1.2),
+            mat: "ice",
+            health: 260.0,
+            poise: 60.0,
+            armor: 0.0,
+            speed: 4.0,
+            body: Some("creatures/hunger/hunger"),
+            blind: false,
         },
         _ => return None,
     })
@@ -1944,7 +2012,7 @@ fn register_encounter(registry: &mut somnium_ecs::reflect::TypeRegistry) {
         CombatEncounterComponent as "somnium.CombatEncounter", display "Combat Encounter", version 1,
         fields {
             enabled { doc: "Built on Play at this entity's position, taken away on Stop." },
-            kind { doc: "wilds: a horse, a rime wolf pack and a bandit camp, none of them aware yet; wolves: the pack alone; bandits: the camp alone; harrowcat: one, hunting alone; harrowdogs, crocodile, icecrawlers: the bestiary's; lampmen [red, white, amber, green, blue]: a Lamp crew on a street; watch, lance, knights: the law's; ledger_engine: Act VI's climax, the vault-keeper and the Engine's three glyph-boards." },
+            kind { doc: "wilds: a horse, a rime wolf pack and a bandit camp, none of them aware yet; wolves: the pack alone; bandits: the camp alone; harrowcat: one, hunting alone; harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger: the bestiary's; lampmen [red, white, amber, green, blue]: a Lamp crew on a street; watch, lance, knights: the law's; ledger_engine: Act VI's climax, the vault-keeper and the Engine's three glyph-boards." },
             floor { doc: "Bring its own flat ground; off stands everyone on the ground here." },
         }
     });
@@ -2015,7 +2083,7 @@ fn build_encounter(
         band if band_of(band).is_some() => args["only"] = json!(band),
         other => {
             return Err(format!(
-                "no kind {other:?} (try wilds, wolves, bandits, harrowcat, harrowdogs, crocodile, icecrawlers, lampmen [red|white|amber|green|blue], watch, lance, knights or ledger_engine)"
+                "no kind {other:?} (try wilds, wolves, bandits, harrowcat, harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger, lampmen [red|white|amber|green|blue], watch, lance, knights or ledger_engine)"
             ));
         }
     }
@@ -6525,7 +6593,7 @@ mod tests {
     fn the_bestiary_hunts_with_the_beasts() {
         use crate::skinned_crowd::SkinnedBody;
         let content = std::env::temp_dir().join("somnium_combat_bestiary");
-        for stem in ["sheepdog/sheepdog", "delta_crocodile/delta_crocodile", "ice_crawler/ice_crawler"] {
+        for stem in ["harrow_dog/harrow_dog", "delta_crocodile/delta_crocodile", "ice_crawler/ice_crawler"] {
             let file = content.join(format!("creatures/{stem}.glb"));
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(&file, b"").unwrap();
@@ -6535,7 +6603,16 @@ mod tests {
         let bodies = dogs.iter().filter(|e| world.get::<CombatantComponent>(**e).is_some()).count();
         let worn = dogs.iter().filter(|e| world.get::<SkinnedBody>(**e).is_some()).count();
         assert_eq!((bodies, worn), (5, 5));
-        for (kind, stem, count) in [("crocodile", "delta_crocodile", 1), ("icecrawlers", "ice_crawler", 3)] {
+        for stem in ["iron_mole/iron_mole", "seal_wolf/seal_wolf", "smog_wraith/smog_wraith", "warden_guard/warden_guard",
+                     "hunger/hunger"] {
+            let file = content.join(format!("creatures/{stem}.glb"));
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, b"").unwrap();
+        }
+        for (kind, stem, count) in [("crocodile", "delta_crocodile", 1), ("icecrawlers", "ice_crawler", 3),
+                                    ("ironmoles", "iron_mole", 1), ("sealwolves", "seal_wolf", 3),
+                                    ("smogwraiths", "smog_wraith", 2), ("wardenguard", "warden_guard", 1),
+                                    ("hunger", "hunger", 1)] {
             let made = build_encounter(&mut world, kind, Vec3::ZERO, Vec3::X, false, Some(&content)).expect(kind);
             let sources: Vec<AssetId> = made.iter().filter_map(|e| world.get::<SkinnedBody>(*e)).map(|b| b.source).collect();
             let want = AssetId::from_relative_path(format!("creatures/{stem}/{stem}.glb"));
