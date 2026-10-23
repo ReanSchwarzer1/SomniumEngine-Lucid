@@ -949,6 +949,20 @@ impl HelloGame {
         self.life.focus_points = points.to_vec();
     }
 
+    /// The simulation's level of detail for an open world (SIM_LOD_PLAN), on or off; off by default, which keeps
+    /// everything exactly as before. On, the fight's far walkers step every few fixed steps and still ones not at all
+    /// (`combat_demo::WalkLod`). Within 60 m of the protagonist, the fight's camera and every held place nothing
+    /// changes. A game with a streamed open world (Rimeborn) turns it on at init.
+    pub fn set_open_world_lod(&mut self, on: bool) {
+        self.combat.set_open_world_lod(on);
+    }
+
+    /// Whether [`HelloGame::set_open_world_lod`] is on.
+    #[must_use]
+    pub fn open_world_lod(&self) -> bool {
+        self.combat.open_world_lod()
+    }
+
     /// The protagonist's work clip while he stands idle (chopping, fishing, cutting peat: `A|B`, looped), holding the
     /// clip's tools from clips.json `gear`; `None` gives him his own moves back.
     pub fn set_player_clip(&mut self, clip: Option<String>) {
