@@ -124,7 +124,7 @@ pub fn pose_of(
             };
             let clip = resolve(table, &d.animation);
             let clip = if clip.is_empty() {
-                "Sword_Basic_Attack|Attack_Bite".to_string()
+                "Sword_Basic_Attack|Attack_Bite|Peck".to_string()
             } else {
                 clip
             };
@@ -231,10 +231,11 @@ pub fn pose_of(
             let clip = if drawn { guard } else { sentry };
             return (clip.into(), Timing::Loop(1.0));
         }
+        // a winged body stands on its perch, or rests (the barrow crow, the moths)
         let clip = if drawn {
-            "Sword_Aether_Idle_Loop|Sword_Basic_Idle_Loop|Idle_Neutral_Loop|Idle_Loop"
+            "Sword_Aether_Idle_Loop|Sword_Basic_Idle_Loop|Idle_Neutral_Loop|Idle_Loop|Idle_Perch_Loop|Rest_Loop"
         } else {
-            "Idle_Neutral_Loop|Idle_Loop"
+            "Idle_Neutral_Loop|Idle_Loop|Idle_Perch_Loop|Rest_Loop"
         };
         return (clip.into(), Timing::Loop(1.0));
     }
@@ -248,7 +249,7 @@ pub fn pose_of(
     };
     let (clip, rate) = if speed < 2.2 {
         (
-            format!("Loco_Walk_{way}_Loop|Loco_Walk_F_Loop|Walk_F_Loop"),
+            format!("Loco_Walk_{way}_Loop|Loco_Walk_F_Loop|Walk_F_Loop|Fly_Flap_Loop|Flutter_Loop"),
             (speed / 0.86).clamp(0.6, 2.4),
         )
     } else if speed < 6.5 {
@@ -258,12 +259,12 @@ pub fn pose_of(
             format!("Loco_Run_{way}_Loop")
         };
         (
-            format!("{clip}|Loco_Jog_F_Loop|Trot_F_Loop|Gallop_F_Loop"),
+            format!("{clip}|Loco_Jog_F_Loop|Trot_F_Loop|Gallop_F_Loop|Fly_Flap_Loop|Flutter_Loop"),
             (speed / 5.6).clamp(0.75, 1.4),
         )
     } else {
         (
-            "Loco_Sprint_F_Loop|Loco_Jog_F_Loop|Gallop_F_Loop".to_string(),
+            "Loco_Sprint_F_Loop|Loco_Jog_F_Loop|Gallop_F_Loop|Fly_Flap_Loop|Flutter_Loop".to_string(),
             (speed / 7.5).clamp(0.8, 1.4),
         )
     };

@@ -526,8 +526,21 @@ struct Beast {
 /// - `wardenguard`: the Kettle's machine warden with foreleg blades, one, heavy;
 /// - `hunger`: the Unspooled "cold fog with a face", one;
 /// - `barrowcrows`: the barrows' carrion crows, five, small and quick (rb-pois' barrows).
+///
+/// The south's (WS3, ECOLOGY 5.6 and the Sunscar bible 3.6), each in its own WS3 body:
+/// - `glassscorpions`: the Sunscar's glass scorpions, two, big and armoured, slow (they wait unseen and strike);
+/// - `miragehounds`: desert dogs that hide in mirages, a pack of five on the pans, fast;
+/// - `boilcrabs` (or `wreckcrabs` until wreck crabs have bodies of their own): the Cauldron's crimson crabs of the
+///   hot pools, four, small and shelled.
+///
+/// The Nightside's (WS3, ECOLOGY 5.3), each in its own WS3 body:
+/// - `nhalspawn`: Nhal's spawn, frost-black things with too many limbs, a pack of four;
+/// - `frostwarg`: a Named rime wolf the size of a horse, one, Morrowdeep and the Pale Courts;
+/// - `hollowwolves`: Hollows in a wolf's shape, three; they hunt by soul-sight, so the dark hides no one from them.
+///
+/// A kind may be written with underscores (`glass_scorpions`), as rb-pois' and rb-pois-south's files have them.
 fn beast_of(kind: &str) -> Option<Beast> {
-    Some(match kind.trim().to_ascii_lowercase().as_str() {
+    Some(match kind.trim().to_ascii_lowercase().replace('_', "").as_str() {
         "harrowdogs" => Beast {
             name: "Harrow-dog",
             count: 5,
@@ -635,6 +648,78 @@ fn beast_of(kind: &str) -> Option<Beast> {
             speed: 6.0,
             body: Some("creatures/barrow_crow/barrow_crow"),
             blind: false,
+        },
+        "glassscorpions" => Beast {
+            name: "Glass scorpion",
+            count: 2,
+            size: Vec3::new(1.2, 0.8, 2.2),
+            mat: "ice",
+            health: 160.0,
+            poise: 60.0,
+            armor: 5.0,
+            speed: 2.1,
+            body: Some("creatures/glass_scorpion/glass_scorpion"),
+            blind: false,
+        },
+        "miragehounds" => Beast {
+            name: "Mirage hound",
+            count: 5,
+            size: Vec3::new(0.4, 0.65, 1.1),
+            mat: "ash",
+            health: 70.0,
+            poise: 25.0,
+            armor: 0.0,
+            speed: 7.0,
+            body: Some("creatures/mirage_hound/mirage_hound"),
+            blind: false,
+        },
+        "boilcrabs" | "wreckcrabs" => Beast {
+            name: "Boil-crab",
+            count: 4,
+            size: Vec3::new(0.6, 0.3, 0.5),
+            mat: "stone",
+            health: 30.0,
+            poise: 8.0,
+            armor: 4.0,
+            speed: 3.0,
+            body: Some("creatures/boil_crab/boil_crab"),
+            blind: false,
+        },
+        "nhalspawn" => Beast {
+            name: "Nhal's spawn",
+            count: 4,
+            size: Vec3::new(1.5, 0.8, 1.8),
+            mat: "dark",
+            health: 80.0,
+            poise: 30.0,
+            armor: 2.0,
+            speed: 4.5,
+            body: Some("creatures/nhal_spawn/nhal_spawn"),
+            blind: false,
+        },
+        "frostwarg" => Beast {
+            name: "Frost-warg",
+            count: 1,
+            size: Vec3::new(0.7, 2.0, 3.3),
+            mat: "ice",
+            health: 600.0,
+            poise: 220.0,
+            armor: 5.0,
+            speed: 8.5,
+            body: Some("creatures/frost_warg/frost_warg"),
+            blind: false,
+        },
+        "hollowwolves" => Beast {
+            name: "Hollow wolf",
+            count: 3,
+            size: Vec3::new(0.45, 0.75, 1.3),
+            mat: "dark",
+            health: 70.0,
+            poise: 20.0,
+            armor: 0.0,
+            speed: 7.0,
+            body: Some("creatures/hollow_wolf/hollow_wolf"),
+            blind: true,
         },
         _ => return None,
     })
@@ -2025,7 +2110,7 @@ fn register_encounter(registry: &mut somnium_ecs::reflect::TypeRegistry) {
         CombatEncounterComponent as "somnium.CombatEncounter", display "Combat Encounter", version 1,
         fields {
             enabled { doc: "Built on Play at this entity's position, taken away on Stop." },
-            kind { doc: "wilds: a horse, a rime wolf pack and a bandit camp, none of them aware yet; wolves: the pack alone; bandits: the camp alone; harrowcat: one, hunting alone; harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger, barrowcrows: the bestiary's; lampmen [red, white, amber, green, blue]: a Lamp crew on a street; watch, lance, knights: the law's; ledger_engine: Act VI's climax, the vault-keeper and the Engine's three glyph-boards." },
+            kind { doc: "wilds: a horse, a rime wolf pack and a bandit camp, none of them aware yet; wolves: the pack alone; bandits: the camp alone; harrowcat: one, hunting alone; harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger, barrowcrows, glassscorpions, miragehounds, boilcrabs, nhalspawn, frostwarg, hollowwolves: the bestiary's; lampmen [red, white, amber, green, blue]: a Lamp crew on a street; watch, lance, knights: the law's; ledger_engine: Act VI's climax, the vault-keeper and the Engine's three glyph-boards." },
             floor { doc: "Bring its own flat ground; off stands everyone on the ground here." },
         }
     });
@@ -2096,7 +2181,7 @@ fn build_encounter(
         band if band_of(band).is_some() => args["only"] = json!(band),
         other => {
             return Err(format!(
-                "no kind {other:?} (try wilds, wolves, bandits, harrowcat, harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger, barrowcrows, lampmen [red|white|amber|green|blue], watch, lance, knights or ledger_engine)"
+                "no kind {other:?} (try wilds, wolves, bandits, harrowcat, harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger, barrowcrows, glassscorpions, miragehounds, boilcrabs, nhalspawn, frostwarg, hollowwolves, lampmen [red|white|amber|green|blue], watch, lance, knights or ledger_engine)"
             ));
         }
     }
@@ -7059,7 +7144,9 @@ mod tests {
         let worn = dogs.iter().filter(|e| world.get::<SkinnedBody>(**e).is_some()).count();
         assert_eq!((bodies, worn), (5, 5));
         for stem in ["iron_mole/iron_mole", "seal_wolf/seal_wolf", "smog_wraith/smog_wraith", "warden_guard/warden_guard",
-                     "hunger/hunger", "barrow_crow/barrow_crow"] {
+                     "hunger/hunger", "barrow_crow/barrow_crow", "glass_scorpion/glass_scorpion",
+                     "mirage_hound/mirage_hound", "boil_crab/boil_crab", "nhal_spawn/nhal_spawn",
+                     "frost_warg/frost_warg", "hollow_wolf/hollow_wolf"] {
             let file = content.join(format!("creatures/{stem}.glb"));
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(&file, b"").unwrap();
@@ -7067,7 +7154,10 @@ mod tests {
         for (kind, stem, count) in [("crocodile", "delta_crocodile", 1), ("icecrawlers", "ice_crawler", 3),
                                     ("ironmoles", "iron_mole", 1), ("sealwolves", "seal_wolf", 3),
                                     ("smogwraiths", "smog_wraith", 2), ("wardenguard", "warden_guard", 1),
-                                    ("hunger", "hunger", 1), ("barrowcrows", "barrow_crow", 5)] {
+                                    ("hunger", "hunger", 1), ("barrowcrows", "barrow_crow", 5),
+                                    ("glassscorpions", "glass_scorpion", 2), ("miragehounds", "mirage_hound", 5),
+                                    ("boilcrabs", "boil_crab", 4), ("nhalspawn", "nhal_spawn", 4),
+                                    ("frostwarg", "frost_warg", 1), ("hollowwolves", "hollow_wolf", 3)] {
             let made = build_encounter(&mut world, kind, Vec3::ZERO, Vec3::X, false, Some(&content)).expect(kind);
             let sources: Vec<AssetId> = made.iter().filter_map(|e| world.get::<SkinnedBody>(*e)).map(|b| b.source).collect();
             let want = AssetId::from_relative_path(format!("creatures/{stem}/{stem}.glb"));
