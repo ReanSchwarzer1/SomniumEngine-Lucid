@@ -164,6 +164,7 @@ impl Cells {
         }
         self.min = lo;
         self.dims = [((hi[0] - lo[0]) / CELL) as i32 + 1, ((hi[1] - lo[1]) / CELL) as i32 + 1];
+        debug_assert!(i64::from(self.dims[0]) * i64::from(self.dims[1]) <= 1 << 24, "more cells than a batch id holds");
         let cell_of = |p: &PaintedFoliage| {
             let cx = ((p.position.x - lo[0]) / CELL) as i32;
             let cz = ((p.position.z - lo[1]) / CELL) as i32;
@@ -212,8 +213,10 @@ pub(crate) struct FoliageBatches {
     pub changes: Changes,
 }
 
+/// The namespace byte, 16 bits of terrain, 24 of cell (a 131 km square of 32 m cells) and 16 of kind, so every
+/// kind a palette can hold has its own batch in a cell. Runtime only: never saved.
 fn batch_id(terrain: u32, cell: u32, kind: u8) -> u64 {
-    ID_SPACE | (u64::from(terrain & 0xFFFF) << 40) | (u64::from(cell) << 8) | u64::from(kind)
+    ID_SPACE | (u64::from(terrain & 0xFFFF) << 40) | (u64::from(cell & 0xFF_FFFF) << 16) | u64::from(kind)
 }
 
 fn mix(h: &mut u64, word: u32) {
@@ -406,6 +409,14 @@ mod tests {
         assert_eq!(fars, [300.0; 3]);
     }
 
+    #[test]
+    fn a_batch_id_keeps_terrain_cell_and_kind_apart() {
+        let fields = |id: u64| (id >> 56, (id >> 40) & 0xFFFF, (id >> 16) & 0xFF_FFFF, id & 0xFFFF);
+        assert_eq!(fields(batch_id(7, 0xAB_CDEF, 200)), (0xF0, 7, 0xAB_CDEF, 200));
+        assert_eq!(fields(batch_id(0x1_0007, 0, 0)), (0xF0, 7, 0, 0), "terrain bits never reach the namespace");
+        assert_ne!(batch_id(1, 1, 0), batch_id(1, 0, 0));
+    }
+
     fn field() -> Vec<PaintedFoliage> {
         (0..200)
             .map(|i| PaintedFoliage {
@@ -435,8 +446,8 @@ mod tests {
         batches.end_frame();
         let first = batches.changes.set.len();
         assert!(first > 0 && copies > 0);
-        let wide = batches.changes.set.iter().filter(|(id, _)| id & 0xFF == 131).count();
-        let short = batches.changes.set.iter().filter(|(id, _)| id & 0xFF == 130).count();
+        let wide = batches.changes.set.iter().filter(|(id, _)| id & 0xFFFF == 131).count();
+        let short = batches.changes.set.iter().filter(|(id, _)| id & 0xFFFF == 130).count();
         assert!(wide > short, "the longer-reach kind is set over more cells");
         // The same frame again: nothing to send.
         batches.begin_frame();
