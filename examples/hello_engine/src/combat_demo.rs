@@ -524,7 +524,8 @@ struct Beast {
 /// - `sealwolves`: the fjord's seal-wolves, a fluke for a tail, three;
 /// - `smogwraiths`: Unspooled of crystal smoke over the slag, two, light;
 /// - `wardenguard`: the Kettle's machine warden with foreleg blades, one, heavy;
-/// - `hunger`: the Unspooled "cold fog with a face", one.
+/// - `hunger`: the Unspooled "cold fog with a face", one;
+/// - `barrowcrows`: the barrows' carrion crows, five, small and quick (rb-pois' barrows).
 fn beast_of(kind: &str) -> Option<Beast> {
     Some(match kind.trim().to_ascii_lowercase().as_str() {
         "harrowdogs" => Beast {
@@ -621,6 +622,18 @@ fn beast_of(kind: &str) -> Option<Beast> {
             armor: 0.0,
             speed: 4.0,
             body: Some("creatures/hunger/hunger"),
+            blind: false,
+        },
+        "barrowcrows" => Beast {
+            name: "Barrow crow",
+            count: 5,
+            size: Vec3::new(0.35, 0.4, 0.55),
+            mat: "dark",
+            health: 25.0,
+            poise: 5.0,
+            armor: 0.0,
+            speed: 6.0,
+            body: Some("creatures/barrow_crow/barrow_crow"),
             blind: false,
         },
         _ => return None,
@@ -2012,7 +2025,7 @@ fn register_encounter(registry: &mut somnium_ecs::reflect::TypeRegistry) {
         CombatEncounterComponent as "somnium.CombatEncounter", display "Combat Encounter", version 1,
         fields {
             enabled { doc: "Built on Play at this entity's position, taken away on Stop." },
-            kind { doc: "wilds: a horse, a rime wolf pack and a bandit camp, none of them aware yet; wolves: the pack alone; bandits: the camp alone; harrowcat: one, hunting alone; harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger: the bestiary's; lampmen [red, white, amber, green, blue]: a Lamp crew on a street; watch, lance, knights: the law's; ledger_engine: Act VI's climax, the vault-keeper and the Engine's three glyph-boards." },
+            kind { doc: "wilds: a horse, a rime wolf pack and a bandit camp, none of them aware yet; wolves: the pack alone; bandits: the camp alone; harrowcat: one, hunting alone; harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger, barrowcrows: the bestiary's; lampmen [red, white, amber, green, blue]: a Lamp crew on a street; watch, lance, knights: the law's; ledger_engine: Act VI's climax, the vault-keeper and the Engine's three glyph-boards." },
             floor { doc: "Bring its own flat ground; off stands everyone on the ground here." },
         }
     });
@@ -2083,7 +2096,7 @@ fn build_encounter(
         band if band_of(band).is_some() => args["only"] = json!(band),
         other => {
             return Err(format!(
-                "no kind {other:?} (try wilds, wolves, bandits, harrowcat, harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger, lampmen [red|white|amber|green|blue], watch, lance, knights or ledger_engine)"
+                "no kind {other:?} (try wilds, wolves, bandits, harrowcat, harrowdogs, crocodile, icecrawlers, ironmoles, sealwolves, smogwraiths, wardenguard, hunger, barrowcrows, lampmen [red|white|amber|green|blue], watch, lance, knights or ledger_engine)"
             ));
         }
     }
@@ -6604,7 +6617,7 @@ mod tests {
         let worn = dogs.iter().filter(|e| world.get::<SkinnedBody>(**e).is_some()).count();
         assert_eq!((bodies, worn), (5, 5));
         for stem in ["iron_mole/iron_mole", "seal_wolf/seal_wolf", "smog_wraith/smog_wraith", "warden_guard/warden_guard",
-                     "hunger/hunger"] {
+                     "hunger/hunger", "barrow_crow/barrow_crow"] {
             let file = content.join(format!("creatures/{stem}.glb"));
             std::fs::create_dir_all(file.parent().unwrap()).unwrap();
             std::fs::write(&file, b"").unwrap();
@@ -6612,7 +6625,7 @@ mod tests {
         for (kind, stem, count) in [("crocodile", "delta_crocodile", 1), ("icecrawlers", "ice_crawler", 3),
                                     ("ironmoles", "iron_mole", 1), ("sealwolves", "seal_wolf", 3),
                                     ("smogwraiths", "smog_wraith", 2), ("wardenguard", "warden_guard", 1),
-                                    ("hunger", "hunger", 1)] {
+                                    ("hunger", "hunger", 1), ("barrowcrows", "barrow_crow", 5)] {
             let made = build_encounter(&mut world, kind, Vec3::ZERO, Vec3::X, false, Some(&content)).expect(kind);
             let sources: Vec<AssetId> = made.iter().filter_map(|e| world.get::<SkinnedBody>(*e)).map(|b| b.source).collect();
             let want = AssetId::from_relative_path(format!("creatures/{stem}/{stem}.glb"));
