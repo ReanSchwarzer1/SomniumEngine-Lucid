@@ -3098,6 +3098,15 @@ struct Run {
     hunt_due: BTreeMap<String, f64>,
     /// The beasts are calm (the game's say): woken ones are made neutral too.
     beasts_calm: bool,
+    /// Fixed steps walked under the walkers' LOD ([`CombatDemo::walk_lod`]), which staggers far bodies' steps by it,
+    /// and each body's pace there.
+    walk_steps: u64,
+    paced: HashMap<CombatantId, Paced>,
+    /// With the writes once a frame ([`CombatDemo::frame_writes`]): what each fighter's entity was last placed from,
+    /// and the seconds and steps the skins have not been written for yet.
+    placed: HashMap<CombatantId, Placed>,
+    unwritten: f32,
+    unwritten_steps: u32,
 }
 
 struct Hud {
@@ -3287,6 +3296,15 @@ pub struct CombatDemo {
     /// Whether the beasts (wolves, harrowcats, all of team [`BEAST_TEAM`])
     /// fight the protagonist ([`CombatDemo::set_beasts_hostile`]).
     beasts_hostile: bool,
+    /// The walkers' LOD ([`WalkLod`]): far bodies step every few fixed steps and still ones not at all, near ones as
+    /// ever. `None` (the default) steps everyone every step. Set with [`CombatDemo::set_open_world_lod`].
+    pub walk_lod: Option<WalkLod>,
+    /// Write the fight onto the scene once a frame, in [`CombatDemo::update`], not after every fixed step: each
+    /// fighter's entity where it ended the frame (those that did not move left alone), the effects, and the skins
+    /// with their clocks on by all the frame's steps. The protagonist and his mount are still written every step.
+    /// Off (the default) writes everything every step. Needs `update` once a frame after the steps (as the shell
+    /// calls it). Set with [`CombatDemo::set_open_world_lod`].
+    pub frame_writes: bool,
 }
 
 /// The game's law on the fight: each faction hostile to the party when it is
@@ -3366,6 +3384,8 @@ impl Default for CombatDemo {
             hunting_factions: BTreeSet::new(),
             click: Default::default(),
             beasts_hostile: true,
+            walk_lod: None,
+            frame_writes: false,
         }
     }
 }
@@ -3647,11 +3667,22 @@ impl CombatDemo {
         self.input.devices_mut().release_all();
     }
 
-    /// The player's command for the coming fixed steps (once a frame).
+    /// The player's command for the coming fixed steps (once a frame). With [`CombatDemo::frame_writes`], first the
+    /// fight as the frame's steps left it onto the scene.
     pub fn update(&mut self, ctx: &mut EngineContext) {
         let Some(run) = &mut self.run else {
             return;
         };
+        if run.unwritten_steps > 0 {
+            crate::zone(&mut ctx.renderer, Some("Combat write scene"));
+            write_frame_scene(ctx.world, ctx.physics, run);
+            crate::zone(&mut ctx.renderer, None);
+            crate::zone(&mut ctx.renderer, Some("Combat skins write"));
+            write_frame_skins(ctx.world, run);
+            crate::zone(&mut ctx.renderer, None);
+            // gear the frame's write hung (a drawn sword) is drawn only once uploaded
+            ctx.upload_imports(run.skins.imports.drain(..));
+        }
         self.input.update(ctx.dt());
         run.world.darkness = darkness(ctx.world);
         let Some(player) = run.player else {
@@ -3872,6 +3903,21 @@ impl CombatDemo {
         std::mem::take(&mut self.events)
     }
 
+    /// The fight's level of detail for an open world, on or off (off by default: everything as before). On, far
+    /// walkers step every few fixed steps and still ones not at all ([`WalkLod`]), and the fight is written onto the
+    /// scene once a frame ([`CombatDemo::frame_writes`]); within 60 m of the protagonist, the fight's camera and every
+    /// held place the walkers step as ever.
+    pub fn set_open_world_lod(&mut self, on: bool) {
+        self.walk_lod = on.then(WalkLod::default);
+        self.frame_writes = on;
+    }
+
+    /// Whether [`CombatDemo::set_open_world_lod`] is on (either half of it).
+    #[must_use]
+    pub fn open_world_lod(&self) -> bool {
+        self.walk_lod.is_some() || self.frame_writes
+    }
+
     /// One fixed step of the fight, then everything it changed onto the scene.
     pub fn fixed(&mut self, ctx: &mut EngineContext) {
         if self.run.is_none() || !self.take_step(ctx.time.frame_count()) {
@@ -3880,6 +3926,7 @@ impl CombatDemo {
         let Some(run) = &mut self.run else {
             return;
         };
+        crate::zone(&mut ctx.renderer, Some("Combat fixed"));
         let dt = ctx.simulation.fixed_delta_seconds;
         // Brains think by their distance from what matters (the combat
         // world's LOD): the protagonist, and the fight's camera on the ground.
@@ -3903,12 +3950,37 @@ impl CombatDemo {
             .or(run.nav.as_ref());
         let query = JoltQuery(ctx.physics);
         let rode = run.player.and_then(|p| run.world.combatant(p)).and_then(|c| c.mount);
+        crate::zone(&mut ctx.renderer, Some("Combat world step"));
         run.world.step(dt, &query, nav);
+        crate::zone(&mut ctx.renderer, None);
         let terrain = JoltTerrain {
             physics: ctx.physics,
             water: &run.water,
         };
-        for (id, event) in walk(&mut run.world, &mut run.walkers, dt, &terrain) {
+        crate::zone(&mut ctx.renderer, Some("Combat walk"));
+        let walked = match self.walk_lod {
+            None => {
+                // Turned off mid-fight: no pace is kept for when it comes back on.
+                run.paced.clear();
+                walk(&mut run.world, &mut run.walkers, dt, &terrain)
+            }
+            Some(lod) => {
+                // The protagonist and the mount under him step every step, as does
+                // everyone within `near` of a focus (him, the camera, a held place).
+                run.walk_steps += 1;
+                let steed = run.player.and_then(|p| run.world.combatant(p)).and_then(|c| c.mount);
+                let plan = WalkPlan {
+                    lod,
+                    focus: &focus,
+                    always: [run.player, steed],
+                    step: run.walk_steps,
+                    paced: &mut run.paced,
+                };
+                walk_with(&mut run.world, &mut run.walkers, dt, &terrain, Some(plan))
+            }
+        };
+        crate::zone(&mut ctx.renderer, None);
+        for (id, event) in walked {
             log_locomotion(run, id, event);
         }
         // In a boat the protagonist is carried at its seat, facing the bow.
@@ -3937,15 +4009,23 @@ impl CombatDemo {
             *left -= dt;
             *left > 0.0
         });
+        crate::zone(&mut ctx.renderer, Some("Encounters tend"));
         tend_encounters(ctx.world, Some(&mut *ctx.physics), run, dt);
+        crate::zone(&mut ctx.renderer, None);
         engine_tick(ctx.world, run, dt);
-        write_scene(ctx, run);
+        crate::zone(&mut ctx.renderer, Some("Combat write scene"));
+        write_step_scene(ctx.world, ctx.physics, run, self.frame_writes);
+        crate::zone(&mut ctx.renderer, None);
         // Bodies for fighters that woke this frame, and every body's pose.
         run.skins.dress(ctx.world, &run.bodies, &run.world, &mut run.spawned);
-        run.skins.write(ctx.world, &run.world, &run.walkers, dt);
+        crate::zone(&mut ctx.renderer, Some("Combat skins write"));
+        write_step_skins(ctx.world, run, dt, self.frame_writes);
+        crate::zone(&mut ctx.renderer, None);
         // Gear hung and encounter meshes made this step are drawn only once uploaded.
         ctx.upload_imports(run.skins.imports.drain(..));
         ctx.upload_imports(run.imports.drain(..));
+        // Closes "Combat fixed".
+        crate::zone(&mut ctx.renderer, None);
     }
 
     /// HUD text (once a frame, before the UI is drawn).
@@ -4193,6 +4273,11 @@ fn build(world: &World) -> Option<Run> {
         hunts: 0,
         hunt_due: BTreeMap::new(),
         beasts_calm: false,
+        walk_steps: 0,
+        paced: HashMap::new(),
+        placed: HashMap::new(),
+        unwritten: 0.0,
+        unwritten_steps: 0,
     })
 }
 
@@ -4368,6 +4453,94 @@ fn walker_config(c: &somnium_combat::Combatant) -> ControllerConfig {
     config
 }
 
+/// The walkers' level of detail in an open world ([`CombatDemo::walk_lod`], set by
+/// [`CombatDemo::set_open_world_lod`]; SIM_LOD_PLAN step 2). Near what matters every body steps every fixed step, as
+/// without it; far off, a body on the ground steps every few steps with the time it was owed, and one standing still
+/// is not stepped at all, its ground looked at again now and then.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WalkLod {
+    /// Within this of any focus (metres on the ground plane: the protagonist, the fight's camera, a held place)
+    /// every body steps every step.
+    pub near: f32,
+    /// Out to this a far walker steps every `mid_stride` steps, beyond it every `far_stride`. A body in a fight
+    /// within it steps every step.
+    pub far: f32,
+    /// Steps between a far walker's steps, out to `far`.
+    pub mid_stride: u32,
+    /// Steps between a far walker's steps beyond `far`.
+    pub far_stride: u32,
+    /// Most one strided step may carry a body on the ground (metres): the stride shortens to keep under it. It stays
+    /// under the controller's snap (0.35 m below the feet) so that downhill a strided step never loses the ground
+    /// (no false fall, no hard landing).
+    pub max_step: f32,
+    /// Steps between looks at a still body's ground (staggered by id): a broken board or a collider streamed out
+    /// still drops it within this many steps.
+    pub still_probe: u32,
+}
+
+impl Default for WalkLod {
+    fn default() -> Self {
+        Self {
+            near: 60.0,
+            far: 140.0,
+            mid_stride: 4,
+            far_stride: 8,
+            max_step: 0.3,
+            still_probe: 30,
+        }
+    }
+}
+
+impl WalkLod {
+    /// Steps between a body's steps: 1 for anyone `always` stepped (the protagonist and his mount), anyone
+    /// `unsettled` (in the air, swimming, on a ledge, jumping or climbing, on a sledge), anyone within `near` of a
+    /// focus (`d2` is the squared distance to the nearest) and anyone `engaged` in a fight within `far` (a ridden
+    /// mount is when its rider is); otherwise the stride for its distance, shortened so that `speed` (metres a second)
+    /// over `dt` a step carries it no further than `max_step` in one.
+    #[must_use]
+    pub fn stride(&self, d2: f32, always: bool, unsettled: bool, engaged: bool, speed: f32, dt: f32) -> u32 {
+        let far = d2 > self.far * self.far;
+        if always || unsettled || d2 <= self.near * self.near || (engaged && !far) {
+            return 1;
+        }
+        let stride = if far { self.far_stride } else { self.mid_stride }.max(1);
+        let reach = speed * dt;
+        if reach > 0.0 && reach.is_finite() {
+            // Whole steps that fit under the most a step may carry.
+            let cap = (self.max_step / reach).floor();
+            if cap < stride as f32 {
+                return (cap as u32).max(1);
+            }
+        }
+        stride
+    }
+
+    /// Whether a body on `stride` steps at fixed step `step`: staggered by its `id`, so a crowd spreads its steps.
+    #[must_use]
+    pub fn due(step: u64, id: CombatantId, stride: u32) -> bool {
+        (step + u64::from(id.0)) % u64::from(stride.max(1)) == 0
+    }
+}
+
+/// A far walker's pace between its steps ([`walk_with`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Paced {
+    /// Seconds of its own clock it has not stepped yet.
+    owed: f32,
+    /// Its last step left it where it was: on the ground, not pushed, wanting nothing, not moving.
+    settled: bool,
+}
+
+/// What strides the walkers this step ([`walk_with`]): the LOD, the points that matter, who steps every step (the
+/// protagonist and the mount under him), the step's number and each body's pace.
+struct WalkPlan<'a> {
+    lod: WalkLod,
+    focus: &'a [Vec3],
+    always: [Option<CombatantId>; 2],
+    step: u64,
+    paced: &'a mut HashMap<CombatantId, Paced>,
+}
+
 /// Everyone's feet from their controllers, after the combat step decided
 /// where each wants to go. Running into a ledge (the run key, or an AI on an
 /// off-mesh link) vaults or climbs it; a brain on a level link jumps. Each
@@ -4379,8 +4552,26 @@ fn walk(
     dt: f32,
     terrain: &impl Terrain,
 ) -> Vec<(CombatantId, LocomotionEvent)> {
+    walk_with(combat, walkers, dt, terrain, None)
+}
+
+/// [`walk`], with the walkers' LOD when there is a `plan`: those it does not step this step are left as they are (their
+/// time owed to their next step), a strided step longer than [`WalkLod::max_step`] is taken in parts, and pushes are
+/// gathered only for those it steps. Without one, everyone steps.
+fn walk_with(
+    combat: &mut CombatWorld,
+    walkers: &mut BTreeMap<CombatantId, Controller>,
+    dt: f32,
+    terrain: &impl Terrain,
+    mut plan: Option<WalkPlan>,
+) -> Vec<(CombatantId, LocomotionEvent)> {
     // Pushes from where everyone stood before anyone moved.
     let ids: Vec<CombatantId> = walkers.keys().copied().collect();
+    // With the LOD: who steps, and the seconds each steps by (its own clock's for those stepped every step).
+    let (ids, spans) = match plan.as_mut() {
+        None => (ids, BTreeMap::new()),
+        Some(plan) => pace_walkers(combat, walkers, dt, &ids, plan),
+    };
     let pushes = combat.separations(&ids);
     let mut out = Vec::new();
     for (id, push) in pushes {
@@ -4396,7 +4587,12 @@ fn walk(
         }
         // The body's own clock (focus slows it). On the ground the intent is
         // the velocity, so dodges, lunges and knockback keep their distance.
-        let body_dt = dt * combat.time_scale_for(id);
+        // A strided body steps by the time it was owed, and its push (a
+        // distance) is spread over that time, so it moves by the push once.
+        let body_dt = spans
+            .get(&id)
+            .copied()
+            .unwrap_or_else(|| dt * combat.time_scale_for(id));
         if body_dt <= 0.0 {
             continue;
         }
@@ -4414,12 +4610,41 @@ fn walk(
             jump: ai::wants_jump(combat, id),
             climb: c.intent.climb || (player && c.intent.sprinting),
         };
-        let events = walker.step(body_dt, &input, &Walled { terrain, combat });
+        let (before, wanted) = (walker.feet, flat_speed(c.intent.velocity));
+        // A strided step that would carry it past the LOD's `max_step` (time owed under a longer stride, or a
+        // speed-up since it was owed) is taken in even parts under it, so downhill none loses the ground. Off the
+        // ground partway (an edge, water, a ledge), the rest is let go, as it is when a body comes to stride 1.
+        let parts = match plan.as_ref() {
+            Some(plan) if spans.contains_key(&id) => strided_parts(flat_speed(velocity) * body_dt, plan.lod.max_step),
+            _ => 1,
+        };
+        let part = body_dt / parts as f32;
+        let mut events = walker.step(part, &input, &Walled { terrain, combat });
+        for _ in 1..parts {
+            if !walker.grounded() || !events.is_empty() {
+                break;
+            }
+            walker.velocity.x = velocity.x;
+            walker.velocity.z = velocity.z;
+            events.extend(walker.step(part, &input, &Walled { terrain, combat }));
+        }
         let (feet, velocity) = (walker.feet, walker.velocity);
         let climb = walker.mantle().map(|m| ai::Climb {
             progress: m.progress(),
             vulnerable: m.vulnerable(),
         });
+        if let Some(plan) = plan.as_mut() {
+            // Left where it was, wanting nothing: still until it wants or is moved again.
+            let settled = events.is_empty()
+                && walker.grounded()
+                && !input.jump
+                && !input.climb
+                && wanted <= STILL_SPEED
+                && flat_speed(velocity) <= STILL_SPEED
+                && push.length_squared() <= STILL_SPEED * STILL_SPEED
+                && feet.distance_squared(before) <= STILL_SPEED * STILL_SPEED;
+            plan.paced.entry(id).or_default().settled = settled;
+        }
         if let Some(c) = combat.combatant_mut(id) {
             c.position = feet;
             c.velocity = velocity;
@@ -4435,6 +4660,95 @@ fn walk(
     }
     somnium_combat::mount::seat_riders(combat);
     out
+}
+
+/// Below this (metres a second, or metres) a walker counts as still ([`Paced::settled`]).
+const STILL_SPEED: f32 = 1e-4;
+
+/// The most parts one strided step is taken in ([`strided_parts`]).
+const MAX_PARTS: u32 = 32;
+
+/// How many even parts a strided step `reach` metres long is taken in so that none carries a body farther than
+/// `max_step` ([`WalkLod::max_step`]): 1 when it is under it (to a rounding's slack, so a stride sized to fit is not
+/// split by the sum of its steps' time), at most [`MAX_PARTS`].
+fn strided_parts(reach: f32, max_step: f32) -> u32 {
+    if !reach.is_finite() || max_step <= 0.0 || reach <= max_step * (1.0 + 1e-4) {
+        return 1;
+    }
+    ((reach / max_step).ceil() as u32).clamp(1, MAX_PARTS)
+}
+
+fn flat_speed(v: Vec3) -> f32 {
+    Vec2::new(v.x, v.z).length()
+}
+
+/// Under `plan`, who of `ids` (in their order) steps this step, and the seconds each steps by where that is not its
+/// own clock's step: the carried (riders, the dead) as ever; those [`WalkLod::stride`] steps every step by their own
+/// clock (time owed from farther off is let go); a strided body when [`WalkLod::due`], by all the time it was owed;
+/// a still one only when its ground is looked at again, by one step. Everyone else's time is owed to their next step.
+fn pace_walkers(
+    combat: &CombatWorld,
+    walkers: &BTreeMap<CombatantId, Controller>,
+    dt: f32,
+    ids: &[CombatantId],
+    plan: &mut WalkPlan,
+) -> (Vec<CombatantId>, BTreeMap<CombatantId, f32>) {
+    if plan.paced.len() > walkers.len() {
+        plan.paced.retain(|id, _| walkers.contains_key(id));
+    }
+    let lod = plan.lod;
+    let mut stepping = Vec::with_capacity(ids.len());
+    let mut spans = BTreeMap::new();
+    for &id in ids {
+        let (Some(c), Some(walker)) = (combat.combatant(id), walkers.get(&id)) else {
+            continue;
+        };
+        if c.mount.is_some() || !c.alive() {
+            // Carried: placed every step, as without the LOD.
+            plan.paced.remove(&id);
+            stepping.push(id);
+            continue;
+        }
+        let body_dt = dt * combat.time_scale_for(id);
+        if body_dt <= 0.0 {
+            continue;
+        }
+        let d2 = plan
+            .focus
+            .iter()
+            .map(|f| Vec2::new(f.x - c.position.x, f.z - c.position.z).length_squared())
+            .fold(f32::INFINITY, f32::min);
+        let always = plan.always.contains(&Some(id));
+        let unsettled =
+            !walker.grounded() || walker.sledging || c.intent.climb || ai::wants_jump(combat, id);
+        // A ridden mount has no brain of its own (it fights for its rider, who is carried): it is in its rider's fight.
+        let fighting = |c: &somnium_combat::Combatant| c.brain.as_ref().is_some_and(|b| b.mind.target.is_some());
+        let engaged = fighting(c) || c.rider.and_then(|r| combat.combatant(r)).is_some_and(fighting);
+        let speed = flat_speed(c.intent.velocity).max(flat_speed(walker.velocity));
+        let stride = lod.stride(d2, always, unsettled, engaged, speed, body_dt);
+        let pace = plan.paced.entry(id).or_default();
+        if stride == 1 {
+            pace.owed = 0.0;
+            stepping.push(id);
+            continue;
+        }
+        if pace.settled && speed <= STILL_SPEED && c.position == walker.feet {
+            // Still: nothing to step but its ground, looked at again now and then.
+            pace.owed = 0.0;
+            if WalkLod::due(plan.step, id, lod.still_probe) {
+                stepping.push(id);
+                spans.insert(id, body_dt);
+            }
+            continue;
+        }
+        pace.owed += body_dt;
+        if WalkLod::due(plan.step, id, stride) {
+            stepping.push(id);
+            spans.insert(id, pace.owed);
+            pace.owed = 0.0;
+        }
+    }
+    (stepping, spans)
 }
 
 /// Anyone's vaults and climbs, and the protagonist's swims and hard landings.
@@ -5224,76 +5538,204 @@ fn set_material(world: &mut World, entity: Entity, slot: &mut &'static str, want
     }
 }
 
+/// Where fighter `id` (`c`) is drawn: the centre, turn and size of its entity in the world, its ragdoll's root
+/// while it has one.
+fn fighter_pose(
+    physics: &somnium_physics::world::PhysicsWorld,
+    run: &Run,
+    id: CombatantId,
+    c: &somnium_combat::Combatant,
+) -> (Vec3, Quat, Vec3) {
+    let size =
+        run.dims
+            .get(&id)
+            .copied()
+            .unwrap_or(Vec3::new(BODY_WIDTH, BODY_HEIGHT, BODY_WIDTH));
+    let pose = match run
+        .ragdolls
+        .get(&id)
+        .and_then(|r| physics.ragdoll_pose(*r).ok())
+    {
+        Some(parts) => {
+            let (_, r, p) = parts[0].to_scale_rotation_translation();
+            (p, r)
+        }
+        // A mount's long body lies along its slope; people stand upright.
+        None => {
+            let up = run
+                .walkers
+                .get(&id)
+                .filter(|w| c.mount_def.is_some() && w.grounded())
+                .map_or(Vec3::Y, |w| w.ground_normal);
+            (
+                c.position + up * size.y * 0.5,
+                Quat::from_rotation_arc(Vec3::Y, up) * yaw(c.facing),
+            )
+        }
+    };
+    (pose.0, pose.1, size)
+}
+
+/// The world matrix of `entity`'s parent (identity at the top).
+fn parent_matrix(world: &World, entity: Entity) -> Mat4 {
+    world
+        .get::<Parent>(entity)
+        .map(|p| p.entity)
+        .filter(|p| *p != Entity::DANGLING)
+        .map_or(Mat4::IDENTITY, |p| world_matrix(world, p))
+}
+
+/// A fighter's entity at `at`, turned `turn`, of `size`, in the world: into its `parent`'s space, written when that
+/// moved or turned it.
+fn place_fighter(world: &mut World, entity: Entity, parent: Mat4, at: Vec3, turn: Quat, size: Vec3) {
+    let local = parent.inverse() * Mat4::from_scale_rotation_translation(size, turn, at);
+    let (s, r, p) = local.to_scale_rotation_translation();
+    if let Some(t) = world.get_mut::<Transform>(entity)
+        && (t.translation.distance_squared(p) > 1e-6 || t.rotation.dot(r).abs() < 0.99999)
+    {
+        t.translation = p;
+        t.rotation = r;
+        t.scale = s;
+    }
+}
+
+/// A fighter's live readouts onto its component, rounded so regeneration does not write every step.
+fn read_out(
+    world: &mut World,
+    readouts: &mut HashMap<Entity, (i32, i32, i32, &'static str)>,
+    entity: Entity,
+    c: &somnium_combat::Combatant,
+) {
+    let state = c
+        .herd
+        .filter(|_| c.rider.is_none() && c.alive())
+        .map_or(c.action.label(), |h| h.doing.label());
+    let reading = (
+        (c.vitals.health.current * 10.0).round() as i32,
+        (c.vitals.stamina.current).round() as i32,
+        (c.vitals.mana.current * 10.0).round() as i32,
+        state,
+    );
+    if readouts.get(&entity) != Some(&reading) {
+        readouts.insert(entity, reading);
+        if let Some(cc) = world.get_mut::<CombatantComponent>(entity) {
+            cc.health = c.vitals.health.current;
+            cc.stamina = c.vitals.stamina.current;
+            cc.mana = c.vitals.mana.current;
+            cc.state = state.to_string();
+        }
+    }
+}
+
+/// What [`write_fighters_once`] last placed a fighter's entity from: placed from the same again, it is left alone
+/// (no inverse, no decompose, no `get_mut` of its Transform).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Placed {
+    entity: Entity,
+    at: Vec3,
+    turn: Quat,
+    size: Vec3,
+    parent: Mat4,
+}
+
+/// Fighters (everyone, or `only` those) onto their entities as [`write_scene`] places them, but each one placed from
+/// the same pose, size and parent as last time left as it is; and their readouts.
+fn write_fighters_once(
+    world: &mut World,
+    physics: &somnium_physics::world::PhysicsWorld,
+    run: &mut Run,
+    only: Option<&[CombatantId]>,
+) {
+    let list: Vec<(CombatantId, Entity)> = match only {
+        Some(ids) => ids.iter().filter_map(|id| Some((*id, *run.bodies.get(id)?))).collect(),
+        None => run.bodies.iter().map(|(id, e)| (*id, *e)).collect(),
+    };
+    if run.placed.len() > run.bodies.len() {
+        run.placed.retain(|id, _| run.bodies.contains_key(id));
+    }
+    for (id, entity) in list {
+        let Some(c) = run.world.combatant(id) else {
+            continue;
+        };
+        let (at, turn, size) = fighter_pose(physics, run, id, c);
+        let parent = parent_matrix(world, entity);
+        let placed = Placed {
+            entity,
+            at,
+            turn,
+            size,
+            parent,
+        };
+        if run.placed.get(&id) != Some(&placed) {
+            place_fighter(world, entity, parent, at, turn, size);
+            run.placed.insert(id, placed);
+        }
+        read_out(world, &mut run.readouts, entity, c);
+    }
+}
+
+/// One fixed step's scene. Written every step (`batched` false): everything ([`write_scene`]). Batched once a frame
+/// ([`CombatDemo::frame_writes`]): only the protagonist and the mount under him, in case a fixed-step reader looks at
+/// them; the rest waits for [`write_frame_scene`].
+fn write_step_scene(world: &mut World, physics: &somnium_physics::world::PhysicsWorld, run: &mut Run, batched: bool) {
+    if batched {
+        let steed = run.player.and_then(|p| run.world.combatant(p)).and_then(|c| c.mount);
+        let only: Vec<CombatantId> = run.player.into_iter().chain(steed).collect();
+        write_fighters_once(world, physics, run, Some(&only));
+    } else {
+        write_scene(world, physics, run);
+    }
+}
+
+/// One fixed step's skins: written now by the step's `dt`, or (`batched`) the time kept for [`write_frame_skins`].
+fn write_step_skins(world: &mut World, run: &mut Run, dt: f32, batched: bool) {
+    if batched {
+        run.unwritten += dt;
+        run.unwritten_steps += 1;
+    } else {
+        run.skins.write(world, &run.world, &run.walkers, dt);
+    }
+}
+
+/// The frame's scene when its steps left it ([`CombatDemo::frame_writes`]): every fighter where it ended the frame
+/// (those that did not move left alone) and every effect. False when no step waits.
+fn write_frame_scene(world: &mut World, physics: &somnium_physics::world::PhysicsWorld, run: &mut Run) -> bool {
+    if run.unwritten_steps == 0 {
+        return false;
+    }
+    write_fighters_once(world, physics, run, None);
+    write_effects(world, run);
+    true
+}
+
+/// The frame's skins when its steps left them: each body's pose as it ended the frame, its clock on by all the time
+/// the frame's steps took.
+fn write_frame_skins(world: &mut World, run: &mut Run) {
+    if run.unwritten_steps == 0 {
+        return;
+    }
+    let dt = std::mem::take(&mut run.unwritten);
+    run.unwritten_steps = 0;
+    run.skins.write(world, &run.world, &run.walkers, dt);
+}
+
 /// Fighters, ragdolls, missiles, walls, blooms, waves, fire and readouts.
-fn write_scene(ctx: &mut EngineContext, run: &mut Run) {
-    let world = &mut *ctx.world;
+fn write_scene(world: &mut World, physics: &somnium_physics::world::PhysicsWorld, run: &mut Run) {
     // Fighters: world pose into the body's parent space.
     for (id, entity) in &run.bodies {
         let Some(c) = run.world.combatant(*id) else {
             continue;
         };
-        let size =
-            run.dims
-                .get(id)
-                .copied()
-                .unwrap_or(Vec3::new(BODY_WIDTH, BODY_HEIGHT, BODY_WIDTH));
-        let pose = match run
-            .ragdolls
-            .get(id)
-            .and_then(|r| ctx.physics.ragdoll_pose(*r).ok())
-        {
-            Some(parts) => {
-                let (_, r, p) = parts[0].to_scale_rotation_translation();
-                (p, r)
-            }
-            // A mount's long body lies along its slope; people stand upright.
-            None => {
-                let up = run
-                    .walkers
-                    .get(id)
-                    .filter(|w| c.mount_def.is_some() && w.grounded())
-                    .map_or(Vec3::Y, |w| w.ground_normal);
-                (
-                    c.position + up * size.y * 0.5,
-                    Quat::from_rotation_arc(Vec3::Y, up) * yaw(c.facing),
-                )
-            }
-        };
-        let parent = world
-            .get::<Parent>(*entity)
-            .map(|p| p.entity)
-            .filter(|p| *p != Entity::DANGLING)
-            .map_or(Mat4::IDENTITY, |p| world_matrix(world, p));
-        let local = parent.inverse() * Mat4::from_scale_rotation_translation(size, pose.1, pose.0);
-        let (s, r, p) = local.to_scale_rotation_translation();
-        if let Some(t) = world.get_mut::<Transform>(*entity)
-            && (t.translation.distance_squared(p) > 1e-6 || t.rotation.dot(r).abs() < 0.99999)
-        {
-            t.translation = p;
-            t.rotation = r;
-            t.scale = s;
-        }
-        // Live readouts, rounded so regeneration does not write every step.
-        let state = c
-            .herd
-            .filter(|_| c.rider.is_none() && c.alive())
-            .map_or(c.action.label(), |h| h.doing.label());
-        let reading = (
-            (c.vitals.health.current * 10.0).round() as i32,
-            (c.vitals.stamina.current).round() as i32,
-            (c.vitals.mana.current * 10.0).round() as i32,
-            state,
-        );
-        if run.readouts.get(entity) != Some(&reading) {
-            run.readouts.insert(*entity, reading);
-            if let Some(cc) = world.get_mut::<CombatantComponent>(*entity) {
-                cc.health = c.vitals.health.current;
-                cc.stamina = c.vitals.stamina.current;
-                cc.mana = c.vitals.mana.current;
-                cc.state = state.to_string();
-            }
-        }
+        let (at, turn, size) = fighter_pose(physics, run, *id, c);
+        let parent = parent_matrix(world, *entity);
+        place_fighter(world, *entity, parent, at, turn, size);
+        read_out(world, &mut run.readouts, *entity, c);
     }
+    write_effects(world, run);
+}
+
+/// Missiles, walls, blooms, waves and fire on the ground, from the pools.
+fn write_effects(world: &mut World, run: &mut Run) {
     let pools = &mut run.pools;
     // Missiles.
     let flying = run.world.projectiles();
@@ -7265,12 +7707,614 @@ mod tests {
             };
             let idle = time(&mut run);
             let ids: Vec<CombatantId> = run.world.combatants().map(|c| c.id).collect();
-            for id in ids {
+            for &id in &ids {
                 run.world.combatant_mut(id).unwrap().intent.velocity = Vec3::X * 1.5;
             }
             let walking = time(&mut run);
             println!("{count} bodies: idle {idle:.3} ms a step, walking {walking:.3} ms a step");
+            // Far: the same bodies 200 m and more from the focus, under the walkers' LOD.
+            let focus = [Vec3::new(-200.0, 0.0, -200.0)];
+            let far = |run: &mut Run| {
+                let start = std::time::Instant::now();
+                for _ in 0..60 {
+                    lod_step(run, WalkLod::default(), &focus, &terrain, dt);
+                }
+                start.elapsed().as_secs_f64() * 1e3 / 60.0
+            };
+            let far_walking = far(&mut run);
+            for &id in &ids {
+                run.world.combatant_mut(id).unwrap().intent.velocity = Vec3::ZERO;
+            }
+            for _ in 0..30 {
+                lod_step(&mut run, WalkLod::default(), &focus, &terrain, dt);
+            }
+            let far_idle = far(&mut run);
+            println!("{count} bodies far: idle {far_idle:.3} ms a step, walking {far_walking:.3} ms a step");
         }
+    }
+
+    /// One fixed step of the walkers under `lod`, the points that matter at `focus`.
+    fn lod_step(
+        run: &mut Run,
+        lod: WalkLod,
+        focus: &[Vec3],
+        terrain: &impl Terrain,
+        dt: f32,
+    ) -> Vec<(CombatantId, LocomotionEvent)> {
+        run.walk_steps += 1;
+        let plan = WalkPlan {
+            lod,
+            focus,
+            always: [run.player, None],
+            step: run.walk_steps,
+            paced: &mut run.paced,
+        };
+        walk_with(&mut run.world, &mut run.walkers, dt, terrain, Some(plan))
+    }
+
+    /// Fighters standing at `spots`, everyone's id in order.
+    fn lod_run(spots: &[Vec3]) -> (Run, Vec<CombatantId>) {
+        let mut world = World::new();
+        let root = world.spawn((Name::new("Scene"), Transform::default(), WorldTransform::identity()));
+        for (i, at) in spots.iter().enumerate() {
+            fighter(&mut world, root, &format!("Body {i}"), *at, Vec3::Z, CombatantComponent::default());
+        }
+        somnium_core::propagate_transforms(&mut world);
+        let run = build(&world).expect("a fight");
+        let ids = run.world.combatants().map(|c| c.id).collect();
+        (run, ids)
+    }
+
+    /// Jolt with `boxes` (scale, rotation, centre) and a floor 800 m across, its top at 0; the boxes' bodies.
+    fn lod_ground(boxes: &[(Vec3, Quat, Vec3)]) -> (somnium_physics::world::PhysicsWorld, Vec<BodyId>) {
+        let mut physics = somnium_physics::world::PhysicsWorld::new(Default::default());
+        let floor = Mat4::from_scale_rotation_translation(Vec3::new(800.0, 1.0, 800.0), Quat::IDENTITY, -Vec3::Y * 0.5);
+        solid_bodies(&mut physics, vec![floor]);
+        let made = solid_bodies(
+            &mut physics,
+            boxes.iter().map(|(s, r, t)| Mat4::from_scale_rotation_translation(*s, *r, *t)).collect(),
+        );
+        (physics, made)
+    }
+
+    fn bits(v: Vec3) -> [u32; 3] {
+        v.to_array().map(f32::to_bits)
+    }
+
+    /// SIM_LOD_PLAN step 2: within 60 m of a focus the walkers' LOD changes nothing. Walkers near the focus (some
+    /// walking, two overlapping, some standing) follow the same feet, velocity and mode to the bit with the LOD on
+    /// as off, while far ones (walking and standing) are strided and skipped.
+    #[test]
+    fn near_walkers_step_to_the_bit_with_the_lod_on() {
+        let _jolt = JOLT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut spots: Vec<Vec3> = (0..8)
+            .map(|i| Vec3::new((i % 4) as f32 * 7.0 - 10.0, 0.0, (i / 4) as f32 * 9.0 - 20.0))
+            .collect();
+        spots.push(Vec3::new(3.0, 0.0, 3.0));
+        spots.push(Vec3::new(3.3, 0.0, 3.1));
+        let near = spots.len();
+        spots.extend((0..6).map(|i| Vec3::new(200.0 + i as f32 * 3.0, 0.0, 40.0)));
+        spots.push(Vec3::new(230.0, 0.0, 40.0));
+        spots.push(Vec3::new(230.25, 0.0, 40.1));
+        let (mut off, ids) = lod_run(&spots);
+        let (mut on, _) = lod_run(&spots);
+        let (physics, _) = lod_ground(&[]);
+        let terrain = JoltTerrain {
+            physics: &physics,
+            water: &[],
+        };
+        for (i, &id) in ids.iter().enumerate() {
+            let way = [Vec3::X, -Vec3::Z, Vec3::ZERO, Vec3::new(0.6, 0.0, 0.8)][i % 4] * (1.0 + (i % 3) as f32);
+            for run in [&mut off, &mut on] {
+                run.world.combatant_mut(id).unwrap().intent.velocity = way;
+            }
+        }
+        let dt = 1.0 / 60.0;
+        let focus = [Vec3::ZERO];
+        let mut strided = false;
+        for step in 0..300 {
+            if step == 150 {
+                // Everyone stops: the far ones settle and are let be, the near ones stand as before.
+                for &id in &ids {
+                    for run in [&mut off, &mut on] {
+                        run.world.combatant_mut(id).unwrap().intent.velocity = Vec3::ZERO;
+                    }
+                }
+            }
+            walk(&mut off.world, &mut off.walkers, dt, &terrain);
+            lod_step(&mut on, WalkLod::default(), &focus, &terrain, dt);
+            for &id in &ids[..near] {
+                let (a, b) = (&off.walkers[&id], &on.walkers[&id]);
+                assert_eq!(bits(a.feet), bits(b.feet), "{id:?} at step {step}");
+                assert_eq!(bits(a.velocity), bits(b.velocity), "{id:?} at step {step}");
+                assert_eq!(a.mode, b.mode, "{id:?} at step {step}");
+                let (ca, cb) = (off.world.combatant(id).unwrap(), on.world.combatant(id).unwrap());
+                assert_eq!(bits(ca.position), bits(cb.position));
+            }
+            strided |= ids[near..].iter().any(|id| off.walkers[id].feet != on.walkers[id].feet);
+        }
+        assert!(strided, "the far walkers stride");
+        // Far bodies standing settle and are not stepped; walking ones were strided, not stopped.
+        assert!(ids[near..].iter().all(|id| on.paced.get(id).is_some_and(|p| p.settled)));
+        let went = |run: &Run, id: CombatantId, from: Vec3| flat_distance(run.walkers[&id].feet, from);
+        let (walker, from) = (ids[near + 1], spots[near + 1]);
+        assert!(went(&off, walker, from) > 5.0, "it walked");
+        assert!(went(&on, walker, from) > 0.9 * went(&off, walker, from));
+    }
+
+    /// SIM_LOD_PLAN step 2: a far body standing still is not stepped, but its ground is looked at again every
+    /// `still_probe` steps (staggered by id): its ledge taken away, it falls at the next look, within 30 steps,
+    /// where at full rate it falls at once.
+    #[test]
+    fn a_far_still_body_is_let_be_but_falls_when_its_ground_goes() {
+        let _jolt = JOLT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let spot = Vec3::new(200.0, 5.0, 0.0);
+        let (mut run, ids) = lod_run(&[spot]);
+        let (mut full, _) = lod_run(&[spot]);
+        let ledge = (Vec3::new(2.0, 1.0, 2.0), Quat::IDENTITY, Vec3::new(200.0, 4.5, 0.0));
+        let (mut physics, made) = lod_ground(&[ledge]);
+        let id = ids[0];
+        let dt = 1.0 / 60.0;
+        let lod = WalkLod::default();
+        let focus = [Vec3::ZERO];
+        for _ in 0..60 {
+            let terrain = JoltTerrain {
+                physics: &physics,
+                water: &[],
+            };
+            lod_step(&mut run, lod, &focus, &terrain, dt);
+            walk(&mut full.world, &mut full.walkers, dt, &terrain);
+        }
+        let stood = run.walkers[&id].feet;
+        assert!(run.walkers[&id].grounded() && (stood.y - 5.0).abs() < 0.05, "on its ledge: {stood}");
+        assert!(run.paced[&id].settled, "still");
+        physics.destroy_body(made[0]);
+        let terrain = JoltTerrain {
+            physics: &physics,
+            water: &[],
+        };
+        walk(&mut full.world, &mut full.walkers, dt, &terrain);
+        assert!(!full.walkers[&id].grounded(), "at full rate it falls at once");
+        let mut fell = None;
+        for k in 1..=lod.still_probe {
+            lod_step(&mut run, lod, &focus, &terrain, dt);
+            let w = &run.walkers[&id];
+            if !w.grounded() {
+                fell = Some(k);
+                break;
+            }
+            assert_eq!(w.feet, stood, "not stepped between looks");
+        }
+        let fell = fell.expect("it falls within still_probe steps");
+        assert!(WalkLod::due(run.walk_steps, id, lod.still_probe), "at its look, step {fell}");
+        for _ in 0..120 {
+            lod_step(&mut run, lod, &focus, &terrain, dt);
+        }
+        assert!(run.walkers[&id].feet.y < 0.1, "down on the floor: {}", run.walkers[&id].feet);
+    }
+
+    /// SIM_LOD_PLAN step 2: a far walker at 1.5 m/s down a 40 degree slope, strided, covers its full-rate distance
+    /// within 2%, never leaving the ground (no false fall, no Landed); it steps an eighth as often.
+    #[test]
+    fn a_far_walker_strides_down_a_slope_as_far_and_never_lands() {
+        let _jolt = JOLT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tilt = 40f32.to_radians();
+        let turn = Quat::from_rotation_x(tilt);
+        let centre = Vec3::new(300.0, 30.0, 0.0);
+        // Its top face, 40 m up the slope from the middle (local +Z runs down it).
+        let start = centre + turn * Vec3::new(0.0, 1.0, -40.0) + Vec3::Y * 0.05;
+        let slope = (Vec3::new(40.0, 2.0, 200.0), turn, centre);
+        let (physics, _) = lod_ground(&[slope]);
+        let terrain = JoltTerrain {
+            physics: &physics,
+            water: &[],
+        };
+        let (mut on, ids) = lod_run(&[start]);
+        let (mut off, _) = lod_run(&[start]);
+        let id = ids[0];
+        for run in [&mut on, &mut off] {
+            let c = run.world.combatant_mut(id).unwrap();
+            c.position = start;
+            run.walkers.get_mut(&id).unwrap().feet = start;
+        }
+        let dt = 1.0 / 60.0;
+        let focus = [Vec3::ZERO];
+        for _ in 0..60 {
+            lod_step(&mut on, WalkLod::default(), &focus, &terrain, dt);
+            walk(&mut off.world, &mut off.walkers, dt, &terrain);
+        }
+        assert!(on.walkers[&id].grounded() && off.walkers[&id].grounded(), "stood on the slope");
+        let from = [on.walkers[&id].feet, off.walkers[&id].feet];
+        for run in [&mut on, &mut off] {
+            run.world.combatant_mut(id).unwrap().intent.velocity = Vec3::Z * 1.5;
+        }
+        let (mut events, mut moves) = (Vec::new(), 0);
+        for _ in 0..480 {
+            let before = on.walkers[&id].feet;
+            events.extend(lod_step(&mut on, WalkLod::default(), &focus, &terrain, dt));
+            events.extend(walk(&mut off.world, &mut off.walkers, dt, &terrain));
+            moves += usize::from(on.walkers[&id].feet != before);
+            assert!(on.walkers[&id].grounded() && off.walkers[&id].grounded(), "on the ground");
+        }
+        assert!(!events.iter().any(|e| matches!(e.1, LocomotionEvent::Landed { .. })), "{events:?}");
+        let strided = flat_distance(on.walkers[&id].feet, from[0]);
+        let whole = flat_distance(off.walkers[&id].feet, from[1]);
+        assert!(whole > 11.0, "it walked: {whole}");
+        assert!((strided - whole).abs() <= whole * 0.02, "strided {strided} m, full rate {whole} m");
+        assert!(on.walkers[&id].feet.y < from[0].y - 8.0, "down the slope");
+        assert_eq!(moves, 480 / 8, "an eighth of the steps");
+    }
+
+    /// SIM_LOD_PLAN step 2: a far walker strided at 1.5 m/s down a 40 degree slope breaks into a 6 m/s run just as
+    /// it is owed all but one step of its long stride, and its shorter stride is due next. That step carries it all
+    /// the time it was owed at the new speed (0.8 m, the ground about 0.67 m down by then, past the controller's 0.35 m
+    /// snap). Taken in parts under `max_step`, it keeps the ground (no false fall, no Landed), as at full rate.
+    #[test]
+    fn a_far_walker_breaking_into_a_run_down_a_slope_keeps_the_ground() {
+        let _jolt = JOLT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tilt = 40f32.to_radians();
+        let turn = Quat::from_rotation_x(tilt);
+        let centre = Vec3::new(300.0, 30.0, 0.0);
+        let start = centre + turn * Vec3::new(0.0, 1.0, -40.0) + Vec3::Y * 0.05;
+        let slope = (Vec3::new(40.0, 2.0, 200.0), turn, centre);
+        let (physics, _) = lod_ground(&[slope]);
+        let terrain = JoltTerrain {
+            physics: &physics,
+            water: &[],
+        };
+        let (mut on, ids) = lod_run(&[start]);
+        let (mut off, _) = lod_run(&[start]);
+        let id = ids[0];
+        for run in [&mut on, &mut off] {
+            run.world.combatant_mut(id).unwrap().position = start;
+            run.walkers.get_mut(&id).unwrap().feet = start;
+        }
+        let (dt, lod, focus) = (1.0 / 60.0, WalkLod::default(), [Vec3::ZERO]);
+        for _ in 0..60 {
+            lod_step(&mut on, lod, &focus, &terrain, dt);
+            walk(&mut off.world, &mut off.walkers, dt, &terrain);
+        }
+        for run in [&mut on, &mut off] {
+            run.world.combatant_mut(id).unwrap().intent.velocity = Vec3::Z * 1.5;
+        }
+        let d2 = Vec2::new(start.x, start.z).length_squared();
+        let slow = lod.stride(d2, false, false, false, 1.5, dt);
+        let fast = lod.stride(d2, false, false, false, 6.0, dt);
+        assert!(slow == 8 && fast < slow, "strides {slow} then {fast}");
+        let (mut events, mut ran, mut longest) = (Vec::new(), None, 0f32);
+        for step in 0..240 {
+            let owed = on.paced.get(&id).map_or(0.0, |p| p.owed);
+            if ran.is_none() && owed > (slow - 1) as f32 * dt * 0.99 && WalkLod::due(on.walk_steps + 1, id, fast) {
+                ran = Some(step);
+                for run in [&mut on, &mut off] {
+                    run.world.combatant_mut(id).unwrap().intent.velocity = Vec3::Z * 6.0;
+                }
+            }
+            let before = on.walkers[&id].feet;
+            events.extend(lod_step(&mut on, lod, &focus, &terrain, dt));
+            events.extend(walk(&mut off.world, &mut off.walkers, dt, &terrain));
+            longest = longest.max(flat_distance(on.walkers[&id].feet, before));
+            assert!(on.walkers[&id].grounded(), "strided, on the ground at step {step} (ran from {ran:?})");
+            assert!(off.walkers[&id].grounded(), "full rate, on the ground at step {step}");
+        }
+        assert!(ran.is_some_and(|r| r < 200), "it broke into a run: {ran:?}");
+        assert!(!events.iter().any(|e| matches!(e.1, LocomotionEvent::Landed { .. })), "{events:?}");
+        assert!(longest > lod.max_step * 2.0, "the step it was owed for carried it {longest} m");
+        assert_eq!(strided_parts(0.8, 0.3), 3);
+        assert_eq!(strided_parts(0.3, 0.3), 1, "a stride sized to fit is one step");
+        assert_eq!(strided_parts(f32::NAN, 0.3), 1);
+    }
+
+    /// SIM_LOD_PLAN step 2: a ridden mount has no brain (it fights for its rider), so a rider in a fight 100 m from
+    /// every focus (a woken Lance band) is in it on his pony's legs: the pony steps every step, to the bit as without
+    /// the LOD. Once its rider has no target it strides like any far walker.
+    #[test]
+    fn a_ridden_mount_steps_every_step_while_its_rider_fights() {
+        let _jolt = JOLT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let make = || {
+            let mut world = World::new();
+            let root = world.spawn((Name::new("Scene"), Transform::default(), WorldTransform::identity()));
+            let pony = CombatantComponent {
+                mount: 1,
+                ..CombatantComponent::default()
+            };
+            let foe = CombatantComponent {
+                team: 2,
+                ..CombatantComponent::default()
+            };
+            fighter(&mut world, root, "Rider", Vec3::new(100.0, 0.0, 0.0), Vec3::X, CombatantComponent::default());
+            fighter(&mut world, root, "Pony", Vec3::new(101.0, 0.0, 0.0), Vec3::X, pony);
+            fighter(&mut world, root, "Foe", Vec3::new(100.0, 0.0, 30.0), Vec3::X, foe);
+            somnium_core::propagate_transforms(&mut world);
+            let mut run = build(&world).expect("a fight");
+            let id = |run: &Run, name: &str| run.world.combatants().find(|c| c.name == name).map(|c| c.id).unwrap();
+            let (rider, horse, foe) = (id(&run, "Rider"), id(&run, "Pony"), id(&run, "Foe"));
+            assert_eq!(somnium_combat::mount::mount(&mut run.world, rider, horse), Ok(()));
+            assert!(run.world.combatant(horse).unwrap().brain.is_none(), "a ridden mount has no brain");
+            run.world.combatant_mut(rider).unwrap().brain.as_mut().expect("a brain").mind.target = Some(foe);
+            run.world.combatant_mut(horse).unwrap().intent.velocity = Vec3::X * 5.0;
+            (run, rider, horse)
+        };
+        let (mut off, rider, horse) = make();
+        let (mut on, ..) = make();
+        let (physics, _) = lod_ground(&[]);
+        let terrain = JoltTerrain {
+            physics: &physics,
+            water: &[],
+        };
+        let (dt, focus) = (1.0 / 60.0, [Vec3::ZERO]);
+        for step in 0..120 {
+            walk(&mut off.world, &mut off.walkers, dt, &terrain);
+            lod_step(&mut on, WalkLod::default(), &focus, &terrain, dt);
+            let (a, b) = (&off.walkers[&horse], &on.walkers[&horse]);
+            let at = flat_distance(b.feet, Vec3::ZERO);
+            assert!(at > 60.0 && at < 140.0, "between near and far: {at}");
+            assert_eq!(bits(a.feet), bits(b.feet), "the pony at step {step}");
+            assert_eq!(bits(a.velocity), bits(b.velocity), "the pony at step {step}");
+            assert_eq!(a.mode, b.mode, "the pony at step {step}");
+        }
+        // Out of the fight, the pony strides.
+        for run in [&mut off, &mut on] {
+            run.world.combatant_mut(rider).unwrap().brain.as_mut().unwrap().mind.target = None;
+        }
+        let mut strided = false;
+        for _ in 0..30 {
+            walk(&mut off.world, &mut off.walkers, dt, &terrain);
+            lod_step(&mut on, WalkLod::default(), &focus, &terrain, dt);
+            strided |= off.walkers[&horse].feet != on.walkers[&horse].feet;
+        }
+        assert!(strided, "out of the fight the pony strides");
+    }
+
+    /// SIM_LOD_PLAN step 2: two far bodies overlapping are pushed apart by their push once a strided step (spread
+    /// over the time owed), just as each full-rate step moves a body by its push, not by the push times the stride.
+    #[test]
+    fn far_bodies_overlapping_part_by_one_push_a_strided_step() {
+        let _jolt = JOLT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let spots = [Vec3::new(200.0, 0.0, 0.0), Vec3::new(200.3, 0.0, 0.05)];
+        let (physics, _) = lod_ground(&[]);
+        let terrain = JoltTerrain {
+            physics: &physics,
+            water: &[],
+        };
+        let dt = 1.0 / 60.0;
+        let focus = [Vec3::ZERO];
+        for lod in [Some(WalkLod::default()), None] {
+            let (mut run, ids) = lod_run(&spots);
+            let (mut pushes, mut gaps) = (0, Vec::new());
+            let mut last = None;
+            for step in 0..240usize {
+                let before: Vec<(Vec3, bool, Vec3)> = ids
+                    .iter()
+                    .map(|id| {
+                        let w = &run.walkers[id];
+                        (w.feet, w.grounded(), run.world.separation(*id))
+                    })
+                    .collect();
+                match lod {
+                    Some(lod) => drop(lod_step(&mut run, lod, &focus, &terrain, dt)),
+                    None => drop(walk(&mut run.world, &mut run.walkers, dt, &terrain)),
+                }
+                for (id, (feet, grounded, push)) in ids.iter().zip(before) {
+                    let moved = run.walkers[id].feet - feet;
+                    if !grounded || !run.walkers[id].grounded() || moved == Vec3::ZERO {
+                        continue;
+                    }
+                    let flat = Vec3::new(moved.x, 0.0, moved.z);
+                    assert!(flat.distance(push) < 1e-4, "{lod:?}: moved {flat}, pushed {push}");
+                    pushes += usize::from(push != Vec3::ZERO);
+                    if *id == ids[0] {
+                        gaps.extend(last.map(|l| step - l));
+                        last = Some(step);
+                    }
+                }
+            }
+            assert!(pushes > 0, "{lod:?}: pushed apart");
+            let (a, b) = (run.world.combatant(ids[0]).unwrap(), run.world.combatant(ids[1]).unwrap());
+            let apart = flat_distance(a.position, b.position);
+            assert!(apart >= a.body.radius + b.body.radius - 1e-3, "{lod:?}: apart {apart}");
+            match lod {
+                Some(_) => assert!(gaps.iter().all(|g| *g > 1), "strided: {gaps:?}"),
+                None => assert!(gaps.iter().all(|g| *g == 1), "every step: {gaps:?}"),
+            }
+        }
+    }
+
+    /// SIM_LOD_PLAN step 2: who strides. Near a focus, the protagonist and his mount, anyone off the ground and
+    /// anyone in a fight within `far` step every step; farther, 4 then 8, shortened so a step carries no more
+    /// than 0.3 m; strides are staggered by id.
+    #[test]
+    fn the_walkers_stride_by_distance_speed_and_state() {
+        let lod = WalkLod::default();
+        let dt = 1.0 / 60.0;
+        let d = |m: f32| m * m;
+        assert_eq!(lod.stride(d(59.0), false, false, false, 1.5, dt), 1);
+        assert_eq!(lod.stride(d(61.0), false, false, false, 1.5, dt), 4);
+        assert_eq!(lod.stride(d(141.0), false, false, false, 1.5, dt), 8);
+        assert_eq!(lod.stride(d(500.0), true, false, false, 0.0, dt), 1, "the protagonist and his mount");
+        assert_eq!(lod.stride(d(500.0), false, true, false, 0.0, dt), 1, "in the air, jumping, climbing");
+        assert_eq!(lod.stride(d(100.0), false, false, true, 0.0, dt), 1, "in a fight within far");
+        assert_eq!(lod.stride(d(200.0), false, false, true, 0.0, dt), 8, "in a fight beyond it");
+        // 5 m/s: 0.083 m a step, so 3 steps carry 0.25 m and 4 would carry 0.33.
+        assert_eq!(lod.stride(d(500.0), false, false, false, 5.0, dt), 3);
+        assert_eq!(lod.stride(d(500.0), false, false, false, 40.0, dt), 1);
+        for speed in [0.5f32, 1.5, 3.0, 5.0, 9.0, 17.0] {
+            let s = lod.stride(d(500.0), false, false, false, speed, dt);
+            assert!(s == 1 || speed * dt * s as f32 <= lod.max_step, "{speed} m/s, stride {s}");
+        }
+        let due: Vec<u64> = (0..16).filter(|&s| WalkLod::due(s, CombatantId(3), 4)).collect();
+        assert_eq!(due, [1, 5, 9, 13]);
+        let other: Vec<u64> = (0..16).filter(|&s| WalkLod::due(s, CombatantId(4), 4)).collect();
+        assert_eq!(other, [0, 4, 8, 12], "staggered");
+        let mut demo = CombatDemo::default();
+        assert!(!demo.open_world_lod() && demo.walk_lod.is_none() && !demo.frame_writes, "off by default");
+        demo.set_open_world_lod(true);
+        assert_eq!(demo.walk_lod, Some(lod));
+        assert!(demo.frame_writes);
+        demo.set_open_world_lod(false);
+        assert!(demo.walk_lod.is_none() && !demo.frame_writes);
+    }
+
+    /// SIM_LOD_PLAN step 3: the sandbox fight with two fixed steps a frame, written every step and written once a
+    /// frame. At each frame's end the skinned bodies stand the same and play the same clips, and each fighter's
+    /// entity holds the same pose to within the write's own threshold (it is written when the pose moved past 1 mm
+    /// or about half a degree from what it holds, so either way it holds the pose to within that). A clock that ran
+    /// the whole frame on one clip advanced by the frame's time in both. Clocks are not the same everywhere, by
+    /// design: written once a frame, a clip changing on the frame's second step starts a step later, and a clip
+    /// held for only part of a frame (a flicker between two clips, which written every step restarts the clock
+    /// every frame) is not seen at all.
+    #[test]
+    fn written_once_a_frame_the_fight_ends_each_frame_as_written_every_step() {
+        use crate::skinned_crowd::SkinnedBody;
+        let _jolt = JOLT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let physics = somnium_physics::world::PhysicsWorld::new(Default::default());
+        let make = || {
+            let mut world = World::new();
+            spawn_sandbox(&mut world, &json!({})).expect("preset builds");
+            let fighters: Vec<Entity> = world.iter_with::<CombatantComponent>().map(|(e, _)| e).collect();
+            for e in fighters {
+                world.insert_component(e, SkinnedBody::default()).unwrap();
+            }
+            somnium_core::propagate_transforms(&mut world);
+            let mut run = build(&world).expect("a fight");
+            run.skins = crate::combat_bodies::Skins::new(None);
+            run.skins.dress(&mut world, &run.bodies, &run.world, &mut run.spawned);
+            (world, run)
+        };
+        let (mut every, mut a) = make();
+        let (mut once, mut b) = make();
+        assert_eq!(a.skins.count(), 10);
+        let terrain = boxes(&every, &a);
+        let dt = 1.0 / 60.0;
+        let open = somnium_combat::OpenField;
+        let (mut samples, mut clips_apart, mut moved, mut steady, mut kept_time) = (0, 0, 0, 0, 0);
+        // Each body's clip and clock at the last frame's end (written every step, once a frame), and its clip
+        // after the frame's first step (written every step).
+        let mut last: BTreeMap<CombatantId, ((String, f32), (String, f32))> = BTreeMap::new();
+        let mut halfway: BTreeMap<CombatantId, String> = BTreeMap::new();
+        let skin = |world: &World, run: &Run, id: CombatantId| {
+            let b = world.get::<SkinnedBody>(run.skins.body_of(id).expect("a body")).unwrap();
+            (b.clip.clone(), b.time)
+        };
+        for _ in 0..300 {
+            for step in 0..2 {
+                // One fight, written two ways.
+                a.world.step(dt, &open, a.nav.as_ref());
+                walk(&mut a.world, &mut a.walkers, dt, &terrain);
+                b.world.clone_from(&a.world);
+                b.walkers.clone_from(&a.walkers);
+                for (world, run, batched) in [(&mut every, &mut a, false), (&mut once, &mut b, true)] {
+                    write_step_scene(world, &physics, run, batched);
+                    run.skins.dress(world, &run.bodies, &run.world, &mut run.spawned);
+                    write_step_skins(world, run, dt, batched);
+                }
+                if step == 0 {
+                    halfway = a.bodies.keys().map(|id| (*id, skin(&every, &a, *id).0)).collect();
+                }
+            }
+            assert!(!write_frame_scene(&mut every, &physics, &mut a), "written every step: nothing waits");
+            assert!(write_frame_scene(&mut once, &physics, &mut b), "two steps wait");
+            write_frame_skins(&mut once, &mut b);
+            assert_eq!((b.unwritten, b.unwritten_steps), (0.0, 0));
+            for (id, entity) in &a.bodies {
+                let (ca, cb) = (a.world.combatant(*id).unwrap(), b.world.combatant(*id).unwrap());
+                assert_eq!(ca.position, cb.position, "one fight");
+                // An entity is written when its pose moved past the write's threshold (1 mm, about half a degree)
+                // from what it holds, so each holds its pose to within that: the same, or apart by at most twice it.
+                let (ta, tb) = (every.get::<Transform>(*entity).unwrap(), once.get::<Transform>(*entity).unwrap());
+                assert!(
+                    ta.scale.distance(tb.scale) <= 1e-5
+                        && ta.translation.distance(tb.translation) <= 2e-3
+                        && ta.rotation.dot(tb.rotation).abs() >= 0.99996,
+                    "{}'s entity: {ta:?} against {tb:?}",
+                    ca.name
+                );
+                let body = a.skins.body_of(*id).expect("a body");
+                assert_eq!(Some(body), b.skins.body_of(*id));
+                let (ta, tb) = (every.get::<Transform>(body).unwrap(), once.get::<Transform>(body).unwrap());
+                assert_eq!((ta.translation, ta.rotation), (tb.translation, tb.rotation), "{}'s body", ca.name);
+                let (now_a, now_b) = (skin(&every, &a, *id), skin(&once, &b, *id));
+                samples += 1;
+                moved += usize::from(ca.velocity.length() > 0.5);
+                clips_apart += usize::from(now_a.0 != now_b.0);
+                // One clip the whole frame, in both: each clock went on by the frame's time (a loop at its rate,
+                // the same in both unless the rate itself changed between the two steps).
+                if let Some((was_a, was_b)) = last.get(id)
+                    && was_a.0 == now_a.0
+                    && halfway.get(id) == Some(&now_a.0)
+                    && was_b.0 == now_b.0
+                    && now_a.0 == now_b.0
+                {
+                    steady += 1;
+                    let (went_a, went_b) = (now_a.1 - was_a.1, now_b.1 - was_b.1);
+                    assert!(
+                        (went_a - went_b).abs() <= dt * 1.8 + 1e-4,
+                        "{}: {} on {went_a} against {went_b}",
+                        ca.name,
+                        now_a.0
+                    );
+                    kept_time += usize::from((went_a - went_b).abs() <= 1e-5);
+                }
+                last.insert(*id, (now_a, now_b));
+            }
+        }
+        println!("{samples} samples: {clips_apart} clips apart; {kept_time} of {steady} steady clocks went on alike");
+        assert!(moved > samples / 10, "a fight, not a standing crowd: {moved} of {samples}");
+        assert!(clips_apart * 50 <= samples, "clips apart in {clips_apart} of {samples}");
+        assert!(steady * 2 >= samples, "clips held whole frames: {steady} of {samples}");
+        assert!(kept_time * 10 >= steady * 9, "steady clocks alike: {kept_time} of {steady}");
+    }
+
+    /// SIM_LOD_PLAN step 3: written once a frame, a fighter that did not move keeps its Transform untouched (no
+    /// `get_mut`, so the transforms are not marked changed), where every step's write takes every fighter's; one
+    /// that moved is written, and the protagonist is written at each step.
+    #[test]
+    fn written_once_a_frame_a_still_fighter_is_not_taken() {
+        let _jolt = JOLT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut world = World::new();
+        let root = world.spawn((Name::new("Scene"), Transform::default(), WorldTransform::identity()));
+        fighter(&mut world, root, "Protagonist", Vec3::ZERO, Vec3::X, CombatantComponent::protagonist());
+        for i in 0..4 {
+            let at = Vec3::new(3.0 * i as f32, 0.0, 5.0);
+            fighter(&mut world, root, &format!("Body {i}"), at, Vec3::Z, CombatantComponent::default());
+        }
+        somnium_core::propagate_transforms(&mut world);
+        let mut run = build(&world).expect("a fight");
+        let physics = somnium_physics::world::PhysicsWorld::new(Default::default());
+        let dt = 1.0 / 60.0;
+        let frame = |world: &mut World, run: &mut Run| {
+            for _ in 0..2 {
+                write_step_scene(world, &physics, run, true);
+                write_step_skins(world, run, dt, true);
+            }
+            write_frame_scene(world, &physics, run);
+            write_frame_skins(world, run);
+        };
+        let taken = |world: &World| world.change_tick(somnium_core::ComponentId::of::<Transform>());
+        frame(&mut world, &mut run);
+        let before = taken(&world);
+        frame(&mut world, &mut run);
+        assert_eq!(taken(&world), before, "nothing moved, nothing taken");
+        // Every step's write takes every fighter's Transform, moved or not.
+        write_scene(&mut world, &physics, &mut run);
+        assert!(taken(&world) >= before + 5);
+        // One moved: its entity, and only its, is written.
+        let mover = run.world.combatants().find(|c| c.name == "Body 2").map(|c| c.id).unwrap();
+        run.world.combatant_mut(mover).unwrap().position += Vec3::X;
+        let entity = run.bodies[&mover];
+        let was = world.get::<Transform>(entity).unwrap().translation;
+        let before = taken(&world);
+        frame(&mut world, &mut run);
+        assert_eq!(taken(&world), before + 1);
+        assert!((world.get::<Transform>(entity).unwrap().translation - was).distance(Vec3::X) < 1e-4);
+        // The protagonist is written at the step, before the frame's write.
+        let hero = run.player.unwrap();
+        run.world.combatant_mut(hero).unwrap().position += Vec3::Z;
+        write_step_scene(&mut world, &physics, &mut run, true);
+        let at = world.get::<Transform>(run.bodies[&hero]).unwrap().translation;
+        assert!((at.z - 1.0).abs() < 1e-4, "{at}");
+        write_frame_scene(&mut world, &physics, &mut run);
+        write_frame_skins(&mut world, &mut run);
     }
 
     /// Where the scene baked no navmesh, a woken camp gets a patch of ground

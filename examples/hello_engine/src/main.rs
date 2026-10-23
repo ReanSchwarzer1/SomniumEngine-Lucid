@@ -47,6 +47,36 @@ use somnium_physics::layer::{LAYER_MOVING, LAYER_NON_MOVING};
 use somnium_physics::shape::ColliderShape;
 use tracing::info;
 
+/// A CPU profiler zone (`SOMNIUM_PROFILE=1`): `Some(name)` opens one, `None` closes the innermost. It takes the
+/// context's renderer alone, so a caller still holding the world or physics can time what it does with them.
+pub(crate) fn zone(
+    renderer: &mut Option<&mut somnium_renderer::SomniumRenderer>,
+    name: Option<&'static str>,
+) {
+    if let Some(r) = renderer.as_deref_mut() {
+        match name {
+            Some(name) => r.profiler.cpu_begin(name),
+            None => r.profiler.cpu_end(),
+        }
+    }
+}
+
+/// Whether the scene asks for voxel terrain: an entity with a `VoxelTerrainComponent`. Only the archetypes that hold
+/// one are visited, not every entity (a streamed world has tens of thousands).
+fn wants_voxel_terrain(world: &somnium_ecs::World) -> bool {
+    world.iter_with::<somnium_core::VoxelTerrainComponent>().next().is_some()
+}
+
+/// The scene's first enabled UI canvas, its transform and whether the Outliner's eye hides it, in the world's order
+/// (the first a walk of every entity would find), visiting only the archetypes that hold a canvas.
+fn first_canvas(world: &somnium_ecs::World) -> Option<(UiCanvasComponent, Transform, bool)> {
+    world.iter_with::<UiCanvasComponent>().find_map(|(entity, canvas)| {
+        let transform = world.get::<Transform>(entity).copied().unwrap_or_default();
+        let hidden = world.get::<EditorFlags>(entity).copied().unwrap_or_default().hidden;
+        canvas.enabled.then_some((*canvas, transform, hidden))
+    })
+}
+
 // â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
 // Components
 // â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
@@ -919,6 +949,22 @@ impl HelloGame {
         self.life.focus_points = points.to_vec();
     }
 
+    /// The simulation's level of detail for an open world (SIM_LOD_PLAN), on or off; off by default, which keeps
+    /// everything exactly as before. On, the fight's far walkers step every few fixed steps and still ones not at all
+    /// (`combat_demo::WalkLod`), and the fight is written onto the scene once a frame rather than after every fixed
+    /// step (`CombatDemo::frame_writes`; the protagonist and his mount still every step). Within 60 m of the
+    /// protagonist, the fight's camera and every held place the walkers step as ever. A game with a streamed open
+    /// world (Rimeborn) turns it on at init.
+    pub fn set_open_world_lod(&mut self, on: bool) {
+        self.combat.set_open_world_lod(on);
+    }
+
+    /// Whether [`HelloGame::set_open_world_lod`] is on.
+    #[must_use]
+    pub fn open_world_lod(&self) -> bool {
+        self.combat.open_world_lod()
+    }
+
     /// The protagonist's work clip while he stands idle (chopping, fishing, cutting peat: `A|B`, looped), holding the
     /// clip's tools from clips.json `gear`; `None` gives him his own moves back.
     pub fn set_player_clip(&mut self, clip: Option<String>) {
@@ -1224,11 +1270,7 @@ impl HelloGame {
     /// entities (they stream constantly), so the driver lives here in game code
     /// and is built/torn down to follow that single entity.
     fn sync_voxel_terrain(&mut self, ctx: &mut EngineContext) {
-        let wants_voxel = ctx.world.entities().any(|e| {
-            ctx.world
-                .get::<somnium_core::VoxelTerrainComponent>(e)
-                .is_some()
-        });
+        let wants_voxel = wants_voxel_terrain(ctx.world);
 
         match (wants_voxel, self.voxel_terrain.is_some()) {
             // Entity appeared â€” spin up the streaming driver.
@@ -1976,7 +2018,9 @@ impl GameApp for HelloGame {
         if !play_session(ctx) {
             return;
         }
+        zone(&mut ctx.renderer, Some("Boats fixed"));
         self.boats.fixed(ctx, &mut self.combat);
+        zone(&mut ctx.renderer, None);
         self.combat.fixed(ctx);
 
         let (eye, forward) = self
@@ -1990,7 +2034,9 @@ impl GameApp for HelloGame {
                 )
             })
             .unwrap_or((self.camera.position, self.camera.forward_vector()));
+        zone(&mut ctx.renderer, Some("Interactions tick"));
         self.interactions.tick(ctx, eye, forward);
+        zone(&mut ctx.renderer, None);
         self.work_demo.tick(ctx, eye, forward);
 
         let Some(boat) = self.boat.as_ref() else {
@@ -2330,21 +2376,7 @@ impl GameApp for HelloGame {
         // authoring state — *"not submitted for drawing"* — not an unload: a
         // hidden canvas still owns its document, and a script writing to that
         // document must not start failing because somebody clicked an eye.
-        let authored_canvas = ctx.world.entities().find_map(|entity| {
-            let canvas = ctx.world.get::<UiCanvasComponent>(entity).copied()?;
-            let transform = ctx
-                .world
-                .get::<Transform>(entity)
-                .copied()
-                .unwrap_or_default();
-            let hidden = ctx
-                .world
-                .get::<EditorFlags>(entity)
-                .copied()
-                .unwrap_or_default()
-                .hidden;
-            canvas.enabled.then_some((canvas, transform, hidden))
-        });
+        let authored_canvas = first_canvas(ctx.world);
         // The Outliner's eye applies to a canvas like it applies to a mesh: a
         // canvas that ignored it would be the one thing in the scene the eye
         // could not turn off, which reads as the eye being broken rather than
@@ -3680,5 +3712,129 @@ mod audit_harness_tests {
         assert_eq!(parse("1920X1080"), Some((1920, 1080)));
         assert_eq!(parse("0x1080"), None);
         assert_eq!(parse("wide"), None);
+    }
+}
+
+#[cfg(test)]
+mod scene_scan_tests {
+    use super::*;
+    use somnium_core::VoxelTerrainComponent;
+    use somnium_ecs::World;
+
+    /// SIM_LOD_PLAN step 1: the shell's per-frame lookups by query take what the old walks of every entity took.
+    /// Canvases over three archetypes: a disabled one first, then an enabled one hidden by the eye, then one with no
+    /// Transform and one more enabled, so the first enabled is picked as before; voxel terrain found or not.
+    #[test]
+    fn the_shells_lookups_by_query_take_what_the_whole_world_walks_took() {
+        // The walks `on_render` and `sync_voxel_terrain` made before, kept as the oracles.
+        let old_canvas = |world: &World| {
+            world.entities().find_map(|entity| {
+                let canvas = world.get::<UiCanvasComponent>(entity).copied()?;
+                let transform = world.get::<Transform>(entity).copied().unwrap_or_default();
+                let hidden = world.get::<EditorFlags>(entity).copied().unwrap_or_default().hidden;
+                canvas.enabled.then_some((canvas, transform, hidden))
+            })
+        };
+        let old_voxel = |world: &World| world.entities().any(|e| world.get::<VoxelTerrainComponent>(e).is_some());
+        // Transform has no PartialEq: compare its parts.
+        let bits = |c: Option<(UiCanvasComponent, Transform, bool)>| {
+            c.map(|(c, t, h)| (c, [t.translation, t.scale], t.rotation, h))
+        };
+        let mut world = World::new();
+        for i in 0..40 {
+            world.spawn((Name::new(&format!("Prop {i}")), Transform::from_translation(Vec3::X * i as f32)));
+        }
+        assert_eq!(bits(first_canvas(&world)), None);
+        assert!(!wants_voxel_terrain(&world) && !old_voxel(&world));
+        let canvas = |layer: i64, enabled: bool| UiCanvasComponent {
+            enabled,
+            layer,
+            ..Default::default()
+        };
+        world.spawn((Transform::default(), canvas(1, false)));
+        world.spawn((Transform::from_translation(Vec3::Y), canvas(2, true), EditorFlags { hidden: true, locked: false }));
+        world.spawn((canvas(3, true),));
+        let fourth = world.spawn((Transform::default(), canvas(4, true)));
+        assert_eq!(bits(first_canvas(&world)), bits(old_canvas(&world)));
+        // The world's order is by archetype: the last canvas shares the first one's, so it comes before the hidden.
+        assert_eq!(first_canvas(&world).map(|c| (c.0.layer, c.2)), Some((4, false)), "the first enabled");
+        world.despawn(fourth);
+        assert_eq!(bits(first_canvas(&world)), bits(old_canvas(&world)));
+        assert_eq!(first_canvas(&world).map(|c| (c.0.layer, c.2)), Some((2, true)), "then the hidden one");
+        world.spawn((Name::new("Voxels"), VoxelTerrainComponent::default()));
+        assert!(wants_voxel_terrain(&world) && old_voxel(&world));
+    }
+}
+
+#[cfg(test)]
+mod profiler_zone_tests {
+    /// The body of the function that starts at `head` (a method: it ends at the first `}` back at its indent).
+    /// A checkout with Windows line ends reads the same.
+    fn body(source: &str, head: &str) -> String {
+        let source = source.replace("\r\n", "\n");
+        let at = source
+            .find(head)
+            .unwrap_or_else(|| panic!("no {head}"));
+        let rest = &source[at..];
+        rest[..rest.find("\n    }\n").expect("the method's end")].to_string()
+    }
+
+    /// Walk `body`'s zone calls in order: each `open` nests one deeper and each `close` comes back out, never
+    /// below the function's own level, and no bare `return;` leaves one open. Returns the names opened.
+    fn zones(body: &str, open: &str, close: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let (mut depth, mut at) = (0usize, 0usize);
+        loop {
+            let next = [body[at..].find(open).map(|i| (i, true)), body[at..].find(close).map(|i| (i, false))]
+                .into_iter()
+                .flatten()
+                .min_by_key(|(i, _)| *i);
+            let Some((i, opens)) = next else {
+                break;
+            };
+            assert!(depth == 0 || !body[at..at + i].contains("return;"), "a return leaves a zone open");
+            at += i;
+            if opens {
+                depth += 1;
+                at += open.len();
+                let name = &body[at..];
+                names.push(name[..name.find('"').expect("a quoted name")].to_string());
+            } else {
+                assert!(depth > 0, "a zone closed that was not opened");
+                depth -= 1;
+                at += close.len();
+            }
+        }
+        assert_eq!(depth, 0, "every zone is closed");
+        names
+    }
+
+    /// SIM_LOD_PLAN step 0: the combat host's fixed step, the shell's fixed step and the skinned crowd each time
+    /// their parts, every zone closed in the function that opens it. A source check because the profiler needs a
+    /// GPU: a zone left open would nest every later scope of the frame under it.
+    #[test]
+    fn the_simulation_zones_open_and_close_in_pairs() {
+        let shell = r#"zone(&mut ctx.renderer, Some(""#;
+        let shut = "zone(&mut ctx.renderer, None)";
+        let fixed = zones(&body(include_str!("combat_demo.rs"), "pub fn fixed("), shell, shut);
+        assert_eq!(
+            fixed,
+            [
+                "Combat fixed",
+                "Combat world step",
+                "Combat walk",
+                "Encounters tend",
+                "Combat write scene",
+                "Combat skins write"
+            ]
+        );
+        let host = zones(&body(include_str!("main.rs"), "fn on_fixed_update("), shell, shut);
+        assert_eq!(host, ["Boats fixed", "Interactions tick"]);
+        let crowd = zones(
+            &body(include_str!("skinned_crowd.rs"), "pub fn render("),
+            r#"profiler.cpu_begin(""#,
+            "profiler.cpu_end()",
+        );
+        assert_eq!(crowd, ["Crowd plan", "Crowd upload", "Crowd bodies", "Crowd sockets"]);
     }
 }

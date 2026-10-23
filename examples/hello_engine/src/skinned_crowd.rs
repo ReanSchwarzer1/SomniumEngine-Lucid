@@ -969,6 +969,7 @@ impl SkinnedBodies {
         let camera = r.camera_pos;
         let dt = ctx.time.dt().min(0.1);
         let running = ctx.simulation.state != somnium_core::SimulationState::Paused;
+        r.profiler.cpu_begin("Crowd plan");
         let mut wanted: Vec<(Entity, SkinnedBody, Mat4)> = ctx
             .world
             .iter_with::<SkinnedBody>()
@@ -1089,6 +1090,7 @@ impl SkinnedBodies {
                 }
             });
         if let Some((id, read, lighter)) = finished {
+            r.profiler.cpu_begin("Crowd upload");
             self.pending.remove(&id);
             match read.and_then(|asset| upload(gpu, r, asset, lighter)) {
                 Ok(shared) => {
@@ -1101,6 +1103,7 @@ impl SkinnedBodies {
                     self.failed.insert(id, error);
                 }
             }
+            r.profiler.cpu_end();
         }
         // Each drawn body's level: its distance's, coarsened from the back until
         // the crowd fits the vertex budget.
@@ -1143,6 +1146,7 @@ impl SkinnedBodies {
         );
         let held: std::collections::HashSet<Entity> =
             plan.iter().skip(covered).map(|p| p.1).collect();
+        r.profiler.cpu_end();
         let planned = started.elapsed().as_secs_f64() * 1000.0;
         // Nearest first, so the bodies posed first under the frame's cap are the ones closest.
         wanted.sort_by(|a, b| {
@@ -1179,6 +1183,7 @@ impl SkinnedBodies {
             });
             self.pending.insert(id, (rx, level > 0));
         }
+        r.profiler.cpu_begin("Crowd bodies");
         for (e, settings, matrix) in wanted {
             let distance = matrix.w_axis.truncate().distance(camera);
             let ids = levels(&settings);
@@ -1429,10 +1434,13 @@ impl SkinnedBodies {
             drawn += 1;
             posed += shared.vertices;
         }
+        r.profiler.cpu_end();
         if drawn > 0 {
             r.invalidate_shadow_casters();
         }
+        r.profiler.cpu_begin("Crowd sockets");
         self.place_sockets(ctx.world);
+        r.profiler.cpu_end();
         let s = &mut self.stats;
         s.bodies = self.bodies.len();
         s.drawn = drawn;
