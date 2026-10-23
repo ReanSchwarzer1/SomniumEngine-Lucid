@@ -1961,58 +1961,158 @@ impl TerrainData {
 
     /// Load heightmap + splatmap from a sidecar binary written by
     /// [`Self::save_binary`]. Dimensions must match this terrain's descriptor.
+    ///
+    /// Reads through [`read_sidecar`], so the checks and messages are the same
+    /// whichever thread reads. Unlike [`Self::adopt_sidecar`] this does not
+    /// bump the edit revision.
     pub fn load_binary(&mut self, path: &str) -> Result<(), String> {
-        let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
-        let u32_at = |off: usize| -> Result<u32, String> {
-            bytes
-                .get(off..off + 4)
-                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .ok_or_else(|| "truncated terrain sidecar".to_string())
-        };
-        if u32_at(0)? != Self::SIDECAR_MAGIC {
-            return Err("not a terrain sidecar file".into());
-        }
-        let version = u32_at(4)?;
-        if version != 2 && version != 3 && version != 4 {
-            return Err(format!(
-                "terrain sidecar is version {version}; this build reads 2/3 (migrate) or 4 (thirty-two layers)"
-            ));
-        }
-        let (tx, tz) = (u32_at(8)?, u32_at(12)?);
-        let (sw, sh) = (u32_at(16)?, u32_at(20)?);
-        if tx != self.desc.total_vertices_x()
-            || tz != self.desc.total_vertices_z()
-            || sw != self.splatmap.width
-            || sh != self.splatmap.height
-        {
-            return Err("terrain sidecar dimensions do not match descriptor".into());
-        }
-        let h_bytes = (tx * tz) as usize * 4;
-        let texel_count = (sw * sh) as usize;
-        let src_channels: usize = match version {
-            2 => 8,
-            3 => 16,
-            _ => TERRAIN_LAYER_COUNT as usize,
-        };
-        let s_bytes = texel_count * src_channels;
-        let body = bytes
-            .get(24..24 + h_bytes + s_bytes)
-            .ok_or("truncated terrain sidecar")?;
-        let painted_foliage = foliage_paint::load_instances(path)?;
-        self.heightmap
-            .copy_from_slice(bytemuck::cast_slice(&body[..h_bytes]));
-        let splat_src = &body[h_bytes..];
-        self.splatmap.data =
-            crate::terrain::splat::migrate_sidecar_splat(version, splat_src, texel_count)?;
-        self.painted_foliage = painted_foliage;
+        let sidecar = read_sidecar(path, self.sidecar_dims())?;
+        self.heightmap = sidecar.heights;
+        self.splatmap.data = sidecar.splat;
+        self.painted_foliage = sidecar.foliage;
         self.macro_dirty = true;
         self.horizon_dirty = true;
         for chunk in &mut self.chunks {
             chunk.dirty = true;
         }
+        let [_, _, sw, sh] = sidecar.dims;
         self.splatmap.mark_dirty(0, 0, sw - 1, sh - 1);
         Ok(())
     }
+
+    /// The `expected` dimensions [`read_sidecar`] checks for this terrain: vertices along X and Z, then splat texels
+    /// along X and Z.
+    #[must_use]
+    pub fn sidecar_dims(&self) -> [u32; 4] {
+        [self.desc.total_vertices_x(), self.desc.total_vertices_z(), self.splatmap.width, self.splatmap.height]
+    }
+
+    /// Take a sidecar read elsewhere ([`read_sidecar`], usually on a worker thread) into this terrain, placed at
+    /// `model`, with its geometry resident within `geometry_distance` metres ([`Self::stream_geometry`]).
+    ///
+    /// This is how a streamed terrain tile moves into a reused slot. Everything derived from the ground is rebuilt:
+    /// the baked horizon and relief maps are written now when the sidecar carries them ([`TerrainSidecar::bake`]) and
+    /// rebaked on the next rebuild otherwise. Unlike [`Self::load_binary`] the edit revision goes up, because the
+    /// colliders, foliage grids and ground cover cached for the slot's last tile must not survive into this one.
+    pub fn adopt_sidecar(
+        &mut self,
+        queue: &wgpu::Queue,
+        sidecar: TerrainSidecar,
+        model: glam::Mat4,
+        geometry_distance: f32,
+    ) -> Result<(), String> {
+        let TerrainSidecar { heights, splat, foliage, dims, baked } = sidecar;
+        let [tx, tz, sw, sh] = dims;
+        if dims != self.sidecar_dims()
+            || heights.len() != (tx * tz) as usize
+            || splat.len() != (sw * sh) as usize
+        {
+            return Err("terrain sidecar dimensions do not match descriptor".into());
+        }
+        self.heightmap = heights;
+        self.splatmap.data = splat;
+        self.painted_foliage = foliage;
+        // Maps of another size would not fit the textures they are written into, so they are rebaked instead.
+        match baked {
+            Some((horizon_maps, relief_maps))
+                if horizon_maps.size == horizon::HORIZON_SIZE && relief_maps.size == relief::RELIEF_SIZE =>
+            {
+                horizon::rewrite(queue, &self.horizon_gpu, &horizon_maps);
+                relief::rewrite(queue, &self.relief_gpu, &relief_maps);
+                self.horizon_dirty = false;
+            }
+            _ => self.horizon_dirty = true,
+        }
+        self.macro_dirty = true;
+        for chunk in &mut self.chunks {
+            chunk.dirty = true;
+        }
+        self.splatmap.mark_dirty(0, 0, sw - 1, sh - 1);
+        self.model = model;
+        self.geometry_stream_distance = geometry_distance;
+        self.edit_revision = self.edit_revision.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Put a terrain aside for reuse (a streamed tile that left the view): every pool span goes back and the painted
+    /// foliage goes. Returns the vertex offsets of the chunks that were resident, whose ray-tracing BLAS the caller
+    /// must drop. The heights stay, so [`Self::height_at`] still has something to index.
+    pub fn retire(&mut self, pool: &mut crate::geometry::GeometryPool) -> Vec<u32> {
+        let resident = self.chunks.iter().map(|c| c.vertex_offset).filter(|&o| o != UNALLOCATED).collect();
+        self.release_pool_spans(pool);
+        self.painted_foliage = Vec::new();
+        resident
+    }
+}
+
+/// A terrain sidecar read without a terrain or a device ([`read_sidecar`]), ready for
+/// [`TerrainData::adopt_sidecar`].
+pub struct TerrainSidecar {
+    /// Raw heights, row-major, `dims[0] * dims[1]` values.
+    pub heights: Vec<f32>,
+    /// Thirty-two layer weights per splat texel, `dims[2] * dims[3]` texels.
+    pub splat: Vec<textures::SplatTexel>,
+    /// The painted foliage beside it (`{path}.foliage.json`); empty when there is none.
+    pub foliage: Vec<foliage_paint::PaintedFoliage>,
+    /// Vertices along X and Z, then splat texels along X and Z.
+    pub dims: [u32; 4],
+    /// The horizon and relief maps baked from `heights` by [`TerrainSidecar::bake`], if it ran.
+    pub baked: Option<(horizon::HorizonMaps, relief::ReliefMaps)>,
+}
+
+impl TerrainSidecar {
+    /// Bake the horizon and relief maps the terrain's next rebuild would, so a worker thread can do it.
+    pub fn bake(&mut self, cell_size: f32, height_scale: f32) {
+        let [tx, tz, _, _] = self.dims;
+        self.baked = Some((
+            horizon::bake(&self.heights, tx, tz, cell_size, height_scale, horizon::HORIZON_SIZE),
+            relief::bake(&self.heights, tx, tz, cell_size, height_scale, relief::RELIEF_SIZE),
+        ));
+    }
+}
+
+/// Read a sidecar written by [`TerrainData::save_binary`] on any thread. `expected` is what
+/// [`TerrainData::sidecar_dims`] gives for the terrain it is meant for.
+///
+/// The checks, their order and their messages are [`TerrainData::load_binary`]'s, which reads through this. The
+/// dimensions are checked before the painted foliage is read.
+pub fn read_sidecar(path: &str, expected: [u32; 4]) -> Result<TerrainSidecar, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+    let u32_at = |off: usize| -> Result<u32, String> {
+        bytes
+            .get(off..off + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .ok_or_else(|| "truncated terrain sidecar".to_string())
+    };
+    if u32_at(0)? != TerrainData::SIDECAR_MAGIC {
+        return Err("not a terrain sidecar file".into());
+    }
+    let version = u32_at(4)?;
+    if version != 2 && version != 3 && version != 4 {
+        return Err(format!(
+            "terrain sidecar is version {version}; this build reads 2/3 (migrate) or 4 (thirty-two layers)"
+        ));
+    }
+    let (tx, tz) = (u32_at(8)?, u32_at(12)?);
+    let (sw, sh) = (u32_at(16)?, u32_at(20)?);
+    if [tx, tz, sw, sh] != expected {
+        return Err("terrain sidecar dimensions do not match descriptor".into());
+    }
+    let h_bytes = (tx * tz) as usize * 4;
+    let texel_count = (sw * sh) as usize;
+    let src_channels: usize = match version {
+        2 => 8,
+        3 => 16,
+        _ => TERRAIN_LAYER_COUNT as usize,
+    };
+    let s_bytes = texel_count * src_channels;
+    let body = bytes
+        .get(24..24 + h_bytes + s_bytes)
+        .ok_or("truncated terrain sidecar")?;
+    let foliage = foliage_paint::load_instances(path)?;
+    let heights = bytemuck::cast_slice::<u8, f32>(&body[..h_bytes]).to_vec();
+    let splat = splat::migrate_sidecar_splat(version, &body[h_bytes..], texel_count)?;
+    Ok(TerrainSidecar { heights, splat, foliage, dims: expected, baked: None })
 }
 
 #[cfg(test)]
