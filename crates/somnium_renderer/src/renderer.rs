@@ -3719,6 +3719,14 @@ impl SomniumRenderer {
         set_splat_resident(terrain, &mut self.texture_pool, &mut self.global_pool, &ctx.device, false);
     }
 
+    /// Terrain material entries a new terrain can still take. A terrain made with none left shares entry 0 with
+    /// another terrain and shades with its ground, so a caller that makes terrains as it goes (the cell streamer's
+    /// tiles) asks first.
+    #[must_use]
+    pub fn terrain_material_room(&self) -> u32 {
+        self.terrain_materials.room()
+    }
+
     /// Mutable access to a terrain (sculpting, painting, raycasts).
     pub fn terrain_mut(&mut self, terrain_id: u32) -> Option<&mut crate::terrain::TerrainData> {
         self.terrains.get_mut(terrain_id as usize)

@@ -2933,8 +2933,11 @@ impl<G: GameApp> Engine<G> {
                     continue;
                 };
                 // Prefab reconstruction also calls this method without resetting
-                // the scene. Its existing terrain must retain sculpted data.
-                let existed = renderer.terrain(component.terrain_id).is_some();
+                // the scene. Its existing terrain must retain sculpted data. A
+                // streamed tile's slot is never the scene's: a saved id that
+                // names one gets a terrain of its own.
+                let existed = renderer.terrain(component.terrain_id).is_some()
+                    && !self.cell_streamer.owns_terrain(component.terrain_id, renderer.scene_resets);
                 let streamed = self
                     .world
                     .get::<crate::cell_streaming::TerrainStreamingComponent>(entity)
@@ -7148,6 +7151,9 @@ impl<G: GameApp> Engine<G> {
         let Some(terrain) = self.world.get::<TerrainComponent>(entity) else {
             return Some("Select a Landscape in the Outliner.");
         };
+        if let Some(reason) = crate::cell_streaming::read_only_reason(&self.world, entity) {
+            return Some(reason);
+        }
         if self
             .renderer
             .as_ref()

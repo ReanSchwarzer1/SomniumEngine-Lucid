@@ -88,6 +88,9 @@ impl<G: GameApp> Engine<G> {
                 if self.terrain_stroke.is_some() {
                     return Err("finish the designer's current brush stroke first".into());
                 }
+                if let Some(reason) = crate::cell_streaming::read_only_reason(&self.world, entity) {
+                    return Err(reason.into());
+                }
                 let stroke: Stroke =
                     serde_json::from_value(p["stroke"].clone()).map_err(|e| e.to_string())?;
                 stroke.validate()?;
@@ -168,6 +171,9 @@ impl<G: GameApp> Engine<G> {
                     .get::<TerrainComponent>(entity)
                     .copied()
                     .ok_or("entity is not terrain")?;
+                if let Some(reason) = crate::cell_streaming::read_only_reason(&self.world, entity) {
+                    return Err(reason.into());
+                }
                 let samples: Vec<[f32; 2]> = serde_json::from_value(p["samples"].clone())
                     .map_err(|_| "samples need terrain-local [x,z]")?;
                 if samples.is_empty()

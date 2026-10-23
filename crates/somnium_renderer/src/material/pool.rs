@@ -338,6 +338,12 @@ impl TerrainMaterialPool {
         Some(index)
     }
 
+    /// Entries [`Self::allocate`] can still claim before it returns `None`.
+    #[must_use]
+    pub fn room(&self) -> u32 {
+        self.capacity.saturating_sub(self.count)
+    }
+
     /// Write one terrain's material for this frame.
     pub fn write(
         &self,

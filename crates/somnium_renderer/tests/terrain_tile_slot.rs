@@ -1,10 +1,11 @@
-//! A streamed terrain tile's slot: a sidecar read anywhere and adopted is the ground `load_binary` gives, and a
-//! retired slot hands every pool span back.
+//! A streamed terrain tile's slot: a sidecar read anywhere and adopted is the ground `load_binary` gives, a retired
+//! slot hands every pool span back, and the terrain material pool says when it has no room for another slot.
 #[path = "support/gpu.rs"]
 mod gpu;
 
 use glam::{Mat4, Vec3};
 use somnium_renderer::geometry::GeometryPool;
+use somnium_renderer::material::pool::TerrainMaterialPool;
 use somnium_renderer::terrain::foliage_paint::PaintedFoliage;
 use somnium_renderer::terrain::{self, TerrainData, TerrainDescriptor, UNALLOCATED, horizon, relief};
 
@@ -123,6 +124,18 @@ fn an_adopted_sidecar_is_the_ground_load_binary_gives_and_a_retired_slot_frees_i
     assert!(adopted.painted_foliage.is_empty());
     assert_eq!(adopted.heightmap, source.heightmap);
     assert!(adopted.retire(&mut pool).is_empty(), "a retired slot has nothing left to give");
+
+    // The material pool says when it has no entry left for another terrain, so a tile can be refused one rather than
+    // share entry 0 with another terrain's ground.
+    // SAFETY: as above; nothing else in this binary reads it.
+    unsafe { std::env::set_var("SOMNIUM_TERRAIN_MATERIALS", "3") };
+    let mut materials = TerrainMaterialPool::new(&device);
+    assert_eq!(materials.room(), 3);
+    assert_eq!((materials.allocate(), materials.room()), (Some(0), 2));
+    assert_eq!((materials.allocate(), materials.allocate()), (Some(1), Some(2)));
+    assert_eq!((materials.room(), materials.allocate()), (0, None), "full: no room, and no entry");
+    materials.reset();
+    assert_eq!(materials.room(), 3, "a scene reset gives every entry back");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

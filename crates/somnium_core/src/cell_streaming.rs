@@ -349,6 +349,58 @@ pub(crate) fn take_free_slot(
     Some(free.remove(at))
 }
 
+/// Where a tile's terrain goes ([`choose_slot`]).
+#[derive(Debug, PartialEq)]
+pub(crate) enum SlotChoice {
+    /// A retired slot of its shape and ground.
+    Reuse(TerrainSlot),
+    /// A new renderer terrain.
+    New,
+    /// Nowhere: no retired slot fits and the renderer's terrain material pool is full. A new terrain would share
+    /// material entry 0 with another terrain and shade with that terrain's ground, so the tile is not drawn instead.
+    Full,
+}
+
+/// A retired slot of `desc`'s shape and `asset_dir`'s ground ([`take_free_slot`]), else a new terrain while the
+/// terrain material pool has `material_room` entries left for it, else none.
+pub(crate) fn choose_slot(
+    free: &mut Vec<TerrainSlot>,
+    desc: &somnium_renderer::terrain::TerrainDescriptor,
+    asset_dir: &Path,
+    material_room: u32,
+) -> SlotChoice {
+    match take_free_slot(free, desc, asset_dir) {
+        Some(slot) => SlotChoice::Reuse(slot),
+        None if material_room > 0 => SlotChoice::New,
+        None => SlotChoice::Full,
+    }
+}
+
+/// Why `entity` may not be sculpted, painted or foliage-painted in place, or `None`. A streamed cell's entity is
+/// read-only: Save never writes its edits, and once its cell unloads its terrain slot goes to another tile, where an
+/// undo recorded against the slot would land.
+pub(crate) fn read_only_reason(world: &somnium_ecs::World, entity: Entity) -> Option<&'static str> {
+    world.get::<Streamed>(entity).is_some().then_some("A streamed tile is read-only: open its cell scene to edit it.")
+}
+
+/// A cell whose ground (a terrain sidecar) did not read: a sidecar being rewritten, or held by a sync, reads a moment
+/// later.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct GroundRetry {
+    /// Why the last read failed.
+    pub(crate) error: String,
+    /// Reads that failed in a row.
+    pub(crate) failures: u32,
+    /// When the next read may start.
+    pub(crate) next: std::time::Instant,
+}
+
+/// Failed ground reads in a row after which a hold stops waiting for the cell ([`CellStreamer::settled`]), so a
+/// missing sidecar never strands a hold. Reads go on meanwhile.
+pub(crate) const GROUND_TRIES: u32 = 4;
+/// The longest pause between ground reads, seconds (they start at one second and double).
+pub(crate) const GROUND_RETRY_MAX_SECONDS: u64 = 30;
+
 /// The streamer's state, owned by the app.
 #[derive(Default)]
 pub struct CellStreamer {
@@ -375,6 +427,8 @@ pub struct CellStreamer {
     pub(crate) free_terrains: Vec<TerrainSlot>,
     /// The renderer's `scene_resets` the two above belong to: a scene reset drops every terrain by itself.
     pub(crate) terrain_resets: u64,
+    /// Cells whose ground did not read, read again after a pause ([`Self::ground_failed`]). Not in `failed`.
+    pub(crate) ground_retries: HashMap<usize, GroundRetry>,
 }
 
 /// How long a streamed mesh no loaded cell uses stays uploaded (coming back soon costs nothing).
@@ -488,6 +542,36 @@ impl CellStreamer {
     #[must_use]
     pub fn streamed_entities(&self) -> usize {
         self.loaded.values().map(Vec::len).sum()
+    }
+
+    /// Cell `index` read without its ground (`error`) at `now`: it is read again after a pause that starts at one
+    /// second and doubles with each failure in a row, up to [`GROUND_RETRY_MAX_SECONDS`].
+    pub(crate) fn ground_failed(&mut self, index: usize, error: String, now: std::time::Instant) {
+        let failures = self.ground_retries.get(&index).map_or(0, |retry| retry.failures).saturating_add(1);
+        let pause = (1u64 << (failures - 1).min(16)).min(GROUND_RETRY_MAX_SECONDS);
+        let next = now + std::time::Duration::from_secs(pause);
+        self.ground_retries.insert(index, GroundRetry { error, failures, next });
+    }
+
+    /// Whether cell `index` may start a read at `now`: not failed for good, and not pausing before its ground is read
+    /// again.
+    pub(crate) fn may_read(&self, index: usize, now: std::time::Instant) -> bool {
+        !self.failed.contains_key(&index) && self.ground_retries.get(&index).is_none_or(|retry| now >= retry.next)
+    }
+
+    /// Whether a hold counts cell `index` as in: loaded, or failed for good, so a broken file never strands it. A cell
+    /// whose ground is to be read again is not in until [`GROUND_TRIES`] reads of it have failed in a row.
+    pub(crate) fn settled(&self, index: usize) -> bool {
+        self.loaded.contains_key(&index)
+            || self.failed.contains_key(&index)
+            || self.ground_retries.get(&index).is_some_and(|retry| retry.failures >= GROUND_TRIES)
+    }
+
+    /// Whether renderer terrain `id` is a streamed tile's slot, live or retired, as of the renderer's `resets`
+    /// (`SomniumRenderer::scene_resets`). A scene's own terrain must never take one over.
+    pub(crate) fn owns_terrain(&self, id: u32, resets: u64) -> bool {
+        resets == self.terrain_resets
+            && self.cell_terrains.values().flatten().chain(&self.free_terrains).any(|slot| slot.id == id)
     }
 }
 
@@ -630,6 +714,117 @@ mod tests {
         let wider = TerrainDescriptor { grid_size: [16, 8], ..tile };
         assert_eq!(take_free_slot(&mut free, &wider, ground), None);
         assert_eq!(free.iter().map(|s| s.id).collect::<Vec<_>>(), vec![2, 3], "what did not match stays");
+    }
+
+    #[test]
+    fn a_tile_gets_a_new_terrain_only_while_the_material_pool_has_room() {
+        use somnium_renderer::terrain::TerrainDescriptor;
+        let tile = TerrainDescriptor { chunk_cells: 64, grid_size: [8, 8], cell_size: 2.0, ..Default::default() };
+        let ground = Path::new("assets/terrain");
+        let mut free = vec![TerrainSlot { id: 7, desc: tile, asset_dir: ground.to_path_buf() }];
+        let reused = choose_slot(&mut free, &tile, ground, 0);
+        assert_eq!(reused, SlotChoice::Reuse(free_slot(7, tile)), "a retired slot needs no entry");
+        assert_eq!(choose_slot(&mut free, &tile, ground, 1), SlotChoice::New);
+        // The seventeenth live slot with the default sixteen entries: a new terrain would shade with entry 0's ground.
+        assert_eq!(choose_slot(&mut free, &tile, ground, 0), SlotChoice::Full);
+    }
+
+    fn free_slot(id: u32, desc: somnium_renderer::terrain::TerrainDescriptor) -> TerrainSlot {
+        TerrainSlot { id, desc, asset_dir: PathBuf::from("assets/terrain") }
+    }
+
+    #[test]
+    fn a_cell_whose_ground_did_not_read_is_read_again_and_a_hold_waits_for_it() {
+        let mut streamer = CellStreamer::default();
+        let start = std::time::Instant::now();
+        let at = |seconds: u64| start + std::time::Duration::from_secs(seconds);
+        // A cell that is broken for good (it did not parse) is in for a hold and never read again, as before.
+        streamer.failed.insert(0, "c.json: expected value".into());
+        assert!(streamer.settled(0) && !streamer.may_read(0, at(3600)));
+
+        // A sidecar being rewritten: the cell is not in, and reads again a second later, then two, four...
+        streamer.ground_failed(1, "terrain 0: truncated terrain sidecar".into(), start);
+        assert!(!streamer.settled(1), "a hold does not put the player over a hole");
+        assert!(!streamer.may_read(1, start) && streamer.may_read(1, at(1)));
+        streamer.ground_failed(1, "terrain 0: read: sharing violation".into(), at(1));
+        assert!(!streamer.may_read(1, at(2)) && streamer.may_read(1, at(3)), "the pause doubles");
+        assert_eq!(streamer.ground_retries[&1].error, "terrain 0: read: sharing violation");
+        streamer.ground_failed(1, "again".into(), at(3));
+        assert!(!streamer.settled(1));
+        // Four in a row: a missing sidecar must not strand a hold, but the reads go on, at most 30 s apart.
+        streamer.ground_failed(1, "again".into(), at(7));
+        assert!(streamer.settled(1) && streamer.may_read(1, at(15)));
+        for failed_at in [15, 31, 61] {
+            streamer.ground_failed(1, "again".into(), at(failed_at));
+        }
+        assert!(!streamer.may_read(1, at(90)) && streamer.may_read(1, at(91)), "thirty seconds at most");
+        assert!(!streamer.failed.contains_key(&1), "a ground retry is not a failure for good");
+    }
+
+    #[test]
+    fn a_streamed_entity_is_read_only_and_its_terrain_slots_are_the_streamers() {
+        let mut world = somnium_ecs::World::new();
+        let scene = world.spawn((TerrainStreamingComponent::default(),));
+        let tile = world.spawn((TerrainStreamingComponent::default(), Streamed { cell: 3 }));
+        assert_eq!(read_only_reason(&world, scene), None);
+        assert!(read_only_reason(&world, tile).is_some(), "a tile's edits would never be saved");
+
+        use somnium_renderer::terrain::TerrainDescriptor;
+        let tile_desc = TerrainDescriptor::default();
+        let mut streamer = CellStreamer { terrain_resets: 2, ..CellStreamer::default() };
+        streamer.cell_terrains.insert(3, vec![free_slot(0, tile_desc)]);
+        streamer.free_terrains.push(free_slot(4, tile_desc));
+        assert!(streamer.owns_terrain(0, 2), "a live tile's slot");
+        assert!(streamer.owns_terrain(4, 2), "a retired slot");
+        assert!(!streamer.owns_terrain(1, 2), "a scene's own terrain");
+        assert!(!streamer.owns_terrain(0, 3), "after a scene reset the recorded slots are gone");
+    }
+
+    // The engine's side of the four checks above, read from its source: the methods need a window and a GPU.
+
+    /// `fn name`'s text in `source`, from its name to its closing brace (the first line that is four spaces and `}`).
+    fn method<'a>(source: &'a str, name: &str) -> &'a str {
+        let rest = source.split_once(&format!("fn {name}(")).unwrap_or_else(|| panic!("fn {name} exists")).1;
+        &rest[..rest.find("\n    }").unwrap_or(rest.len())]
+    }
+
+    #[test]
+    fn a_tile_slot_is_chosen_knowing_the_material_pool_s_room() {
+        let adopt = method(include_str!("app_cell_streaming.rs"), "adopt_terrain");
+        assert!(
+            ["terrain_material_room()", "choose_slot(", "SlotChoice::Full"].iter().all(|code| adopt.contains(code)),
+            "a tile past the pool's last entry would be given entry 0 and shade with another tile's ground"
+        );
+    }
+
+    #[test]
+    fn a_ground_read_failure_is_retried_and_holds_wait_through_it() {
+        let source = include_str!("app_cell_streaming.rs");
+        let pump = method(source, "pump_cell_reads");
+        assert!(pump.contains("ground_failed("), "a sidecar read error fails the cell for good");
+        let schedule = method(source, "schedule_cells");
+        assert!(schedule.contains("may_read(index"), "a cell waiting out a ground retry is read again every frame");
+        assert!(schedule.contains("streamer.settled(index)"), "a hold is ready over a tile whose ground is retried");
+    }
+
+    #[test]
+    fn streamed_tiles_are_not_sculpted_painted_or_foliage_painted() {
+        assert!(method(include_str!("app.rs"), "persona_target_reason").contains("read_only_reason("));
+        let mcp = include_str!("app_authoring_specialized.rs");
+        let arms = [("\"terrain_stroke\" => {", "terrain_stroke = Some("), ("\"foliage_stroke\" => {", "push_silent(")];
+        for (arm, before) in arms {
+            let arm = mcp.split_once(arm).unwrap_or_else(|| panic!("{arm} exists")).1;
+            let arm = &arm[..arm.find(before).unwrap_or_else(|| panic!("{before} follows"))];
+            assert!(arm.contains("read_only_reason("), "an undo recorded against a tile's slot lands in the next tile");
+        }
+    }
+
+    #[test]
+    fn a_scene_terrain_never_keeps_a_tile_s_slot() {
+        let restore = method(include_str!("app.rs"), "restore_terrain_gpu");
+        let existed = restore.split_once("let existed").expect("restore_terrain_gpu keeps existing terrains").1;
+        let existed = &existed[..existed.find(';').unwrap_or(existed.len())];
+        assert!(existed.contains("owns_terrain("), "a prefab terrain saved with a tile's id would bind to the tile");
     }
 
     #[test]
