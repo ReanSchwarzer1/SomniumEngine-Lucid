@@ -4402,9 +4402,9 @@ impl Default for WalkLod {
 impl WalkLod {
     /// Steps between a body's steps: 1 for anyone `always` stepped (the protagonist and his mount), anyone
     /// `unsettled` (in the air, swimming, on a ledge, jumping or climbing, on a sledge), anyone within `near` of a
-    /// focus (`d2` is the squared distance to the nearest) and anyone `engaged` in a fight within `far`; otherwise
-    /// the stride for its distance, shortened so that `speed` (metres a second) over `dt` a step carries it no further
-    /// than `max_step` in one.
+    /// focus (`d2` is the squared distance to the nearest) and anyone `engaged` in a fight within `far` (a ridden
+    /// mount is when its rider is); otherwise the stride for its distance, shortened so that `speed` (metres a second)
+    /// over `dt` a step carries it no further than `max_step` in one.
     #[must_use]
     pub fn stride(&self, d2: f32, always: bool, unsettled: bool, engaged: bool, speed: f32, dt: f32) -> u32 {
         let far = d2 > self.far * self.far;
@@ -4464,7 +4464,8 @@ fn walk(
 }
 
 /// [`walk`], with the walkers' LOD when there is a `plan`: those it does not step this step are left as they are (their
-/// time owed to their next step), and pushes are gathered only for those it steps. Without one, everyone steps.
+/// time owed to their next step), a strided step longer than [`WalkLod::max_step`] is taken in parts, and pushes are
+/// gathered only for those it steps. Without one, everyone steps.
 fn walk_with(
     combat: &mut CombatWorld,
     walkers: &mut BTreeMap<CombatantId, Controller>,
@@ -4518,7 +4519,23 @@ fn walk_with(
             climb: c.intent.climb || (player && c.intent.sprinting),
         };
         let (before, wanted) = (walker.feet, flat_speed(c.intent.velocity));
-        let events = walker.step(body_dt, &input, &Walled { terrain, combat });
+        // A strided step that would carry it past the LOD's `max_step` (time owed under a longer stride, or a
+        // speed-up since it was owed) is taken in even parts under it, so downhill none loses the ground. Off the
+        // ground partway (an edge, water, a ledge), the rest is let go, as it is when a body comes to stride 1.
+        let parts = match plan.as_ref() {
+            Some(plan) if spans.contains_key(&id) => strided_parts(flat_speed(velocity) * body_dt, plan.lod.max_step),
+            _ => 1,
+        };
+        let part = body_dt / parts as f32;
+        let mut events = walker.step(part, &input, &Walled { terrain, combat });
+        for _ in 1..parts {
+            if !walker.grounded() || !events.is_empty() {
+                break;
+            }
+            walker.velocity.x = velocity.x;
+            walker.velocity.z = velocity.z;
+            events.extend(walker.step(part, &input, &Walled { terrain, combat }));
+        }
         let (feet, velocity) = (walker.feet, walker.velocity);
         let climb = walker.mantle().map(|m| ai::Climb {
             progress: m.progress(),
@@ -4555,6 +4572,19 @@ fn walk_with(
 
 /// Below this (metres a second, or metres) a walker counts as still ([`Paced::settled`]).
 const STILL_SPEED: f32 = 1e-4;
+
+/// The most parts one strided step is taken in ([`strided_parts`]).
+const MAX_PARTS: u32 = 32;
+
+/// How many even parts a strided step `reach` metres long is taken in so that none carries a body farther than
+/// `max_step` ([`WalkLod::max_step`]): 1 when it is under it (to a rounding's slack, so a stride sized to fit is not
+/// split by the sum of its steps' time), at most [`MAX_PARTS`].
+fn strided_parts(reach: f32, max_step: f32) -> u32 {
+    if !reach.is_finite() || max_step <= 0.0 || reach <= max_step * (1.0 + 1e-4) {
+        return 1;
+    }
+    ((reach / max_step).ceil() as u32).clamp(1, MAX_PARTS)
+}
 
 fn flat_speed(v: Vec3) -> f32 {
     Vec2::new(v.x, v.z).length()
@@ -4599,7 +4629,9 @@ fn pace_walkers(
         let always = plan.always.contains(&Some(id));
         let unsettled =
             !walker.grounded() || walker.sledging || c.intent.climb || ai::wants_jump(combat, id);
-        let engaged = c.brain.as_ref().is_some_and(|b| b.mind.target.is_some());
+        // A ridden mount has no brain of its own (it fights for its rider, who is carried): it is in its rider's fight.
+        let fighting = |c: &somnium_combat::Combatant| c.brain.as_ref().is_some_and(|b| b.mind.target.is_some());
+        let engaged = fighting(c) || c.rider.and_then(|r| combat.combatant(r)).is_some_and(fighting);
         let speed = flat_speed(c.intent.velocity).max(flat_speed(walker.velocity));
         let stride = lod.stride(d2, always, unsettled, engaged, speed, body_dt);
         let pace = plan.paced.entry(id).or_default();
@@ -7810,6 +7842,127 @@ mod tests {
         assert!((strided - whole).abs() <= whole * 0.02, "strided {strided} m, full rate {whole} m");
         assert!(on.walkers[&id].feet.y < from[0].y - 8.0, "down the slope");
         assert_eq!(moves, 480 / 8, "an eighth of the steps");
+    }
+
+    /// SIM_LOD_PLAN step 2: a far walker strided at 1.5 m/s down a 40 degree slope breaks into a 6 m/s run just as
+    /// it is owed all but one step of its long stride, and its shorter stride is due next. That step carries it all
+    /// the time it was owed at the new speed (0.8 m, the ground about 0.67 m down by then, past the controller's 0.35 m
+    /// snap). Taken in parts under `max_step`, it keeps the ground (no false fall, no Landed), as at full rate.
+    #[test]
+    fn a_far_walker_breaking_into_a_run_down_a_slope_keeps_the_ground() {
+        let _jolt = JOLT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tilt = 40f32.to_radians();
+        let turn = Quat::from_rotation_x(tilt);
+        let centre = Vec3::new(300.0, 30.0, 0.0);
+        let start = centre + turn * Vec3::new(0.0, 1.0, -40.0) + Vec3::Y * 0.05;
+        let slope = (Vec3::new(40.0, 2.0, 200.0), turn, centre);
+        let (physics, _) = lod_ground(&[slope]);
+        let terrain = JoltTerrain {
+            physics: &physics,
+            water: &[],
+        };
+        let (mut on, ids) = lod_run(&[start]);
+        let (mut off, _) = lod_run(&[start]);
+        let id = ids[0];
+        for run in [&mut on, &mut off] {
+            run.world.combatant_mut(id).unwrap().position = start;
+            run.walkers.get_mut(&id).unwrap().feet = start;
+        }
+        let (dt, lod, focus) = (1.0 / 60.0, WalkLod::default(), [Vec3::ZERO]);
+        for _ in 0..60 {
+            lod_step(&mut on, lod, &focus, &terrain, dt);
+            walk(&mut off.world, &mut off.walkers, dt, &terrain);
+        }
+        for run in [&mut on, &mut off] {
+            run.world.combatant_mut(id).unwrap().intent.velocity = Vec3::Z * 1.5;
+        }
+        let d2 = Vec2::new(start.x, start.z).length_squared();
+        let slow = lod.stride(d2, false, false, false, 1.5, dt);
+        let fast = lod.stride(d2, false, false, false, 6.0, dt);
+        assert!(slow == 8 && fast < slow, "strides {slow} then {fast}");
+        let (mut events, mut ran, mut longest) = (Vec::new(), None, 0f32);
+        for step in 0..240 {
+            let owed = on.paced.get(&id).map_or(0.0, |p| p.owed);
+            if ran.is_none() && owed > (slow - 1) as f32 * dt * 0.99 && WalkLod::due(on.walk_steps + 1, id, fast) {
+                ran = Some(step);
+                for run in [&mut on, &mut off] {
+                    run.world.combatant_mut(id).unwrap().intent.velocity = Vec3::Z * 6.0;
+                }
+            }
+            let before = on.walkers[&id].feet;
+            events.extend(lod_step(&mut on, lod, &focus, &terrain, dt));
+            events.extend(walk(&mut off.world, &mut off.walkers, dt, &terrain));
+            longest = longest.max(flat_distance(on.walkers[&id].feet, before));
+            assert!(on.walkers[&id].grounded(), "strided, on the ground at step {step} (ran from {ran:?})");
+            assert!(off.walkers[&id].grounded(), "full rate, on the ground at step {step}");
+        }
+        assert!(ran.is_some_and(|r| r < 200), "it broke into a run: {ran:?}");
+        assert!(!events.iter().any(|e| matches!(e.1, LocomotionEvent::Landed { .. })), "{events:?}");
+        assert!(longest > lod.max_step * 2.0, "the step it was owed for carried it {longest} m");
+        assert_eq!(strided_parts(0.8, 0.3), 3);
+        assert_eq!(strided_parts(0.3, 0.3), 1, "a stride sized to fit is one step");
+        assert_eq!(strided_parts(f32::NAN, 0.3), 1);
+    }
+
+    /// SIM_LOD_PLAN step 2: a ridden mount has no brain (it fights for its rider), so a rider in a fight 100 m from
+    /// every focus (a woken Lance band) is in it on his pony's legs: the pony steps every step, to the bit as without
+    /// the LOD. Once its rider has no target it strides like any far walker.
+    #[test]
+    fn a_ridden_mount_steps_every_step_while_its_rider_fights() {
+        let _jolt = JOLT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let make = || {
+            let mut world = World::new();
+            let root = world.spawn((Name::new("Scene"), Transform::default(), WorldTransform::identity()));
+            let pony = CombatantComponent {
+                mount: 1,
+                ..CombatantComponent::default()
+            };
+            let foe = CombatantComponent {
+                team: 2,
+                ..CombatantComponent::default()
+            };
+            fighter(&mut world, root, "Rider", Vec3::new(100.0, 0.0, 0.0), Vec3::X, CombatantComponent::default());
+            fighter(&mut world, root, "Pony", Vec3::new(101.0, 0.0, 0.0), Vec3::X, pony);
+            fighter(&mut world, root, "Foe", Vec3::new(100.0, 0.0, 30.0), Vec3::X, foe);
+            somnium_core::propagate_transforms(&mut world);
+            let mut run = build(&world).expect("a fight");
+            let id = |run: &Run, name: &str| run.world.combatants().find(|c| c.name == name).map(|c| c.id).unwrap();
+            let (rider, horse, foe) = (id(&run, "Rider"), id(&run, "Pony"), id(&run, "Foe"));
+            assert_eq!(somnium_combat::mount::mount(&mut run.world, rider, horse), Ok(()));
+            assert!(run.world.combatant(horse).unwrap().brain.is_none(), "a ridden mount has no brain");
+            run.world.combatant_mut(rider).unwrap().brain.as_mut().expect("a brain").mind.target = Some(foe);
+            run.world.combatant_mut(horse).unwrap().intent.velocity = Vec3::X * 5.0;
+            (run, rider, horse)
+        };
+        let (mut off, rider, horse) = make();
+        let (mut on, ..) = make();
+        let (physics, _) = lod_ground(&[]);
+        let terrain = JoltTerrain {
+            physics: &physics,
+            water: &[],
+        };
+        let (dt, focus) = (1.0 / 60.0, [Vec3::ZERO]);
+        for step in 0..120 {
+            walk(&mut off.world, &mut off.walkers, dt, &terrain);
+            lod_step(&mut on, WalkLod::default(), &focus, &terrain, dt);
+            let (a, b) = (&off.walkers[&horse], &on.walkers[&horse]);
+            let at = flat_distance(b.feet, Vec3::ZERO);
+            assert!(at > 60.0 && at < 140.0, "between near and far: {at}");
+            assert_eq!(bits(a.feet), bits(b.feet), "the pony at step {step}");
+            assert_eq!(bits(a.velocity), bits(b.velocity), "the pony at step {step}");
+            assert_eq!(a.mode, b.mode, "the pony at step {step}");
+        }
+        // Out of the fight, the pony strides.
+        for run in [&mut off, &mut on] {
+            run.world.combatant_mut(rider).unwrap().brain.as_mut().unwrap().mind.target = None;
+        }
+        let mut strided = false;
+        for _ in 0..30 {
+            walk(&mut off.world, &mut off.walkers, dt, &terrain);
+            lod_step(&mut on, WalkLod::default(), &focus, &terrain, dt);
+            strided |= off.walkers[&horse].feet != on.walkers[&horse].feet;
+        }
+        assert!(strided, "out of the fight the pony strides");
     }
 
     /// SIM_LOD_PLAN step 2: two far bodies overlapping are pushed apart by their push once a strided step (spread
