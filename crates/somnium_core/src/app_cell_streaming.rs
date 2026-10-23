@@ -6,8 +6,9 @@
 //! writes, or a finished cell's entities (their meshes all cached by then, so installing is cheap). Cells leave by
 //! despawning; their meshes stay cached for the next cell that uses them.
 use super::*;
-use crate::cell_streaming::{self as cells, CellStreamingComponent, Piece, Streamed};
-use std::collections::HashSet;
+use crate::cell_streaming::{self as cells, CellStreamingComponent, Piece, SlotChoice, Streamed, TerrainSlot};
+use somnium_renderer::terrain::TerrainSidecar;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// Main-thread time a frame gives streaming once it has done one piece.
@@ -18,6 +19,15 @@ const FIRST_FILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(90)
 impl<G: GameApp> Engine<G> {
     /// Stream the cells of the scene's `somnium.CellStreaming` around this frame's view.
     pub(super) fn update_cell_streaming(&mut self) {
+        // A scene open's `reset_scene_gpu` dropped every terrain: the slots recorded here are gone, or are the new
+        // scene's, so they are forgotten and never retired.
+        if let Some(resets) = self.renderer.as_ref().map(|renderer| renderer.scene_resets)
+            && resets != self.cell_streamer.terrain_resets
+        {
+            self.cell_streamer.cell_terrains.clear();
+            self.cell_streamer.free_terrains.clear();
+            self.cell_streamer.terrain_resets = resets;
+        }
         let Some(owner) = self.world.entities_with::<CellStreamingComponent>().next() else {
             if self.cell_streamer.key.is_some() {
                 self.reset_cell_streaming();
@@ -102,10 +112,19 @@ impl<G: GameApp> Engine<G> {
             u32::try_from(streamer.reading.len()).unwrap_or(u32::MAX),
             u32::try_from(streamer.streamed_entities()).unwrap_or(u32::MAX),
         );
+        let retrying = streamer.ground_retries.values().next();
         let status = match streamer.failed.values().next() {
             Some(error) => format!("{} cells failed; first: {error}", streamer.failed.len()),
             None if !settings.enabled => "Off: cells unloaded".into(),
-            None => format!("{loaded} of {} cells live", streamer.cells.len()),
+            None => match retrying {
+                Some(retry) => format!(
+                    "{loaded} of {} cells live; {} reading their ground again; first: {}",
+                    streamer.cells.len(),
+                    streamer.ground_retries.len(),
+                    retry.error
+                ),
+                None => format!("{loaded} of {} cells live", streamer.cells.len()),
+            },
         };
         if let Some(component) = self.world.get::<CellStreamingComponent>(owner)
             && (component.loaded_cells, component.pending_cells, component.streamed_entities) != (loaded, pending, entities)
@@ -138,18 +157,17 @@ impl<G: GameApp> Engine<G> {
         for index in unload {
             self.unload_cell(index);
         }
+        let now = std::time::Instant::now();
         for index in load {
             if self.cell_streamer.reading.len() >= cells::READERS {
                 break;
             }
-            if !self.cell_streamer.failed.contains_key(&index) {
+            if self.cell_streamer.may_read(index, now) {
                 self.start_cell_read(index);
             }
         }
         let streamer = &self.cell_streamer;
-        holds.mark_ready(&streamer.cells, |index| {
-            streamer.loaded.contains_key(&index) || streamer.failed.contains_key(&index)
-        });
+        holds.mark_ready(&streamer.cells, |index| streamer.settled(index));
         self.world.put_cache(holds);
     }
 
@@ -168,7 +186,7 @@ impl<G: GameApp> Engine<G> {
             let document = match crate::scene_file::read(&path) {
                 Ok((_, document)) => document,
                 Err(error) => {
-                    let _ = send.send(Piece::Cell(Err(format!("{}: {error}", path.display()))));
+                    let _ = send.send(Piece::Cell(Err(format!("{}: {error}", path.display())), Vec::new()));
                     return;
                 }
             };
@@ -193,7 +211,21 @@ impl<G: GameApp> Engine<G> {
                     return; // the cell was dropped
                 }
             }
-            let _ = send.send(Piece::Cell(Ok(document)));
+            // A tile's ground: each terrain's sidecar read and its horizon and relief baked here, not on the main
+            // thread. Only for a drawn world, as with the sources.
+            let terrains = cells::terrains_of(&document)
+                .into_iter()
+                .filter(|_| drawing)
+                .map(|terrain| {
+                    let sidecar = format!("{}.terrain{}.bin", path.display(), terrain.saved_id);
+                    let read = somnium_renderer::terrain::read_sidecar(&sidecar, terrain.dims).map(|mut read| {
+                        read.bake(terrain.cell_size, terrain.height_scale);
+                        read
+                    });
+                    (terrain.saved_id, read)
+                })
+                .collect();
+            let _ = send.send(Piece::Cell(Ok(document), terrains));
         });
         self.cell_streamer.reading.insert(index, receive);
     }
@@ -216,13 +248,30 @@ impl<G: GameApp> Engine<G> {
                         pieces += 1;
                         self.upload_streamed_source(&path, &parts, &scene, prepared);
                     }
-                    Ok(Piece::Cell(parsed)) => {
+                    Ok(Piece::Cell(parsed, terrains)) => {
                         pieces += 1;
                         installed += 1;
                         finished = true;
-                        if let Err(error) = parsed.and_then(|document| self.install_cell(index, &document)) {
-                            warn!(%error, cell = index, "streamed cell skipped");
-                            self.cell_streamer.failed.insert(index, error);
+                        // A sidecar that did not read (being rewritten, held by a sync) is read again shortly, not
+                        // given up on: the tile would be a hole for the rest of the session.
+                        let ground = terrains.iter().find_map(|(saved_id, read)| {
+                            read.as_ref().err().map(|error| format!("terrain {saved_id}: {error}"))
+                        });
+                        match (parsed, ground) {
+                            (Ok(_), Some(error)) => {
+                                warn!(%error, cell = index, "streamed cell's ground not read; read again shortly");
+                                self.cell_streamer.ground_failed(index, error, std::time::Instant::now());
+                            }
+                            (parsed, _) => {
+                                if let Err(error) =
+                                    parsed.and_then(|document| self.install_cell(index, &document, terrains))
+                                {
+                                    warn!(%error, cell = index, "streamed cell skipped");
+                                    self.cell_streamer.failed.insert(index, error);
+                                } else {
+                                    self.cell_streamer.ground_retries.remove(&index);
+                                }
+                            }
                         }
                         break;
                     }
@@ -263,8 +312,20 @@ impl<G: GameApp> Engine<G> {
         }
     }
 
-    /// Put a parsed cell's entities into the world and restore their GPU state (from the cache, as a rule).
-    fn install_cell(&mut self, index: usize, document: &serde_json::Value) -> Result<(), String> {
+    /// Put a parsed cell's entities into the world and restore their GPU state (from the cache, as a rule). Its
+    /// terrains take the sidecars its reader read (`terrains`, by saved id).
+    fn install_cell(
+        &mut self,
+        index: usize,
+        document: &serde_json::Value,
+        terrains: Vec<(u32, Result<TerrainSidecar, String>)>,
+    ) -> Result<(), String> {
+        // A tile whose ground could not be read fails whole, before anything of it spawns (`pump_cell_reads` reads
+        // such a cell again before it gets here).
+        let mut sidecars = HashMap::new();
+        for (saved_id, read) in terrains {
+            sidecars.insert(saved_id, read.map_err(|error| format!("terrain {saved_id}: {error}"))?);
+        }
         let report = crate::scene_schema::scene_from_json(&mut self.world, &self.type_registry, document)
             .map_err(|error| error.to_string())?;
         // Which uploads this cell keeps alive (for eviction once no loaded cell draws them).
@@ -281,6 +342,7 @@ impl<G: GameApp> Engine<G> {
         for &entity in &report.entities {
             let _ = self.world.insert_component(entity, Streamed { cell });
         }
+        self.adopt_cell_terrains(index, &report.entities, sidecars);
         self.restore_entity_gpu(&report.entities);
         // ponytail: both passes walk the whole world once per installed cell; per-entity variants if they show up in
         // a profile.
@@ -290,9 +352,106 @@ impl<G: GameApp> Engine<G> {
         Ok(())
     }
 
-    /// Despawn a cell's entities (or drop its reader). Its meshes stay cached for the next cell that uses them.
+    /// Give each terrain a cell installed a renderer terrain holding its ground: a retired one of the same shape and
+    /// ground layers when there is one, else a new streamed terrain. Its runtime id goes into its `TerrainComponent`.
+    /// With no renderer, or no ground for it, that id is `u32::MAX`, which drawing, colliders and foliage all skip.
+    fn adopt_cell_terrains(&mut self, index: usize, entities: &[Entity], mut sidecars: HashMap<u32, TerrainSidecar>) {
+        let asset_dir = self.config.content_root.join("terrain");
+        // Saved id -> runtime id: entities saved with one id share one terrain, as a scene open has them.
+        let mut runtime: HashMap<u32, u32> = HashMap::new();
+        let mut slots = Vec::new();
+        for &entity in entities {
+            let Some(component) = self.world.get::<TerrainComponent>(entity).copied() else {
+                continue;
+            };
+            let id = match runtime.get(&component.terrain_id) {
+                Some(&id) => id,
+                None => {
+                    let sidecar = sidecars.remove(&component.terrain_id);
+                    let slot = self.adopt_terrain(index, entity, &component, sidecar, &asset_dir);
+                    let id = slot.as_ref().map_or(u32::MAX, |slot| slot.id);
+                    slots.extend(slot);
+                    runtime.insert(component.terrain_id, id);
+                    id
+                }
+            };
+            if let Some(saved) = self.world.get_mut::<TerrainComponent>(entity) {
+                saved.terrain_id = id;
+            }
+        }
+        if !slots.is_empty() {
+            self.cell_streamer.cell_terrains.insert(index, slots);
+        }
+    }
+
+    /// One tile's terrain into a slot ([`Self::adopt_cell_terrains`]); `None` when it gets none.
+    fn adopt_terrain(
+        &mut self,
+        index: usize,
+        entity: Entity,
+        component: &TerrainComponent,
+        sidecar: Option<TerrainSidecar>,
+        asset_dir: &Path,
+    ) -> Option<TerrainSlot> {
+        let (renderer, ctx) = self.renderer.as_mut().zip(self.render_ctx.as_ref())?;
+        let Some(desc) = cells::terrain_descriptor(component) else {
+            warn!(terrain_id = component.terrain_id, cell = index, "invalid saved terrain descriptor");
+            return None;
+        };
+        let Some(sidecar) = sidecar else {
+            warn!(terrain_id = component.terrain_id, cell = index, "streamed terrain has no sidecar; not drawn");
+            return None;
+        };
+        let model = self.world.get::<Transform>(entity).map_or(glam::Mat4::IDENTITY, Transform::to_matrix);
+        let streaming = self.world.get::<cells::TerrainStreamingComponent>(entity);
+        // Always streamed: a retired slot takes its chunks back only through `stream_geometry`.
+        let distance = streaming.map(|s| s.geometry_distance).filter(|distance| *distance > 0.0).unwrap_or(800.0);
+        // A region's own ground layers (WS1-24), else the project's; a slot is reused only on the same ground.
+        let layers = streaming.map_or_else(|| asset_dir.to_path_buf(), |s| s.layer_dir(asset_dir));
+        let asset_dir = layers.as_path();
+        let room = renderer.terrain_material_room();
+        let (slot, kind) = match cells::choose_slot(&mut self.cell_streamer.free_terrains, &desc, asset_dir, room) {
+            SlotChoice::Reuse(slot) => (slot, "reused"),
+            SlotChoice::New => {
+                let id = renderer.create_streamed_terrain_with_asset_dir(ctx, desc, asset_dir, distance);
+                (TerrainSlot { id, desc, asset_dir: asset_dir.to_path_buf() }, "new")
+            }
+            SlotChoice::Full => {
+                let live: usize = self.cell_streamer.cell_terrains.values().map(Vec::len).sum();
+                error!(
+                    terrain_id = component.terrain_id,
+                    cell = index,
+                    live_slots = live,
+                    retired_slots = self.cell_streamer.free_terrains.len(),
+                    "terrain material pool full: tile {} not drawn (set SOMNIUM_TERRAIN_MATERIALS higher)",
+                    self.cell_streamer.cells[index].file.display()
+                );
+                return None;
+            }
+        };
+        let adopted = match renderer.terrain_mut(slot.id) {
+            Some(terrain) => terrain.adopt_sidecar(&ctx.queue, sidecar, model, distance),
+            None => Err(format!("the renderer has no terrain {}", slot.id)),
+        };
+        if let Err(error) = adopted {
+            warn!(%error, terrain_id = component.terrain_id, cell = index, "streamed terrain not adopted");
+            self.cell_streamer.free_terrains.push(slot);
+            return None;
+        }
+        info!("Terrain tile {}: slot {} ({kind})", self.cell_streamer.cells[index].file.display(), slot.id);
+        Some(slot)
+    }
+
+    /// Despawn a cell's entities (or drop its reader). Its meshes stay cached for the next cell that uses them, and
+    /// its terrains are retired and kept for the next tile of the same shape.
     fn unload_cell(&mut self, index: usize) {
         self.cell_streamer.reading.remove(&index);
+        for slot in self.cell_streamer.cell_terrains.remove(&index).unwrap_or_default() {
+            if let Some((renderer, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref()) {
+                renderer.retire_terrain(ctx, slot.id);
+            }
+            self.cell_streamer.free_terrains.push(slot);
+        }
         let now = std::time::Instant::now();
         for source in self.cell_streamer.cell_sources.remove(&index).unwrap_or_default() {
             let users = self.cell_streamer.source_users.entry(source.clone()).or_default();
@@ -374,7 +533,10 @@ impl<G: GameApp> Engine<G> {
         for index in indices {
             self.unload_cell(index);
         }
-        self.cell_streamer = crate::cell_streaming::CellStreamer::default();
+        // The retired terrains are still the renderer's, and still worth reusing.
+        let old = std::mem::take(&mut self.cell_streamer);
+        self.cell_streamer.free_terrains = old.free_terrains;
+        self.cell_streamer.terrain_resets = old.terrain_resets;
     }
 
     fn set_cell_status(&mut self, owner: Entity, status: String) {

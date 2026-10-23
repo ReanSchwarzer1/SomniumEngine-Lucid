@@ -298,22 +298,28 @@ impl GpuMaterial {
 pub struct TerrainMaterialPool {
     pub buffer: wgpu::Buffer,
     count: u32,
+    /// Entries the buffer holds, fixed at creation ([`capacity_from`]).
+    capacity: u32,
+}
+
+/// Terrain material entries from `SOMNIUM_TERRAIN_MATERIALS`'s value: 16 when unset or not a number, which is well
+/// past what an editor session uses (each terrain costs 34 MB of vertex pool long before this buffer matters), and
+/// otherwise clamped to 1..=1024. An open world of streamed tiles keeps more slots alive than a scene does.
+fn capacity_from(value: Option<&str>) -> u32 {
+    value.and_then(|v| v.trim().parse::<u32>().ok()).map_or(16, |n| n.clamp(1, 1024))
 }
 
 impl TerrainMaterialPool {
-    /// Room for 16 terrains, which is well past what an editor session uses —
-    /// each one costs 34 MB of vertex pool long before this buffer matters.
-    const CAPACITY: u32 = 16;
-
     pub fn new(device: &wgpu::Device) -> Self {
+        let capacity = capacity_from(std::env::var("SOMNIUM_TERRAIN_MATERIALS").ok().as_deref());
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Terrain Material Buffer"),
-            size: Self::CAPACITY as u64
+            size: capacity as u64
                 * std::mem::size_of::<crate::terrain::GpuTerrainMaterial>() as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Self { buffer, count: 0 }
+        Self { buffer, count: 0, capacity }
     }
 
     /// Reclaim every slot. Map load creates a new terrain that allocates from zero.
@@ -323,13 +329,19 @@ impl TerrainMaterialPool {
 
     /// Claim the next slot, or `None` when the buffer is full.
     pub fn allocate(&mut self) -> Option<u32> {
-        if self.count >= Self::CAPACITY {
-            tracing::error!("terrain material buffer full ({} entries)", Self::CAPACITY);
+        if self.count >= self.capacity {
+            tracing::error!("terrain material buffer full ({} entries)", self.capacity);
             return None;
         }
         let index = self.count;
         self.count += 1;
         Some(index)
+    }
+
+    /// Entries [`Self::allocate`] can still claim before it returns `None`.
+    #[must_use]
+    pub fn room(&self) -> u32 {
+        self.capacity.saturating_sub(self.count)
     }
 
     /// Write one terrain's material for this frame.
@@ -339,7 +351,7 @@ impl TerrainMaterialPool {
         index: u32,
         material: &crate::terrain::GpuTerrainMaterial,
     ) {
-        if index >= Self::CAPACITY {
+        if index >= self.capacity {
             return;
         }
         queue.write_buffer(
@@ -437,6 +449,16 @@ mod material_flag_tests {
         // Above 1 nothing survives, which would delete the whole mesh.
         assert_eq!(cutout_threshold(AlphaMode::Mask, 4.0), 1.0);
         assert_eq!(cutout_threshold(AlphaMode::Mask, 0.25), 0.25);
+    }
+
+    #[test]
+    fn terrain_material_capacity_defaults_to_16_and_clamps_what_is_set() {
+        assert_eq!(capacity_from(None), 16);
+        assert_eq!(capacity_from(Some("32")), 32);
+        assert_eq!(capacity_from(Some("x")), 16);
+        assert_eq!(capacity_from(Some("-4")), 16);
+        assert_eq!(capacity_from(Some("0")), 1);
+        assert_eq!(capacity_from(Some("5000")), 1024);
     }
 
     #[test]
