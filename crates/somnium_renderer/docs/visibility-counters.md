@@ -29,8 +29,9 @@ Native foliage uses horizontal distance rejection before material-part
 submission. The renderer then applies its usual GPU frustum and Hi-Z tests.
 A mesh used more than eight times in a frame intentionally uses whole-mesh
 arguments instead of expanding every copy into many meshlet arguments. Project
-palette kinds 128–255 retain every selected material part until distance culling;
-the legacy tree leaf-dropping LOD rules only apply to built-in kinds below 128.
+palette kinds (25 up to `FOLIAGE_KINDS` - 1, 8191) retain every selected material
+part until distance culling; the legacy tree leaf-dropping LOD rules only apply
+to the built-in kinds 0–24.
 Project entries may supply an optional simplified `lod` source and distance;
 `foliage.lod_instances` records its selection. Without it, the full mesh remains.
 This does not claim early CPU frustum rejection of whole painted patches.
