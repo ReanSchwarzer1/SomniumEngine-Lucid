@@ -951,8 +951,10 @@ impl HelloGame {
 
     /// The simulation's level of detail for an open world (SIM_LOD_PLAN), on or off; off by default, which keeps
     /// everything exactly as before. On, the fight's far walkers step every few fixed steps and still ones not at all
-    /// (`combat_demo::WalkLod`). Within 60 m of the protagonist, the fight's camera and every held place nothing
-    /// changes. A game with a streamed open world (Rimeborn) turns it on at init.
+    /// (`combat_demo::WalkLod`), and the fight is written onto the scene once a frame rather than after every fixed
+    /// step (`CombatDemo::frame_writes`; the protagonist and his mount still every step). Within 60 m of the
+    /// protagonist, the fight's camera and every held place the walkers step as ever. A game with a streamed open
+    /// world (Rimeborn) turns it on at init.
     pub fn set_open_world_lod(&mut self, on: bool) {
         self.combat.set_open_world_lod(on);
     }

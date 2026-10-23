@@ -3017,6 +3017,11 @@ struct Run {
     /// and each body's pace there.
     walk_steps: u64,
     paced: HashMap<CombatantId, Paced>,
+    /// With the writes once a frame ([`CombatDemo::frame_writes`]): what each fighter's entity was last placed from,
+    /// and the seconds and steps the skins have not been written for yet.
+    placed: HashMap<CombatantId, Placed>,
+    unwritten: f32,
+    unwritten_steps: u32,
 }
 
 struct Hud {
@@ -3209,6 +3214,12 @@ pub struct CombatDemo {
     /// The walkers' LOD ([`WalkLod`]): far bodies step every few fixed steps and still ones not at all, near ones as
     /// ever. `None` (the default) steps everyone every step. Set with [`CombatDemo::set_open_world_lod`].
     pub walk_lod: Option<WalkLod>,
+    /// Write the fight onto the scene once a frame, in [`CombatDemo::update`], not after every fixed step: each
+    /// fighter's entity where it ended the frame (those that did not move left alone), the effects, and the skins
+    /// with their clocks on by all the frame's steps. The protagonist and his mount are still written every step.
+    /// Off (the default) writes everything every step. Needs `update` once a frame after the steps (as the shell
+    /// calls it). Set with [`CombatDemo::set_open_world_lod`].
+    pub frame_writes: bool,
 }
 
 /// The game's law on the fight: each faction hostile to the party when it is
@@ -3289,6 +3300,7 @@ impl Default for CombatDemo {
             click: Default::default(),
             beasts_hostile: true,
             walk_lod: None,
+            frame_writes: false,
         }
     }
 }
@@ -3569,11 +3581,20 @@ impl CombatDemo {
         self.input.devices_mut().release_all();
     }
 
-    /// The player's command for the coming fixed steps (once a frame).
+    /// The player's command for the coming fixed steps (once a frame). With [`CombatDemo::frame_writes`], first the
+    /// fight as the frame's steps left it onto the scene.
     pub fn update(&mut self, ctx: &mut EngineContext) {
         let Some(run) = &mut self.run else {
             return;
         };
+        if run.unwritten_steps > 0 {
+            crate::zone(&mut ctx.renderer, Some("Combat write scene"));
+            write_frame_scene(ctx.world, ctx.physics, run);
+            crate::zone(&mut ctx.renderer, None);
+            crate::zone(&mut ctx.renderer, Some("Combat skins write"));
+            write_frame_skins(ctx.world, run);
+            crate::zone(&mut ctx.renderer, None);
+        }
         self.input.update(ctx.dt());
         run.world.darkness = darkness(ctx.world);
         let Some(player) = run.player else {
@@ -3795,16 +3816,18 @@ impl CombatDemo {
     }
 
     /// The fight's level of detail for an open world, on or off (off by default: everything as before). On, far
-    /// walkers step every few fixed steps and still ones not at all ([`WalkLod`]); within 60 m of the protagonist, the
-    /// fight's camera and every held place nothing changes.
+    /// walkers step every few fixed steps and still ones not at all ([`WalkLod`]), and the fight is written onto the
+    /// scene once a frame ([`CombatDemo::frame_writes`]); within 60 m of the protagonist, the fight's camera and every
+    /// held place the walkers step as ever.
     pub fn set_open_world_lod(&mut self, on: bool) {
         self.walk_lod = on.then(WalkLod::default);
+        self.frame_writes = on;
     }
 
-    /// Whether [`CombatDemo::set_open_world_lod`] is on.
+    /// Whether [`CombatDemo::set_open_world_lod`] is on (either half of it).
     #[must_use]
     pub fn open_world_lod(&self) -> bool {
-        self.walk_lod.is_some()
+        self.walk_lod.is_some() || self.frame_writes
     }
 
     /// One fixed step of the fight, then everything it changed onto the scene.
@@ -3903,12 +3926,12 @@ impl CombatDemo {
         crate::zone(&mut ctx.renderer, None);
         engine_tick(ctx.world, run, dt);
         crate::zone(&mut ctx.renderer, Some("Combat write scene"));
-        write_scene(ctx, run);
+        write_step_scene(ctx.world, ctx.physics, run, self.frame_writes);
         crate::zone(&mut ctx.renderer, None);
         // Bodies for fighters that woke this frame, and every body's pose.
         run.skins.dress(ctx.world, &run.bodies, &run.world, &mut run.spawned);
         crate::zone(&mut ctx.renderer, Some("Combat skins write"));
-        run.skins.write(ctx.world, &run.world, &run.walkers, dt);
+        write_step_skins(ctx.world, run, dt, self.frame_writes);
         crate::zone(&mut ctx.renderer, None);
         // Closes "Combat fixed".
         crate::zone(&mut ctx.renderer, None);
@@ -4160,6 +4183,9 @@ fn build(world: &World) -> Option<Run> {
         beasts_calm: false,
         walk_steps: 0,
         paced: HashMap::new(),
+        placed: HashMap::new(),
+        unwritten: 0.0,
+        unwritten_steps: 0,
     })
 }
 
@@ -5388,76 +5414,204 @@ fn set_material(world: &mut World, entity: Entity, slot: &mut &'static str, want
     }
 }
 
+/// Where fighter `id` (`c`) is drawn: the centre, turn and size of its entity in the world, its ragdoll's root
+/// while it has one.
+fn fighter_pose(
+    physics: &somnium_physics::world::PhysicsWorld,
+    run: &Run,
+    id: CombatantId,
+    c: &somnium_combat::Combatant,
+) -> (Vec3, Quat, Vec3) {
+    let size =
+        run.dims
+            .get(&id)
+            .copied()
+            .unwrap_or(Vec3::new(BODY_WIDTH, BODY_HEIGHT, BODY_WIDTH));
+    let pose = match run
+        .ragdolls
+        .get(&id)
+        .and_then(|r| physics.ragdoll_pose(*r).ok())
+    {
+        Some(parts) => {
+            let (_, r, p) = parts[0].to_scale_rotation_translation();
+            (p, r)
+        }
+        // A mount's long body lies along its slope; people stand upright.
+        None => {
+            let up = run
+                .walkers
+                .get(&id)
+                .filter(|w| c.mount_def.is_some() && w.grounded())
+                .map_or(Vec3::Y, |w| w.ground_normal);
+            (
+                c.position + up * size.y * 0.5,
+                Quat::from_rotation_arc(Vec3::Y, up) * yaw(c.facing),
+            )
+        }
+    };
+    (pose.0, pose.1, size)
+}
+
+/// The world matrix of `entity`'s parent (identity at the top).
+fn parent_matrix(world: &World, entity: Entity) -> Mat4 {
+    world
+        .get::<Parent>(entity)
+        .map(|p| p.entity)
+        .filter(|p| *p != Entity::DANGLING)
+        .map_or(Mat4::IDENTITY, |p| world_matrix(world, p))
+}
+
+/// A fighter's entity at `at`, turned `turn`, of `size`, in the world: into its `parent`'s space, written when that
+/// moved or turned it.
+fn place_fighter(world: &mut World, entity: Entity, parent: Mat4, at: Vec3, turn: Quat, size: Vec3) {
+    let local = parent.inverse() * Mat4::from_scale_rotation_translation(size, turn, at);
+    let (s, r, p) = local.to_scale_rotation_translation();
+    if let Some(t) = world.get_mut::<Transform>(entity)
+        && (t.translation.distance_squared(p) > 1e-6 || t.rotation.dot(r).abs() < 0.99999)
+    {
+        t.translation = p;
+        t.rotation = r;
+        t.scale = s;
+    }
+}
+
+/// A fighter's live readouts onto its component, rounded so regeneration does not write every step.
+fn read_out(
+    world: &mut World,
+    readouts: &mut HashMap<Entity, (i32, i32, i32, &'static str)>,
+    entity: Entity,
+    c: &somnium_combat::Combatant,
+) {
+    let state = c
+        .herd
+        .filter(|_| c.rider.is_none() && c.alive())
+        .map_or(c.action.label(), |h| h.doing.label());
+    let reading = (
+        (c.vitals.health.current * 10.0).round() as i32,
+        (c.vitals.stamina.current).round() as i32,
+        (c.vitals.mana.current * 10.0).round() as i32,
+        state,
+    );
+    if readouts.get(&entity) != Some(&reading) {
+        readouts.insert(entity, reading);
+        if let Some(cc) = world.get_mut::<CombatantComponent>(entity) {
+            cc.health = c.vitals.health.current;
+            cc.stamina = c.vitals.stamina.current;
+            cc.mana = c.vitals.mana.current;
+            cc.state = state.to_string();
+        }
+    }
+}
+
+/// What [`write_fighters_once`] last placed a fighter's entity from: placed from the same again, it is left alone
+/// (no inverse, no decompose, no `get_mut` of its Transform).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Placed {
+    entity: Entity,
+    at: Vec3,
+    turn: Quat,
+    size: Vec3,
+    parent: Mat4,
+}
+
+/// Fighters (everyone, or `only` those) onto their entities as [`write_scene`] places them, but each one placed from
+/// the same pose, size and parent as last time left as it is; and their readouts.
+fn write_fighters_once(
+    world: &mut World,
+    physics: &somnium_physics::world::PhysicsWorld,
+    run: &mut Run,
+    only: Option<&[CombatantId]>,
+) {
+    let list: Vec<(CombatantId, Entity)> = match only {
+        Some(ids) => ids.iter().filter_map(|id| Some((*id, *run.bodies.get(id)?))).collect(),
+        None => run.bodies.iter().map(|(id, e)| (*id, *e)).collect(),
+    };
+    if run.placed.len() > run.bodies.len() {
+        run.placed.retain(|id, _| run.bodies.contains_key(id));
+    }
+    for (id, entity) in list {
+        let Some(c) = run.world.combatant(id) else {
+            continue;
+        };
+        let (at, turn, size) = fighter_pose(physics, run, id, c);
+        let parent = parent_matrix(world, entity);
+        let placed = Placed {
+            entity,
+            at,
+            turn,
+            size,
+            parent,
+        };
+        if run.placed.get(&id) != Some(&placed) {
+            place_fighter(world, entity, parent, at, turn, size);
+            run.placed.insert(id, placed);
+        }
+        read_out(world, &mut run.readouts, entity, c);
+    }
+}
+
+/// One fixed step's scene. Written every step (`batched` false): everything ([`write_scene`]). Batched once a frame
+/// ([`CombatDemo::frame_writes`]): only the protagonist and the mount under him, in case a fixed-step reader looks at
+/// them; the rest waits for [`write_frame_scene`].
+fn write_step_scene(world: &mut World, physics: &somnium_physics::world::PhysicsWorld, run: &mut Run, batched: bool) {
+    if batched {
+        let steed = run.player.and_then(|p| run.world.combatant(p)).and_then(|c| c.mount);
+        let only: Vec<CombatantId> = run.player.into_iter().chain(steed).collect();
+        write_fighters_once(world, physics, run, Some(&only));
+    } else {
+        write_scene(world, physics, run);
+    }
+}
+
+/// One fixed step's skins: written now by the step's `dt`, or (`batched`) the time kept for [`write_frame_skins`].
+fn write_step_skins(world: &mut World, run: &mut Run, dt: f32, batched: bool) {
+    if batched {
+        run.unwritten += dt;
+        run.unwritten_steps += 1;
+    } else {
+        run.skins.write(world, &run.world, &run.walkers, dt);
+    }
+}
+
+/// The frame's scene when its steps left it ([`CombatDemo::frame_writes`]): every fighter where it ended the frame
+/// (those that did not move left alone) and every effect. False when no step waits.
+fn write_frame_scene(world: &mut World, physics: &somnium_physics::world::PhysicsWorld, run: &mut Run) -> bool {
+    if run.unwritten_steps == 0 {
+        return false;
+    }
+    write_fighters_once(world, physics, run, None);
+    write_effects(world, run);
+    true
+}
+
+/// The frame's skins when its steps left them: each body's pose as it ended the frame, its clock on by all the time
+/// the frame's steps took.
+fn write_frame_skins(world: &mut World, run: &mut Run) {
+    if run.unwritten_steps == 0 {
+        return;
+    }
+    let dt = std::mem::take(&mut run.unwritten);
+    run.unwritten_steps = 0;
+    run.skins.write(world, &run.world, &run.walkers, dt);
+}
+
 /// Fighters, ragdolls, missiles, walls, blooms, waves, fire and readouts.
-fn write_scene(ctx: &mut EngineContext, run: &mut Run) {
-    let world = &mut *ctx.world;
+fn write_scene(world: &mut World, physics: &somnium_physics::world::PhysicsWorld, run: &mut Run) {
     // Fighters: world pose into the body's parent space.
     for (id, entity) in &run.bodies {
         let Some(c) = run.world.combatant(*id) else {
             continue;
         };
-        let size =
-            run.dims
-                .get(id)
-                .copied()
-                .unwrap_or(Vec3::new(BODY_WIDTH, BODY_HEIGHT, BODY_WIDTH));
-        let pose = match run
-            .ragdolls
-            .get(id)
-            .and_then(|r| ctx.physics.ragdoll_pose(*r).ok())
-        {
-            Some(parts) => {
-                let (_, r, p) = parts[0].to_scale_rotation_translation();
-                (p, r)
-            }
-            // A mount's long body lies along its slope; people stand upright.
-            None => {
-                let up = run
-                    .walkers
-                    .get(id)
-                    .filter(|w| c.mount_def.is_some() && w.grounded())
-                    .map_or(Vec3::Y, |w| w.ground_normal);
-                (
-                    c.position + up * size.y * 0.5,
-                    Quat::from_rotation_arc(Vec3::Y, up) * yaw(c.facing),
-                )
-            }
-        };
-        let parent = world
-            .get::<Parent>(*entity)
-            .map(|p| p.entity)
-            .filter(|p| *p != Entity::DANGLING)
-            .map_or(Mat4::IDENTITY, |p| world_matrix(world, p));
-        let local = parent.inverse() * Mat4::from_scale_rotation_translation(size, pose.1, pose.0);
-        let (s, r, p) = local.to_scale_rotation_translation();
-        if let Some(t) = world.get_mut::<Transform>(*entity)
-            && (t.translation.distance_squared(p) > 1e-6 || t.rotation.dot(r).abs() < 0.99999)
-        {
-            t.translation = p;
-            t.rotation = r;
-            t.scale = s;
-        }
-        // Live readouts, rounded so regeneration does not write every step.
-        let state = c
-            .herd
-            .filter(|_| c.rider.is_none() && c.alive())
-            .map_or(c.action.label(), |h| h.doing.label());
-        let reading = (
-            (c.vitals.health.current * 10.0).round() as i32,
-            (c.vitals.stamina.current).round() as i32,
-            (c.vitals.mana.current * 10.0).round() as i32,
-            state,
-        );
-        if run.readouts.get(entity) != Some(&reading) {
-            run.readouts.insert(*entity, reading);
-            if let Some(cc) = world.get_mut::<CombatantComponent>(*entity) {
-                cc.health = c.vitals.health.current;
-                cc.stamina = c.vitals.stamina.current;
-                cc.mana = c.vitals.mana.current;
-                cc.state = state.to_string();
-            }
-        }
+        let (at, turn, size) = fighter_pose(physics, run, *id, c);
+        let parent = parent_matrix(world, *entity);
+        place_fighter(world, *entity, parent, at, turn, size);
+        read_out(world, &mut run.readouts, *entity, c);
     }
+    write_effects(world, run);
+}
+
+/// Missiles, walls, blooms, waves and fire on the ground, from the pools.
+fn write_effects(world: &mut World, run: &mut Run) {
     let pools = &mut run.pools;
     // Missiles.
     let flying = run.world.projectiles();
@@ -7739,11 +7893,174 @@ mod tests {
         let other: Vec<u64> = (0..16).filter(|&s| WalkLod::due(s, CombatantId(4), 4)).collect();
         assert_eq!(other, [0, 4, 8, 12], "staggered");
         let mut demo = CombatDemo::default();
-        assert!(!demo.open_world_lod() && demo.walk_lod.is_none(), "off by default");
+        assert!(!demo.open_world_lod() && demo.walk_lod.is_none() && !demo.frame_writes, "off by default");
         demo.set_open_world_lod(true);
         assert_eq!(demo.walk_lod, Some(lod));
+        assert!(demo.frame_writes);
         demo.set_open_world_lod(false);
-        assert!(demo.walk_lod.is_none());
+        assert!(demo.walk_lod.is_none() && !demo.frame_writes);
+    }
+
+    /// SIM_LOD_PLAN step 3: the sandbox fight with two fixed steps a frame, written every step and written once a
+    /// frame. At each frame's end the skinned bodies stand the same and play the same clips, and each fighter's
+    /// entity holds the same pose to within the write's own threshold (it is written when the pose moved past 1 mm
+    /// or about half a degree from what it holds, so either way it holds the pose to within that). A clock that ran
+    /// the whole frame on one clip advanced by the frame's time in both. Clocks are not the same everywhere, by
+    /// design: written once a frame, a clip changing on the frame's second step starts a step later, and a clip
+    /// held for only part of a frame (a flicker between two clips, which written every step restarts the clock
+    /// every frame) is not seen at all.
+    #[test]
+    fn written_once_a_frame_the_fight_ends_each_frame_as_written_every_step() {
+        use crate::skinned_crowd::SkinnedBody;
+        let _jolt = JOLT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let physics = somnium_physics::world::PhysicsWorld::new(Default::default());
+        let make = || {
+            let mut world = World::new();
+            spawn_sandbox(&mut world, &json!({})).expect("preset builds");
+            let fighters: Vec<Entity> = world.iter_with::<CombatantComponent>().map(|(e, _)| e).collect();
+            for e in fighters {
+                world.insert_component(e, SkinnedBody::default()).unwrap();
+            }
+            somnium_core::propagate_transforms(&mut world);
+            let mut run = build(&world).expect("a fight");
+            run.skins = crate::combat_bodies::Skins::new(None);
+            run.skins.dress(&mut world, &run.bodies, &run.world, &mut run.spawned);
+            (world, run)
+        };
+        let (mut every, mut a) = make();
+        let (mut once, mut b) = make();
+        assert_eq!(a.skins.count(), 10);
+        let terrain = boxes(&every, &a);
+        let dt = 1.0 / 60.0;
+        let open = somnium_combat::OpenField;
+        let (mut samples, mut clips_apart, mut moved, mut steady, mut kept_time) = (0, 0, 0, 0, 0);
+        // Each body's clip and clock at the last frame's end (written every step, once a frame), and its clip
+        // after the frame's first step (written every step).
+        let mut last: BTreeMap<CombatantId, ((String, f32), (String, f32))> = BTreeMap::new();
+        let mut halfway: BTreeMap<CombatantId, String> = BTreeMap::new();
+        let skin = |world: &World, run: &Run, id: CombatantId| {
+            let b = world.get::<SkinnedBody>(run.skins.body_of(id).expect("a body")).unwrap();
+            (b.clip.clone(), b.time)
+        };
+        for _ in 0..300 {
+            for step in 0..2 {
+                // One fight, written two ways.
+                a.world.step(dt, &open, a.nav.as_ref());
+                walk(&mut a.world, &mut a.walkers, dt, &terrain);
+                b.world.clone_from(&a.world);
+                b.walkers.clone_from(&a.walkers);
+                for (world, run, batched) in [(&mut every, &mut a, false), (&mut once, &mut b, true)] {
+                    write_step_scene(world, &physics, run, batched);
+                    run.skins.dress(world, &run.bodies, &run.world, &mut run.spawned);
+                    write_step_skins(world, run, dt, batched);
+                }
+                if step == 0 {
+                    halfway = a.bodies.keys().map(|id| (*id, skin(&every, &a, *id).0)).collect();
+                }
+            }
+            assert!(!write_frame_scene(&mut every, &physics, &mut a), "written every step: nothing waits");
+            assert!(write_frame_scene(&mut once, &physics, &mut b), "two steps wait");
+            write_frame_skins(&mut once, &mut b);
+            assert_eq!((b.unwritten, b.unwritten_steps), (0.0, 0));
+            for (id, entity) in &a.bodies {
+                let (ca, cb) = (a.world.combatant(*id).unwrap(), b.world.combatant(*id).unwrap());
+                assert_eq!(ca.position, cb.position, "one fight");
+                // An entity is written when its pose moved past the write's threshold (1 mm, about half a degree)
+                // from what it holds, so each holds its pose to within that: the same, or apart by at most twice it.
+                let (ta, tb) = (every.get::<Transform>(*entity).unwrap(), once.get::<Transform>(*entity).unwrap());
+                assert!(
+                    ta.scale.distance(tb.scale) <= 1e-5
+                        && ta.translation.distance(tb.translation) <= 2e-3
+                        && ta.rotation.dot(tb.rotation).abs() >= 0.99996,
+                    "{}'s entity: {ta:?} against {tb:?}",
+                    ca.name
+                );
+                let body = a.skins.body_of(*id).expect("a body");
+                assert_eq!(Some(body), b.skins.body_of(*id));
+                let (ta, tb) = (every.get::<Transform>(body).unwrap(), once.get::<Transform>(body).unwrap());
+                assert_eq!((ta.translation, ta.rotation), (tb.translation, tb.rotation), "{}'s body", ca.name);
+                let (now_a, now_b) = (skin(&every, &a, *id), skin(&once, &b, *id));
+                samples += 1;
+                moved += usize::from(ca.velocity.length() > 0.5);
+                clips_apart += usize::from(now_a.0 != now_b.0);
+                // One clip the whole frame, in both: each clock went on by the frame's time (a loop at its rate,
+                // the same in both unless the rate itself changed between the two steps).
+                if let Some((was_a, was_b)) = last.get(id)
+                    && was_a.0 == now_a.0
+                    && halfway.get(id) == Some(&now_a.0)
+                    && was_b.0 == now_b.0
+                    && now_a.0 == now_b.0
+                {
+                    steady += 1;
+                    let (went_a, went_b) = (now_a.1 - was_a.1, now_b.1 - was_b.1);
+                    assert!(
+                        (went_a - went_b).abs() <= dt * 1.8 + 1e-4,
+                        "{}: {} on {went_a} against {went_b}",
+                        ca.name,
+                        now_a.0
+                    );
+                    kept_time += usize::from((went_a - went_b).abs() <= 1e-5);
+                }
+                last.insert(*id, (now_a, now_b));
+            }
+        }
+        println!("{samples} samples: {clips_apart} clips apart; {kept_time} of {steady} steady clocks went on alike");
+        assert!(moved > samples / 10, "a fight, not a standing crowd: {moved} of {samples}");
+        assert!(clips_apart * 50 <= samples, "clips apart in {clips_apart} of {samples}");
+        assert!(steady * 2 >= samples, "clips held whole frames: {steady} of {samples}");
+        assert!(kept_time * 10 >= steady * 9, "steady clocks alike: {kept_time} of {steady}");
+    }
+
+    /// SIM_LOD_PLAN step 3: written once a frame, a fighter that did not move keeps its Transform untouched (no
+    /// `get_mut`, so the transforms are not marked changed), where every step's write takes every fighter's; one
+    /// that moved is written, and the protagonist is written at each step.
+    #[test]
+    fn written_once_a_frame_a_still_fighter_is_not_taken() {
+        let _jolt = JOLT.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut world = World::new();
+        let root = world.spawn((Name::new("Scene"), Transform::default(), WorldTransform::identity()));
+        fighter(&mut world, root, "Protagonist", Vec3::ZERO, Vec3::X, CombatantComponent::protagonist());
+        for i in 0..4 {
+            let at = Vec3::new(3.0 * i as f32, 0.0, 5.0);
+            fighter(&mut world, root, &format!("Body {i}"), at, Vec3::Z, CombatantComponent::default());
+        }
+        somnium_core::propagate_transforms(&mut world);
+        let mut run = build(&world).expect("a fight");
+        let physics = somnium_physics::world::PhysicsWorld::new(Default::default());
+        let dt = 1.0 / 60.0;
+        let frame = |world: &mut World, run: &mut Run| {
+            for _ in 0..2 {
+                write_step_scene(world, &physics, run, true);
+                write_step_skins(world, run, dt, true);
+            }
+            write_frame_scene(world, &physics, run);
+            write_frame_skins(world, run);
+        };
+        let taken = |world: &World| world.change_tick(somnium_core::ComponentId::of::<Transform>());
+        frame(&mut world, &mut run);
+        let before = taken(&world);
+        frame(&mut world, &mut run);
+        assert_eq!(taken(&world), before, "nothing moved, nothing taken");
+        // Every step's write takes every fighter's Transform, moved or not.
+        write_scene(&mut world, &physics, &mut run);
+        assert!(taken(&world) >= before + 5);
+        // One moved: its entity, and only its, is written.
+        let mover = run.world.combatants().find(|c| c.name == "Body 2").map(|c| c.id).unwrap();
+        run.world.combatant_mut(mover).unwrap().position += Vec3::X;
+        let entity = run.bodies[&mover];
+        let was = world.get::<Transform>(entity).unwrap().translation;
+        let before = taken(&world);
+        frame(&mut world, &mut run);
+        assert_eq!(taken(&world), before + 1);
+        assert!((world.get::<Transform>(entity).unwrap().translation - was).distance(Vec3::X) < 1e-4);
+        // The protagonist is written at the step, before the frame's write.
+        let hero = run.player.unwrap();
+        run.world.combatant_mut(hero).unwrap().position += Vec3::Z;
+        write_step_scene(&mut world, &physics, &mut run, true);
+        let at = world.get::<Transform>(run.bodies[&hero]).unwrap().translation;
+        assert!((at.z - 1.0).abs() < 1e-4, "{at}");
+        write_frame_scene(&mut world, &physics, &mut run);
+        write_frame_skins(&mut world, &mut run);
     }
 
     /// Where the scene baked no navmesh, a woken camp gets a patch of ground
