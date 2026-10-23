@@ -517,6 +517,9 @@ pub struct SomniumRenderer {
     pub clipmaps: Vec<crate::terrain::clipmap::TerrainClipmap>,
     /// Set only inside [`Self::create_streamed_terrain_with_asset_dir`].
     streamed_terrain_distance: f32,
+    /// How many times [`Self::reset_scene_gpu`] has dropped every terrain. A caller that keeps terrain ids across
+    /// frames (the cell streamer's retired slots) compares this to know its ids are gone and must not be retired.
+    pub scene_resets: u64,
     /// `SOMNIUM_RENDER_UNPRESENTED`: when the swap chain gives no image (a screensaver over the window, a locked
     /// session), draw the frame into `unpresented_target` instead of dropping it, so captures and tours finish. Off,
     /// a frame without an image is skipped as always. Frame generation stays off while it is set.
@@ -1472,6 +1475,7 @@ impl SomniumRenderer {
             terrains: Vec::new(),
             clipmaps: Vec::new(),
             streamed_terrain_distance: 0.0,
+            scene_resets: 0,
             unpresented: std::env::var_os("SOMNIUM_RENDER_UNPRESENTED").is_some(),
             unpresented_target: None,
             unpresented_wait: 0,
@@ -3698,6 +3702,21 @@ impl SomniumRenderer {
         self.underwater_body = None;
         self.underwater_pass.invalidate();
         self.clear_gizmo();
+        self.scene_resets = self.scene_resets.wrapping_add(1);
+    }
+
+    /// Put terrain `terrain_id` aside for reuse ([`crate::terrain::TerrainData::retire`]): its chunk spans and their
+    /// ray-tracing BLAS go, and its splat maps are parked as a far streamed window's are. The id, its bindless slots
+    /// and its material entry stay, for [`crate::terrain::TerrainData::adopt_sidecar`] to fill again. Does nothing
+    /// for an id that does not exist.
+    pub fn retire_terrain(&mut self, ctx: &RenderContext, terrain_id: u32) {
+        let Some(terrain) = self.terrains.get_mut(terrain_id as usize) else {
+            return;
+        };
+        for offset in terrain.retire(&mut self.geometry) {
+            self.raytrace_pass.unregister_mesh(offset);
+        }
+        set_splat_resident(terrain, &mut self.texture_pool, &mut self.global_pool, &ctx.device, false);
     }
 
     /// Mutable access to a terrain (sculpting, painting, raycasts).
@@ -4851,31 +4870,10 @@ impl SomniumRenderer {
             for offset in terrain.stream_geometry(&mut self.geometry, local_cam) {
                 self.raytrace_pass.unregister_mesh(offset);
             }
-            // WS1-18: a streamed window with no geometry draws nothing, so its splat maps (~134 MB at 2048^2 x 8)
-            // go too, and come back, re-uploaded from the CPU weights, as its first chunks return. The bindless
-            // slots keep their numbers and point at the dummy image meanwhile.
+            // WS1-18: a streamed window with no geometry gives its splat maps back until its chunks return.
             if terrain.geometry_stream_distance > 0.0 {
                 let resident = terrain.chunks.iter().any(|c| c.vertex_offset != crate::terrain::UNALLOCATED);
-                if resident == terrain.splatmap.is_parked() {
-                    if resident {
-                        terrain.splatmap.unpark(&ctx.device);
-                    } else {
-                        terrain.splatmap.park(&ctx.device);
-                    }
-                    for (i, &slot) in terrain.texture_ids.splat_maps.iter().enumerate() {
-                        let Ok(slot) = usize::try_from(slot) else { continue };
-                        let view = if resident {
-                            terrain.splatmap.views[i].clone()
-                        } else {
-                            self.texture_pool.dummy_view.clone()
-                        };
-                        if let Some(owned) = self.texture_pool.views.get_mut(slot) {
-                            *owned = view.clone();
-                        }
-                        self.global_pool.set_slot(slot, view);
-                    }
-                    self.global_pool.update_textures(&ctx.device);
-                }
+                set_splat_resident(terrain, &mut self.texture_pool, &mut self.global_pool, &ctx.device, resident);
             }
             terrain.select_lods(local_cam, &shoreline_regions);
             self.rebuilt_chunks.clear();
@@ -7573,6 +7571,36 @@ fn cpu_frustum_env_off() -> bool {
 
 fn cascade_cull_env_off() -> bool {
     std::env::var("SOMNIUM_CASCADE_CULL").as_deref() == Ok("0")
+}
+
+/// WS1-18: a streamed window with no geometry draws nothing, so its splat maps (~134 MB at 2048^2 x 8) go too, and
+/// come back, re-uploaded from the CPU weights, as its first chunks return. The bindless slots keep their numbers and
+/// point at the dummy image meanwhile. Does nothing when the splat is already where `resident` wants it; otherwise
+/// one bind-group rebuild.
+fn set_splat_resident(
+    terrain: &mut crate::terrain::TerrainData,
+    texture_pool: &mut TexturePool,
+    global_pool: &mut GlobalResourcePool,
+    device: &wgpu::Device,
+    resident: bool,
+) {
+    if resident != terrain.splatmap.is_parked() {
+        return;
+    }
+    if resident {
+        terrain.splatmap.unpark(device);
+    } else {
+        terrain.splatmap.park(device);
+    }
+    for (i, &slot) in terrain.texture_ids.splat_maps.iter().enumerate() {
+        let Ok(slot) = usize::try_from(slot) else { continue };
+        let view = if resident { terrain.splatmap.views[i].clone() } else { texture_pool.dummy_view.clone() };
+        if let Some(owned) = texture_pool.views.get_mut(slot) {
+            *owned = view.clone();
+        }
+        global_pool.set_slot(slot, view);
+    }
+    global_pool.update_textures(device);
 }
 
 /// Frames counted by the clipmap trace, so a log line can be placed in time.
