@@ -48,7 +48,7 @@ In the project foliage palette (`foliage.palette.json`), give a kind a `"ground_
 - "where the view looks" is the ground under the middle of the screen: an isometric camera stands 60 m or more behind what it shows, so cover grown round the camera itself would leave the far half of the frame bare. A view looking level keeps the camera's own place;
 - it is made per 16 m cell from the kind's brush rules: its splat layer and minimum weight, its slope limit, scale and tilt;
 - `"align_to_ground": true` tilts each instance to the slope under it, for patches of grass that should neither float nor sink on a hillside; without it they stand upright, as flowers do;
-- the same cell always gets the same tufts;
+- the same cell always gets the same tufts. A streamed tile's tufts come from its place in the world, not from the renderer slot it lands in, so a tile you come back to grows the same grass;
 - a terrain edit regenerates them.
 
 Use it for grass and flowers. They only matter near the camera, and painting them over a whole open world would fill the instance budget.

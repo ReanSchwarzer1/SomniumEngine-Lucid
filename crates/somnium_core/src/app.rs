@@ -8957,6 +8957,7 @@ impl<G: GameApp> Engine<G> {
             f32,
             somnium_ecs::curve::Curve,
             Option<glam::Vec4>,
+            Option<u64>,
         )> = self
             .world
             .entities_with::<TerrainComponent>()
@@ -8973,6 +8974,12 @@ impl<G: GameApp> Engine<G> {
                     .world
                     .get::<Transform>(e)
                     .map_or(glam::Mat4::IDENTITY, Transform::to_matrix);
+                // Ground cover's seed: a streamed tile's place in the world, since its renderer slot changes from
+                // visit to visit; any other terrain keeps its id (`None`), as always.
+                let seed_key = self
+                    .world
+                    .get::<crate::cell_streaming::Streamed>(e)
+                    .map(|_| crate::ground_cover::streamed_seed_key(model.w_axis.truncate()));
                 Some((
                     tc.terrain_id,
                     model,
@@ -8985,6 +8992,7 @@ impl<G: GameApp> Engine<G> {
                         .get::<crate::cell_streaming::TerrainStreamingComponent>(e)
                         .map(|s| s.own_area)
                         .filter(|a| *a != glam::Vec4::ZERO),
+                    seed_key,
                 ))
             })
             .collect();
@@ -9006,6 +9014,7 @@ impl<G: GameApp> Engine<G> {
             impostor_distance,
             lod_falloff,
             own_area,
+            seed_key,
         ) in terrains
         {
             // Which palette entries this terrain actually uses, so nothing is
@@ -9121,7 +9130,12 @@ impl<G: GameApp> Engine<G> {
                 t.world_height_at(camera_local.x, camera_local.z),
                 400.0,
             );
-            self.ground_cover.update(terrain_id, t, &self.project_foliage, focus_local, own_area);
+            match seed_key {
+                Some(key) => {
+                    self.ground_cover.update_seeded(terrain_id, key, t, &self.project_foliage, focus_local, own_area);
+                }
+                None => self.ground_cover.update(terrain_id, t, &self.project_foliage, focus_local, own_area),
+            }
             self.foliage_batch.clear();
             let painted = self.foliage_visit.iter().map(|&index| (&t.painted_foliage[index], None));
             let cover = self.ground_cover.instances(terrain_id).iter().map(|c| (&c.instance, Some(c.rotation)));
