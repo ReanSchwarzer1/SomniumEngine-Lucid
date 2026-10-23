@@ -24,11 +24,16 @@
 
 use glam::Vec3;
 
+/// How many foliage kinds a palette can name: ids `0..FOLIAGE_KINDS`, the engine's 25 built-in kinds and up to
+/// 8,167 a project adds. A sidecar or palette naming a kind at or past it is refused, and per-kind tables are this
+/// long. The kind never reaches the GPU; a foliage batch id gives it 16 bits.
+pub const FOLIAGE_KINDS: usize = 8192;
+
 /// One painted instance.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PaintedFoliage {
-    /// Index into the foliage palette — which mesh this is.
-    pub kind: u8,
+    /// Stable foliage palette id, below `FOLIAGE_KINDS` — which mesh this is.
+    pub kind: u16,
     /// Terrain-local position, already on the ground.
     pub position: Vec3,
     /// Rotation about Y, radians.
@@ -53,7 +58,7 @@ pub struct PaintedFoliage {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct StoredInstance {
-    kind: u8,
+    kind: u16,
     position: [f32; 3],
     yaw: f32,
     #[serde(default)]
@@ -84,6 +89,9 @@ fn decode_instances(bytes: &[u8]) -> Result<Vec<PaintedFoliage>, String> {
                 || i.scale <= 0.0
             {
                 return Err("foliage instance needs finite coordinates and positive scale".into());
+            }
+            if usize::from(i.kind) >= FOLIAGE_KINDS {
+                return Err(format!("foliage kind {} is past the limit of {FOLIAGE_KINDS} kinds", i.kind));
             }
             Ok(PaintedFoliage {
                 kind: i.kind,
@@ -166,13 +174,55 @@ mod persistence_tests {
             .is_err()
         );
     }
+
+    /// A kind past a byte survives the whole trip, sidecar file and all, and the limit is refused before writing.
+    #[test]
+    fn kinds_past_a_byte_round_trip_and_the_limit_is_refused() {
+        let top = (FOLIAGE_KINDS - 1) as u16;
+        let wide: Vec<PaintedFoliage> = [0, 44, 255, 256, 300, 999, top]
+            .into_iter()
+            .map(|kind| PaintedFoliage { kind, position: Vec3::splat(f32::from(kind)), yaw: 0.5, tilt: 0.0, scale: 1.0 })
+            .collect();
+        let dir = std::env::temp_dir().join(format!("foliage_kinds_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wide.terrain0.bin");
+        let path = path.to_str().unwrap();
+        save_instances(path, &wide).unwrap();
+        let text = std::fs::read_to_string(format!("{path}.foliage.json")).unwrap();
+        assert!(text.contains(r#""kind":300,"#) && text.contains(&format!(r#""kind":{top},"#)), "{text}");
+        assert_eq!(load_instances(path).unwrap(), wide);
+        let past = PaintedFoliage { kind: FOLIAGE_KINDS as u16, ..wide[0] };
+        assert!(save_instances(path, &[past]).is_err(), "refused, not written");
+        assert_eq!(load_instances(path).unwrap(), wide, "the old file is left as it was");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let error = decode_instances(
+            format!(r#"{{"version":1,"instances":[{{"kind":{FOLIAGE_KINDS},"position":[0,0,0],"yaw":0,"scale":1}}]}}"#)
+                .as_bytes(),
+        )
+        .unwrap_err();
+        assert!(error.contains(&format!("kind {FOLIAGE_KINDS}")), "{error}");
+        // A version-1 sidecar from before, with byte kinds, reads exactly as it did.
+        let old = br#"{"version":1,"instances":[{"kind":0,"position":[1,2,3],"yaw":0.5,"scale":1},{"kind":255,"position":[4,5,6],"yaw":0,"tilt":0.25,"scale":2}]}"#;
+        let decoded = decode_instances(old).unwrap();
+        assert_eq!(
+            decoded,
+            [
+                PaintedFoliage { kind: 0, position: Vec3::new(1.0, 2.0, 3.0), yaw: 0.5, tilt: 0.0, scale: 1.0 },
+                PaintedFoliage { kind: 255, position: Vec3::new(4.0, 5.0, 6.0), yaw: 0.0, tilt: 0.25, scale: 2.0 },
+            ]
+        );
+        assert!(decode_instances(br#"{"version":1,"instances":[{"kind":-1,"position":[0,0,0],"yaw":0,"scale":1}]}"#).is_err());
+        assert!(decode_instances(br#"{"version":1,"instances":[{"kind":3.0,"position":[0,0,0],"yaw":0,"scale":1}]}"#).is_err());
+        assert_eq!(std::mem::size_of::<PaintedFoliage>(), 28, "no bigger per instance than with a byte kind");
+    }
 }
 
 /// Brush settings for a paint stroke.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FoliageBrush {
     /// Palette entry being painted.
-    pub kind: u8,
+    pub kind: u16,
     /// Brush radius in world units.
     pub radius: f32,
     /// Target instances per square metre inside the brush.
@@ -406,7 +456,7 @@ pub fn erase(
     out: &mut Vec<PaintedFoliage>,
     center: [f32; 2],
     radius: f32,
-    kind: Option<u8>,
+    kind: Option<u16>,
 ) -> usize {
     if radius <= 0.0 {
         return 0;

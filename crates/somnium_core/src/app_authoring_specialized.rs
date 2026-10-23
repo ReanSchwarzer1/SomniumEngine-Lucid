@@ -184,9 +184,9 @@ impl<G: GameApp> Engine<G> {
                 }
                 let kind = p["kind"]
                     .as_u64()
-                    .filter(|v| *v <= u8::MAX as u64 && self.foliage_kind_exists(*v as u8))
+                    .filter(|v| *v <= u64::from(u16::MAX) && self.foliage_kind_exists(*v as u16))
                     .ok_or("kind must be a foliage palette index")?
-                    as u8;
+                    as u16;
                 if self.foliage_brush.kind != kind {
                     self.foliage_brush.kind = kind;
                     self.apply_foliage_palette_defaults();

@@ -1,6 +1,7 @@
-//! Project-owned foliage kinds. Stable IDs past the built-in palette's (25..255; projects began at 128 and those
-//! ids keep their meaning) leave legacy palette IDs intact.
+//! Project-owned foliage kinds. Stable IDs past the built-in palette's (25..FOLIAGE_KINDS-1, so 25..8191; projects
+//! began at 128, then 25..127, and those ids keep their meaning) leave legacy palette IDs intact.
 use serde::Deserialize;
+pub(crate) use somnium_renderer::terrain::foliage_paint::FOLIAGE_KINDS;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
@@ -44,7 +45,7 @@ pub(crate) struct ProjectLod {
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProjectEntry {
-    pub kind: u8,
+    pub kind: u16,
     pub name: String,
     pub source: PathBuf,
     /// Flattened renderable-node ordinals, identical to ImportedMesh.node.
@@ -113,17 +114,26 @@ struct Document {
 
 /// Whether a foliage kind is a project's (its palette file) rather than one of the built-in `FOLIAGE_PALETTE`.
 #[must_use]
-pub(crate) fn is_project_kind(kind: u8) -> bool {
+pub(crate) fn is_project_kind(kind: u16) -> bool {
     usize::from(kind) >= crate::app::FOLIAGE_PALETTE.len()
 }
 
-fn parse(bytes: &[u8]) -> Result<BTreeMap<u8, ProjectEntry>, String> {
+fn parse(bytes: &[u8]) -> Result<BTreeMap<u16, ProjectEntry>, String> {
     let document: Document = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
-    if document.version != 1 || document.entries.len() > 256 - crate::app::FOLIAGE_PALETTE.len() {
-        return Err("unsupported or oversized foliage palette".into());
+    let most = FOLIAGE_KINDS - crate::app::FOLIAGE_PALETTE.len();
+    if document.version != 1 || document.entries.len() > most {
+        return Err(format!("unsupported or oversized foliage palette (version 1, at most {most} entries)"));
     }
     let mut entries = BTreeMap::new();
     for entry in document.entries {
+        if usize::from(entry.kind) >= FOLIAGE_KINDS {
+            return Err(format!(
+                "foliage kind {} is past the limit: project kinds are {}..{}",
+                entry.kind,
+                crate::app::FOLIAGE_PALETTE.len(),
+                FOLIAGE_KINDS - 1
+            ));
+        }
         // A kind must draw somewhere; a shadow distance of 0 is a kind that never casts (grass, crops).
         if entry.draw_distance.is_some_and(|d| !d.is_finite() || d <= 0.0)
             || entry.shadow_distance.is_some_and(|d| !d.is_finite() || d < 0.0)
@@ -198,7 +208,7 @@ fn parse(bytes: &[u8]) -> Result<BTreeMap<u8, ProjectEntry>, String> {
 
 pub(crate) fn load(
     config: &crate::config::EngineConfig,
-) -> Result<BTreeMap<u8, ProjectEntry>, String> {
+) -> Result<BTreeMap<u16, ProjectEntry>, String> {
     let Some(root) = config.project_root.as_deref() else {
         return Ok(BTreeMap::new());
     };
@@ -299,11 +309,46 @@ mod tests {
 
     #[test]
     fn project_kinds_start_past_the_built_in_palette() {
-        let first = crate::app::FOLIAGE_PALETTE.len() as u8;
-        let entry = |kind: u8| format!(r#"{{"version":1,"entries":[{{"kind":{kind},"name":"k","source":"x","primitives":[0]}}]}}"#);
+        let first = crate::app::FOLIAGE_PALETTE.len() as u16;
+        let entry = |kind: u16| format!(r#"{{"version":1,"entries":[{{"kind":{kind},"name":"k","source":"x","primitives":[0]}}]}}"#);
         assert!(parse(entry(first).as_bytes()).is_ok(), "the first free id");
         assert!(parse(entry(127).as_bytes()).is_ok());
         assert!(parse(entry(first - 1).as_bytes()).is_err(), "a built-in kind");
         assert!(is_project_kind(128) && is_project_kind(255) && !is_project_kind(0));
+    }
+
+    /// Ids past a byte are kept whole: each is its own entry, found by its own id, up to the limit and not past it.
+    #[test]
+    fn project_kinds_run_past_a_byte_to_the_limit() {
+        let top = (FOLIAGE_KINDS - 1) as u16;
+        let named = |kinds: &[u16]| {
+            let entries: Vec<_> = kinds
+                .iter()
+                .map(|k| serde_json::json!({"kind":k,"name":format!("plant {k}"),"source":"x","primitives":[0]}))
+                .collect();
+            serde_json::to_vec(&serde_json::json!({"version":1,"entries":entries})).unwrap()
+        };
+        let parsed = parse(&named(&[44, 255, 256, 300, 459, 556, top])).unwrap();
+        assert_eq!(parsed.keys().copied().collect::<Vec<_>>(), [44, 255, 256, 300, 459, 556, top]);
+        for k in [44, 256, 300, 556, top] {
+            assert_eq!(parsed[&k].name, format!("plant {k}"), "kind {k} found as itself");
+        }
+        assert!(is_project_kind(300) && is_project_kind(top));
+        assert!(parse(&named(&[300, 44 + 256])).is_err(), "300 twice is a duplicate");
+        let past = parse(&named(&[FOLIAGE_KINDS as u16])).err().unwrap();
+        assert!(past.contains(&format!("kind {FOLIAGE_KINDS}")), "{past}");
+        assert!(parse(&named(&[u16::MAX])).is_err());
+        let big = br#"{"version":1,"entries":[{"kind":65536,"name":"k","source":"x","primitives":[0]}]}"#;
+        assert!(parse(big).is_err(), "past u16");
+
+        // As many entries as there are project ids, and no more.
+        let first = crate::app::FOLIAGE_PALETTE.len() as u16;
+        let every: Vec<u16> = (first..=top).collect();
+        assert!(every.len() >= 4096);
+        assert_eq!(parse(&named(&every)).unwrap().len(), every.len());
+        let mut over = every.clone();
+        over.push(top);
+        let error = parse(&named(&over)).err().unwrap();
+        assert!(error.contains(&format!("at most {} entries", every.len())), "{error}");
     }
 }

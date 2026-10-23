@@ -20,7 +20,7 @@ pub(crate) struct FoliageGrid {
     order: Vec<u32>,
     starts: Vec<u32>,
     /// The kinds painted, sorted, each once.
-    pub kinds: Vec<u8>,
+    pub kinds: Vec<u16>,
 }
 
 fn ends(instances: &[PaintedFoliage]) -> [u32; 8] {
@@ -39,7 +39,7 @@ impl FoliageGrid {
             return;
         }
         self.key = Some(key);
-        let mut kinds: Vec<u8> = instances.iter().map(|p| p.kind).collect();
+        let mut kinds: Vec<u16> = instances.iter().map(|p| p.kind).collect();
         kinds.sort_unstable();
         kinds.dedup();
         self.kinds = kinds;
@@ -119,7 +119,7 @@ mod tests {
         };
         (0..5000)
             .map(|i| PaintedFoliage {
-                kind: (128 + i % 7) as u8,
+                kind: [128, 129, 130, 255, 256, 300, 556][i % 7],
                 position: Vec3::new(rand() * 1500.0 - 300.0, 20.0, rand() * 900.0 + 40.0),
                 yaw: 0.0,
                 tilt: 0.0,
@@ -133,7 +133,7 @@ mod tests {
         let instances = field();
         let mut grid = FoliageGrid::default();
         grid.refresh(1, &instances);
-        assert_eq!(grid.kinds, (128..135).collect::<Vec<u8>>());
+        assert_eq!(grid.kinds, [128, 129, 130, 255, 256, 300, 556], "kinds past a byte kept whole");
         for (centre, reach) in [([200.0, 400.0], 60.0), ([-290.0, 50.0], 320.0), ([5000.0, 5000.0], 50.0), ([0.0, 0.0], 2000.0)] {
             let mut seen = vec![false; instances.len()];
             grid.visit(centre, reach, |i| seen[i] = true);

@@ -60,7 +60,7 @@ fn limit(sq: f32) -> f32 {
 
 /// The parts one copy of `kind` draws and between which horizontal distances, the per-instance path's choice
 /// written as distance bands: `near` (a LOD mesh from its swap) and `far` (`0` for no limit).
-pub(crate) fn kind_parts(kind: u8, near_mesh: &[Piece], lod_mesh: Option<&[Piece]>, d: KindDistances) -> Vec<BatchPart> {
+pub(crate) fn kind_parts(kind: u16, near_mesh: &[Piece], lod_mesh: Option<&[Piece]>, d: KindDistances) -> Vec<BatchPart> {
     let reach = limit(d.cull_sq);
     let shadow_far = limit(d.shadow_sq);
     let casts = d.shadow_sq > 0.0;
@@ -108,7 +108,7 @@ pub(crate) fn kind_parts(kind: u8, near_mesh: &[Piece], lod_mesh: Option<&[Piece
 /// Per part of `mesh`, the distance past which the legacy LOD (a built-in kind) drops it, 0 if never: past
 /// `lod_distance` the leaves go (the heaviest part, without leaves), past `impostor_distance` everything but the
 /// solid parts (the cheapest, without leaves). Read off `App::submit_foliage`'s `keep_only`/`drop_heavy`.
-fn legacy_limits(kind: u8, mesh: &[Piece], d: KindDistances) -> Vec<f32> {
+fn legacy_limits(kind: u16, mesh: &[Piece], d: KindDistances) -> Vec<f32> {
     if crate::foliage_palette::is_project_kind(kind) || mesh.len() < 2 {
         return vec![0.0; mesh.len()];
     }
@@ -143,7 +143,7 @@ struct Cells {
     min: [f32; 2],
     dims: [i32; 2],
     /// Per cell, `(kind, start, end)` into `order`.
-    cells: Vec<Vec<(u8, u32, u32)>>,
+    cells: Vec<Vec<(u16, u32, u32)>>,
     order: Vec<u32>,
 }
 
@@ -207,7 +207,7 @@ pub(crate) struct Changes {
 pub(crate) struct FoliageBatches {
     cells: std::collections::HashMap<u32, Cells>,
     /// `(terrain, cell, kind)` -> (signature, frame last needed, copies).
-    live: std::collections::HashMap<(u32, u32, u8), (u64, u64, u32)>,
+    live: std::collections::HashMap<(u32, u32, u16), (u64, u64, u32)>,
     frame: u64,
     seen: Vec<u32>,
     pub changes: Changes,
@@ -215,7 +215,7 @@ pub(crate) struct FoliageBatches {
 
 /// The namespace byte, 16 bits of terrain, 24 of cell (a 131 km square of 32 m cells) and 16 of kind, so every
 /// kind a palette can hold has its own batch in a cell. Runtime only: never saved.
-fn batch_id(terrain: u32, cell: u32, kind: u8) -> u64 {
+fn batch_id(terrain: u32, cell: u32, kind: u16) -> u64 {
     ID_SPACE | (u64::from(terrain & 0xFFFF) << 40) | (u64::from(cell & 0xFF_FFFF) << 16) | u64::from(kind)
 }
 
@@ -232,8 +232,8 @@ impl FoliageBatches {
     }
 
     /// One terrain's frame: set the batches of cells newly within reach (or whose foliage, parts or distances
-    /// changed), and keep the rest live. `parts[kind]` is `None` while a kind's mesh is not loaded. Returns the
-    /// copies its live batches hold.
+    /// changed), and keep the rest live. `parts[kind]` is `None` while a kind's mesh is not loaded, and a kind past
+    /// its end is not drawn. Returns the copies its live batches hold.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn terrain(
         &mut self,
@@ -242,14 +242,14 @@ impl FoliageBatches {
         instances: &[PaintedFoliage],
         model: Mat4,
         camera_local: glam::Vec3,
-        parts: &[Option<Vec<BatchPart>>; 256],
+        parts: &[Option<Vec<BatchPart>>],
     ) -> u32 {
         self.seen.push(terrain);
         let cells = self.cells.entry(terrain).or_default();
         cells.refresh(revision, instances);
         // Per kind: its reach and the signature its batches are built to (a new one rebuilds them).
-        let mut reach = [f32::NAN; 256];
-        let mut signature = [0u64; 256];
+        let mut reach = vec![f32::NAN; parts.len()];
+        let mut signature = vec![0u64; parts.len()];
         let mut farthest = 0.0f32;
         for (kind, list) in parts.iter().enumerate() {
             let Some(list) = list else { continue };
@@ -296,7 +296,7 @@ impl FoliageBatches {
                 let lo = Vec2::new(cells.min[0] + cx as f32 * CELL, cells.min[1] + cz as f32 * CELL);
                 let gap = (lo - centre).max(centre - (lo + Vec2::splat(CELL))).max(Vec2::ZERO).length();
                 for &(kind, start, end) in &cells.cells[cell as usize] {
-                    let r = reach[kind as usize];
+                    let r = reach.get(usize::from(kind)).copied().unwrap_or(f32::NAN);
                     if r.is_nan() || gap > r + KEEP {
                         continue;
                     }
@@ -415,12 +415,51 @@ mod tests {
         assert_eq!(fields(batch_id(7, 0xAB_CDEF, 200)), (0xF0, 7, 0xAB_CDEF, 200));
         assert_eq!(fields(batch_id(0x1_0007, 0, 0)), (0xF0, 7, 0, 0), "terrain bits never reach the namespace");
         assert_ne!(batch_id(1, 1, 0), batch_id(1, 0, 0));
+        let top = (crate::foliage_palette::FOLIAGE_KINDS - 1) as u16;
+        assert_eq!(fields(batch_id(7, 9, top)), (0xF0, 7, 9, u64::from(top)));
+        assert_ne!(batch_id(1, 5, 44), batch_id(1, 5, 300), "a kind past a byte is not its low byte");
+        assert_ne!(batch_id(1, 5, 44 + 256), batch_id(1, 6, 44), "nor does it spill into the cell");
+    }
+
+    /// Two kinds that share a low byte, painted on the same ground, are two batches, each with its own parts.
+    #[test]
+    fn kinds_past_a_byte_in_one_cell_are_their_own_batches() {
+        let instances: Vec<PaintedFoliage> = (0..8)
+            .map(|i| PaintedFoliage {
+                kind: [44, 300][i % 2],
+                position: glam::Vec3::new(i as f32, 0.0, 1.0),
+                yaw: 0.0,
+                tilt: 0.0,
+                scale: 1.0,
+            })
+            .collect();
+        let mut parts = vec![None; 301];
+        parts[44] = Some(kind_parts(44, &[piece(30, false)], None, distances(100.0, 0.0)));
+        parts[300] = Some(kind_parts(300, &[piece(60, false)], None, distances(100.0, 0.0)));
+        let mut batches = FoliageBatches::default();
+        batches.begin_frame();
+        let copies = batches.terrain(3, 1, &instances, Mat4::IDENTITY, glam::Vec3::ZERO, &parts);
+        batches.end_frame();
+        assert_eq!(copies, 8);
+        let mut set: Vec<(u64, u32, usize)> = batches
+            .changes
+            .set
+            .iter()
+            .map(|(id, b)| (id & 0xFFFF, b.parts[0].index_count, b.placements.len()))
+            .collect();
+        set.sort_unstable();
+        assert_eq!(set, [(44, 30, 4), (300, 60, 4)]);
+        // A kind past the parts it was given is not drawn, rather than read out of bounds.
+        batches.begin_frame();
+        batches.terrain(3, 2, &instances, Mat4::IDENTITY, glam::Vec3::ZERO, &parts[..45]);
+        batches.end_frame();
+        assert_eq!(batches.changes.set.iter().map(|(id, _)| id & 0xFFFF).collect::<Vec<_>>(), [44]);
     }
 
     fn field() -> Vec<PaintedFoliage> {
         (0..200)
             .map(|i| PaintedFoliage {
-                kind: 130 + (i % 2) as u8,
+                kind: [130, 131][i % 2],
                 position: glam::Vec3::new((i % 20) as f32 * 20.0, 0.0, (i / 20) as f32 * 20.0),
                 yaw: 0.0,
                 tilt: 0.0,
@@ -429,8 +468,8 @@ mod tests {
             .collect()
     }
 
-    fn parts_for(reach_a: f32, reach_b: f32) -> [Option<Vec<BatchPart>>; 256] {
-        let mut parts: [Option<Vec<BatchPart>>; 256] = std::array::from_fn(|_| None);
+    fn parts_for(reach_a: f32, reach_b: f32) -> Vec<Option<Vec<BatchPart>>> {
+        let mut parts = vec![None; 256];
         parts[130] = Some(kind_parts(130, &[piece(30, false)], None, distances(reach_a, 0.0)));
         parts[131] = Some(kind_parts(131, &[piece(60, false)], None, distances(reach_b, 0.0)));
         parts
