@@ -1,10 +1,10 @@
 // Project palette adapter: native terrain instances share one upload per source.
 impl<G: GameApp> Engine<G> {
-    fn foliage_kind_exists(&self, kind: u8) -> bool {
+    fn foliage_kind_exists(&self, kind: u16) -> bool {
         (kind as usize) < FOLIAGE_PALETTE.len() || self.project_foliage.contains_key(&kind)
     }
 
-    fn foliage_kind_name(&self, kind: u8) -> &str {
+    fn foliage_kind_name(&self, kind: u16) -> &str {
         self.project_foliage
             .get(&kind)
             .map(|e| e.name.as_str())
@@ -12,11 +12,11 @@ impl<G: GameApp> Engine<G> {
             .unwrap_or("Unknown foliage")
     }
 
-    fn foliage_palette_labels(&self) -> Vec<(u8, String)> {
+    fn foliage_palette_labels(&self) -> Vec<(u16, String)> {
         FOLIAGE_PALETTE
             .iter()
             .enumerate()
-            .map(|(i, e)| (i as u8, e.name.to_owned()))
+            .map(|(i, e)| (i as u16, e.name.to_owned()))
             .chain(
                 self.project_foliage
                     .iter()
@@ -25,9 +25,10 @@ impl<G: GameApp> Engine<G> {
             .collect()
     }
 
-    fn ensure_project_palette_mesh(&mut self, kind: u8) {
+    fn ensure_project_palette_mesh(&mut self, kind: u16) {
         let index = kind as usize;
-        if self.foliage_meshes[index].is_some() || self.foliage_failed[index] {
+        // Past every table: no palette or sidecar can name it (both refuse it), so it is drawn as unavailable.
+        if index >= FOLIAGE_KINDS || self.foliage_meshes[index].is_some() || self.foliage_failed[index] {
             return;
         }
         let Some(entry) = self.project_foliage.get(&kind).cloned() else {

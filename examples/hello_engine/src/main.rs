@@ -1536,7 +1536,7 @@ impl GameApp for HelloGame {
                                 // Ground cover over a patch in front of the camera,
                                 // then a few trees standing in it.
                                 for (kind, radius, density, single, count) in
-                                    [(0u8, 26.0f32, 2.5f32, false, 12), (1u8, 1.0, 1.0, true, 6)]
+                                    [(0u16, 26.0f32, 2.5f32, false, 12), (1u16, 1.0, 1.0, true, 6)]
                                 {
                                     let brush = FoliageBrush {
                                         kind,

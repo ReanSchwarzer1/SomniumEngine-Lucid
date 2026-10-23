@@ -77,7 +77,7 @@ struct TerrainCover {
     seed: u64,
     /// The area cover grows in (`TerrainStreaming::own_area`), if not the whole terrain.
     area: Option<glam::Vec4>,
-    cells: HashMap<(u8, i32, i32), Vec<Cover>>,
+    cells: HashMap<(u16, i32, i32), Vec<Cover>>,
     /// Every live cell's instances, rebuilt when the set of cells changes.
     flat: Vec<Cover>,
 }
@@ -104,7 +104,7 @@ impl GroundCover {
         &mut self,
         terrain_id: u32,
         terrain: &impl Ground,
-        palette: &std::collections::BTreeMap<u8, ProjectEntry>,
+        palette: &std::collections::BTreeMap<u16, ProjectEntry>,
         camera: Vec3,
         area: Option<glam::Vec4>,
     ) {
@@ -119,11 +119,11 @@ impl GroundCover {
         terrain_id: u32,
         seed_key: u64,
         terrain: &impl Ground,
-        palette: &std::collections::BTreeMap<u8, ProjectEntry>,
+        palette: &std::collections::BTreeMap<u16, ProjectEntry>,
         camera: Vec3,
         area: Option<glam::Vec4>,
     ) {
-        let kinds: Vec<(u8, &ProjectEntry, f32, f32)> = palette
+        let kinds: Vec<(u16, &ProjectEntry, f32, f32)> = palette
             .iter()
             .filter_map(|(kind, entry)| entry.ground_cover.as_ref().map(|g| (*kind, entry, g.density, g.radius)))
             .collect();
@@ -200,10 +200,13 @@ fn unit(h: u64) -> f32 {
 }
 
 /// A cell's seed, from the terrain's seed key, the kind and the cell. A key below 2^24 (every renderer terrain id)
-/// hashes exactly as the id always did; the bits of a larger one (a streamed tile's place) that the shift drops are
-/// mixed in after, so no two places share a seed for want of them.
-fn cell_seed(seed_key: u64, kind: u8, cx: i32, cz: i32) -> u64 {
+/// with a kind under 256 hashes exactly as the id and byte kind always did. A wider kind's high bits would overlap
+/// the key's at bit 40 (key t with kind k + 256 would grow key t ^ 1's kind k), so it is mixed in once more; and the
+/// bits of a larger key (a streamed tile's place) that the shift drops are mixed in after, so no two places share a
+/// seed for want of them.
+fn cell_seed(seed_key: u64, kind: u16, cx: i32, cz: i32) -> u64 {
     let seed = mix(seed_key << 40 ^ u64::from(kind) << 32 ^ (cx as u32 as u64) << 16 ^ (cz as u32 as u64));
+    let seed = if kind > 255 { mix(seed ^ u64::from(kind)) } else { seed };
     match seed_key >> 24 {
         0 => seed,
         high => mix(seed ^ high),
@@ -214,7 +217,7 @@ fn cell_seed(seed_key: u64, kind: u8, cx: i32, cz: i32) -> u64 {
 fn generate(
     seed_key: u64,
     terrain: &impl Ground,
-    kind: u8,
+    kind: u16,
     entry: &ProjectEntry,
     density: f32,
     cx: i32,
@@ -340,7 +343,7 @@ mod tests {
         }
     }
 
-    fn grass() -> std::collections::BTreeMap<u8, ProjectEntry> {
+    fn grass() -> std::collections::BTreeMap<u16, ProjectEntry> {
         let entry: ProjectEntry = serde_json::from_value(serde_json::json!({
             "kind": 132, "name": "grass", "source": "g.gltf", "primitives": [0],
             "brush": {"max_tilt_deg": 10.0},
@@ -373,7 +376,7 @@ mod tests {
         for id in [0u32, 1, 3, 15, 4095] {
             for (kind, cx, cz) in [(132u8, 0, 0), (200, -3, 7), (255, 1000, -1000)] {
                 let old = mix(u64::from(id) << 40 ^ u64::from(kind) << 32 ^ (cx as u32 as u64) << 16 ^ (cz as u32 as u64));
-                assert_eq!(cell_seed(u64::from(id), kind, cx, cz), old, "terrain {id}, cell {cx} {cz}");
+                assert_eq!(cell_seed(u64::from(id), u16::from(kind), cx, cz), old, "terrain {id}, cell {cx} {cz}");
             }
         }
         let ground = Plain { revision: 4 };
@@ -422,5 +425,28 @@ mod tests {
         assert!((mean - 0.5).abs() < 0.05, "{mean}");
         assert!(a.iter().all(|v| (0.0..1.0).contains(v)));
         assert_eq!(unit(mix(42)), unit(mix(42)));
+    }
+
+    #[test]
+    fn byte_kinds_seed_as_before_and_wide_kinds_their_own_cells() {
+        // The seed byte kinds had, so every existing cover kind grows the same instances.
+        let old = |t: u32, k: u8, cx: i32, cz: i32| {
+            mix(u64::from(t) << 40 ^ u64::from(k) << 32 ^ (cx as u32 as u64) << 16 ^ (cz as u32 as u64))
+        };
+        for (t, k, cx, cz) in [(0, 25, 0, 0), (3, 128, -4, 9), (17, 255, 250, -1)] {
+            assert_eq!(cell_seed(u64::from(t), u16::from(k), cx, cz), old(t, k, cx, cz));
+        }
+        // A wide kind is not its low byte, nor a neighbouring terrain's kind.
+        assert_ne!(cell_seed(4, 300, 1, 2), cell_seed(4, 44, 1, 2));
+        assert_ne!(cell_seed(4, 44 + 256, 1, 2), cell_seed(5, 44, 1, 2));
+        assert_ne!(cell_seed(4, 300, 1, 2), cell_seed(4, 301, 1, 2));
+        // A terrain id's wide kind seeds as it did before tiles had places.
+        assert_eq!(cell_seed(4, 300, 1, 2), mix(mix(4 << 40 ^ 300 << 32 ^ 1 << 16 ^ 2) ^ 300));
+        // A tile's place (a key past 2^24) keeps the wide-kind mix too: without it, the kind's high byte and the key's
+        // low bit meet at bit 40, and the high bits mixed in after are the same for both.
+        let place = streamed_seed_key(Vec3::new(1400.0, 0.0, 2100.0));
+        assert_ne!(place >> 24, 0);
+        assert_ne!(cell_seed(place, 44 + 256, 1, 2), cell_seed(place ^ 1, 44, 1, 2));
+        assert_ne!(cell_seed(place, 300, 1, 2), cell_seed(place, 44, 1, 2));
     }
 }

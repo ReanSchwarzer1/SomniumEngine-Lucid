@@ -44,7 +44,7 @@ fn an_adopted_sidecar_is_the_ground_load_binary_gives_and_a_retired_slot_frees_i
     }
     source.painted_foliage = (0..24)
         .map(|i| PaintedFoliage {
-            kind: i as u8,
+            kind: i as u16,
             position: Vec3::new((next() % 64) as f32, (next() % 40) as f32 * 0.5, (next() % 64) as f32),
             yaw: (next() % 628) as f32 * 0.01,
             tilt: 0.0,

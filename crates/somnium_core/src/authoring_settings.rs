@@ -97,7 +97,7 @@ impl BrushPreferences {
         foliage.kind = crate::app::FOLIAGE_PALETTE
             .iter()
             .position(|entry| entry.path == self.foliage_resource)
-            .unwrap_or(0) as u8;
+            .unwrap_or(0) as u16;
         let entry = &crate::app::FOLIAGE_PALETTE[foliage.kind as usize];
         foliage.layer = entry.layer;
         foliage.max_tilt_deg = entry.max_tilt_deg;
