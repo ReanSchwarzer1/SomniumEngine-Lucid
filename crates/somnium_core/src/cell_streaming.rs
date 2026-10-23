@@ -380,17 +380,18 @@ pub(crate) struct TerrainSlot {
 }
 
 /// Take a retired slot made for `desc`, the most recently retired first: one already wearing `asset_dir`'s ground
-/// layers when there is one, else one wearing another set's, whose layers the caller swaps (it then compares the
-/// slot's `asset_dir`). A virtual-textured slot keeps the set it was made with, so it goes only to its own set.
+/// layers when there is one, else one wearing another set's other than `free[spare]` ([`spare_slot`]), whose layers
+/// the caller swaps (it then compares the slot's `asset_dir`). A virtual-textured slot keeps the set it was made
+/// with, so it goes only to its own set.
 pub(crate) fn take_free_slot(
     free: &mut Vec<TerrainSlot>,
     desc: &somnium_renderer::terrain::TerrainDescriptor,
     asset_dir: &Path,
+    spare: Option<usize>,
 ) -> Option<TerrainSlot> {
-    let at = free
-        .iter()
-        .rposition(|slot| slot.desc == *desc && slot.asset_dir == asset_dir)
-        .or_else(|| free.iter().rposition(|slot| slot.desc == *desc && !desc.virtual_texturing))?;
+    let at = free.iter().rposition(|slot| slot.desc == *desc && slot.asset_dir == asset_dir).or_else(|| {
+        (0..free.len()).rev().find(|&i| Some(i) != spare && free[i].desc == *desc && !desc.virtual_texturing)
+    })?;
     Some(free.remove(at))
 }
 
@@ -410,37 +411,51 @@ pub(crate) enum SlotChoice {
 }
 
 /// A retired slot of `desc`'s shape ([`take_free_slot`]), wearing `asset_dir`'s ground or, failing that, another
-/// set's; else a new terrain while the terrain material pool has `material_room` entries left for it; else none.
-/// Since any retired slot of the shape will do, the slots made only ever number the most tiles live at once, however
-/// many sets the world wears.
+/// set's other than the spare (`free[spare]`, [`spare_slot`]); else a new terrain while the terrain material pool
+/// has `material_room` entries left for it; else the spare, rather than no ground; else none. Since any other
+/// retired slot of the shape will do, the slots made only ever number the most tiles live at once and the spare,
+/// however many sets the world wears.
 pub(crate) fn choose_slot(
     free: &mut Vec<TerrainSlot>,
     desc: &somnium_renderer::terrain::TerrainDescriptor,
     asset_dir: &Path,
     material_room: u32,
+    spare: Option<usize>,
 ) -> SlotChoice {
-    match take_free_slot(free, desc, asset_dir) {
+    match take_free_slot(free, desc, asset_dir, spare) {
         Some(slot) if slot.asset_dir == asset_dir => SlotChoice::Reuse(slot),
         Some(slot) => SlotChoice::Swap(slot),
         None if material_room > 0 => SlotChoice::New,
-        None => SlotChoice::Full,
+        None => take_free_slot(free, desc, asset_dir, None).map_or(SlotChoice::Full, SlotChoice::Swap),
     }
+}
+
+/// The retired slot that keeps the ground set left last: the most recently retired one wearing a set no live slot
+/// wears. Its set stays loaded, so a view that steps back over the border it just crossed takes that region's tile
+/// at no cost, rather than loading the set again on the main thread (0.4 to 0.9 s). The sets left before it are
+/// freed ([`next_rewear`]), so at most one set no tile wears is kept. `None` while every retired slot wears a live
+/// set. A virtual-textured slot never changes its ground and is not counted.
+pub(crate) fn spare_slot(live: &[&TerrainSlot], free: &[TerrainSlot]) -> Option<usize> {
+    free.iter().rposition(|slot| !slot.desc.virtual_texturing && live.iter().all(|l| l.asset_dir != slot.asset_dir))
 }
 
 /// The next retired slot to dress in a live ground set, and that set. A retired slot wearing a set no live slot
 /// wears would keep that set's layer arrays (about 213 MiB of BC7 a region) in memory while it waits, and a region
 /// left behind may never take it back, so it takes the set the most live slots wear (the region the view is in;
-/// the first folder of those that tie), ready for that region's next tile. `None` while every retired slot wears a
-/// live set, or while no slot is live to say which (a teleport's first frames: its first tile takes a retired slot
-/// of any set, and the rest follow). A virtual-textured slot cannot change its ground and is left.
+/// the first folder of those that tie), ready for that region's next tile. The [`spare_slot`] is left, keeping the
+/// set left last. `None` while every other retired slot wears a live set, or while no slot is live to say which (a
+/// teleport's first frames: its first tile takes a retired slot of any set, and the rest follow). A
+/// virtual-textured slot cannot change its ground and is left.
 pub(crate) fn next_rewear(live: &[&TerrainSlot], free: &[TerrainSlot]) -> Option<(usize, PathBuf)> {
     let mut worn: BTreeMap<&Path, usize> = BTreeMap::new();
     for slot in live {
         *worn.entry(slot.asset_dir.as_path()).or_default() += 1;
     }
     let target = worn.iter().max_by(|a, b| a.1.cmp(b.1).then(b.0.cmp(a.0)))?.0;
-    let index =
-        free.iter().rposition(|slot| !slot.desc.virtual_texturing && !worn.contains_key(slot.asset_dir.as_path()))?;
+    let spare = spare_slot(live, free);
+    let index = (0..free.len()).rev().find(|&i| {
+        Some(i) != spare && !free[i].desc.virtual_texturing && !worn.contains_key(free[i].asset_dir.as_path())
+    })?;
     Some((index, target.to_path_buf()))
 }
 
@@ -817,7 +832,7 @@ mod tests {
             slot(5, tile, verglas),
         ];
         let take = |free: &mut Vec<TerrainSlot>, desc: &TerrainDescriptor, dir: &str| {
-            take_free_slot(free, desc, Path::new(dir)).map(|s| (s.id, s.asset_dir.to_string_lossy().into_owned()))
+            take_free_slot(free, desc, Path::new(dir), None).map(|s| (s.id, s.asset_dir.to_string_lossy().into_owned()))
         };
         assert_eq!(take(&mut free, &tile, ground), Some((4, ground.into())), "its own set, the last retired first");
         assert_eq!(take(&mut free, &tile, ground), Some((1, ground.into())));
@@ -841,19 +856,19 @@ mod tests {
         let ground = Path::new("assets/terrain");
         let verglas = Path::new("assets/terrain/sets/verglas");
         let mut free = vec![TerrainSlot { id: 7, desc: tile, asset_dir: ground.to_path_buf() }];
-        let reused = choose_slot(&mut free, &tile, ground, 0);
+        let reused = choose_slot(&mut free, &tile, ground, 0, None);
         assert_eq!(reused, SlotChoice::Reuse(free_slot(7, tile)), "a retired slot needs no entry");
-        assert_eq!(choose_slot(&mut free, &tile, ground, 1), SlotChoice::New);
+        assert_eq!(choose_slot(&mut free, &tile, ground, 1, None), SlotChoice::New);
         // The seventeenth live slot with the default sixteen entries: a new terrain would shade with entry 0's ground.
-        assert_eq!(choose_slot(&mut free, &tile, ground, 0), SlotChoice::Full);
+        assert_eq!(choose_slot(&mut free, &tile, ground, 0, None), SlotChoice::Full);
         // A slot of another region's set is taken before a new terrain, with or without room, and swapped.
         for room in [0, 5] {
             let mut free = vec![free_slot(8, tile)];
-            assert_eq!(choose_slot(&mut free, &tile, verglas, room), SlotChoice::Swap(free_slot(8, tile)));
+            assert_eq!(choose_slot(&mut free, &tile, verglas, room, None), SlotChoice::Swap(free_slot(8, tile)));
             assert!(free.is_empty());
         }
         let mut free = vec![free_slot(8, tile), TerrainSlot { id: 9, desc: tile, asset_dir: verglas.to_path_buf() }];
-        assert_eq!(choose_slot(&mut free, &tile, ground, 0), SlotChoice::Reuse(free_slot(8, tile)), "own set first");
+        assert_eq!(choose_slot(&mut free, &tile, ground, 0, None), SlotChoice::Reuse(free_slot(8, tile)), "own set first");
     }
 
     #[test]
@@ -866,20 +881,54 @@ mod tests {
         let live: Vec<&TerrainSlot> = live.iter().collect();
         // Every retired slot wears a live set: nothing to do.
         assert_eq!(next_rewear(&live, &[slot(4, tyffir), slot(5, verglas)]), None);
-        // The south was left behind: its retired slots take Verglas's ground (worn by the most live tiles), the last
-        // retired first.
-        let free = [slot(4, south), slot(5, tyffir), slot(6, south)];
+        // The south was left behind: its retired slots take Verglas's ground (worn by the most live tiles), but the
+        // last one retired keeps the south's, the region left last.
+        let mut free = vec![slot(4, south), slot(5, tyffir), slot(6, south)];
+        assert_eq!(spare_slot(&live, &free), Some(2));
+        assert_eq!(next_rewear(&live, &free), Some((0, PathBuf::from(verglas))));
+        free[0].asset_dir = PathBuf::from(verglas);
+        assert_eq!(next_rewear(&live, &free), None, "the south stays on slot 6");
+        // Another region left after it: that one is kept, and the south goes.
+        free.push(slot(8, "assets/terrain/sets/mirage"));
         assert_eq!(next_rewear(&live, &free), Some((2, PathBuf::from(verglas))));
-        assert_eq!(next_rewear(&live, &free[..2]), Some((0, PathBuf::from(verglas))));
         // No live tile (a teleport's first frames): no set to take yet.
         assert_eq!(next_rewear(&[], &free), None);
         // Sets worn by as many live tiles: the first folder of them.
         let even = [slot(1, verglas), slot(3, tyffir)];
         let even: Vec<&TerrainSlot> = even.iter().collect();
-        assert_eq!(next_rewear(&even, &free), Some((2, PathBuf::from(tyffir))));
+        let free = [slot(4, south), slot(5, tyffir), slot(6, south)];
+        assert_eq!(next_rewear(&even, &free), Some((0, PathBuf::from(tyffir))));
         // A virtual-textured slot keeps its own.
         let paged = TerrainSlot { desc: TerrainDescriptor { virtual_texturing: true, ..tile }, ..slot(7, south) };
-        assert_eq!(next_rewear(&live, &[paged]), None);
+        assert_eq!(next_rewear(&live, &[paged.clone()]), None);
+        assert_eq!(spare_slot(&live, &[paged]), None, "nor is it the spare");
+    }
+
+    #[test]
+    fn a_region_just_left_keeps_one_slot_so_stepping_back_over_its_border_loads_nothing() {
+        // A road along the border of two southern windows, each with its own set: the view drifts in and out of the
+        // neighbour's load radius, so its last tile goes and comes back.
+        use somnium_renderer::terrain::TerrainDescriptor;
+        let tile = TerrainDescriptor { chunk_cells: 64, grid_size: [8, 8], cell_size: 2.0, ..Default::default() };
+        let slot = |id, dir: &str| TerrainSlot { id, desc: tile, asset_dir: PathBuf::from(dir) };
+        let (here, left, older) = ("sets/mirage_shirazan", "sets/mirage_kavir", "sets/sunscar");
+        let live = [slot(1, here), slot(2, here)];
+        let live: Vec<&TerrainSlot> = live.iter().collect();
+        let mut free = vec![slot(7, left)];
+        let spare = spare_slot(&live, &free);
+        assert_eq!(spare, Some(0));
+        // A tile of this region makes a new terrain while the pool has room, rather than free the set just left.
+        assert_eq!(choose_slot(&mut free, &tile, Path::new(here), 5, spare), SlotChoice::New);
+        // Stepping back: the neighbour's tile takes its own ground back, nothing loaded.
+        assert_eq!(choose_slot(&mut free, &tile, Path::new(left), 5, spare), SlotChoice::Reuse(slot(7, left)));
+        // The pool full: the spare is swapped rather than leave the tile without ground.
+        let mut free = vec![slot(7, left)];
+        assert_eq!(choose_slot(&mut free, &tile, Path::new(here), 0, spare), SlotChoice::Swap(slot(7, left)));
+        // A slot of a region left earlier goes first.
+        let mut free = vec![slot(6, older), slot(7, left)];
+        let spare = spare_slot(&live, &free);
+        assert_eq!(choose_slot(&mut free, &tile, Path::new(here), 5, spare), SlotChoice::Swap(slot(6, older)));
+        assert_eq!(free, vec![slot(7, left)]);
     }
 
     fn free_slot(id: u32, desc: somnium_renderer::terrain::TerrainDescriptor) -> TerrainSlot {
@@ -963,6 +1012,7 @@ mod tests {
         );
         let rewear = method(source, "rewear_retired_slot");
         assert!(rewear.contains("next_rewear(") && rewear.contains("set_terrain_layers("));
+        assert!(adopt.contains("spare_slot("), "a tile would free the set the view just left");
     }
 
     #[test]

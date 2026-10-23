@@ -409,11 +409,16 @@ impl<G: GameApp> Engine<G> {
         // Always streamed: a retired slot takes its chunks back only through `stream_geometry`.
         let distance = streaming.map(|s| s.geometry_distance).filter(|distance| *distance > 0.0).unwrap_or(800.0);
         // A region's own ground layers (WS1-24), else the project's. A retired slot wearing them is taken first, else
-        // one wearing another region's, re-dressed in these.
+        // one wearing another region's, re-dressed in these, though not the one keeping the region left last.
         let layers = streaming.map_or_else(|| asset_dir.to_path_buf(), |s| s.layer_dir(asset_dir));
         let asset_dir = layers.as_path();
         let room = renderer.terrain_material_room();
-        let (slot, kind) = match cells::choose_slot(&mut self.cell_streamer.free_terrains, &desc, asset_dir, room) {
+        let spare = {
+            let live: Vec<&TerrainSlot> = self.cell_streamer.cell_terrains.values().flatten().collect();
+            cells::spare_slot(&live, &self.cell_streamer.free_terrains)
+        };
+        let free = &mut self.cell_streamer.free_terrains;
+        let (slot, kind) = match cells::choose_slot(free, &desc, asset_dir, room, spare) {
             SlotChoice::Reuse(slot) => (slot, "reused"),
             SlotChoice::Swap(mut slot) => {
                 if !renderer.set_terrain_layers(ctx, slot.id, asset_dir) {
@@ -455,8 +460,9 @@ impl<G: GameApp> Engine<G> {
     }
 
     /// Dress one retired terrain slot a frame whose ground set no live tile wears in the set most live tiles wear
-    /// ([`cells::next_rewear`]), so a region's layer arrays are freed once its last tile has gone, rather than kept
-    /// by slots waiting for a tile of that region. One a frame keeps it to one bind-group rebuild a frame.
+    /// ([`cells::next_rewear`]), so a region's layer arrays are freed once its last tile has gone and another region
+    /// has been left since ([`cells::spare_slot`] keeps the one left last), rather than kept by slots waiting for a
+    /// tile of that region. One a frame keeps it to one bind-group rebuild a frame.
     fn rewear_retired_slot(&mut self) {
         let next = {
             let live: Vec<&TerrainSlot> = self.cell_streamer.cell_terrains.values().flatten().collect();
