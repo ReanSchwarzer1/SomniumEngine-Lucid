@@ -3794,6 +3794,7 @@ impl CombatDemo {
         let Some(run) = &mut self.run else {
             return;
         };
+        crate::zone(&mut ctx.renderer, Some("Combat fixed"));
         let dt = ctx.simulation.fixed_delta_seconds;
         // Brains think by their distance from what matters (the combat
         // world's LOD): the protagonist, and the fight's camera on the ground.
@@ -3817,12 +3818,17 @@ impl CombatDemo {
             .or(run.nav.as_ref());
         let query = JoltQuery(ctx.physics);
         let rode = run.player.and_then(|p| run.world.combatant(p)).and_then(|c| c.mount);
+        crate::zone(&mut ctx.renderer, Some("Combat world step"));
         run.world.step(dt, &query, nav);
+        crate::zone(&mut ctx.renderer, None);
         let terrain = JoltTerrain {
             physics: ctx.physics,
             water: &run.water,
         };
-        for (id, event) in walk(&mut run.world, &mut run.walkers, dt, &terrain) {
+        crate::zone(&mut ctx.renderer, Some("Combat walk"));
+        let walked = walk(&mut run.world, &mut run.walkers, dt, &terrain);
+        crate::zone(&mut ctx.renderer, None);
+        for (id, event) in walked {
             log_locomotion(run, id, event);
         }
         // In a boat the protagonist is carried at its seat, facing the bow.
@@ -3851,12 +3857,20 @@ impl CombatDemo {
             *left -= dt;
             *left > 0.0
         });
+        crate::zone(&mut ctx.renderer, Some("Encounters tend"));
         tend_encounters(ctx.world, Some(&mut *ctx.physics), run, dt);
+        crate::zone(&mut ctx.renderer, None);
         engine_tick(ctx.world, run, dt);
+        crate::zone(&mut ctx.renderer, Some("Combat write scene"));
         write_scene(ctx, run);
+        crate::zone(&mut ctx.renderer, None);
         // Bodies for fighters that woke this frame, and every body's pose.
         run.skins.dress(ctx.world, &run.bodies, &run.world, &mut run.spawned);
+        crate::zone(&mut ctx.renderer, Some("Combat skins write"));
         run.skins.write(ctx.world, &run.world, &run.walkers, dt);
+        crate::zone(&mut ctx.renderer, None);
+        // Closes "Combat fixed".
+        crate::zone(&mut ctx.renderer, None);
     }
 
     /// HUD text (once a frame, before the UI is drawn).

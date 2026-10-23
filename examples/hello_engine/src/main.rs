@@ -47,6 +47,20 @@ use somnium_physics::layer::{LAYER_MOVING, LAYER_NON_MOVING};
 use somnium_physics::shape::ColliderShape;
 use tracing::info;
 
+/// A CPU profiler zone (`SOMNIUM_PROFILE=1`): `Some(name)` opens one, `None` closes the innermost. It takes the
+/// context's renderer alone, so a caller still holding the world or physics can time what it does with them.
+pub(crate) fn zone(
+    renderer: &mut Option<&mut somnium_renderer::SomniumRenderer>,
+    name: Option<&'static str>,
+) {
+    if let Some(r) = renderer.as_deref_mut() {
+        match name {
+            Some(name) => r.profiler.cpu_begin(name),
+            None => r.profiler.cpu_end(),
+        }
+    }
+}
+
 // â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
 // Components
 // â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
@@ -1976,7 +1990,9 @@ impl GameApp for HelloGame {
         if !play_session(ctx) {
             return;
         }
+        zone(&mut ctx.renderer, Some("Boats fixed"));
         self.boats.fixed(ctx, &mut self.combat);
+        zone(&mut ctx.renderer, None);
         self.combat.fixed(ctx);
 
         let (eye, forward) = self
@@ -1990,7 +2006,9 @@ impl GameApp for HelloGame {
                 )
             })
             .unwrap_or((self.camera.position, self.camera.forward_vector()));
+        zone(&mut ctx.renderer, Some("Interactions tick"));
         self.interactions.tick(ctx, eye, forward);
+        zone(&mut ctx.renderer, None);
         self.work_demo.tick(ctx, eye, forward);
 
         let Some(boat) = self.boat.as_ref() else {
@@ -3680,5 +3698,78 @@ mod audit_harness_tests {
         assert_eq!(parse("1920X1080"), Some((1920, 1080)));
         assert_eq!(parse("0x1080"), None);
         assert_eq!(parse("wide"), None);
+    }
+}
+
+#[cfg(test)]
+mod profiler_zone_tests {
+    /// The body of the function that starts at `head` (a method: it ends at the first `}` back at its indent).
+    /// A checkout with Windows line ends reads the same.
+    fn body(source: &str, head: &str) -> String {
+        let source = source.replace("\r\n", "\n");
+        let at = source
+            .find(head)
+            .unwrap_or_else(|| panic!("no {head}"));
+        let rest = &source[at..];
+        rest[..rest.find("\n    }\n").expect("the method's end")].to_string()
+    }
+
+    /// Walk `body`'s zone calls in order: each `open` nests one deeper and each `close` comes back out, never
+    /// below the function's own level, and no bare `return;` leaves one open. Returns the names opened.
+    fn zones(body: &str, open: &str, close: &str) -> Vec<String> {
+        let mut names = Vec::new();
+        let (mut depth, mut at) = (0usize, 0usize);
+        loop {
+            let next = [body[at..].find(open).map(|i| (i, true)), body[at..].find(close).map(|i| (i, false))]
+                .into_iter()
+                .flatten()
+                .min_by_key(|(i, _)| *i);
+            let Some((i, opens)) = next else {
+                break;
+            };
+            assert!(depth == 0 || !body[at..at + i].contains("return;"), "a return leaves a zone open");
+            at += i;
+            if opens {
+                depth += 1;
+                at += open.len();
+                let name = &body[at..];
+                names.push(name[..name.find('"').expect("a quoted name")].to_string());
+            } else {
+                assert!(depth > 0, "a zone closed that was not opened");
+                depth -= 1;
+                at += close.len();
+            }
+        }
+        assert_eq!(depth, 0, "every zone is closed");
+        names
+    }
+
+    /// SIM_LOD_PLAN step 0: the combat host's fixed step, the shell's fixed step and the skinned crowd each time
+    /// their parts, every zone closed in the function that opens it. A source check because the profiler needs a
+    /// GPU: a zone left open would nest every later scope of the frame under it.
+    #[test]
+    fn the_simulation_zones_open_and_close_in_pairs() {
+        let shell = r#"zone(&mut ctx.renderer, Some(""#;
+        let shut = "zone(&mut ctx.renderer, None)";
+        let fixed = zones(&body(include_str!("combat_demo.rs"), "pub fn fixed("), shell, shut);
+        assert_eq!(
+            fixed,
+            [
+                "Combat fixed",
+                "Combat world step",
+                "Combat walk",
+                "Encounters tend",
+                "Combat write scene",
+                "Combat skins write"
+            ]
+        );
+        let host = zones(&body(include_str!("main.rs"), "fn on_fixed_update("), shell, shut);
+        assert_eq!(host, ["Boats fixed", "Interactions tick"]);
+        let crowd = zones(
+            &body(include_str!("skinned_crowd.rs"), "pub fn render("),
+            r#"profiler.cpu_begin(""#,
+            "profiler.cpu_end()",
+        );
+        assert_eq!(crowd, ["Crowd plan", "Crowd upload", "Crowd bodies", "Crowd sockets"]);
     }
 }
