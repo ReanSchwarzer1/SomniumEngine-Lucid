@@ -845,6 +845,7 @@ fn engine_tick(world: &mut World, run: &mut Run, dt: f32) {
             for e in meshes {
                 if let Some(mesh) = world.get_mut::<ImportedMesh>(e) {
                     mesh.source = format!("assets/{file}");
+                    run.imports.push(e);
                 }
             }
         }
@@ -2709,6 +2710,7 @@ fn wake(
         members.len()
     );
     run.spawned.extend(made.iter().copied());
+    run.imports.extend(made.iter().copied().filter(|e| world.get::<ImportedMesh>(*e).is_some()));
     run.colliders.extend(solids.iter().copied());
     let starts = members
         .iter()
@@ -2986,6 +2988,8 @@ struct Run {
     floor: f32,
     pools: Pools,
     spawned: Vec<Entity>,
+    /// Imported meshes made or changed since the host last uploaded (encounter boards, a board breaking).
+    imports: Vec<Entity>,
     log: VecDeque<String>,
     /// Who has noticed the protagonist, how far (suspicious or alerted), and
     /// the seconds its mark has left.
@@ -3529,6 +3533,7 @@ impl CombatDemo {
             run.skins = crate::combat_bodies::Skins::new(Some(&ctx.config.content_root));
             run.content = Some(ctx.config.content_root.clone());
             run.skins.dress(ctx.world, &run.bodies, &run.world, &mut run.spawned);
+            ctx.upload_imports(run.skins.imports.drain(..));
             apply_law(run, &self.hostile_factions, &self.hunting_factions, self.beasts_hostile);
             // Those already near wake now, the rest as the protagonist comes.
             tend_encounters(ctx.world, Some(&mut *ctx.physics), run, f32::INFINITY);
@@ -3857,6 +3862,9 @@ impl CombatDemo {
         // Bodies for fighters that woke this frame, and every body's pose.
         run.skins.dress(ctx.world, &run.bodies, &run.world, &mut run.spawned);
         run.skins.write(ctx.world, &run.world, &run.walkers, dt);
+        // Gear hung and encounter meshes made this step are drawn only once uploaded.
+        ctx.upload_imports(run.skins.imports.drain(..));
+        ctx.upload_imports(run.imports.drain(..));
     }
 
     /// HUD text (once a frame, before the UI is drawn).
@@ -4090,6 +4098,7 @@ fn build(world: &World) -> Option<Run> {
         floor,
         pools: Pools::default(),
         spawned: Vec::new(),
+        imports: Vec::new(),
         log: VecDeque::new(),
         marks: BTreeMap::new(),
         encounters: None,

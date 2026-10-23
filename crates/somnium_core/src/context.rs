@@ -175,6 +175,10 @@ pub struct EngineContext<'a> {
 
     /// A scene the game asked to open with [`EngineContext::request_scene`], taken once the update returns.
     pub scene_request: Option<std::path::PathBuf>,
+
+    /// Entities the game spawned with an `ImportedMesh` during this update ([`EngineContext::upload_imports`]),
+    /// uploaded once the update returns.
+    pub imports: Vec<somnium_ecs::Entity>,
 }
 
 impl<'a> EngineContext<'a> {
@@ -183,6 +187,13 @@ impl<'a> EngineContext<'a> {
     /// Rimeborn's title (20 Oct) starts in a small scene and asks for the world only when the player chooses to play.
     pub fn request_scene(&mut self, path: impl Into<std::path::PathBuf>) {
         self.scene_request = Some(path.into());
+    }
+
+    /// Upload these runtime-spawned entities' `ImportedMesh` (and their other GPU parts) once this update returns, as
+    /// a scene load or a streamed cell's install does for theirs. Without it an imported mesh a game spawns in Play
+    /// (a sword hung on a body, a boat's hull) is never drawn.
+    pub fn upload_imports(&mut self, entities: impl IntoIterator<Item = somnium_ecs::Entity>) {
+        self.imports.extend(entities);
     }
 
     /// Consume any pending exact pose. Returns `(position, yaw, pitch)` once.
@@ -244,6 +255,7 @@ impl<'a> EngineContext<'a> {
             scripts,
             should_exit: false,
             scene_request: None,
+            imports: Vec::new(),
         }
     }
 

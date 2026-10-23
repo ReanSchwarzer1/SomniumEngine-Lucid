@@ -419,10 +419,11 @@ pub(crate) fn mesh_node_names(path: &std::path::Path) -> Vec<(u32, String)> {
         .collect()
 }
 
-/// A piece's meshes, hung on `socket`.
-fn hang(world: &mut World, socket: Entity, name: &str, piece: &str, g: &Piece) {
+/// A piece's meshes, hung on `socket`: the entities, for the host to upload (`EngineContext::upload_imports`).
+fn hang(world: &mut World, socket: Entity, name: &str, piece: &str, g: &Piece) -> Vec<Entity> {
+    let mut hung = Vec::new();
     for &node in &g.nodes {
-        world.spawn((
+        hung.push(world.spawn((
             Name::new(&format!("{name} {piece} {node}")),
             Transform::default(),
             WorldTransform::identity(),
@@ -435,8 +436,9 @@ fn hang(world: &mut World, socket: Entity, name: &str, piece: &str, g: &Piece) {
                 asset: somnium_asset::database::AssetId::NONE,
                 runtime_id: 0,
             },
-        ));
+        )));
     }
+    hung
 }
 
 /// WS3's scabbard (`characters/gear/scabbard.glb`, in the `sheath` frame), where it is there.
@@ -535,6 +537,9 @@ pub struct Skins {
     pub work: Option<(CombatantId, String)>,
     /// Each clip's pieces (clips.json's `gear`).
     clip_gear: BTreeMap<String, Vec<String>>,
+    /// Gear meshes hung since the host last took them, to upload (an imported mesh spawned in Play is drawn only once
+    /// uploaded: `EngineContext::upload_imports`).
+    pub imports: Vec<Entity>,
     hidden: Vec<(Entity, Option<EditorFlags>)>,
 }
 
@@ -658,7 +663,7 @@ impl Skins {
                     Some(g) => {
                         // Out of a fight to begin with: a sword or knife starts in its sheath.
                         let s = socket(world, if sheathes { "sheath" } else { &g.joint });
-                        hang(world, s, &name, piece, g);
+                        self.imports.extend(hang(world, s, &name, piece, g));
                         Some((s, g.joint.clone(), sheathes))
                     }
                     None if piece == "sword" => {
@@ -686,7 +691,7 @@ impl Skins {
                 .filter(|_| c.weapon.kind == WeaponKind::Sword)
                 .map(|g| {
                     let s = socket(world, "sheath");
-                    hang(world, s, &name, "scabbard", g);
+                    self.imports.extend(hang(world, s, &name, "scabbard", g));
                     s
                 });
             let saddle = c.mount_def.is_some().then(|| socket(world, "saddle"));
@@ -826,7 +831,7 @@ impl Skins {
                     for piece in self.clip_gear.get(&t).into_iter().flatten() {
                         if let Some(g) = self.gear.get(piece) {
                             let s = socket_on(world, skin.body, &g.joint);
-                            hang(world, s, &name, piece, g);
+                            self.imports.extend(hang(world, s, &name, piece, g));
                             sockets.push(s);
                         }
                     }
@@ -1137,6 +1142,10 @@ mod tests {
             "Chop_Wood_Loop|Idle_Loop"
         );
         assert_eq!(axes(&world), 2, "the axe's two nodes in his hand");
+        // Hung in Play, so the host must upload them or they are never drawn (the second play's missing sword).
+        let queued: Vec<Entity> = skins.imports.drain(..).collect();
+        assert_eq!(queued.len(), 2);
+        assert!(queued.iter().all(|e| world.get::<ImportedMesh>(*e).is_some()));
         skins.work = None;
         skins.write(&mut world, &combat, &BTreeMap::new(), 1.0 / 60.0);
         assert!(

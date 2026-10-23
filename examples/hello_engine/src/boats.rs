@@ -635,6 +635,8 @@ impl BoatHost {
                     )
                 } else {
                     let hull = hull_mesh(ctx.world, entity, &file, &nodes, authored.scale);
+                    // drawn only once uploaded (the developer's second play: "couldnt find boats")
+                    ctx.upload_imports(hull.iter().copied());
                     let oars = hull
                         .iter()
                         .zip(&nodes)
@@ -644,6 +646,12 @@ impl BoatHost {
                     (hull, oars)
                 }
             };
+            // `SOMNIUM_BOATS_LOG=1`: where each boat floats and the water it finds there (a mooring off its water
+            // sinks or drifts, and nothing else says so).
+            if std::env::var_os("SOMNIUM_BOATS_LOG").is_some() {
+                let surface = self.water.as_ref().and_then(|w| w.surface(Vec2::new(at.2.x, at.2.z)));
+                info!(boat = %name_of(ctx.world, entity), at = ?at.2, surface = ?surface.map(|s| s.height), "boats: floated");
+            }
             self.afloat.push(Afloat {
                 entity,
                 body,
@@ -704,6 +712,18 @@ impl BoatHost {
         if self.look_in <= 0.0 {
             self.look_in = 1.0;
             self.adopt(ctx);
+            // `SOMNIUM_BOATS_LOG=1`: once a second, the boat nearest the protagonist and how far off it is.
+            if std::env::var_os("SOMNIUM_BOATS_LOG").is_some()
+                && let Some((feet, _)) = combat.player_feet()
+            {
+                let nearest = self.afloat.iter().map(|a| (ctx.physics.get_position(a.body), a)).min_by(|x, y| {
+                    x.0.distance(feet).total_cmp(&y.0.distance(feet))
+                });
+                if let Some((at, a)) = nearest {
+                    let reach = self.in_reach(ctx.physics, feet).is_some();
+                    info!(boat = %name_of(ctx.world, a.entity), ?at, metres = at.distance(feet), reach, "boats: nearest");
+                }
+            }
         }
         let rowed = self
             .aboard

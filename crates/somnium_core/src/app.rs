@@ -4754,6 +4754,11 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                         &mut self.scripts,
                     );
                     self.game.on_fixed_update(&mut ctx);
+                    let imports = std::mem::take(&mut ctx.imports);
+                    drop(ctx);
+                    if !imports.is_empty() {
+                        self.restore_entity_gpu(&imports);
+                    }
                 }
                 // `onFixedUpdate` runs here, inside the accumulator and
                 // **before** `physics.step`, so a force a script applies is
@@ -4922,7 +4927,13 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             ctx.orbit_selection = orbit_selection;
             ctx.orbit_pivot = orbit_pivot;
             self.game.on_update(&mut ctx);
-            ctx.scene_request.take()
+            let imports = std::mem::take(&mut ctx.imports);
+            let request = ctx.scene_request.take();
+            drop(ctx);
+            if !imports.is_empty() {
+                self.restore_entity_gpu(&imports);
+            }
+            request
         };
         // A scene the game asked for (`EngineContext::request_scene`): Stop, load, Play, as a standalone start runs.
         // Between Stop and the load the game gets one update in the stopped state, with no frame drawn, so its
