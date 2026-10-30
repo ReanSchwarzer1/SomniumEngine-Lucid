@@ -5255,11 +5255,16 @@ impl SomniumRenderer {
             // WS1-18: a streamed window with no geometry gives its splat maps back until its chunks return.
             if terrain.geometry_stream_distance > 0.0 {
                 let resident = terrain.chunks.iter().any(|c| c.vertex_offset != crate::terrain::UNALLOCATED);
+                // Zoned apart: a tile coming into reach cost a 45 ms "Terrain" frame with nothing below it (Sunscar).
+                self.profiler.cpu_begin("Terrain splat residency");
                 set_splat_resident(terrain, &mut self.texture_pool, &mut self.global_pool, &ctx.device, resident);
+                self.profiler.cpu_end();
             }
             terrain.select_lods(local_cam, &shoreline_regions);
             self.rebuilt_chunks.clear();
+            self.profiler.cpu_begin("Terrain chunk rebuild");
             terrain.rebuild_dirty_chunks(&ctx.queue, &mut self.geometry, &mut self.rebuilt_chunks);
+            self.profiler.cpu_end();
             shadow_geometry_changed |= !self.rebuilt_chunks.is_empty();
             terrain.ensure_index_blocks(&ctx.queue, &mut self.geometry);
             terrain.splatmap.upload_dirty(&ctx.queue);

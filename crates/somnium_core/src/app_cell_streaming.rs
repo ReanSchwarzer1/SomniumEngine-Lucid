@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 const FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(6);
 /// The longest a first fill may hold the frame before the rest streams in as usual.
 const FIRST_FILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(90);
+/// Retired terrain slots made at the end of a first fill, for tiles that stream in later ([`Engine::warm_terrain_slots`]).
+const SPARE_TERRAIN_SLOTS: usize = 4;
 
 impl<G: GameApp> Engine<G> {
     /// Stream the cells of the scene's `somnium.CellStreaming` around this frame's view.
@@ -74,7 +76,9 @@ impl<G: GameApp> Engine<G> {
         let focus = pinned.pinned().or_else(|| self.renderer.as_ref().map(|renderer| renderer.camera_pos));
         self.world.put_cache(pinned);
         let first_fill = !self.cell_streamer.filled;
+        self.zone_begin("Cell schedule");
         self.schedule_cells(&settings, focus);
+        self.zone_end();
         if first_fill && !self.cell_streamer.reading.is_empty() {
             self.cell_streamer.filled = true;
             // Nothing is in yet (a scene just opened, Play just began): the view's own cells come in whole before the
@@ -100,12 +104,17 @@ impl<G: GameApp> Engine<G> {
                 seconds = format!("{:.1}", started.elapsed().as_secs_f64()),
                 "World cells: first fill"
             );
+            self.warm_terrain_slots(SPARE_TERRAIN_SLOTS);
         } else {
             self.pump_cell_reads(settings.cells_per_frame.max(1) as usize);
         }
 
+        self.zone_begin("Cell evict");
         self.evict_cold_sources();
+        self.zone_end();
+        self.zone_begin("Cell rewear");
         self.rewear_retired_slot();
+        self.zone_end();
 
         let streamer = &self.cell_streamer;
         let (loaded, pending, entities) = (
@@ -333,6 +342,7 @@ impl<G: GameApp> Engine<G> {
         let report = crate::scene_schema::scene_from_json(&mut self.world, &self.type_registry, document);
         self.zone_end();
         let report = report.map_err(|error| error.to_string())?;
+        self.zone_begin("Cell sources");
         // Which uploads this cell keeps alive (for eviction once no loaded cell draws them).
         let sources: Vec<PathBuf> = cells::sources_of(document)
             .into_keys()
@@ -343,6 +353,7 @@ impl<G: GameApp> Engine<G> {
             self.cell_streamer.cold.remove(source);
         }
         self.cell_streamer.cell_sources.insert(index, sources);
+        self.zone_end();
         let cell = u32::try_from(index).unwrap_or(u32::MAX);
         for &entity in &report.entities {
             let _ = self.world.insert_component(entity, Streamed { cell });
@@ -467,6 +478,27 @@ impl<G: GameApp> Engine<G> {
         }
         info!("Terrain tile {}: slot {} ({kind})", self.cell_streamer.cells[index].file.display(), slot.id);
         Some(slot)
+    }
+
+    /// Make `count` retired terrain slots shaped and dressed like a live tile's, behind the first fill's loading wait,
+    /// so tiles that stream in later take one ("reused") rather than making a terrain mid-play ("new": 318 ms against
+    /// 18 ms for a reused slot, Sunscar, 30 Oct 2026). Never past the renderer's terrain material room.
+    fn warm_terrain_slots(&mut self, count: usize) {
+        let Some(like) = self.cell_streamer.cell_terrains.values().flatten().next().cloned() else {
+            return;
+        };
+        let Some((renderer, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref()) else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        let mut made = 0;
+        while made < count && renderer.terrain_material_room() > 0 {
+            let id = renderer.create_streamed_terrain_with_asset_dir(ctx, like.desc, &like.asset_dir, 800.0);
+            renderer.retire_terrain(ctx, id);
+            self.cell_streamer.free_terrains.push(TerrainSlot { id, ..like.clone() });
+            made += 1;
+        }
+        info!(made, ms = started.elapsed().as_millis(), "terrain slots made ahead for tiles to come");
     }
 
     /// Dress one retired terrain slot a frame whose ground set no live tile wears in the set most live tiles wear
