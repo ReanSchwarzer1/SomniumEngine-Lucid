@@ -13,9 +13,12 @@
 //!
 //! First person (Sunscar, 30 Oct 2026: "grass needs to be much much more denser"): a cell is generated once, on
 //! worker threads under a per-frame candidate budget, and drawn as one instance batch per terrain, kind and cell
-//! whose copies are one instanced draw per part ([`CoverBatches`]). Each copy carries a rank; past [`BAND_NEAR`]
-//! each doubling of distance keeps half the copies, widened to hold the ground they cover (AMD's mesh-shader grass
-//! drops blades and widens the rest the same way). `SOMNIUM_COVER_DENSITY` scales every kind's density.
+//! whose copies are one instanced draw per part ([`CoverBatches`]). Each copy carries a rank; past [`BAND_NEAR`] a
+//! copy at distance d draws while its rank is below `BAND_NEAR / d` (half the copies per doubling), widened to hold
+//! the ground they cover (AMD's mesh-shader grass drops blades and widens the rest the same way). Measured per copy,
+//! not per cell: per-cell steps striped a meadow along the cell columns. A cell is rebuilt each half-octave of its
+//! distance, at most [`SLOTS_SET_PER_FRAME`] copies a frame, nearest first. `SOMNIUM_COVER_DENSITY` scales every
+//! kind's density.
 
 use std::collections::HashMap;
 
@@ -29,8 +32,11 @@ use crate::foliage_palette::ProjectEntry;
 /// Cell edge, metres.
 pub const CELL: f32 = 16.0;
 /// Most candidates generated in one frame, over every cell made then (the rest come next frame); at least one cell.
-const CANDIDATES_PER_FRAME: f32 = 160_000.0;
-/// Inside this distance every copy draws; past it each doubling keeps half ([`band`]).
+const CANDIDATES_PER_FRAME: f32 = 40_000.0;
+/// Most copies of parts (slots) set in batches in one frame, nearest cells first (the rest wait a frame): a tile
+/// streaming in beside the player once set 100,000+ in one frame (40 MB of slots, a 350 ms frame).
+const SLOTS_SET_PER_FRAME: i64 = 48_000;
+/// Inside this distance every copy draws; past it each doubling keeps half ([`keep_at`]).
 pub const BAND_NEAR: f32 = 12.0;
 /// The widest a thinned copy is drawn, against its own width.
 const MOST_WIDEN: f32 = 2.5;
@@ -351,19 +357,22 @@ pub fn density_scale() -> f32 {
     *SCALE
 }
 
-/// The distance band of ground `distance` metres from the cover's centre: 0 inside [`BAND_NEAR`], then one more per
-/// doubling. Band `b` draws the copies ranked below `2^-b`, each widened by `sqrt(2)^b` (at most [`MOST_WIDEN`]).
+/// A cell's distance step, `distance` metres from the cover's centre: 0 inside [`BAND_NEAR`], then one more per half
+/// doubling. A cell's batch is rebuilt (its copies thinned again) when its step changes.
 #[must_use]
 pub fn band(distance: f32) -> u32 {
-    if distance <= BAND_NEAR { 0 } else { ((distance / BAND_NEAR).log2().ceil() as u32).min(8) }
+    if distance <= BAND_NEAR { 0 } else { (((distance / BAND_NEAR).log2() * 2.0).ceil() as u32).min(16) }
 }
 
-fn band_keep(band: u32) -> f32 {
-    0.5f32.powi(band as i32)
+/// The share of copies drawn `distance` metres from the cover's centre: all inside [`BAND_NEAR`], then half per
+/// doubling.
+fn keep_at(distance: f32) -> f32 {
+    if distance <= BAND_NEAR { 1.0 } else { BAND_NEAR / distance }
 }
 
-fn band_widen(band: u32) -> f32 {
-    std::f32::consts::SQRT_2.powi(band as i32).min(MOST_WIDEN)
+/// How much wider a copy draws where only `keep` of them do, to hold the ground they cover (at most [`MOST_WIDEN`]).
+fn widen(keep: f32) -> f32 {
+    keep.sqrt().recip().min(MOST_WIDEN)
 }
 
 /// Ground cover as instance batches: one per terrain, kind and cell, every part's copies one instanced draw
@@ -374,6 +383,8 @@ pub(crate) struct CoverBatches {
     /// Batch id -> (signature, frame last needed, copies).
     live: HashMap<u64, (u64, u64, u32)>,
     frame: u64,
+    /// Slots this frame may still set.
+    budget: i64,
     pub set: Vec<(u64, InstanceBatch)>,
     pub remove: Vec<u64>,
 }
@@ -394,6 +405,7 @@ fn fold(h: &mut u64, word: u32) {
 impl CoverBatches {
     pub(crate) fn begin_frame(&mut self) {
         self.frame += 1;
+        self.budget = SLOTS_SET_PER_FRAME;
         self.set.clear();
         self.remove.clear();
     }
@@ -410,22 +422,27 @@ impl CoverBatches {
         focus: Vec3,
     ) -> u32 {
         let Some(t) = cover.terrains.get(&terrain_id) else { return 0 };
+        let mut cells: Vec<(f32, (u16, i32, i32), &Vec<Cover>)> = t
+            .cells
+            .iter()
+            .filter(|(_, cell)| !cell.is_empty())
+            .map(|(&key, cell)| (cell_distance(key.1, key.2, focus), key, cell))
+            .collect();
+        cells.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut copies = 0;
-        for (&(kind, cx, cz), cell) in &t.cells {
+        for (d, (kind, cx, cz), cell) in cells {
             let Some(Some(list)) = parts.get(usize::from(kind)) else { continue };
             let Some(radius) = palette.get(&kind).and_then(|e| e.ground_cover.as_ref()).map(|g| g.radius) else {
                 continue;
             };
-            let d = cell_distance(cx, cz, focus);
-            if d > radius || cell.is_empty() {
+            if d > radius {
                 continue;
             }
-            let b = band(d);
             // A cell past its kind's shadow distance casts nothing: a casting batch set or removed redraws every
             // cascade, and the far cells come and go all the time.
             let casts = list.iter().any(|p| p.casts_shadow && (p.shadow_far <= 0.0 || d <= p.shadow_far));
             let mut sig = 0xcbf2_9ce4_8422_2325u64 ^ t.epoch.rotate_left(17);
-            fold(&mut sig, b);
+            fold(&mut sig, band(d));
             fold(&mut sig, u32::from(casts));
             for v in model.to_cols_array() {
                 fold(&mut sig, v.to_bits());
@@ -437,27 +454,34 @@ impl CoverBatches {
                 fold(&mut sig, p.shadow_far.to_bits());
             }
             let id = cover_batch_id(terrain_id, kind, cx, cz);
-            let n = match self.live.get(&id) {
-                Some(&(old, _, n)) if old == sig => n,
+            let live = self.live.get(&id).copied();
+            let n = match live {
+                Some((old, _, n)) if old == sig => n,
+                // Over this frame's budget: an old batch draws on until next frame, a new one waits for it.
+                Some((old, _, n)) if self.budget <= 0 => {
+                    self.live.insert(id, (old, self.frame, n));
+                    copies += n;
+                    continue;
+                }
+                None if self.budget <= 0 => continue,
                 _ => {
-                    let (keep, widen) = (band_keep(b), band_widen(b));
                     let placements: Vec<Mat4> = cell
                         .iter()
-                        .filter(|c| c.rank < keep && c.instance.scale > 0.0)
-                        .map(|c| {
-                            let s = c.instance.scale;
-                            model
-                                * Mat4::from_scale_rotation_translation(
-                                    Vec3::new(s * widen, s, s * widen),
-                                    c.rotation,
-                                    c.instance.position,
-                                )
+                        .filter_map(|c| {
+                            let at = c.instance.position;
+                            let keep = keep_at((at.x - focus.x).hypot(at.z - focus.z));
+                            if c.rank >= keep || c.instance.scale <= 0.0 {
+                                return None;
+                            }
+                            let (s, w) = (c.instance.scale, widen(keep));
+                            Some(model * Mat4::from_scale_rotation_translation(Vec3::new(s * w, s, s * w), c.rotation, at))
                         })
                         .collect();
                     let n = placements.len() as u32;
                     if n == 0 {
                         continue;
                     }
+                    self.budget -= i64::from(n) * list.len() as i64;
                     let mut parts = list.clone();
                     if !casts {
                         parts.iter_mut().for_each(|p| p.casts_shadow = false);
@@ -679,11 +703,11 @@ mod tests {
     }
 
     #[test]
-    fn bands_halve_per_doubling_and_keep_nested_copies() {
-        assert_eq!([band(0.0), band(BAND_NEAR), band(BAND_NEAR + 0.1), band(2.0 * BAND_NEAR), band(3.0 * BAND_NEAR)], [0, 0, 1, 1, 2]);
-        assert_eq!(band(1.0e6), 8, "capped");
-        assert_eq!((band_keep(0), band_keep(2)), (1.0, 0.25));
-        assert!((band_widen(2) - 2.0).abs() < 1e-6 && band_widen(6) == MOST_WIDEN);
+    fn copies_halve_per_doubling_and_cells_rebuild_each_half_doubling() {
+        assert_eq!([band(0.0), band(BAND_NEAR), band(BAND_NEAR + 0.1), band(2.0 * BAND_NEAR), band(4.0 * BAND_NEAR)], [0, 0, 1, 2, 4]);
+        assert_eq!(band(1.0e6), 16, "capped");
+        assert_eq!((keep_at(1.0), keep_at(BAND_NEAR), keep_at(4.0 * BAND_NEAR)), (1.0, 1.0, 0.25));
+        assert!((widen(0.25) - 2.0).abs() < 1e-6 && widen(0.01) == MOST_WIDEN && widen(1.0) == 1.0);
     }
 
     #[test]
@@ -715,6 +739,8 @@ mod tests {
         assert!(copies > 0 && (copies as usize) < all, "{copies} of {all}: far cells thinned");
         assert!(batches.set.iter().all(|(id, b)| id >> 56 == 0xF1 && !b.placements.is_empty()));
         let first = batches.set.len();
+        let slots: usize = batches.set.iter().map(|(_, b)| b.placements.len()).sum();
+        assert!(slots as i64 <= SLOTS_SET_PER_FRAME + 10_000, "a frame's sets stay near its budget");
         // The same frame again: nothing to send. Far away: everything removed.
         batches.begin_frame();
         batches.terrain(1, &cover, &palette, &parts, Mat4::IDENTITY, Vec3::new(64.0, 2.0, 64.0));
