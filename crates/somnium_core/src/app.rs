@@ -8722,14 +8722,17 @@ impl<G: GameApp> Engine<G> {
             let fsr_fallback = pp.fsr_enabled() && !fsr_active;
             r.taa_pass
                 .set_enabled((pp.taa_enabled() || fsr_fallback) && !fsr_active && !retro);
-            r.gtao_pass.enabled = pp.gtao_enabled && budget.gtao && !path_active && !retro;
+            // On under the path tracer too: the raster keeps the sky's fill there, and its contact shadows with it.
+            r.gtao_pass.enabled = pp.gtao_enabled && budget.gtao && !retro;
             r.bloom_pass.enabled = pp.bloom_enabled;
             r.bloom_pass.intensity = pp.bloom_intensity;
             r.bloom_pass.lens_flare = pp.lens_flare.max(r.lens_flare_requested).max(0.0);
             r.dof_pass.enabled = pp.dof_enabled && budget.camera_effects && !retro;
             r.dof_pass.focus_distance = pp.dof_focus_distance;
             r.dof_pass.f_stop = pp.aperture_f_stops;
-            r.restir_pass.enabled = pp.restir_enabled && budget.traced_direct && !path_active && !retro;
+            // The path tracer traces only the bounced light (29 Oct 2026): the direct light stays the raster's, so its
+            // traced shadows (the sun's visibility here, the lamps' rays in shading) stay on under it, at any tier.
+            r.restir_pass.enabled = (pp.restir_enabled && budget.traced_direct || path_active) && !retro;
             let restir_gi_active = pp.restir_gi_enabled
                 && budget.traced_gi
                 && r.restir_gi_pass.supported()
@@ -8782,6 +8785,8 @@ impl<G: GameApp> Engine<G> {
             r.volumetric_pass.fog.shafts = pp.light_shafts && budget.light_shafts;
             r.volumetric_pass.fog.shaft_intensity = pp.shaft_intensity;
             r.volumetric_pass.fog.sky_occlusion = pp.fog_sky_occlusion;
+            r.volumetric_pass.max_distance = pp.fog_range.max(10.0);
+            r.volumetric_pass.fog.skylight = pp.fog_skylight;
             r.vertex_paint.fade = pp.paint_fade;
             r.vertex_paint.green = pp.foliage_green;
             r.vertex_paint.fog = [pp.retro_fog[0], pp.retro_fog[1], pp.retro_fog_color[0], pp.retro_fog_color[1], pp.retro_fog_color[2]];
@@ -8799,8 +8804,9 @@ impl<G: GameApp> Engine<G> {
                 r.path_tracer_pass.reflections = traced_reflections;
                 r.path_tracer_pass.reflection_roughness = pp.traced_reflection_roughness;
                 if path_active {
-                    // Path tracing replaces the frame (renderer `path_tracer`, which sets shading's path-mode bit).
-                    // Baking caches/probes or tracing the separate specular buffer underneath it only wastes work.
+                    // Path tracing replaces the bounced light and the reflections (renderer `path_tracer`, which sets
+                    // shading's path-mode bit). Baking caches/probes or tracing the separate specular buffer under it
+                    // only wastes work.
                     flags = 0;
                 } else {
                     if pp.world_cache && budget.traced_gi && rt && !ddgi_active {
