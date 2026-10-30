@@ -142,9 +142,10 @@ fn parse(bytes: &[u8]) -> Result<BTreeMap<u16, ProjectEntry>, String> {
             return Err(format!("invalid draw or shadow distance for kind {}", entry.kind));
         }
         if entry.ground_cover.as_ref().is_some_and(|g| {
-            !(g.density.is_finite() && g.density > 0.0 && g.density <= 8.0 && g.radius.is_finite() && g.radius > 0.0 && g.radius <= 400.0)
+            !(g.density.is_finite() && g.density > 0.0 && g.density <= 64.0 && g.radius.is_finite() && g.radius > 0.0 && g.radius <= 400.0)
         }) {
-            return Err(format!("invalid ground cover for kind {} (density 0..8 per m2, radius 0..400 m)", entry.kind));
+            // 64 per m2: first-person grass (Sunscar, 30 Oct 2026) wants tens of tufts a square metre at the feet.
+            return Err(format!("invalid ground cover for kind {} (density 0..64 per m2, radius 0..400 m)", entry.kind));
         }
         if let Some(lod) = &entry.lod {
             if !lod.distance.is_finite()

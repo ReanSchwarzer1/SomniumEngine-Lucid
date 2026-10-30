@@ -82,11 +82,48 @@ pub(crate) struct GpuSlot {
     /// Local bounds; `w`s are the far and near draw distances.
     pub aabb_min: [f32; 4],
     pub aabb_max: [f32; 4],
-    /// Shadow distance, casts (0 or 1).
+    /// Shadow distance, casts (0 or 1), run: 0 one copy, n > 0 the head of n copies drawn as one instanced draw,
+    /// -1 a later copy of a run (drawn by its head).
     pub shadow: [f32; 4],
 }
 
 const SLOT_SIZE: u64 = std::mem::size_of::<GpuSlot>() as u64;
+
+/// Make `slots` (every copy of one part, in order) one run: the first slot draws them all in one instanced draw,
+/// culled by a box round every copy, put in its own frame; the rest only hold their instances. Ground cover's
+/// copies are small and many: a draw each would cost the GPU's front end more than drawing them (30 Oct 2026).
+pub(crate) fn make_run(slots: &mut [GpuSlot]) {
+    let Some(head) = slots.first().copied() else { return };
+    let n = slots.len();
+    let (local_min, local_max) = (glam::Vec3::from_slice(&head.aabb_min[..3]), glam::Vec3::from_slice(&head.aabb_max[..3]));
+    if n > 1 && local_min.is_finite() && local_max.is_finite() {
+        let (mut lo, mut hi) = (glam::Vec3::splat(f32::MAX), glam::Vec3::splat(f32::MIN));
+        let (centre, extent) = ((local_min + local_max) * 0.5, (local_max - local_min) * 0.5);
+        for slot in slots.iter() {
+            let model = Mat4::from_cols_array_2d(&slot.model);
+            let c = model.transform_point3(centre);
+            let e = model.x_axis.truncate().abs() * extent.x
+                + model.y_axis.truncate().abs() * extent.y
+                + model.z_axis.truncate().abs() * extent.z;
+            (lo, hi) = (lo.min(c - e), hi.max(c + e));
+        }
+        // The world box in the head's frame, which the cull pass puts back into the world (conservative twice).
+        let inverse = Mat4::from_cols_array_2d(&head.model).inverse();
+        let c = inverse.transform_point3((lo + hi) * 0.5);
+        let half = (hi - lo) * 0.5;
+        let e = inverse.x_axis.truncate().abs() * half.x
+            + inverse.y_axis.truncate().abs() * half.y
+            + inverse.z_axis.truncate().abs() * half.z;
+        if c.is_finite() && e.is_finite() {
+            slots[0].aabb_min[..3].copy_from_slice(&(c - e).to_array());
+            slots[0].aabb_max[..3].copy_from_slice(&(c + e).to_array());
+        }
+    }
+    slots[0].shadow[2] = n as f32;
+    for slot in &mut slots[1..] {
+        slot.shadow[2] = -1.0;
+    }
+}
 
 impl GpuSlot {
     /// Slot for `part` placed at `placement`, with the mesh's local `bounds` (`None`: never culled).
@@ -328,11 +365,14 @@ pub struct BatchShadowDraws<'a> {
 /// The renderer's instance batches.
 #[derive(Default)]
 pub(crate) struct InstanceBatches {
-    batches: crate::fast_hash::FastMap<u64, (u32, u32)>,
+    /// Each batch's slot range and whether any of its copies casts.
+    batches: crate::fast_hash::FastMap<u64, (u32, u32, bool)>,
     traced: crate::fast_hash::FastMap<u64, Traced>,
     ranges: SlotRanges,
     pending: Vec<Write>,
     revision: u64,
+    /// Changes when a batch that casts is set or removed: only then must the shadow cascades be redrawn.
+    shadow_revision: u64,
     gpu: Option<BatchGpu>,
     /// What the instance and bounds regions hold: (revision, instance start, argument start).
     written: Option<(u64, u32, u32)>,
@@ -352,7 +392,11 @@ impl InstanceBatches {
         }
         let len = u32::try_from(slots.len()).unwrap_or(u32::MAX);
         let start = self.ranges.alloc(len);
-        self.batches.insert(id, (start, len));
+        let casts = slots.iter().any(|s| s.shadow[1] != 0.0);
+        if casts {
+            self.shadow_revision = self.shadow_revision.wrapping_add(1);
+        }
+        self.batches.insert(id, (start, len, casts));
         if !traced.is_empty() {
             let (mut lo, mut hi) = ([f32::MAX; 2], [f32::MIN; 2]);
             for copy in &traced {
@@ -367,9 +411,12 @@ impl InstanceBatches {
     }
 
     pub(crate) fn remove(&mut self, id: u64) -> bool {
-        let Some((start, len)) = self.batches.remove(&id) else {
+        let Some((start, len, casts)) = self.batches.remove(&id) else {
             return false;
         };
+        if casts {
+            self.shadow_revision = self.shadow_revision.wrapping_add(1);
+        }
         self.traced.remove(&id);
         self.ranges.release(start, len);
         self.pending.push(Write::Free(start, len));
@@ -394,9 +441,10 @@ impl InstanceBatches {
         self.ranges.end
     }
 
-    /// Changes with every set and remove (the shadow cascades are redrawn on it).
-    pub(crate) fn revision(&self) -> u64 {
-        self.revision
+    /// Changes when a batch that casts is set or removed (the shadow cascades are redrawn on it): ground cover that
+    /// casts nothing comes and goes round the eye without redrawing every cascade.
+    pub(crate) fn shadow_revision(&self) -> u64 {
+        self.shadow_revision
     }
 
     pub(crate) fn batch_count(&self) -> usize {
@@ -643,13 +691,54 @@ mod tests {
         assert_eq!(batches.slot_end(), 150);
         batches.set(7, vec![slot; 20], Vec::new());
         // The first 20 of 7's old range, then 8's.
-        assert_eq!(batches.batches[&7], (0, 20));
+        assert_eq!(batches.batches[&7], (0, 20, true));
         assert_eq!(batches.slot_end(), 150);
         assert!(batches.remove(8));
         assert_eq!(batches.slot_end(), 20);
         batches.clear();
         assert!(batches.is_empty());
         assert_eq!(batches.batch_count(), 0);
+    }
+
+    #[test]
+    fn a_run_is_drawn_by_its_head_inside_a_box_round_every_copy() {
+        let part = BatchPart {
+            vertex_offset: 0,
+            index_offset: 0,
+            index_count: 3,
+            material_id: 0,
+            local: Mat4::IDENTITY,
+            near: 0.0,
+            far: 0.0,
+            casts_shadow: false,
+            shadow_far: 0.0,
+        };
+        let at = |x: f32, yaw: f32| {
+            Mat4::from_rotation_translation(glam::Quat::from_rotation_y(yaw), glam::Vec3::new(x, 0.0, 2.0))
+        };
+        let mut slots: Vec<GpuSlot> =
+            [at(1.0, 0.7), at(9.0, 0.0), at(-5.0, 2.0)].iter().map(|&m| GpuSlot::new(&part, m, Some(([-0.5; 3], [0.5; 3])))).collect();
+        make_run(&mut slots);
+        assert_eq!(slots.iter().map(|s| s.shadow[2]).collect::<Vec<_>>(), [3.0, -1.0, -1.0]);
+        // The head's box, put back into the world as the cull pass does, holds every copy's.
+        let head = Mat4::from_cols_array_2d(&slots[0].model);
+        let (min, max) = (glam::Vec3::from_slice(&slots[0].aabb_min[..3]), glam::Vec3::from_slice(&slots[0].aabb_max[..3]));
+        let c = head.transform_point3((min + max) * 0.5);
+        let half = (max - min) * 0.5;
+        let e = head.x_axis.truncate().abs() * half.x + head.y_axis.truncate().abs() * half.y + head.z_axis.truncate().abs() * half.z;
+        for x in [9.5, -5.5] {
+            assert!(c.x - e.x <= x.min(-5.5) && c.x + e.x >= x.max(9.5), "{c} {e}");
+        }
+        let mut one = vec![GpuSlot::new(&part, at(0.0, 0.0), None)];
+        make_run(&mut one);
+        assert_eq!(one[0].shadow[2], 1.0, "a run of one is its head");
+        let mut batches = InstanceBatches::default();
+        batches.set(1, slots.clone(), Vec::new());
+        batches.remove(1);
+        assert_eq!(batches.shadow_revision(), 0, "copies that cast nothing never redraw the cascades");
+        let casting = GpuSlot::new(&BatchPart { casts_shadow: true, ..part }, at(0.0, 0.0), None);
+        batches.set(2, vec![casting], Vec::new());
+        assert_eq!(batches.shadow_revision(), 1);
     }
 
     #[test]

@@ -173,3 +173,31 @@ fn a_copy_too_small_at_its_distance_casts_no_shadow() {
     let counts: Vec<u32> = read(&device, &queue, batches.shadow_draws().unwrap().counts.unwrap());
     assert_eq!(counts[0], 1);
 }
+
+#[test]
+fn a_run_is_one_instanced_argument_and_its_later_copies_only_instances() {
+    let (device, queue) = gpu::device();
+    let shaders = crate::shaders::Shaders::new();
+    let mut batches = InstanceBatches::default();
+    let mut run = slots(&part(36, 0.0), &[0.0, 5.0, 10.0]);
+    make_run(&mut run);
+    batches.set(1, run, Vec::new());
+    batches.set(2, slots(&part(72, 0.0), &[20.0]), Vec::new());
+    batches.flush(&device, &queue, &shaders);
+    (batches.instance_base, batches.arg_base) = (16, 8);
+    let instances = buffer(&device, 32 * std::mem::size_of::<GpuInstanceData>() as u64);
+    let args = buffer(&device, 16 * crate::indirect::ARGS_SIZE);
+    let aabbs = buffer(&device, 16 * std::mem::size_of::<GpuCullAabb>() as u64);
+    let mut encoder = device.create_command_encoder(&Default::default());
+    batches.record_expand(&device, &queue, &mut encoder, &instances, &args, &aabbs, false);
+    queue.submit([encoder.finish()]);
+    let written: Vec<DrawIndirectArgs> = read(&device, &queue, &args);
+    assert_eq!(written[8], DrawIndirectArgs { vertex_count: 36, instance_count: 3, first_vertex: 0, first_instance: 16 });
+    assert_eq!(written[9..11], [DrawIndirectArgs::default(); 2], "drawn by the head");
+    assert_eq!(written[11].instance_count, 1, "an ordinary slot as before");
+    let placed: Vec<GpuInstanceData> = read(&device, &queue, &instances);
+    assert_eq!([placed[17].model_matrix[3][0], placed[18].model_matrix[3][0]], [5.0, 10.0], "every copy's instance");
+    let bounds: Vec<GpuCullAabb> = read(&device, &queue, &aabbs);
+    assert!(bounds[8].min[0] <= -1.0 && bounds[8].max[0] >= 11.0, "the head's box holds the run");
+    assert!(bounds[9].min[0] > bounds[9].max[0], "a later copy is never culled in on its own");
+}

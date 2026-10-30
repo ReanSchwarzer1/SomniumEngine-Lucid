@@ -180,11 +180,15 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
+    // Phase two revives a draw with the copies phase one had (its flag): an instance batch's run (`make_run`) is
+    // one argument for many copies, and reviving it as one would draw only its first.
+    var revive = 1u;
     if params.phase == 1u {
         if occluded_flags[i] == 0u {
             draws[i].instance_count = 0u;
             return;
         }
+        revive = occluded_flags[i];
         occluded_flags[i] = 0u;
     }
 
@@ -293,20 +297,19 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         hidden = is_occluded(world_min, world_max);
     }
 
+    if params.phase == 0u {
+        // Remember it for phase two, which re-tests against a fresher pyramid: its copies, so it comes back whole.
+        occluded_flags[i] = select(0u, max(draws[i].instance_count, 1u), hidden);
+    }
     // Zero to skip the draw. Do not replace a live count with 1: batched
     // copies share one argument and would all vanish except the first.
     if hidden {
         draws[i].instance_count = 0u;
     } else if params.phase == 1u {
-        // Phase one left this at 0. Revival is always a single instance;
-        // the CPU no longer collapses copies into instance_count > 1.
-        draws[i].instance_count = 1u;
+        // Phase one left this at 0: back to the copies it had.
+        draws[i].instance_count = revive;
     }
     if !hidden {
         emit_visible(i);
-    }
-    if params.phase == 0u {
-        // Remember it for phase two, which re-tests against a fresher pyramid.
-        occluded_flags[i] = select(0u, 1u, hidden);
     }
 }

@@ -18,8 +18,17 @@ struct Slot {
     // drawn from this distance. The cull pass reads both from the bounds it is given.
     aabb_min: vec4<f32>,
     aabb_max: vec4<f32>,
-    // x: casts while nearer than this (0 = no limit); y: casts at all (0 or 1).
+    // x: casts while nearer than this (0 = no limit); y: casts at all (0 or 1); z: run (`instance_batch.rs`
+    // `make_run`): 0 one copy, n > 0 the head of n copies drawn as one instanced draw, -1 a later copy of a run.
     shadow: vec4<f32>,
+}
+
+// Copies the slot's argument draws: a run's head draws all of them, a later copy of a run none (its head does).
+fn run_copies(s: Slot) -> u32 {
+    if s.shadow.z < 0.0 {
+        return 0u;
+    }
+    return max(u32(s.shadow.z), 1u);
 }
 
 struct Instance {
@@ -97,11 +106,22 @@ fn expand(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let i = expand_params.instance_base + j;
-    args[a] = DrawArgs(s.index_count, 1u, 0u, i);
+    let copies = run_copies(s);
+    if copies == 0u {
+        args[a] = DrawArgs(0u, 0u, 0u, 0u);
+    } else {
+        args[a] = DrawArgs(s.index_count, copies, 0u, i);
+    }
     if expand_params.write_static != 0u {
         instances[i] = Instance(s.model, s.material_id, s.vertex_offset, s.index_offset, 0u);
-        // Cone test off (w = 2): batches draw two-sided.
-        aabbs[a] = CullAabb(s.aabb_min, s.aabb_max, vec4<f32>(0.0, 0.0, 0.0, 2.0));
+        if copies == 0u {
+            // A later copy of a run: drawn by its head, never culled on its own.
+            aabbs[a] = CullAabb(vec4<f32>(1.0, 1.0, 1.0, 0.0), vec4<f32>(-1.0, -1.0, -1.0, 0.0),
+                                vec4<f32>(0.0, 0.0, 0.0, 2.0));
+        } else {
+            // Cone test off (w = 2): batches draw two-sided.
+            aabbs[a] = CullAabb(s.aabb_min, s.aabb_max, vec4<f32>(0.0, 0.0, 0.0, 2.0));
+        }
     }
 }
 
@@ -112,7 +132,8 @@ fn shadow_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let s = slots[j];
-    var casts = s.index_count != 0u && s.shadow.y != 0.0;
+    let copies = run_copies(s);
+    var casts = s.index_count != 0u && s.shadow.y != 0.0 && copies != 0u;
     if casts && s.shadow.x > 0.0 {
         // Horizontal, like the draw distance: climbing a hill does not switch the shadows below back on.
         let d = s.model[3].xz - shadow_params.camera.xz;
@@ -130,7 +151,7 @@ fn shadow_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
         let threshold = shadow_params.radius_threshold;
         casts = radius * radius > threshold * threshold * dot(to, to);
     }
-    let arg = DrawArgs(s.index_count, 1u, 0u, shadow_params.instance_base + j);
+    let arg = DrawArgs(s.index_count, copies, 0u, shadow_params.instance_base + j);
     for (var c = 0u; c < 4u; c = c + 1u) {
         if ((shadow_params.dirty >> c) & 1u) == 0u {
             continue;

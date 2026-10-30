@@ -3542,6 +3542,26 @@ impl SomniumRenderer {
         self.instance_batches.set(id, slots, traced);
     }
 
+    /// As [`Self::set_instance_batch`], but each part's copies are one instanced draw (`instance_batch::make_run`):
+    /// one argument draws them all, culled by one box round every copy, and nothing of it is traced. For many small
+    /// copies seen together, as ground cover's cells are: one draw per copy would cost the GPU's front end more than
+    /// the copies themselves. A part's distance band is measured from its first copy.
+    pub fn set_instanced_batch(&mut self, id: u64, batch: &crate::instance_batch::InstanceBatch) {
+        let mut slots = Vec::with_capacity(batch.parts.len() * batch.placements.len());
+        for part in &batch.parts {
+            if self.material_blend.get(part.material_id as usize).copied().unwrap_or(false) {
+                continue;
+            }
+            let bounds = self.geometry.mesh_aabb(part.vertex_offset);
+            let start = slots.len();
+            slots.extend(
+                batch.placements.iter().map(|&placement| crate::instance_batch::GpuSlot::new(part, placement, bounds)),
+            );
+            crate::instance_batch::make_run(&mut slots[start..]);
+        }
+        self.instance_batches.set(id, slots, Vec::new());
+    }
+
     /// Remove instance batch `id`. Returns whether there was one.
     pub fn remove_instance_batch(&mut self, id: u64) -> bool {
         self.instance_batches.remove(id)
@@ -5741,8 +5761,9 @@ impl SomniumRenderer {
         // cascade volume. See `rebuild_shadow_casters`.
         self.rebuild_shadow_casters();
         if !self.instance_batches.is_empty() {
-            // A batch set or removed redraws every cascade; its casters are culled per cascade on the GPU below.
-            let mix = self.instance_batches.revision().wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            // A batch that casts, set or removed, redraws every cascade; its casters are culled per cascade on the GPU
+            // below. Ground cover that casts nothing comes and goes round the eye without a redraw.
+            let mix = self.instance_batches.shadow_revision().wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
             for revision in &mut self.cascade_shadow_revisions {
                 *revision ^= mix;
             }

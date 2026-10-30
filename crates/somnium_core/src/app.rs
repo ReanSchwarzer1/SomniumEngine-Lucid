@@ -1036,6 +1036,8 @@ pub struct Engine<G: GameApp> {
     cell_streamer: crate::cell_streaming::CellStreamer,
     /// Grass and flowers generated round the camera for `ground_cover` foliage kinds.
     ground_cover: crate::ground_cover::GroundCover,
+    /// Ground cover's cells as instanced batches (`SOMNIUM_FOLIAGE_BATCHES=1`).
+    cover_batches: crate::ground_cover::CoverBatches,
     /// The inventory and the reference graph travel together, because they
     /// are two readings of the same disk and a panel showing one against the
     /// other's assets is worse than no panel (MORROWIND-M item 3).
@@ -1782,6 +1784,7 @@ impl<G: GameApp + 'static> Engine<G> {
             world_partition_pin: None,
             cell_streamer: crate::cell_streaming::CellStreamer::default(),
             ground_cover: crate::ground_cover::GroundCover::default(),
+            cover_batches: crate::ground_cover::CoverBatches::default(),
             asset_scan: None,
             asset_gate: somnium_asset::database::DebouncedAssetDb::default(),
             locale_catalog: None,
@@ -9081,6 +9084,7 @@ impl<G: GameApp> Engine<G> {
         let batched = crate::foliage_batches::enabled();
         if batched {
             self.foliage_batches.begin_frame();
+            self.cover_batches.begin_frame();
         }
 
         for (
@@ -9215,9 +9219,52 @@ impl<G: GameApp> Engine<G> {
                 }
                 None => self.ground_cover.update(terrain_id, t, &self.project_foliage, focus_local, own_area),
             }
+            // Batched, ground cover is one instanced batch per kind and cell (`CoverBatches`), not a draw per copy.
+            if painted_batched {
+                let mut parts: Vec<Option<Vec<somnium_renderer::instance_batch::BatchPart>>> = vec![None; span];
+                for (&kind, _) in self.project_foliage.iter().filter(|(_, e)| e.ground_cover.is_some()) {
+                    let k = usize::from(kind);
+                    let Some(Some(near)) = self.foliage_meshes.get(k) else { continue };
+                    let near: Vec<_> = near
+                        .iter()
+                        .map(|p| crate::foliage_batches::Piece {
+                            vertex_offset: p.vertex_offset,
+                            index_offset: p.index_offset,
+                            index_count: p.index_count,
+                            material_id: p.material_id,
+                            local: p.local,
+                            is_leaf: p.is_leaf,
+                        })
+                        .collect();
+                    // Drawn as far as its cells reach; the copies of a run are culled as one.
+                    parts[k] = Some(crate::foliage_batches::kind_parts(
+                        kind,
+                        &near,
+                        None,
+                        crate::foliage_batches::KindDistances {
+                            cull_sq: f32::MAX,
+                            shadow_sq: kind_shadow[k],
+                            lod_sq: f32::INFINITY,
+                            legacy_lod: 0.0,
+                            legacy_impostor: 0.0,
+                        },
+                    ));
+                }
+                let copies = self.cover_batches.terrain(
+                    terrain_id,
+                    &self.ground_cover,
+                    &self.project_foliage,
+                    &parts,
+                    model,
+                    focus_local,
+                );
+                counts.submitted_instances = counts.submitted_instances.saturating_add(copies);
+            }
             self.foliage_batch.clear();
             let painted = self.foliage_visit.iter().map(|&index| (&t.painted_foliage[index], None));
-            let cover = self.ground_cover.instances(terrain_id).iter().map(|c| (&c.instance, Some(c.rotation)));
+            let unbatched_cover: &[crate::ground_cover::Cover] =
+                if painted_batched { &[] } else { self.ground_cover.instances(terrain_id) };
+            let cover = unbatched_cover.iter().map(|c| (&c.instance, Some(c.rotation)));
             for (inst, cover_rotation) in painted.chain(cover) {
                 let k = inst.kind as usize;
                 counts.candidates = counts.candidates.saturating_add(1);
@@ -9387,13 +9434,17 @@ impl<G: GameApp> Engine<G> {
         }
         if batched {
             self.foliage_batches.end_frame();
+            self.cover_batches.end_frame();
             let changes = std::mem::take(&mut self.foliage_batches.changes);
             if let Some(r) = self.renderer.as_mut() {
-                for id in changes.remove {
-                    r.remove_instance_batch(id);
+                for id in changes.remove.iter().chain(&self.cover_batches.remove) {
+                    r.remove_instance_batch(*id);
                 }
                 for (id, batch) in &changes.set {
                     r.set_instance_batch(*id, batch);
+                }
+                for (id, batch) in &self.cover_batches.set {
+                    r.set_instanced_batch(*id, batch);
                 }
             }
         }

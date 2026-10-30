@@ -10,20 +10,30 @@
 //! no steeper than `max_slope_deg` (the kind's brush rules). Cells beyond the radius are dropped; a terrain edit
 //! regenerates. A project without `ground_cover` kinds generates nothing. With `align_to_ground` each instance is
 //! tilted to the slope under it, so a patch neither floats nor sinks on a hillside.
+//!
+//! First person (Sunscar, 30 Oct 2026: "grass needs to be much much more denser"): a cell is generated once, on
+//! worker threads under a per-frame candidate budget, and drawn as one instance batch per terrain, kind and cell
+//! whose copies are one instanced draw per part ([`CoverBatches`]). Each copy carries a rank; past [`BAND_NEAR`]
+//! each doubling of distance keeps half the copies, widened to hold the ground they cover (AMD's mesh-shader grass
+//! drops blades and widens the rest the same way). `SOMNIUM_COVER_DENSITY` scales every kind's density.
 
 use std::collections::HashMap;
 
-use glam::{Quat, Vec3};
+use glam::{Mat4, Quat, Vec3};
+use somnium_renderer::instance_batch::{BatchPart, InstanceBatch};
 use somnium_renderer::terrain::TerrainData;
-use somnium_renderer::terrain::foliage::SurfaceSample;
 use somnium_renderer::terrain::foliage_paint::PaintedFoliage;
 
 use crate::foliage_palette::ProjectEntry;
 
 /// Cell edge, metres.
 pub const CELL: f32 = 16.0;
-/// Most cells generated in one frame (the rest come next frame).
-const CELLS_PER_FRAME: usize = 24;
+/// Most candidates generated in one frame, over every cell made then (the rest come next frame); at least one cell.
+const CANDIDATES_PER_FRAME: f32 = 160_000.0;
+/// Inside this distance every copy draws; past it each doubling keeps half ([`band`]).
+pub const BAND_NEAR: f32 = 12.0;
+/// The widest a thinned copy is drawn, against its own width.
+const MOST_WIDEN: f32 = 2.5;
 
 /// What ground cover reads of a terrain: its edit revision, size, heights and splat. A renderer terrain is one; the
 /// tests' plain ground is another, so cover can be checked without a GPU.
@@ -36,8 +46,8 @@ pub(crate) trait Ground {
     fn cell_size(&self) -> f32;
     /// Height at a terrain-local point, metres.
     fn world_height_at(&self, x: f32, z: f32) -> f32;
-    /// Height, slope and `layer`'s weight at a terrain-local point.
-    fn surface_sample(&self, x: f32, z: f32, layer: u8) -> SurfaceSample;
+    /// `layer`'s splat weight at a terrain-local point, `0..=1`.
+    fn layer_weight(&self, x: f32, z: f32, layer: u8) -> f32;
 }
 
 impl Ground for TerrainData {
@@ -57,8 +67,8 @@ impl Ground for TerrainData {
         TerrainData::world_height_at(self, x, z)
     }
 
-    fn surface_sample(&self, x: f32, z: f32, layer: u8) -> SurfaceSample {
-        TerrainData::surface_sample(self, x, z, layer)
+    fn layer_weight(&self, x: f32, z: f32, layer: u8) -> f32 {
+        TerrainData::layer_weight_at(self, x, z, layer)
     }
 }
 
@@ -72,14 +82,17 @@ pub(crate) fn streamed_seed_key(translation: Vec3) -> u64 {
 
 #[derive(Default)]
 struct TerrainCover {
+    /// Unique per remake of this terrain's cover: its batches are rebuilt when it changes.
+    epoch: u64,
     revision: u64,
     /// The seed key the cells were made with.
     seed: u64,
     /// The area cover grows in (`TerrainStreaming::own_area`), if not the whole terrain.
     area: Option<glam::Vec4>,
     cells: HashMap<(u16, i32, i32), Vec<Cover>>,
-    /// Every live cell's instances, rebuilt when the set of cells changes.
+    /// Every live cell's instances, rebuilt when asked after the set of cells changed (the per-instance path).
     flat: Vec<Cover>,
+    flat_stale: bool,
 }
 
 /// One generated instance: where it stands (its yaw and tilt as a painted one's) and its whole rotation.
@@ -89,6 +102,8 @@ pub struct Cover {
     pub instance: PaintedFoliage,
     /// `Ry(yaw) * Rx(tilt)`, turned onto the ground's normal for `align_to_ground` kinds.
     pub rotation: Quat,
+    /// Uniform in `0..1`, hashed: a copy draws in distance band `b` while `rank < 2^-b`.
+    pub rank: f32,
 }
 
 /// Generated ground cover, per terrain.
@@ -103,7 +118,7 @@ impl GroundCover {
     pub(crate) fn update(
         &mut self,
         terrain_id: u32,
-        terrain: &impl Ground,
+        terrain: &(impl Ground + Sync),
         palette: &std::collections::BTreeMap<u16, ProjectEntry>,
         camera: Vec3,
         area: Option<glam::Vec4>,
@@ -118,14 +133,15 @@ impl GroundCover {
         &mut self,
         terrain_id: u32,
         seed_key: u64,
-        terrain: &impl Ground,
+        terrain: &(impl Ground + Sync),
         palette: &std::collections::BTreeMap<u16, ProjectEntry>,
         camera: Vec3,
         area: Option<glam::Vec4>,
     ) {
+        let scale = density_scale();
         let kinds: Vec<(u16, &ProjectEntry, f32, f32)> = palette
             .iter()
-            .filter_map(|(kind, entry)| entry.ground_cover.as_ref().map(|g| (*kind, entry, g.density, g.radius)))
+            .filter_map(|(kind, entry)| entry.ground_cover.as_ref().map(|g| (*kind, entry, g.density * scale, g.radius)))
             .collect();
         if kinds.is_empty() {
             self.terrains.remove(&terrain_id);
@@ -133,44 +149,78 @@ impl GroundCover {
         }
         let cover = self.terrains.entry(terrain_id).or_default();
         let revision = terrain.edit_revision();
-        if cover.revision != revision || cover.area != area || cover.seed != seed_key {
-            *cover = TerrainCover { revision, seed: seed_key, area, ..TerrainCover::default() };
+        if cover.revision != revision || cover.area != area || cover.seed != seed_key || cover.epoch == 0 {
+            static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let epoch = EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            *cover = TerrainCover { epoch, revision, seed: seed_key, area, ..TerrainCover::default() };
         }
         let mut changed = false;
-        let mut made = 0;
-        for &(kind, entry, density, radius) in &kinds {
+        // Every kind's wanted cells, nearest first, then as many as the frame's candidate budget holds.
+        let mut wanted: Vec<(f32, usize, i32, i32)> = Vec::new();
+        for (index, &(kind, _, _, radius)) in kinds.iter().enumerate() {
             let before = cover.cells.len();
             cover.cells.retain(|&(k, cx, cz), _| k != kind || cell_distance(cx, cz, camera) <= radius + CELL);
             changed |= cover.cells.len() != before;
             let reach = (radius / CELL).ceil() as i32 + 1;
             let (ox, oz) = ((camera.x / CELL).floor() as i32, (camera.z / CELL).floor() as i32);
-            let mut wanted: Vec<(f32, i32, i32)> = (-reach..=reach)
-                .flat_map(|dz| (-reach..=reach).map(move |dx| (ox + dx, oz + dz)))
-                .map(|(cx, cz)| (cell_distance(cx, cz, camera), cx, cz))
-                .filter(|&(d, cx, cz)| d <= radius && !cover.cells.contains_key(&(kind, cx, cz)))
-                .collect();
-            wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
-            for (_, cx, cz) in wanted {
-                if made >= CELLS_PER_FRAME {
-                    break;
-                }
-                cover.cells.insert((kind, cx, cz), generate(seed_key, terrain, kind, entry, density, cx, cz, area));
-                made += 1;
-                changed = true;
-            }
+            let cells = &cover.cells;
+            wanted.extend(
+                (-reach..=reach)
+                    .flat_map(|dz| (-reach..=reach).map(move |dx| (ox + dx, oz + dz)))
+                    .map(|(cx, cz)| (cell_distance(cx, cz, camera), index, cx, cz))
+                    .filter(|&(d, _, cx, cz)| d <= radius && !cells.contains_key(&(kind, cx, cz))),
+            );
         }
-        if changed {
-            cover.flat.clear();
-            for cell in cover.cells.values() {
-                cover.flat.extend_from_slice(cell);
+        wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut budget = CANDIDATES_PER_FRAME;
+        let mut take = 0;
+        for &(_, index, _, _) in &wanted {
+            if take > 0 && budget <= 0.0 {
+                break;
             }
+            budget -= kinds[index].2 * CELL * CELL;
+            take += 1;
+        }
+        let jobs = &wanted[..take];
+        let run = |chunk: &[(f32, usize, i32, i32)]| -> Vec<((u16, i32, i32), Vec<Cover>)> {
+            chunk
+                .iter()
+                .map(|&(_, i, cx, cz)| {
+                    let (kind, entry, density, _) = kinds[i];
+                    ((kind, cx, cz), generate(seed_key, terrain, kind, entry, density, cx, cz, area))
+                })
+                .collect()
+        };
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2)).clamp(1, 6);
+        let made: Vec<((u16, i32, i32), Vec<Cover>)> = if threads == 1 || jobs.len() < 2 {
+            run(jobs)
+        } else {
+            let run = &run;
+            std::thread::scope(|scope| {
+                let handles: Vec<_> =
+                    jobs.chunks(jobs.len().div_ceil(threads)).map(|chunk| scope.spawn(move || run(chunk))).collect();
+                handles.into_iter().flat_map(|h| h.join().expect("ground cover worker")).collect()
+            })
+        };
+        changed |= !made.is_empty();
+        cover.cells.extend(made);
+        if changed {
+            cover.flat_stale = true;
         }
     }
 
     /// `terrain`'s generated instances (terrain-local), as painted ones are.
     #[must_use]
-    pub fn instances(&self, terrain_id: u32) -> &[Cover] {
-        self.terrains.get(&terrain_id).map_or(&[], |c| c.flat.as_slice())
+    pub fn instances(&mut self, terrain_id: u32) -> &[Cover] {
+        let Some(cover) = self.terrains.get_mut(&terrain_id) else { return &[] };
+        if cover.flat_stale {
+            cover.flat.clear();
+            for cell in cover.cells.values() {
+                cover.flat.extend_from_slice(cell);
+            }
+            cover.flat_stale = false;
+        }
+        cover.flat.as_slice()
     }
 
     /// Forget a terrain (or every terrain, on a scene change).
@@ -216,7 +266,7 @@ fn cell_seed(seed_key: u64, kind: u16, cx: i32, cz: i32) -> u64 {
 #[allow(clippy::too_many_arguments)]
 fn generate(
     seed_key: u64,
-    terrain: &impl Ground,
+    terrain: &(impl Ground + Sync),
     kind: u16,
     entry: &ProjectEntry,
     density: f32,
@@ -230,31 +280,46 @@ fn generate(
     let expected = density * CELL * CELL;
     let count = expected.floor() as u64 + u64::from(unit(mix(seed)) < expected.fract());
     let min_slope_cos = b.max_slope_deg.to_radians().cos();
+    let least = b.min_layer_weight.max(1e-3);
     let mut out = Vec::new();
+    // A cell with none of the kind's layer on a metre grid grows nothing: skip its candidates.
+    let present = (0..=16).any(|j| {
+        (0..=16).any(|i| {
+            let (x, z) = ((cx as f32 + i as f32 / 16.0) * CELL, (cz as f32 + j as f32 / 16.0) * CELL);
+            terrain.layer_weight(x.clamp(0.0, wx), z.clamp(0.0, wz), b.layer) >= least
+        })
+    });
+    if !present {
+        return out;
+    }
     for i in 0..count {
         let h = mix(seed ^ (i + 1).wrapping_mul(0xA24B_AED4_963E_E407));
         let (x, z) = ((cx as f32 + unit(h)) * CELL, (cz as f32 + unit(mix(h))) * CELL);
         if !(0.0..wx).contains(&x) || !(0.0..wz).contains(&z) || !area.is_none_or(|a| inside(a, x, z)) {
             continue;
         }
-        let s = terrain.surface_sample(x, z, b.layer);
-        let keep = unit(mix(h ^ 1));
-        if s.layer_weight < b.min_layer_weight.max(1e-3) || keep > s.layer_weight || s.slope_cos < min_slope_cos {
+        // The cheap test first: most candidates fall on another layer.
+        let weight = terrain.layer_weight(x, z, b.layer);
+        if weight < least || unit(mix(h ^ 1)) > weight {
+            continue;
+        }
+        let normal = ground_normal(terrain, x, z);
+        if normal.y < min_slope_cos {
             continue;
         }
         let t = unit(mix(h ^ 2));
         let instance = PaintedFoliage {
             kind,
-            position: Vec3::new(x, s.height, z),
+            position: Vec3::new(x, terrain.world_height_at(x, z), z),
             yaw: unit(mix(h ^ 3)) * std::f32::consts::TAU,
             tilt: b.max_tilt_deg.to_radians() * unit(mix(h ^ 4)),
             scale: b.scale_min + (b.scale_max - b.scale_min) * t,
         };
         let mut rotation = Quat::from_rotation_y(instance.yaw) * Quat::from_rotation_x(instance.tilt);
         if entry.ground_cover.as_ref().is_some_and(|g| g.align_to_ground) {
-            rotation = Quat::from_rotation_arc(Vec3::Y, ground_normal(terrain, x, z)) * rotation;
+            rotation = Quat::from_rotation_arc(Vec3::Y, normal) * rotation;
         }
-        out.push(Cover { instance, rotation });
+        out.push(Cover { instance, rotation, rank: unit(mix(h ^ 5)) });
     }
     out
 }
@@ -270,6 +335,153 @@ fn ground_normal(terrain: &impl Ground, x: f32, z: f32) -> Vec3 {
     let hx = terrain.world_height_at(x + d, z) - terrain.world_height_at(x - d, z);
     let hz = terrain.world_height_at(x, z + d) - terrain.world_height_at(x, z - d);
     Vec3::new(-hx, 2.0 * d, -hz).try_normalize().unwrap_or(Vec3::Y)
+}
+
+/// Every ground cover kind's density times `SOMNIUM_COVER_DENSITY` (1 by default): a whole-world dial for density
+/// sweeps, while the palette's densities are the look's.
+#[must_use]
+pub fn density_scale() -> f32 {
+    static SCALE: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+        std::env::var("SOMNIUM_COVER_DENSITY")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map_or(1.0, |v| v.min(64.0))
+    });
+    *SCALE
+}
+
+/// The distance band of ground `distance` metres from the cover's centre: 0 inside [`BAND_NEAR`], then one more per
+/// doubling. Band `b` draws the copies ranked below `2^-b`, each widened by `sqrt(2)^b` (at most [`MOST_WIDEN`]).
+#[must_use]
+pub fn band(distance: f32) -> u32 {
+    if distance <= BAND_NEAR { 0 } else { ((distance / BAND_NEAR).log2().ceil() as u32).min(8) }
+}
+
+fn band_keep(band: u32) -> f32 {
+    0.5f32.powi(band as i32)
+}
+
+fn band_widen(band: u32) -> f32 {
+    std::f32::consts::SQRT_2.powi(band as i32).min(MOST_WIDEN)
+}
+
+/// Ground cover as instance batches: one per terrain, kind and cell, every part's copies one instanced draw
+/// (`SomniumRenderer::set_instanced_batch`). A cell's batch is set when it comes within its kind's radius, set again
+/// when its band changes or its terrain's cover is remade, and removed when it leaves.
+#[derive(Default)]
+pub(crate) struct CoverBatches {
+    /// Batch id -> (signature, frame last needed, copies).
+    live: HashMap<u64, (u64, u64, u32)>,
+    frame: u64,
+    pub set: Vec<(u64, InstanceBatch)>,
+    pub remove: Vec<u64>,
+}
+
+/// Namespace byte 0xF1, then 12 bits of terrain, 13 of kind (every project id) and 15 each of the cell's x and z.
+fn cover_batch_id(terrain: u32, kind: u16, cx: i32, cz: i32) -> u64 {
+    (0xF1u64 << 56)
+        | (u64::from(terrain & 0xFFF) << 44)
+        | (u64::from(kind & 0x1FFF) << 31)
+        | ((cx as u32 as u64 & 0x7FFF) << 15)
+        | (cz as u32 as u64 & 0x7FFF)
+}
+
+fn fold(h: &mut u64, word: u32) {
+    *h = (*h ^ u64::from(word)).wrapping_mul(0x0100_0000_01b3);
+}
+
+impl CoverBatches {
+    pub(crate) fn begin_frame(&mut self) {
+        self.frame += 1;
+        self.set.clear();
+        self.remove.clear();
+    }
+
+    /// One terrain's cells, round `focus` (terrain-local). `parts[kind]` is `None` while a kind's mesh is not loaded.
+    /// Returns the copies its live batches draw.
+    pub(crate) fn terrain(
+        &mut self,
+        terrain_id: u32,
+        cover: &GroundCover,
+        palette: &std::collections::BTreeMap<u16, ProjectEntry>,
+        parts: &[Option<Vec<BatchPart>>],
+        model: Mat4,
+        focus: Vec3,
+    ) -> u32 {
+        let Some(t) = cover.terrains.get(&terrain_id) else { return 0 };
+        let mut copies = 0;
+        for (&(kind, cx, cz), cell) in &t.cells {
+            let Some(Some(list)) = parts.get(usize::from(kind)) else { continue };
+            let Some(radius) = palette.get(&kind).and_then(|e| e.ground_cover.as_ref()).map(|g| g.radius) else {
+                continue;
+            };
+            let d = cell_distance(cx, cz, focus);
+            if d > radius || cell.is_empty() {
+                continue;
+            }
+            let b = band(d);
+            // A cell past its kind's shadow distance casts nothing: a casting batch set or removed redraws every
+            // cascade, and the far cells come and go all the time.
+            let casts = list.iter().any(|p| p.casts_shadow && (p.shadow_far <= 0.0 || d <= p.shadow_far));
+            let mut sig = 0xcbf2_9ce4_8422_2325u64 ^ t.epoch.rotate_left(17);
+            fold(&mut sig, b);
+            fold(&mut sig, u32::from(casts));
+            for v in model.to_cols_array() {
+                fold(&mut sig, v.to_bits());
+            }
+            for p in list {
+                for word in [p.vertex_offset, p.index_offset, p.index_count, p.material_id, u32::from(p.casts_shadow)] {
+                    fold(&mut sig, word);
+                }
+                fold(&mut sig, p.shadow_far.to_bits());
+            }
+            let id = cover_batch_id(terrain_id, kind, cx, cz);
+            let n = match self.live.get(&id) {
+                Some(&(old, _, n)) if old == sig => n,
+                _ => {
+                    let (keep, widen) = (band_keep(b), band_widen(b));
+                    let placements: Vec<Mat4> = cell
+                        .iter()
+                        .filter(|c| c.rank < keep && c.instance.scale > 0.0)
+                        .map(|c| {
+                            let s = c.instance.scale;
+                            model
+                                * Mat4::from_scale_rotation_translation(
+                                    Vec3::new(s * widen, s, s * widen),
+                                    c.rotation,
+                                    c.instance.position,
+                                )
+                        })
+                        .collect();
+                    let n = placements.len() as u32;
+                    if n == 0 {
+                        continue;
+                    }
+                    let mut parts = list.clone();
+                    if !casts {
+                        parts.iter_mut().for_each(|p| p.casts_shadow = false);
+                    }
+                    self.set.push((id, InstanceBatch { parts, placements }));
+                    n
+                }
+            };
+            self.live.insert(id, (sig, self.frame, n));
+            copies += n;
+        }
+        copies
+    }
+
+    /// Every batch not needed this frame is removed.
+    pub(crate) fn end_frame(&mut self) {
+        let (frame, remove) = (self.frame, &mut self.remove);
+        self.live.retain(|&id, &mut (_, last, _)| {
+            if last != frame {
+                remove.push(id);
+            }
+            last == frame
+        });
+    }
 }
 
 /// How far along the view ray the cover's centre may move ahead of the camera, metres: `SOMNIUM_COVER_FOCUS_REACH`,
@@ -353,8 +565,8 @@ mod tests {
             2.0
         }
 
-        fn surface_sample(&self, _x: f32, _z: f32, layer: u8) -> SurfaceSample {
-            SurfaceSample { height: 2.0, slope_cos: 1.0, layer_weight: if layer == 0 { 1.0 } else { 0.0 } }
+        fn layer_weight(&self, _x: f32, _z: f32, layer: u8) -> f32 {
+            if layer == 0 { 1.0 } else { 0.0 }
         }
     }
 
@@ -396,6 +608,7 @@ mod tests {
         }
         let ground = Plain { revision: 4 };
         let by_id = grown(&mut GroundCover::default(), 3, None, &ground);
+        assert!(by_id.iter().all(|(f, _)| (f.position.y - 2.0).abs() < 1e-6), "on the ground");
         let seeded = grown(&mut GroundCover::default(), 3, Some(3), &ground);
         assert!(by_id.len() > 100, "{} instances", by_id.len());
         assert_eq!(by_id, seeded, "update is update_seeded with the id as the key");
@@ -463,5 +676,56 @@ mod tests {
         assert_ne!(place >> 24, 0);
         assert_ne!(cell_seed(place, 44 + 256, 1, 2), cell_seed(place ^ 1, 44, 1, 2));
         assert_ne!(cell_seed(place, 300, 1, 2), cell_seed(place, 44, 1, 2));
+    }
+
+    #[test]
+    fn bands_halve_per_doubling_and_keep_nested_copies() {
+        assert_eq!([band(0.0), band(BAND_NEAR), band(BAND_NEAR + 0.1), band(2.0 * BAND_NEAR), band(3.0 * BAND_NEAR)], [0, 0, 1, 1, 2]);
+        assert_eq!(band(1.0e6), 8, "capped");
+        assert_eq!((band_keep(0), band_keep(2)), (1.0, 0.25));
+        assert!((band_widen(2) - 2.0).abs() < 1e-6 && band_widen(6) == MOST_WIDEN);
+    }
+
+    #[test]
+    fn cover_cells_become_batches_thinned_by_band_and_removed_when_they_leave() {
+        let ground = Plain { revision: 1 };
+        let palette = grass();
+        let mut cover = GroundCover::default();
+        for _ in 0..8 {
+            cover.update(1, &ground, &palette, Vec3::new(64.0, 2.0, 64.0), None);
+        }
+        let part = BatchPart {
+            vertex_offset: 1,
+            index_offset: 0,
+            index_count: 30,
+            material_id: 0,
+            local: Mat4::IDENTITY,
+            near: 0.0,
+            far: 0.0,
+            casts_shadow: false,
+            shadow_far: 0.0,
+        };
+        let mut parts = vec![None; 133];
+        parts[132] = Some(vec![part]);
+        let mut batches = CoverBatches::default();
+        batches.begin_frame();
+        let copies = batches.terrain(1, &cover, &palette, &parts, Mat4::IDENTITY, Vec3::new(64.0, 2.0, 64.0));
+        batches.end_frame();
+        let all: usize = cover.instances(1).len();
+        assert!(copies > 0 && (copies as usize) < all, "{copies} of {all}: far cells thinned");
+        assert!(batches.set.iter().all(|(id, b)| id >> 56 == 0xF1 && !b.placements.is_empty()));
+        let first = batches.set.len();
+        // The same frame again: nothing to send. Far away: everything removed.
+        batches.begin_frame();
+        batches.terrain(1, &cover, &palette, &parts, Mat4::IDENTITY, Vec3::new(64.0, 2.0, 64.0));
+        batches.end_frame();
+        assert!(batches.set.is_empty() && batches.remove.is_empty());
+        batches.begin_frame();
+        batches.end_frame();
+        assert_eq!(batches.remove.len(), first);
+        // Cell ids never collide across kind, terrain or cell.
+        assert_ne!(cover_batch_id(1, 200, 3, 4), cover_batch_id(1, 200, 4, 3));
+        assert_ne!(cover_batch_id(1, 200, 3, 4), cover_batch_id(2, 200, 3, 4));
+        assert_ne!(cover_batch_id(1, 200, 3, 4), cover_batch_id(1, 201, 3, 4));
     }
 }
