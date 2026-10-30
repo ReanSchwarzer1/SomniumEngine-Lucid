@@ -726,9 +726,7 @@ mod tests {
         let c = head.transform_point3((min + max) * 0.5);
         let half = (max - min) * 0.5;
         let e = head.x_axis.truncate().abs() * half.x + head.y_axis.truncate().abs() * half.y + head.z_axis.truncate().abs() * half.z;
-        for x in [9.5, -5.5] {
-            assert!(c.x - e.x <= x.min(-5.5) && c.x + e.x >= x.max(9.5), "{c} {e}");
-        }
+        assert!(c.x - e.x <= -5.5 && c.x + e.x >= 9.5, "{c} {e}");
         let mut one = vec![GpuSlot::new(&part, at(0.0, 0.0), None)];
         make_run(&mut one);
         assert_eq!(one[0].shadow[2], 1.0, "a run of one is its head");
