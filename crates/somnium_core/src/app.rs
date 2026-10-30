@@ -1423,6 +1423,24 @@ fn own_window(attrs: WindowAttributes, _owner: &Window) -> WindowAttributes {
     attrs
 }
 
+/// The project at `root`, opened once per root: `imported_source_path` runs for every imported source of every
+/// streamed cell, two or three times each, and opening reads the manifest and resolves its eleven folders (Sunscar,
+/// 30 Oct 2026: with the source stamps, most of a cell install's "GPU restore"). Resolving a source still checks it
+/// against the project each time.
+fn opened_project(root: &std::path::Path) -> Result<crate::authoring::project::ProjectPaths, String> {
+    static OPEN: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, crate::authoring::project::ProjectPaths>>,
+    > = std::sync::LazyLock::new(Default::default);
+    if let Some(project) = OPEN.lock().ok().and_then(|open| open.get(root).cloned()) {
+        return Ok(project);
+    }
+    let project = crate::authoring::project::ProjectPaths::open(root)?;
+    if let Ok(mut open) = OPEN.lock() {
+        open.insert(root.to_path_buf(), project.clone());
+    }
+    Ok(project)
+}
+
 /// A background window (`somnium_ui::background_window`) after it is shown: a tool window that is never activated,
 /// so it has no taskbar button, is not in Alt+Tab and a click can't bring it forward. winit has neither style for a
 /// main window, and rewrites the extended style when its own flags change, hence after `set_visible`.
@@ -2612,8 +2630,7 @@ impl<G: GameApp> Engine<G> {
     fn imported_source_path(&self, source: &str) -> Result<std::path::PathBuf, String> {
         let source_path = std::path::Path::new(source);
         match self.config.project_root.as_ref() {
-            Some(root) => crate::authoring::project::ProjectPaths::open(root)
-                .and_then(|project| project.resolve(source_path)),
+            Some(root) => opened_project(root).and_then(|project| project.resolve(source_path)),
             None => Ok(source_path.to_path_buf()),
         }
     }
@@ -2791,6 +2808,7 @@ impl<G: GameApp> Engine<G> {
         // textures: a bank of 172 parts of which a level draws five no longer
         // uploads, or decodes, all 172 parts' maps.
         let drawing = self.renderer.is_some() && self.render_ctx.is_some();
+        self.zone_begin("Restore stamps");
         let mut restores = Vec::new();
         for (source, entities) in imported {
             let resolved = match self.imported_source_path(&source) {
@@ -2817,6 +2835,8 @@ impl<G: GameApp> Engine<G> {
             let load = load.filter(|_| drawing).map(|parts| (resolved, parts));
             restores.push((source, entities, stamp, cached, load, parts));
         }
+        self.zone_end();
+        self.zone_begin("Restore uploads");
         // Each bank is read and decoded on a loader thread (its images on
         // every core, `load_gltf_for`) while this one uploads the bank before
         // it, in the same order. Two loaders take every other bank: a bank of
@@ -2904,6 +2924,7 @@ impl<G: GameApp> Engine<G> {
                 upload_time += uploading.elapsed();
             }
         });
+        self.zone_end();
 
         if let Some(renderer) = self.renderer.as_ref() {
             // One line per load, so a slow open says whether textures were

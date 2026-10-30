@@ -333,6 +333,7 @@ impl<G: GameApp> Engine<G> {
         let report = crate::scene_schema::scene_from_json(&mut self.world, &self.type_registry, document);
         self.zone_end();
         let report = report.map_err(|error| error.to_string())?;
+        self.zone_begin("Cell sources");
         // Which uploads this cell keeps alive (for eviction once no loaded cell draws them).
         let sources: Vec<PathBuf> = cells::sources_of(document)
             .into_keys()
@@ -343,6 +344,7 @@ impl<G: GameApp> Engine<G> {
             self.cell_streamer.cold.remove(source);
         }
         self.cell_streamer.cell_sources.insert(index, sources);
+        self.zone_end();
         let cell = u32::try_from(index).unwrap_or(u32::MAX);
         for &entity in &report.entities {
             let _ = self.world.insert_component(entity, Streamed { cell });

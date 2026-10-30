@@ -37,9 +37,25 @@ pub(super) struct SourceStamp {
 }
 
 impl SourceStamp {
+    /// [`Self::read_fresh`], remembered by the path asked for: a stamp still current (every file it names unchanged,
+    /// [`Self::is_current`], stats only) comes back without opening the source and parsing its JSON again. A streamed
+    /// cell asks for each of its sources two or three times, and an open world installs hundreds of cells (Sunscar,
+    /// 30 Oct 2026: most of a cell install's "GPU restore" was this and the project's paths). A changed source, buffer,
+    /// image or mask makes it stale, and it is read afresh.
+    pub(super) fn read(source: &Path) -> Option<Self> {
+        static READ: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, SourceStamp>>> =
+            std::sync::LazyLock::new(Default::default);
+        if let Some(stamp) = READ.lock().ok()?.get(source).filter(|stamp| stamp.is_current()) {
+            return Some(stamp.clone());
+        }
+        let stamp = Self::read_fresh(source)?;
+        READ.lock().ok()?.insert(source.to_path_buf(), stamp.clone());
+        Some(stamp)
+    }
+
     /// Unsupported or unreadable sources simply bypass the cache; the importer
     /// retains responsibility for reporting its own useful loading errors.
-    pub(super) fn read(source: &Path) -> Option<Self> {
+    fn read_fresh(source: &Path) -> Option<Self> {
         let source = source.canonicalize().ok()?;
         let mut files = BTreeMap::new();
         let stamp = file_stamp(&source)??;
