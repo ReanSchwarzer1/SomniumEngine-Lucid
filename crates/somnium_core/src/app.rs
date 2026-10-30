@@ -9107,7 +9107,9 @@ impl<G: GameApp> Engine<G> {
                     continue;
                 };
                 let grid = self.foliage_grids.entry(terrain_id).or_default();
+                let since = std::time::Instant::now();
                 grid.refresh(t.edit_revision, &t.painted_foliage);
+                slow_foliage_step(terrain_id, "painted grid", since);
                 grid.kinds.clone()
             };
             // Kinds generated round the camera need their meshes as painted ones do.
@@ -9190,6 +9192,7 @@ impl<G: GameApp> Engine<G> {
                         },
                     ));
                 }
+                let since = std::time::Instant::now();
                 let copies = self.foliage_batches.terrain(
                     terrain_id,
                     t.edit_revision,
@@ -9198,6 +9201,7 @@ impl<G: GameApp> Engine<G> {
                     camera_local,
                     &parts,
                 );
+                slow_foliage_step(terrain_id, "painted batches", since);
                 counts.submitted_instances = counts.submitted_instances.saturating_add(copies);
             }
             // Only the ground cells within the farthest kind's reach are visited.
@@ -9213,12 +9217,14 @@ impl<G: GameApp> Engine<G> {
                 t.world_height_at(camera_local.x, camera_local.z),
                 crate::ground_cover::focus_reach(),
             );
+            let since = std::time::Instant::now();
             match seed_key {
                 Some(key) => {
                     self.ground_cover.update_seeded(terrain_id, key, t, &self.project_foliage, focus_local, own_area);
                 }
                 None => self.ground_cover.update(terrain_id, t, &self.project_foliage, focus_local, own_area),
             }
+            slow_foliage_step(terrain_id, "cover generate", since);
             // Batched, ground cover is one instanced batch per kind and cell (`CoverBatches`), not a draw per copy.
             if painted_batched {
                 let mut parts: Vec<Option<Vec<somnium_renderer::instance_batch::BatchPart>>> = vec![None; span];
@@ -9250,6 +9256,7 @@ impl<G: GameApp> Engine<G> {
                         },
                     ));
                 }
+                let since = std::time::Instant::now();
                 let copies = self.cover_batches.terrain(
                     terrain_id,
                     &self.ground_cover,
@@ -9258,9 +9265,11 @@ impl<G: GameApp> Engine<G> {
                     model,
                     focus_local,
                 );
+                slow_foliage_step(terrain_id, "cover batches", since);
                 counts.submitted_instances = counts.submitted_instances.saturating_add(copies);
             }
             self.foliage_batch.clear();
+            let per_copy = std::time::Instant::now();
             let painted = self.foliage_visit.iter().map(|&index| (&t.painted_foliage[index], None));
             let unbatched_cover: &[crate::ground_cover::Cover] =
                 if painted_batched { &[] } else { self.ground_cover.instances(terrain_id) };
@@ -9390,6 +9399,7 @@ impl<G: GameApp> Engine<G> {
             self.foliage_batch.sort_by_key(|(part, _, _)| {
                 (part.vertex_offset, part.index_offset, part.material_id)
             });
+            slow_foliage_step(terrain_id, "per-copy draws", per_copy);
 
             if let Some(r) = self.renderer.as_mut() {
                 // Kinds kept out of the ray-traced scene (ground cover by default): their meshes still rasterise.
@@ -9436,6 +9446,7 @@ impl<G: GameApp> Engine<G> {
             self.foliage_batches.end_frame();
             self.cover_batches.end_frame();
             let changes = std::mem::take(&mut self.foliage_batches.changes);
+            let since = std::time::Instant::now();
             if let Some(r) = self.renderer.as_mut() {
                 for id in changes.remove.iter().chain(&self.cover_batches.remove) {
                     r.remove_instance_batch(*id);
@@ -9447,6 +9458,7 @@ impl<G: GameApp> Engine<G> {
                     r.set_instanced_batch(*id, batch);
                 }
             }
+            slow_foliage_step(u32::MAX, "batch sets", since);
         }
         if let Some(r) = self.renderer.as_mut() {
             r.foliage_submission = counts;
@@ -14571,3 +14583,11 @@ mod cell_streaming_host;
 mod prop_sets_host;
 
 include!("app_project_foliage.rs");
+
+/// Says which foliage step took a frame's time when one passes 20 ms (Sunscar's tile-arrival hitches, 30 Oct 2026).
+fn slow_foliage_step(terrain: u32, what: &str, since: std::time::Instant) {
+    let ms = since.elapsed().as_secs_f32() * 1000.0;
+    if ms > 20.0 {
+        tracing::warn!(terrain, step = what, ms, "slow foliage step");
+    }
+}

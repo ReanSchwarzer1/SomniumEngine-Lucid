@@ -160,19 +160,26 @@ impl GroundCover {
             let epoch = EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             *cover = TerrainCover { epoch, revision, seed: seed_key, area, ..TerrainCover::default() };
         }
-        let mut changed = false;
+        // One pass drops every kind's cells past its radius (a pass per kind was kinds x cells a frame, per terrain).
+        let radius_of: HashMap<u16, f32> = kinds.iter().map(|&(kind, _, _, radius)| (kind, radius)).collect();
+        let before = cover.cells.len();
+        cover.cells.retain(|&(k, cx, cz), _| radius_of.get(&k).is_some_and(|r| cell_distance(cx, cz, camera) <= r + CELL));
+        let mut changed = cover.cells.len() != before;
+        // Only cells on this terrain's own ground: a tile the player is not on grows nothing round him. Every loaded
+        // tile once kept thousands of empty cells round the eye (Sunscar, 30 Oct 2026: 40-100 ms a frame).
+        let [wx, wz] = terrain.world_size();
+        let own = area.unwrap_or(glam::Vec4::new(0.0, 0.0, wx, wz));
+        let (lo_x, lo_z) = ((own.x / CELL).floor() as i32, (own.y / CELL).floor() as i32);
+        let (hi_x, hi_z) = (((own.z / CELL).ceil() as i32) - 1, ((own.w / CELL).ceil() as i32) - 1);
         // Every kind's wanted cells, nearest first, then as many as the frame's candidate budget holds.
         let mut wanted: Vec<(f32, usize, i32, i32)> = Vec::new();
         for (index, &(kind, _, _, radius)) in kinds.iter().enumerate() {
-            let before = cover.cells.len();
-            cover.cells.retain(|&(k, cx, cz), _| k != kind || cell_distance(cx, cz, camera) <= radius + CELL);
-            changed |= cover.cells.len() != before;
             let reach = (radius / CELL).ceil() as i32 + 1;
             let (ox, oz) = ((camera.x / CELL).floor() as i32, (camera.z / CELL).floor() as i32);
             let cells = &cover.cells;
             wanted.extend(
-                (-reach..=reach)
-                    .flat_map(|dz| (-reach..=reach).map(move |dx| (ox + dx, oz + dz)))
+                ((oz - reach).max(lo_z)..=(oz + reach).min(hi_z))
+                    .flat_map(|cz| ((ox - reach).max(lo_x)..=(ox + reach).min(hi_x)).map(move |cx| (cx, cz)))
                     .map(|(cx, cz)| (cell_distance(cx, cz, camera), index, cx, cz))
                     .filter(|&(d, _, cx, cz)| d <= radius && !cells.contains_key(&(kind, cx, cz))),
             );
@@ -753,5 +760,21 @@ mod tests {
         assert_ne!(cover_batch_id(1, 200, 3, 4), cover_batch_id(1, 200, 4, 3));
         assert_ne!(cover_batch_id(1, 200, 3, 4), cover_batch_id(2, 200, 3, 4));
         assert_ne!(cover_batch_id(1, 200, 3, 4), cover_batch_id(1, 201, 3, 4));
+    }
+
+    #[test]
+    fn a_terrain_grows_cover_only_on_its_own_ground() {
+        let ground = Plain { revision: 1 };
+        let palette = grass();
+        let mut cover = GroundCover::default();
+        // 200 m east of the 128 m square: past the 40 m radius of every cell it owns.
+        for _ in 0..4 {
+            cover.update(1, &ground, &palette, Vec3::new(328.0, 2.0, 64.0), None);
+        }
+        assert_eq!(cover.terrains[&1].cells.len(), 0, "no cells kept round an eye off this terrain");
+        // At its east edge: only its own cells, none past x = 128.
+        cover.update(1, &ground, &palette, Vec3::new(130.0, 2.0, 64.0), None);
+        assert!(!cover.terrains[&1].cells.is_empty());
+        assert!(cover.terrains[&1].cells.keys().all(|&(_, cx, cz)| (0..8).contains(&cx) && (0..8).contains(&cz)));
     }
 }
