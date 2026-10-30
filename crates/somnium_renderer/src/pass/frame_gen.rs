@@ -631,14 +631,28 @@ fn next_split(split: usize, share: f32, seen: &[Option<f32>; 7]) -> Option<usize
     seen[next].is_none_or(|was| (was - 0.5).abs() < (share - 0.5).abs()).then_some(next)
 }
 
-/// Whether the view jumped between two frames (the renderer's own camera-cut test uses it too).
+/// Whether the view jumped between two frames.
 pub(crate) fn is_cut(last: glam::Mat4, now: glam::Mat4) -> bool {
+    is_cut_within(last, now, CUT_DISTANCE)
+}
+
+/// [`is_cut`] for a frame that may have taken long: the eye moving no more than `CUT_SPEED` (a fall's terminal speed,
+/// with room) covers in `dt` is travel, not a jump. The renderer's camera-cut test; Sunscar, 30 Oct 2026: a 600 ms
+/// streaming stall while running moved the eye 3.6 m and threw away FSR's and TAA's history.
+pub(crate) fn is_cut_after(last: glam::Mat4, now: glam::Mat4, dt: f32) -> bool {
+    is_cut_within(last, now, CUT_DISTANCE.max(CUT_SPEED * dt))
+}
+
+/// Metres a second the eye can travel without a cut (`is_cut_after`).
+const CUT_SPEED: f32 = 60.0;
+
+fn is_cut_within(last: glam::Mat4, now: glam::Mat4, distance: f32) -> bool {
     let (a, b) = (last.inverse(), now.inverse());
     let moved = (a.w_axis.truncate() - b.w_axis.truncate()).length();
     let fa = (-a.z_axis.truncate()).normalize_or_zero();
     let fb = (-b.z_axis.truncate()).normalize_or_zero();
     let turned = fa.dot(fb).clamp(-1.0, 1.0).acos().to_degrees();
-    moved > CUT_DISTANCE || turned > CUT_DEGREES
+    moved > distance || turned > CUT_DEGREES
 }
 
 fn picture(device: &wgpu::Device, format: wgpu::TextureFormat, size: [u32; 2]) -> Picture {

@@ -188,7 +188,11 @@ fn vs_main(
     }
     out.clip_pos = depth_tie_clip(view.view_proj, world, view.camera_pos);
     // Ties between faces in one plane go the same way every frame (`depth_ties`), in steps sized for this plane.
-    let tie = f32(depth_ties[inst_idx]);
+    // Word 0 counts the instances with a tie (`set_depth_ties`); an instance batch's copies lie past them and take 0.
+    var tie = 0.0;
+    if inst_idx < depth_ties[0] {
+        tie = f32(depth_ties[inst_idx + 1u]);
+    }
     if tie > 0.0 {
         let normal = (instance.model * vec4<f32>(vertex.norm_x, vertex.norm_y, vertex.norm_z, 0.0)).xyz;
         out.clip_pos.z -= depth_tie_offset(tie, normal, world, out.clip_pos.w, view.view, view.camera_pos,

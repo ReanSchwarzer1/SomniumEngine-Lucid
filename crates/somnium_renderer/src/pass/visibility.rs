@@ -301,15 +301,21 @@ impl VisibilityBufferPass {
     }
 
     /// This frame's depth tie per opaque instance, in instance order (renderer.rs `depth_tie`; visibility.wgsl).
+    ///
+    /// The buffer's word 0 is how many instances have a tie, and instance `i`'s is word `i + 1`. An instance past
+    /// them takes 0: an instance batch's copy, kept at `instance_base + slot` beyond the frame's own instances
+    /// (`instance_batch.rs`), would otherwise read a stale or arbitrary word (Sunscar, 30 Oct 2026; port plan 2.2).
     pub fn set_depth_ties(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, ties: &[u32]) {
-        let bytes = (ties.len().max(1) * 4) as u64;
+        let bytes = ((ties.len() + 1) * 4) as u64;
         if self.depth_ties.size() < bytes {
             self.depth_ties = depth_ties_buffer(device, bytes.next_power_of_two());
             self.cutout_bind_group =
                 cutout_bind_group(device, &self.cutout_layout, &self.cutout_sampler, &self.depth_ties);
         }
+        let count = u32::try_from(ties.len()).unwrap_or(u32::MAX);
+        queue.write_buffer(&self.depth_ties, 0, bytemuck::bytes_of(&count));
         if !ties.is_empty() {
-            queue.write_buffer(&self.depth_ties, 0, bytemuck::cast_slice(ties));
+            queue.write_buffer(&self.depth_ties, 4, bytemuck::cast_slice(ties));
         }
     }
 

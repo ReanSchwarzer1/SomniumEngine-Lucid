@@ -4982,7 +4982,7 @@ impl SomniumRenderer {
         // A camera cut (`camera_cut`, or a jump between this frame's view and the last one drawn): the temporal passes
         // start over and motion blur sits this frame out (FSR's reset and the blur below).
         let cut = primary && {
-            let cut = camera_cut_now(std::mem::take(&mut self.camera_cut_requested), self.cut_view, self.view_matrix);
+            let cut = camera_cut_now(std::mem::take(&mut self.camera_cut_requested), self.cut_view, self.view_matrix, self.frame_delta_time);
             self.cut_view = Some(self.view_matrix);
             if cut {
                 self.taa_pass.reset_history();
@@ -5441,12 +5441,17 @@ impl SomniumRenderer {
         // `SOMNIUM_DEPTH_TIE=0` (comparisons only) leaves every tie at 0, as before 29 Oct 2026.
         static DEPTH_TIES: std::sync::LazyLock<bool> =
             std::sync::LazyLock::new(|| std::env::var("SOMNIUM_DEPTH_TIE").as_deref() != Ok("0"));
+        // A draw wholly past the ties' fade takes 0 without its hash: an open world's thousands of far draws.
+        let tie_view = self.view_matrix;
         let ties: Vec<u32> = self
             .draw_queue
             .iter()
             .map(|cmd| {
-                let terrain = self.terrain_lod_by_vertex.contains_key(&cmd.vertex_offset);
-                if *DEPTH_TIES { depth_tie(cmd, self.geometry.mesh_aabb(cmd.vertex_offset), terrain) } else { 0 }
+                if !*DEPTH_TIES || self.terrain_lod_by_vertex.contains_key(&cmd.vertex_offset) {
+                    return 0;
+                }
+                let aabb = self.geometry.mesh_aabb(cmd.vertex_offset);
+                if beyond_depth_ties(&tie_view, cmd, aabb) { 0 } else { depth_tie(cmd, aabb, false) }
             })
             .collect();
         self.vis_pass.set_depth_ties(&ctx.device, &ctx.queue, &ties);
@@ -8123,10 +8128,24 @@ fn gpu_instance_from_cmd(
 }
 
 /// Whether this frame is a camera cut: one was asked for (`SomniumRenderer::camera_cut`), or the view jumped from
-/// the last one drawn by as much as frame generation's own test calls a cut (2 m or 50 degrees). The first frame is
-/// not: every temporal pass already starts over on it.
-fn camera_cut_now(requested: bool, last: Option<glam::Mat4>, now: glam::Mat4) -> bool {
-    requested || last.is_some_and(|last| crate::pass::frame_gen::is_cut(last, now))
+/// the last one drawn by as much as frame generation's own test calls a cut (2 m or 50 degrees), or, for a frame
+/// that took `dt` seconds, further than 60 m/s covers in that time (a slow frame while running is travel). The first
+/// frame is not: every temporal pass already starts over on it.
+fn camera_cut_now(requested: bool, last: Option<glam::Mat4>, now: glam::Mat4, dt: f32) -> bool {
+    requested || last.is_some_and(|last| crate::pass::frame_gen::is_cut_after(last, now, dt))
+}
+
+/// Whether a draw lies wholly beyond the view depth where ties have faded out (`DEPTH_TIE_FADE`), so its tie draws
+/// nothing whatever it is. By view depth, not distance: a thing off to the side can be far yet shallow. Its bounds as
+/// a sphere grown by the largest axis scale, so a stretched or turned mesh is never cut short. Unknown bounds: no.
+fn beyond_depth_ties(view: &glam::Mat4, cmd: &DrawCommand, aabb: Option<([f32; 3], [f32; 3])>) -> bool {
+    let Some((min, max)) = aabb else { return false };
+    let (min, max) = (glam::Vec3::from(min), glam::Vec3::from(max));
+    let t = &cmd.transform;
+    let scale = t.x_axis.truncate().length().max(t.y_axis.truncate().length()).max(t.z_axis.truncate().length());
+    let radius = (max - min).length() * 0.5 * scale;
+    let depth = -view.transform_point3(t.transform_point3((min + max) * 0.5)).z;
+    depth - radius > crate::pass::visibility::DEPTH_TIE_FADE[1]
 }
 
 /// A draw's depth tie (visibility.wgsl `depth_ties`, 29 Oct 2026): where two things' faces lie in one plane, the one
@@ -8817,16 +8836,38 @@ mod frame_instance_layout_tests {
     }
 
     #[test]
+    fn a_tie_is_skipped_only_wholly_past_its_fade_in_view_depth() {
+        use super::beyond_depth_ties;
+        // The eye at the origin looking down -Z; ties are gone past 24 m of view depth.
+        let view = glam::Mat4::look_to_rh(glam::Vec3::ZERO, glam::Vec3::NEG_Z, glam::Vec3::Y);
+        let at = |x: f32, z: f32, scale: f32| {
+            let mut d = draw(1, 0, 1, 0.0);
+            d.transform = glam::Mat4::from_scale_rotation_translation(glam::Vec3::new(1.0, 1.0, scale), glam::Quat::IDENTITY, glam::Vec3::new(x, 0.0, z));
+            d
+        };
+        let crate_box = Some(([-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]));
+        assert!(beyond_depth_ties(&view, &at(0.0, -40.0, 1.0), crate_box), "40 m ahead");
+        assert!(!beyond_depth_ties(&view, &at(0.0, -20.0, 1.0), crate_box), "20 m ahead keeps its tie");
+        assert!(!beyond_depth_ties(&view, &at(40.0, -5.0, 1.0), crate_box), "40 m off to the side but 5 m deep");
+        assert!(!beyond_depth_ties(&view, &at(0.0, -40.0, 40.0), crate_box), "a wall 40 m long, stretched back into reach");
+        assert!(!beyond_depth_ties(&view, &at(0.0, -400.0, 1.0), None), "unknown size keeps its tie");
+    }
+
+    #[test]
     fn a_camera_cut_is_one_asked_for_or_a_jump() {
         use super::camera_cut_now;
+        // A frame at 60 fps.
+        const F: f32 = 1.0 / 60.0;
         let at = |x: f32, yaw: f32| {
             glam::Mat4::look_at_rh(glam::vec3(x, 1.6, 0.0), glam::vec3(x + yaw.sin(), 1.6, -yaw.cos()), glam::Vec3::Y)
         };
-        assert!(!camera_cut_now(false, None, at(0.0, 0.0)), "the first frame starts over anyway");
-        assert!(!camera_cut_now(false, Some(at(0.0, 0.0)), at(0.1, 0.05)), "a step and a small turn");
-        assert!(camera_cut_now(true, Some(at(0.0, 0.0)), at(0.0, 0.0)), "asked for (a cinematic's cut nearby)");
-        assert!(camera_cut_now(false, Some(at(0.0, 0.0)), at(3.0, 0.0)), "a 3 m jump");
-        assert!(camera_cut_now(false, Some(at(0.0, 0.0)), at(0.0, 1.2)), "a 69 degree turn");
+        assert!(!camera_cut_now(false, None, at(0.0, 0.0), F), "the first frame starts over anyway");
+        assert!(!camera_cut_now(false, Some(at(0.0, 0.0)), at(0.1, 0.05), F), "a step and a small turn");
+        assert!(camera_cut_now(true, Some(at(0.0, 0.0)), at(0.0, 0.0), F), "asked for (a cinematic's cut nearby)");
+        assert!(camera_cut_now(false, Some(at(0.0, 0.0)), at(3.0, 0.0), F), "a 3 m jump");
+        assert!(!camera_cut_now(false, Some(at(0.0, 0.0)), at(3.6, 0.0), 0.6), "3.6 m in a 600 ms stall while running");
+        assert!(camera_cut_now(false, Some(at(0.0, 0.0)), at(40.0, 0.0), 0.6), "a 40 m teleport in one");
+        assert!(camera_cut_now(false, Some(at(0.0, 0.0)), at(0.0, 1.2), F), "a 69 degree turn");
     }
 
     #[test]
