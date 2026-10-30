@@ -5744,8 +5744,11 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
         // not from a stale ECS settings transform or last frame's renderer.
         // Named apart, and the cell installs inside (app_cell_streaming.rs), so a streaming hitch says where it went
         // (Sunscar, 30 Oct 2026: the whole scope was 50-280 ms with nothing below it).
-        // Source stamps are checked once a frame (`SourceStamp::read`).
-        import_cache::SourceStamp::next_frame();
+        // Source stamps are checked once a frame (`SourceStamp::read`), in the editor: a standalone game's sources
+        // don't change under it, so it checks each once and trusts it for the session.
+        if !self.config.player_mode {
+            import_cache::SourceStamp::next_frame();
+        }
         self.zone_begin("World partition");
         self.update_world_partition();
         self.zone_end();

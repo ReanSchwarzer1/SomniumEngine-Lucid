@@ -76,7 +76,9 @@ impl<G: GameApp> Engine<G> {
         let focus = pinned.pinned().or_else(|| self.renderer.as_ref().map(|renderer| renderer.camera_pos));
         self.world.put_cache(pinned);
         let first_fill = !self.cell_streamer.filled;
+        self.zone_begin("Cell schedule");
         self.schedule_cells(&settings, focus);
+        self.zone_end();
         if first_fill && !self.cell_streamer.reading.is_empty() {
             self.cell_streamer.filled = true;
             // Nothing is in yet (a scene just opened, Play just began): the view's own cells come in whole before the
@@ -107,8 +109,12 @@ impl<G: GameApp> Engine<G> {
             self.pump_cell_reads(settings.cells_per_frame.max(1) as usize);
         }
 
+        self.zone_begin("Cell evict");
         self.evict_cold_sources();
+        self.zone_end();
+        self.zone_begin("Cell rewear");
         self.rewear_retired_slot();
+        self.zone_end();
 
         let streamer = &self.cell_streamer;
         let (loaded, pending, entities) = (
