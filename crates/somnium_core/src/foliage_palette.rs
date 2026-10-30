@@ -103,6 +103,10 @@ pub(crate) struct GroundCoverRules {
     /// Tilt each instance to the ground's slope (patches of grass), instead of standing it upright (flowers).
     #[serde(default)]
     pub align_to_ground: bool,
+    /// Grow in drifts about this many metres across (OPEN_WORLD_CRAFT 6.4.2): low-frequency noise per kind keeps about
+    /// half the candidates, in patches, and grows them taller inside. Unset: evenly, as before.
+    #[serde(default)]
+    pub clump: Option<f32>,
 }
 
 #[derive(Deserialize)]
@@ -143,6 +147,7 @@ fn parse(bytes: &[u8]) -> Result<BTreeMap<u16, ProjectEntry>, String> {
         }
         if entry.ground_cover.as_ref().is_some_and(|g| {
             !(g.density.is_finite() && g.density > 0.0 && g.density <= 64.0 && g.radius.is_finite() && g.radius > 0.0 && g.radius <= 400.0)
+                || g.clump.is_some_and(|m| !(m.is_finite() && (1.0..=500.0).contains(&m)))
         }) {
             // 64 per m2: first-person grass (Sunscar, 30 Oct 2026) wants tens of tufts a square metre at the feet.
             return Err(format!("invalid ground cover for kind {} (density 0..64 per m2, radius 0..400 m)", entry.kind));

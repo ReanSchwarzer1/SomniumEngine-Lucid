@@ -9263,7 +9263,9 @@ impl<G: GameApp> Engine<G> {
             let since = std::time::Instant::now();
             match seed_key {
                 Some(key) => {
-                    self.ground_cover.update_seeded(terrain_id, key, t, &self.project_foliage, focus_local, own_area);
+                    // A tile's drifts follow the world, so they carry across its seams.
+                    let origin = glam::Vec2::new(model.w_axis.x, model.w_axis.z);
+                    self.ground_cover.update_seeded(terrain_id, key, t, &self.project_foliage, focus_local, own_area, origin);
                 }
                 None => self.ground_cover.update(terrain_id, t, &self.project_foliage, focus_local, own_area),
             }

@@ -129,7 +129,7 @@ impl GroundCover {
         camera: Vec3,
         area: Option<glam::Vec4>,
     ) {
-        self.update_seeded(terrain_id, u64::from(terrain_id), terrain, palette, camera, area);
+        self.update_seeded(terrain_id, u64::from(terrain_id), terrain, palette, camera, area, glam::Vec2::ZERO);
     }
 
     /// As [`Self::update`], with the instances hashed from `seed_key` rather than the terrain's id: a streamed tile's
@@ -143,6 +143,7 @@ impl GroundCover {
         palette: &std::collections::BTreeMap<u16, ProjectEntry>,
         camera: Vec3,
         area: Option<glam::Vec4>,
+        origin: glam::Vec2,
     ) {
         let scale = density_scale();
         let kinds: Vec<(u16, &ProjectEntry, f32, f32)> = palette
@@ -200,7 +201,7 @@ impl GroundCover {
                 .iter()
                 .map(|&(_, i, cx, cz)| {
                     let (kind, entry, density, _) = kinds[i];
-                    ((kind, cx, cz), generate(seed_key, terrain, kind, entry, density, cx, cz, area))
+                    ((kind, cx, cz), generate(seed_key, terrain, kind, entry, density, cx, cz, area, origin))
                 })
                 .collect()
         };
@@ -286,6 +287,7 @@ fn generate(
     cx: i32,
     cz: i32,
     area: Option<glam::Vec4>,
+    origin: glam::Vec2,
 ) -> Vec<Cover> {
     let b = &entry.brush;
     let [wx, wz] = terrain.world_size();
@@ -294,6 +296,7 @@ fn generate(
     let count = expected.floor() as u64 + u64::from(unit(mix(seed)) < expected.fract());
     let min_slope_cos = b.max_slope_deg.to_radians().cos();
     let least = b.min_layer_weight.max(1e-3);
+    let clump = entry.ground_cover.as_ref().and_then(|g| g.clump);
     let mut out = Vec::new();
     // A cell with none of the kind's layer on a metre grid grows nothing: skip its candidates.
     let present = (0..=16).any(|j| {
@@ -316,11 +319,17 @@ fn generate(
         if weight < least || unit(mix(h ^ 1)) > weight {
             continue;
         }
+        // Drifts, from the world's position so they carry across tile seams.
+        let patch = clump.map(|m| patch_noise((origin.x + x) / m, (origin.y + z) / m, u64::from(kind)));
+        if patch.is_some_and(|n| unit(mix(h ^ 6)) > drift(n)) {
+            continue;
+        }
         let normal = ground_normal(terrain, x, z);
         if normal.y < min_slope_cos {
             continue;
         }
-        let t = unit(mix(h ^ 2));
+        // Taller inside a drift, shorter at its thin edge: tone that changes over metres, not per tuft.
+        let t = patch.map_or(unit(mix(h ^ 2)), |n| 0.4 * unit(mix(h ^ 2)) + 0.6 * n);
         let instance = PaintedFoliage {
             kind,
             position: Vec3::new(x, terrain.world_height_at(x, z), z),
@@ -335,6 +344,28 @@ fn generate(
         out.push(Cover { instance, rotation, rank: unit(mix(h ^ 5)) });
     }
     out
+}
+
+/// Smooth value noise in `0..1` at a point measured in drift widths, two octaves, its own field per `seed` (kind).
+fn patch_noise(x: f32, z: f32, seed: u64) -> f32 {
+    let octave = |x: f32, z: f32, seed: u64| {
+        let (ix, iz) = (x.floor(), z.floor());
+        let (fx, fz) = (x - ix, z - iz);
+        let corner = |dx: i64, dz: i64| {
+            unit(mix(seed.wrapping_mul(0x9E37_79B9) ^ ((ix as i64 + dx) as u64) << 32 ^ ((iz as i64 + dz) as u64 & 0xFFFF_FFFF)))
+        };
+        let (sx, sz) = (fx * fx * (3.0 - 2.0 * fx), fz * fz * (3.0 - 2.0 * fz));
+        let top = corner(0, 0) + (corner(1, 0) - corner(0, 0)) * sx;
+        let bottom = corner(0, 1) + (corner(1, 1) - corner(0, 1)) * sx;
+        top + (bottom - top) * sz
+    };
+    0.65 * octave(x, z, seed) + 0.35 * octave(x * 2.3 + 17.1, z * 2.3 - 5.3, seed ^ 0x5bd1_e995)
+}
+
+/// The keep chance inside a drift at noise `n`: none in the gaps, all at the heart, a soft edge between.
+fn drift(n: f32) -> f32 {
+    let t = ((n - 0.32) / 0.4).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 /// Whether a terrain-local point is in an own area (x0, z0, x1, z1): a window owns its lower edges, not its upper.
@@ -616,7 +647,7 @@ mod tests {
         for _ in 0..8 {
             let camera = Vec3::new(64.0, 2.0, 64.0);
             match seed_key {
-                Some(key) => cover.update_seeded(id, key, ground, &palette, camera, None),
+                Some(key) => cover.update_seeded(id, key, ground, &palette, camera, None, glam::Vec2::ZERO),
                 None => cover.update(id, ground, &palette, camera, None),
             }
         }
@@ -776,5 +807,28 @@ mod tests {
         cover.update(1, &ground, &palette, Vec3::new(130.0, 2.0, 64.0), None);
         assert!(!cover.terrains[&1].cells.is_empty());
         assert!(cover.terrains[&1].cells.keys().all(|&(_, cx, cz)| (0..8).contains(&cx) && (0..8).contains(&cz)));
+    }
+
+    #[test]
+    fn clumped_kinds_grow_in_drifts_that_follow_the_world() {
+        // Smooth: neighbours a metre apart differ little; spread over 0..1; the same at the same world point.
+        let samples: Vec<f32> = (0..400).map(|i| patch_noise(i as f32 * 0.37, 5.0, 9)).collect();
+        assert!(samples.iter().all(|v| (0.0..=1.0).contains(v)));
+        assert!(samples.iter().cloned().fold(0.0, f32::max) > 0.7 && samples.iter().cloned().fold(1.0, f32::min) < 0.3);
+        assert!((patch_noise(3.0, 4.0, 9) - patch_noise(3.05, 4.0, 9)).abs() < 0.05);
+        assert_ne!(patch_noise(3.0, 4.0, 9), patch_noise(3.0, 4.0, 10), "each kind its own drifts");
+        // A clumped kind keeps about half its candidates, in patches; unclumped grows as before.
+        let ground = Plain { revision: 1 };
+        let mut palette = grass();
+        let plain = grown(&mut GroundCover::default(), 3, None, &ground).len();
+        let entry = palette.get_mut(&132).unwrap();
+        entry.ground_cover.as_mut().unwrap().clump = Some(12.0);
+        let mut cover = GroundCover::default();
+        for _ in 0..8 {
+            cover.update(3, &ground, &palette, Vec3::new(64.0, 2.0, 64.0), None);
+        }
+        let clumped = cover.instances(3).len();
+        assert!(clumped * 4 > plain && clumped * 4 < plain * 3, "{clumped} of {plain}");
+        assert_eq!((drift(0.0), drift(1.0)), (0.0, 1.0));
     }
 }
