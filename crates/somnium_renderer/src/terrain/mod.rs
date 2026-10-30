@@ -1131,9 +1131,11 @@ impl TerrainData {
         if far <= self.geometry_stream_distance {
             // A few chunks a frame, nearest first: each one is rebuilt from the heights (and its BLAS) when it lands,
             // and a whole window at once stalled the frame. 64 still cost 40-120 ms frames as a window returned
-            // (Rimeborn's Kaelmar and Greyham, 19 Oct); 16 spreads it thinner. The window starts 800 m out, so the
-            // nearest-first order fills what is seen long before the last chunk lands.
-            const CHUNKS_PER_FRAME: usize = 16;
+            // (Rimeborn's Kaelmar and Greyham, 19 Oct); 16 spreads it thinner, and still cost a 45-49 ms "Terrain draws"
+            // frame plus ~37 ms of "Scene submit" as a 1 km tile came into reach at a run (Sunscar, 30 Oct). 4 keeps it
+            // near 12 ms. The window starts 800 m out, so the nearest-first order fills what is seen long before the
+            // last chunk lands.
+            const CHUNKS_PER_FRAME: usize = 4;
             let capacity = self.chunk_vertex_capacity;
             let span = self.desc.chunk_cells as f32 * self.desc.cell_size;
             let mut waiting: Vec<(f32, usize)> = self
