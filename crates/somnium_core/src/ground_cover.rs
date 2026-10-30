@@ -408,6 +408,13 @@ fn keep_at(distance: f32) -> f32 {
     if distance <= BAND_NEAR { 1.0 } else { BAND_NEAR / distance }
 }
 
+/// A copy's height share `distance` metres out of a kind's `radius`: whole until the last fifth, then sinking smoothly to
+/// nothing at the radius, so the cover ends in the ground rather than in a line (the lead, 31 Oct: "a hard band").
+fn edge_height(distance: f32, radius: f32) -> f32 {
+    let t = ((radius - distance) / (0.2 * radius)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// How much wider a copy draws where only `keep` of them do, to hold the ground they cover (at most [`MOST_WIDEN`]).
 fn widen(keep: f32) -> f32 {
     keep.sqrt().recip().min(MOST_WIDEN)
@@ -507,12 +514,21 @@ impl CoverBatches {
                         .iter()
                         .filter_map(|c| {
                             let at = c.instance.position;
-                            let keep = keep_at((at.x - focus.x).hypot(at.z - focus.z));
-                            if c.rank >= keep || c.instance.scale <= 0.0 {
+                            let distance = (at.x - focus.x).hypot(at.z - focus.z);
+                            let keep = keep_at(distance);
+                            let sink = edge_height(distance, radius);
+                            if c.rank >= keep || c.instance.scale <= 0.0 || sink <= 0.05 {
                                 return None;
                             }
                             let (s, w) = (c.instance.scale, widen(keep));
-                            Some(model * Mat4::from_scale_rotation_translation(Vec3::new(s * w, s, s * w), c.rotation, at))
+                            Some(
+                                model
+                                    * Mat4::from_scale_rotation_translation(
+                                        Vec3::new(s * w, s * sink, s * w),
+                                        c.rotation,
+                                        at,
+                                    ),
+                            )
                         })
                         .collect();
                     let n = placements.len() as u32;
@@ -746,6 +762,8 @@ mod tests {
         assert_eq!(band(1.0e6), 16, "capped");
         assert_eq!((keep_at(1.0), keep_at(BAND_NEAR), keep_at(4.0 * BAND_NEAR)), (1.0, 1.0, 0.25));
         assert!((widen(0.25) - 2.0).abs() < 1e-6 && widen(0.01) == MOST_WIDEN && widen(1.0) == 1.0);
+        assert_eq!((edge_height(10.0, 40.0), edge_height(40.0, 40.0), edge_height(50.0, 40.0)), (1.0, 0.0, 0.0));
+        assert!((edge_height(36.0, 40.0) - 0.5).abs() < 1e-6, "half height midway through the last fifth");
     }
 
     #[test]
