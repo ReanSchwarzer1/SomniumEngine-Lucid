@@ -5704,8 +5704,14 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
         // `on_render` is where a game publishes its active editor/player view
         // through `renderer.set_view`. Stream from that same-frame position,
         // not from a stale ECS settings transform or last frame's renderer.
+        // Named apart, and the cell installs inside (app_cell_streaming.rs), so a streaming hitch says where it went
+        // (Sunscar, 30 Oct 2026: the whole scope was 50-280 ms with nothing below it).
+        self.zone_begin("World partition");
         self.update_world_partition();
+        self.zone_end();
+        self.zone_begin("Cell streaming");
         self.update_cell_streaming();
+        self.zone_end();
 
         // The active camera is the listener. Reconcile authored emitters only
         // after `on_render` publishes that same-frame view.

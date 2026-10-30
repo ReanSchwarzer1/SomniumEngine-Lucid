@@ -247,7 +247,9 @@ impl<G: GameApp> Engine<G> {
                 match receive.try_recv() {
                     Ok(Piece::Source { path, parts, scene, prepared }) => {
                         pieces += 1;
+                        self.zone_begin("Cell source upload");
                         self.upload_streamed_source(&path, &parts, &scene, prepared);
+                        self.zone_end();
                     }
                     Ok(Piece::Cell(parsed, terrains)) => {
                         pieces += 1;
@@ -327,8 +329,10 @@ impl<G: GameApp> Engine<G> {
         for (saved_id, read) in terrains {
             sidecars.insert(saved_id, read.map_err(|error| format!("terrain {saved_id}: {error}"))?);
         }
-        let report = crate::scene_schema::scene_from_json(&mut self.world, &self.type_registry, document)
-            .map_err(|error| error.to_string())?;
+        self.zone_begin("Cell spawn");
+        let report = crate::scene_schema::scene_from_json(&mut self.world, &self.type_registry, document);
+        self.zone_end();
+        let report = report.map_err(|error| error.to_string())?;
         // Which uploads this cell keeps alive (for eviction once no loaded cell draws them).
         let sources: Vec<PathBuf> = cells::sources_of(document)
             .into_keys()
@@ -343,12 +347,18 @@ impl<G: GameApp> Engine<G> {
         for &entity in &report.entities {
             let _ = self.world.insert_component(entity, Streamed { cell });
         }
+        self.zone_begin("Cell terrain");
         self.adopt_cell_terrains(index, &report.entities, sidecars);
+        self.zone_end();
+        self.zone_begin("Cell GPU restore");
         self.restore_entity_gpu(&report.entities);
+        self.zone_end();
         // ponytail: both passes walk the whole world once per installed cell; per-entity variants if they show up in
-        // a profile.
+        // a profile (their own zone says).
+        self.zone_begin("Cell whole-world passes");
         self.sync_authored_material_components();
         crate::propagate_transforms(&mut self.world);
+        self.zone_end();
         self.cell_streamer.loaded.insert(index, report.entities);
         Ok(())
     }
