@@ -1405,6 +1405,9 @@ fn terrain_generate_texel(
 fn evaluate_terrain_material(
     terrain_index: u32,
     world_pos: vec3<f32>,
+    // The point in the terrain's own frame, from its origin: computed from the vertices' tile-local positions,
+    // not `world_pos - terrain_origin`, which keeps only the precision of a position 13-17 km out.
+    terrain_xz: vec2<f32>,
     geo_normal: vec3<f32>,
     splat_uv: vec2<f32>,
     world_ddx: vec2<f32>,
@@ -1415,7 +1418,7 @@ fn evaluate_terrain_material(
     let splat_ddy = world_ddy * tm.inv_world_size;
     // Hoisted above the unpack because TSUSHIMA-G's perturbation is indexed by
     // world position and runs inside it.
-    let local_xz = world_pos.xz - tm.terrain_origin;
+    let local_xz = terrain_xz;
     var splat_s = terrain_fetch_splats(tm, terrain_index, splat_uv, splat_ddx, splat_ddy);
     var weight = terrain_unpack_splats_painted(splat_s, tm, local_xz);
     let selected = terrain_strongest_four(&weight);
@@ -1502,6 +1505,9 @@ fn evaluate_terrain_material(
     var samples: array<TerrainLayerSample, 4>;
     var adjusted: array<f32, 4>;
     var taps = 0u;
+    // Hex tiling on the strongest layer only (selected[0]; strongest-four is sorted): the ground at the feet is
+    // mostly one layer, which is where a scan's repeat shows, and hex triples a layer's reads. It cost 2.4 ms of
+    // shading on all four on the steep Spine (sunscar-look's choice, 31 Oct 2026).
     for (var s = 0u; s < 4u; s = s + 1u) {
         let i = selected[s];
         if sel_w[s] < epsilon {
@@ -1510,8 +1516,8 @@ fn evaluate_terrain_material(
         }
         let tiling = terrain_layer_tiling(tm, terrain_index, i);
         samples[s] = terrain_sample_layer(
-            tm, terrain_index, i, parallax_xz * tiling, world_ddx * tiling, world_ddy * tiling, hex);
-        taps += select(2u, 6u, hex);
+            tm, terrain_index, i, parallax_xz * tiling, world_ddx * tiling, world_ddy * tiling, hex && s == 0u);
+        taps += select(2u, 6u, hex && s == 0u);
         if tm.height_blend != 0u {
             adjusted[s] = terrain_append_height(tm, terrain_index, i, sel_w[s], samples[s].height);
         } else {
@@ -1570,7 +1576,7 @@ fn evaluate_terrain_material(
     albedo = albedo * albedo;
 
     if cliff_blend > 0.0 {
-        let local_pos = world_pos - vec3(tm.terrain_origin.x, 0.0, tm.terrain_origin.y);
+        let local_pos = vec3(terrain_xz.x, world_pos.y, terrain_xz.y);
         let cliff = terrain_projected_pbr(
             tm,
             terrain_index,
