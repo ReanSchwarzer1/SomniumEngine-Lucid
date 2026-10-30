@@ -1479,6 +1479,35 @@ pub struct UiManager {
     immersive_restore_maximized: bool,
 }
 
+/// `SOMNIUM_BACKGROUND_WINDOW=WIDTHxHEIGHT` (ported from TSF's dev engine, 30 Oct 2026): checks run while someone
+/// works at the machine. The window opens at that size off every screen, is never activated, stays off the taskbar
+/// and never captures the pointer (somnium_core `sync_play_cursor`). Pictures still come from its own frames, since
+/// the capture copies the swap chain.
+pub fn background_window() -> Option<[u32; 2]> {
+    static SIZE: std::sync::LazyLock<Option<[u32; 2]>> =
+        std::sync::LazyLock::new(|| parse_window_size(&std::env::var("SOMNIUM_BACKGROUND_WINDOW").ok()?));
+    *SIZE
+}
+
+fn parse_window_size(text: &str) -> Option<[u32; 2]> {
+    let (w, h) = text.split_once(['x', 'X'])?;
+    let size = [w.trim().parse().ok()?, h.trim().parse().ok()?];
+    size.iter().all(|v| (240..=8192).contains(v)).then_some(size)
+}
+
+#[cfg(test)]
+mod background_window_tests {
+    #[test]
+    fn a_background_window_size_is_width_by_height() {
+        use super::parse_window_size;
+        assert_eq!(parse_window_size("2560x1440"), Some([2560, 1440]));
+        assert_eq!(parse_window_size(" 1920 X 1080 "), Some([1920, 1080]));
+        assert_eq!(parse_window_size("1"), None, "a size, not a switch");
+        assert_eq!(parse_window_size("100x100"), None, "too small to picture anything");
+        assert_eq!(parse_window_size("2560x"), None);
+    }
+}
+
 /// Load the bundled Nocturne faces and publish the [`FontRole`] table.
 ///
 /// Phase 26-Zeta-D. Order is fixed so a capture at 100 % and one at 200 %
@@ -7535,6 +7564,13 @@ impl UiManager {
         self.immersive = on;
         self.native_ui
             .send(ButtonMessage::set_selected(self.immersive_button, on));
+        // A background window (`background_window`) keeps its size and its place off the screens.
+        if background_window().is_some() {
+            if on {
+                self.set_play_overlays_hidden(true);
+            }
+            return;
+        }
         if on {
             self.set_play_overlays_hidden(true);
             self.immersive_restore_maximized = self.window.is_maximized();
