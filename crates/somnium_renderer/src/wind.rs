@@ -75,8 +75,15 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-fn fract(x: f32) -> f32 {
-    x - x.floor()
+/// A plant's sway phase, `wind.wgsl`'s `wind_phase`: an integer hash of its pivot to 1/64 m. The old sine hash lined
+/// tufts up in rows kilometres from the origin.
+fn phase(pivot: Vec3) -> f32 {
+    let (cx, cz) = ((pivot.x * 64.0).floor() as i32 as u32, (pivot.z * 64.0).floor() as i32 as u32);
+    let mut h = cx.wrapping_mul(0x8da6_b343) ^ cz.wrapping_mul(0xd816_3841);
+    h = (h ^ (h >> 16)).wrapping_mul(0x7feb_352d);
+    h = (h ^ (h >> 15)).wrapping_mul(0x846c_a68b);
+    h ^= h >> 16;
+    (h >> 8) as f32 * (std::f32::consts::TAU / 16_777_216.0)
 }
 
 /// Displacement of a vertex at world `p` on a plant standing at `pivot`.
@@ -107,7 +114,7 @@ pub fn offset(
     }
     let dir = velocity / speed;
     let h = (p.y - pivot.y).max(0.0);
-    let phase = fract((pivot.x * 12.9898 + pivot.z * 78.233).sin() * 43758.547) * std::f32::consts::TAU;
+    let phase = phase(pivot);
     // Gust fronts travel downwind across the stand at about 10 m/s.
     let front = (pivot.x * dir.x + pivot.z * dir.y) * 0.09 - time * 0.9;
     let gust = 0.55 + 0.45 * (0.5 + 0.5 * front.sin()) * (0.6 + 0.4 * (time * 0.37 + phase).sin());
@@ -187,5 +194,16 @@ mod tests {
         };
         assert_eq!(w.uniform(), [1.5, -2.0, 0.8, 40.0]);
         assert_eq!(FoliageWind::default().uniform()[2], 0.0);
+    }
+
+    #[test]
+    fn tufts_far_from_the_origin_sway_out_of_step() {
+        // 400 tufts 30 cm apart along x, 13.9 km out (Sunscar's pasture): neighbours' phases as unrelated as chance.
+        let phases: Vec<f32> = (0..400).map(|i| phase(Vec3::new(-13860.0 + i as f32 * 0.3, 15.0, 360.0))).collect();
+        let mean_step = phases.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f32>() / 399.0;
+        // Independent uniform phases on 0..2pi differ by 2pi/3 on average.
+        assert!((mean_step - std::f32::consts::TAU / 3.0).abs() < 0.35, "{mean_step}");
+        assert!(phases.iter().all(|p| (0.0..std::f32::consts::TAU).contains(p)));
+        assert_eq!(phase(Vec3::new(5.0, 0.0, 7.0)), phase(Vec3::new(5.0, 9.0, 7.0)), "height is no part of it");
     }
 }
