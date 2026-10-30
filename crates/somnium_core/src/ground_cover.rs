@@ -32,7 +32,7 @@ use crate::foliage_palette::ProjectEntry;
 /// Cell edge, metres.
 pub const CELL: f32 = 16.0;
 /// Most candidates generated in one frame, over every cell made then (the rest come next frame); at least one cell.
-const CANDIDATES_PER_FRAME: f32 = 40_000.0;
+const CANDIDATES_PER_FRAME: f32 = 16_000.0;
 /// Most copies of parts (slots) set in batches in one frame, nearest cells first (the rest wait a frame): a tile
 /// streaming in beside the player once set 100,000+ in one frame (40 MB of slots, a 350 ms frame).
 const SLOTS_SET_PER_FRAME: i64 = 48_000;
