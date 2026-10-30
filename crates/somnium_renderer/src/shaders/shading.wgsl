@@ -1005,9 +1005,11 @@ fn vis_barycentric(
 /// and column, a plaid on the Office's entry wall. The ray form has no such division. `None` when the ray runs
 /// along the plane.
 fn ray_barycentric(p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, sample_ndc: vec2<f32>) -> vec4<f32> {
-    let near = view.inv_view_proj * vec4<f32>(sample_ndc, 0.0, 1.0);
+    // From the eye itself: every ray of a perspective view starts there (this runs only for a vertex within a
+    // metre of the eye's plane, which an orthographic view never has), and the near-plane point through
+    // `inv_view_proj` keeps only millimetres kilometres from the origin, while `origin - p0` below is exact.
     let far = view.inv_view_proj * vec4<f32>(sample_ndc, 1.0, 1.0);
-    let origin = near.xyz / near.w;
+    let origin = view.camera_pos;
     let dir = far.xyz / far.w - origin;
     let e1 = p1 - p0;
     let e2 = p2 - p0;
@@ -2300,9 +2302,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         p2 += wind_offset(p2, pivot, material.wind_bend, material.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
     }
 
-    let c0 = view.view_proj * vec4<f32>(p0, 1.0);
-    let c1 = view.view_proj * vec4<f32>(p1, 1.0);
-    let c2 = view.view_proj * vec4<f32>(p2, 1.0);
+    // Camera-relative, as the visibility pass rasterised them (depth_tie.wgsl `depth_tie_clip`): a world position
+    // kilometres from the origin keeps only millimetres in f32, and projecting it whole stepped the barycentrics,
+    // and with them everything they interpolate (Sunscar, 31 Oct 2026: blocky ground at the feet 15 km out).
+    let eye_clip = view.view_proj * vec4<f32>(view.camera_pos, 1.0);
+    let c0 = view.view_proj * vec4<f32>(p0 - view.camera_pos, 0.0) + eye_clip;
+    let c1 = view.view_proj * vec4<f32>(p1 - view.camera_pos, 0.0) + eye_clip;
+    let c2 = view.view_proj * vec4<f32>(p2 - view.camera_pos, 0.0) + eye_clip;
 
     let ndc0 = c0.xy / c0.w;
     let ndc1 = c1.xy / c1.w;
@@ -2424,6 +2430,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let hit_point = p0 * bary.x + p1 * bary.y + p2 * bary.z;
+    // The same point in the mesh's own space: a terrain's coordinates come from it (`terrain_xz`, below).
+    let local_hit = vec3<f32>(v0.pos_x, v0.pos_y, v0.pos_z) * bary.x
+        + vec3<f32>(v1.pos_x, v1.pos_y, v1.pos_z) * bary.y
+        + vec3<f32>(v2.pos_x, v2.pos_y, v2.pos_z) * bary.z;
 
     let dbg = select(0.0, light._pad2_z, enable_debug);
     // Source texels per world metre, independent of camera distance, render
@@ -2773,9 +2783,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Derivatives of world position, which the hex-tiled layer sampling
         // needs explicitly. Taken here rather than inside the material because
         // that is where the terrain UVs are derived from.
-        let world_ddx = dpdx(hit_point.xz);
-        let world_ddy = dpdy(hit_point.xz);
         let tm_idx = u32(material.terrain_index);
+        // Terrain coordinates from the vertices' own tile-local positions, turned and scaled by the model but not
+        // moved by it (its translation is the terrain's origin): a world position 13-17 km from the origin holds
+        // only 1-2 mm in f32, a texel or two of a ground layer, and subtracting the origin afterwards can't give
+        // those digits back (Sunscar, 31 Oct 2026: blocky texels at the feet on every layer).
+        let terrain_xz = (instance.model * vec4<f32>(local_hit, 0.0)).xz
+            + (instance.model[3].xz - terrain_materials[tm_idx].terrain_origin);
+        let world_ddx = dpdx(terrain_xz);
+        let world_ddy = dpdy(terrain_xz);
         var terrain: TerrainSurface;
         // `enable_live_terrain` is checked first and is a pipeline override, so
         // when the clipmap owns every queued terrain the live branch is
@@ -2791,7 +2807,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 terrain_materials[tm_idx], tm_idx, hit_point, geo_normal, uv, world_ddx, world_ddy);
         } else {
             terrain = evaluate_terrain_material(
-                tm_idx, hit_point, geo_normal, uv, world_ddx, world_ddy);
+                tm_idx, hit_point, terrain_xz, geo_normal, uv, world_ddx, world_ddy);
         }
         surface.albedo = terrain.albedo;
         surface.roughness = terrain.roughness;
