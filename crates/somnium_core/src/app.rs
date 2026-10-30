@@ -9201,7 +9201,7 @@ impl<G: GameApp> Engine<G> {
                 camera_local,
                 model.inverse().transform_vector3(forward_ws).normalize_or(glam::Vec3::NEG_Z),
                 t.world_height_at(camera_local.x, camera_local.z),
-                400.0,
+                crate::ground_cover::focus_reach(),
             );
             match seed_key {
                 Some(key) => {

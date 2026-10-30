@@ -272,6 +272,21 @@ fn ground_normal(terrain: &impl Ground, x: f32, z: f32) -> Vec3 {
     Vec3::new(-hx, 2.0 * d, -hz).try_normalize().unwrap_or(Vec3::Y)
 }
 
+/// How far along the view ray the cover's centre may move ahead of the camera, metres: `SOMNIUM_COVER_FOCUS_REACH`,
+/// 400 by default (an isometric camera grows its cover where it looks on the ground). A first-person game sets a few
+/// metres (Sunscar, 30 Oct 2026: 4), so the ring round the feet stays full when the eye looks down.
+#[must_use]
+pub fn focus_reach() -> f32 {
+    static REACH: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+        std::env::var("SOMNIUM_COVER_FOCUS_REACH")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(400.0)
+    });
+    *REACH
+}
+
 /// Where the view looks, on the ground: the view's forward ray (from `camera`, terrain-local) met with the ground
 /// height under the camera, at most `reach` metres out. A view looking level or up keeps the camera's own place.
 #[must_use]
