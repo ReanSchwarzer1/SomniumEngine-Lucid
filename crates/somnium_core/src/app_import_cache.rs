@@ -30,6 +30,9 @@ fn file_stamp(path: &Path) -> Option<Option<FileStamp>> {
     }
 }
 
+/// The frame stamps are checked in ([`SourceStamp::next_frame`]).
+static FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct SourceStamp {
     source: PathBuf,
@@ -42,15 +45,28 @@ impl SourceStamp {
     /// cell asks for each of its sources two or three times, and an open world installs hundreds of cells (Sunscar,
     /// 30 Oct 2026: most of a cell install's "GPU restore" was this and the project's paths). A changed source, buffer,
     /// image or mask makes it stale, and it is read afresh.
+    ///
+    /// A stamp is checked once a frame ([`Self::next_frame`]): one cell asks for the same source two or three times
+    /// in a frame, and its files' stats were most of what was left (a glTF with ten maps is some twenty-five). An edit
+    /// to a source is seen from the next frame.
     pub(super) fn read(source: &Path) -> Option<Self> {
-        static READ: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<PathBuf, SourceStamp>>> =
-            std::sync::LazyLock::new(Default::default);
-        if let Some(stamp) = READ.lock().ok()?.get(source).filter(|stamp| stamp.is_current()) {
-            return Some(stamp.clone());
+        type Read = std::collections::HashMap<PathBuf, (SourceStamp, u64)>;
+        static READ: std::sync::LazyLock<std::sync::Mutex<Read>> = std::sync::LazyLock::new(Default::default);
+        let frame = FRAME.load(std::sync::atomic::Ordering::Relaxed);
+        if let Some((stamp, checked)) = READ.lock().ok()?.get_mut(source) {
+            if *checked == frame || stamp.is_current() {
+                *checked = frame;
+                return Some(stamp.clone());
+            }
         }
         let stamp = Self::read_fresh(source)?;
-        READ.lock().ok()?.insert(source.to_path_buf(), stamp.clone());
+        READ.lock().ok()?.insert(source.to_path_buf(), (stamp.clone(), frame));
         Some(stamp)
+    }
+
+    /// A new frame: every stamp read from now on is checked against its files again (once).
+    pub(super) fn next_frame() {
+        FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Unsupported or unreadable sources simply bypass the cache; the importer
@@ -284,7 +300,9 @@ mod tests {
             std::fs::write(path.join("mesh.gltf"), br#"{"asset":{"version":"2.0"},"buffers":[{"uri":"mesh.bin"}],"images":[{"uri":"leaf_diff.png"}]}"#).unwrap();
             Self(path)
         }
+        /// A read in a later frame than the last: stamps are checked once a frame.
         fn stamp(&self) -> SourceStamp {
+            SourceStamp::next_frame();
             SourceStamp::read(&self.0.join("mesh.gltf")).unwrap()
         }
     }

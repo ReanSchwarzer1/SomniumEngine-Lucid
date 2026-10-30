@@ -1441,6 +1441,23 @@ fn opened_project(root: &std::path::Path) -> Result<crate::authoring::project::P
     Ok(project)
 }
 
+/// A source resolved against the project at `root`, remembered: a streamed cell resolves each of its sources two or
+/// three times, and resolving canonicalizes. A project's folders don't move under a running engine; the first
+/// resolve still checks the source against the project.
+fn resolved_source(root: &std::path::Path, source: &str) -> Result<std::path::PathBuf, String> {
+    type Resolved = std::collections::HashMap<(std::path::PathBuf, String), std::path::PathBuf>;
+    static RESOLVED: std::sync::LazyLock<std::sync::Mutex<Resolved>> = std::sync::LazyLock::new(Default::default);
+    let key = (root.to_path_buf(), source.to_owned());
+    if let Some(path) = RESOLVED.lock().ok().and_then(|resolved| resolved.get(&key).cloned()) {
+        return Ok(path);
+    }
+    let path = opened_project(root)?.resolve(std::path::Path::new(source))?;
+    if let Ok(mut resolved) = RESOLVED.lock() {
+        resolved.insert(key, path.clone());
+    }
+    Ok(path)
+}
+
 /// A background window (`somnium_ui::background_window`) after it is shown: a tool window that is never activated,
 /// so it has no taskbar button, is not in Alt+Tab and a click can't bring it forward. winit has neither style for a
 /// main window, and rewrites the extended style when its own flags change, hence after `set_visible`.
@@ -2630,7 +2647,7 @@ impl<G: GameApp> Engine<G> {
     fn imported_source_path(&self, source: &str) -> Result<std::path::PathBuf, String> {
         let source_path = std::path::Path::new(source);
         match self.config.project_root.as_ref() {
-            Some(root) => opened_project(root).and_then(|project| project.resolve(source_path)),
+            Some(root) => resolved_source(root, source),
             None => Ok(source_path.to_path_buf()),
         }
     }
@@ -5727,6 +5744,8 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
         // not from a stale ECS settings transform or last frame's renderer.
         // Named apart, and the cell installs inside (app_cell_streaming.rs), so a streaming hitch says where it went
         // (Sunscar, 30 Oct 2026: the whole scope was 50-280 ms with nothing below it).
+        // Source stamps are checked once a frame (`SourceStamp::read`).
+        import_cache::SourceStamp::next_frame();
         self.zone_begin("World partition");
         self.update_world_partition();
         self.zone_end();
