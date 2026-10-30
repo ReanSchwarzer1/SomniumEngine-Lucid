@@ -133,6 +133,14 @@ fn fs_multiscatter(in: VOut) -> @location(0) vec4<f32> {
 
     // Geometric series over all remaining scattering orders. `scatter_total`
     // stays well below 1 for a real atmosphere, so this converges.
-    let ms = luminance_total / max(vec3<f32>(1.0) - scatter_total, vec3<f32>(1e-4));
+    //
+    // The second-order light gathered over the sphere scatters on toward the
+    // eye isotropically: times 1/4pi, Hillaire's L_2ndorder (his Eq. 5,
+    // `LSharedMem * IsotropicPhase`). `scatter_total` already carries its 1/4pi
+    // in the integrand above. Without it the multiple scattering was 4pi times
+    // too strong: a clear noon sky lit the ground several times what it should
+    // against the sun, flat and blue-grey (sunscar-look, 30 Oct 2026).
+    let second_order = luminance_total * (1.0 / (4.0 * 3.14159265));
+    let ms = second_order / max(vec3<f32>(1.0) - scatter_total, vec3<f32>(1e-4));
     return vec4<f32>(ms, 1.0);
 }
