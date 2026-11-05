@@ -113,7 +113,8 @@ fn expand(@builtin(global_invocation_id) gid: vec3<u32>) {
         args[a] = DrawArgs(s.index_count, copies, 0u, i);
     }
     if expand_params.write_static != 0u {
-        instances[i] = Instance(s.model, s.material_id, s.vertex_offset, s.index_offset, 0u);
+        // `shadow.w` holds the copy's LOD hand-over (instance.rs `foliage_fade`), as the instance's spare word.
+        instances[i] = Instance(s.model, s.material_id, s.vertex_offset, s.index_offset, bitcast<u32>(s.shadow.w));
         if copies == 0u {
             // A later copy of a run: drawn by its head, never culled on its own.
             aabbs[a] = CullAabb(vec4<f32>(1.0, 1.0, 1.0, 0.0), vec4<f32>(-1.0, -1.0, -1.0, 0.0),

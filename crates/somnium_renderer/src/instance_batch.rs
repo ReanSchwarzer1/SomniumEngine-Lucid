@@ -45,6 +45,10 @@ pub struct InstanceBatch {
     pub parts: Vec<BatchPart>,
     /// World transforms, one per copy.
     pub placements: Vec<Mat4>,
+    /// A LOD hand-over at a band edge, horizontal metres from the camera (`instance::foliage_fade`): > 0 these copies
+    /// fade out past it, < 0 they fade in past `-fade`, 0 none. The batch on the other side of the edge carries the
+    /// opposite sign and both hold the copies near it, so one dithers in as the other dithers out.
+    pub fade: f32,
 }
 
 /// A copy whose mesh has a bottom level: what the top level needs to trace it.

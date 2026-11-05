@@ -3544,6 +3544,7 @@ impl SomniumRenderer {
     /// on the GPU-driven path only; a part with a blended material is left out (the visibility buffer cannot
     /// blend).
     pub fn set_instance_batch(&mut self, id: u64, batch: &crate::instance_batch::InstanceBatch) {
+        let fade = crate::instance::foliage_fade(batch.fade);
         let mut slots = Vec::with_capacity(batch.parts.len() * batch.placements.len());
         let mut traced = Vec::new();
         for part in &batch.parts {
@@ -3569,9 +3570,11 @@ impl SomniumRenderer {
                     }
                 }
             }
-            slots.extend(
-                batch.placements.iter().map(|&placement| crate::instance_batch::GpuSlot::new(part, placement, bounds)),
-            );
+            slots.extend(batch.placements.iter().map(|&placement| {
+                let mut slot = crate::instance_batch::GpuSlot::new(part, placement, bounds);
+                slot.shadow[3] = f32::from_bits(fade);
+                slot
+            }));
         }
         self.instance_batches.set(id, slots, traced);
     }
@@ -3583,6 +3586,7 @@ impl SomniumRenderer {
     /// copies of a traced mesh join the top level near the eye as a batch's do; a mesh kept out of tracing this frame
     /// ([`Self::exclude_from_tracing`], ground cover) adds none.
     pub fn set_instanced_batch(&mut self, id: u64, batch: &crate::instance_batch::InstanceBatch) {
+        let fade = crate::instance::foliage_fade(batch.fade);
         let mut slots = Vec::with_capacity(batch.parts.len() * batch.placements.len());
         let mut traced = Vec::new();
         for part in &batch.parts {
@@ -3611,9 +3615,11 @@ impl SomniumRenderer {
                     }
                 }
             }
-            slots.extend(
-                batch.placements.iter().map(|&placement| crate::instance_batch::GpuSlot::new(part, placement, bounds)),
-            );
+            slots.extend(batch.placements.iter().map(|&placement| {
+                let mut slot = crate::instance_batch::GpuSlot::new(part, placement, bounds);
+                slot.shadow[3] = f32::from_bits(fade);
+                slot
+            }));
             crate::instance_batch::make_run(&mut slots[start..]);
         }
         self.instance_batches.set(id, slots, traced);

@@ -34,6 +34,10 @@ const ID_SPACE: u64 = 0xF0 << 56;
 const BAND_SNAP: f32 = 16.0;
 /// Most (cell, kind, band) batches built in one frame, nearest first; the rest keep their old batch a frame longer.
 const BUILDS_PER_FRAME: usize = 96;
+/// Copies this near a band edge with another band beyond it are in both batches, which hand them over there
+/// (`InstanceBatch::fade`; visibility.wgsl dithers 8 m across the edge, as the eye sees it): half that dither band plus
+/// the most the snapped camera ([`BAND_SNAP`]) can be from the eye, 11.3 m.
+const HANDOVER: f32 = 16.0;
 
 /// Whether `SOMNIUM_FOLIAGE_BATCHES=1` is set.
 pub(crate) fn enabled() -> bool {
@@ -349,15 +353,22 @@ impl FoliageBatches {
             let Some(Some(groups)) = grouped.get(usize::from(kind)) else { continue };
             let members = &cells.order[start as usize..end as usize];
             for (band, (near, far, band_parts)) in groups.iter().enumerate().take(8) {
-                let whole = *near <= gap && (*far == 0.0 || far_corner < *far);
-                let none = (*far > 0.0 && gap >= *far) || far_corner < *near;
+                // An edge with another band beyond it is a hand-over: the copies near it go in both bands, this one
+                // fading them out past its far edge, or in past its near edge (never both: a middle band fades in).
+                let fade_out = *far > 0.0 && groups.iter().any(|(n, _, _)| n == far);
+                let fade_in = *near > 0.0 && groups.iter().any(|(_, f, _)| f == near);
+                let lo = if fade_in { *near - HANDOVER } else { *near };
+                let hi = if fade_out { *far + HANDOVER } else { *far };
+                let fade = if fade_in { -*near } else if fade_out { *far } else { 0.0 };
+                let whole = lo <= gap && (*far == 0.0 || far_corner < hi);
+                let none = (*far > 0.0 && gap >= hi) || far_corner < lo;
                 if none {
                     continue;
                 }
                 let inside = |i: &u32| {
                     let p = instances[*i as usize].position;
                     let d = Vec2::new(p.x, p.z).distance(centre);
-                    d >= *near && (*far == 0.0 || d < *far)
+                    d >= lo && (*far == 0.0 || d < hi)
                 };
                 // Which copies the band holds, folded into the signature: a copy crossing the edge rebuilds it.
                 let mut sig = signature[kind as usize] ^ (band as u64).rotate_left(29);
@@ -399,7 +410,7 @@ impl FoliageBatches {
                         let n = placements.len() as u32;
                         self.changes.set.push((
                             batch_id(terrain, cell, key.2),
-                            InstanceBatch { parts: band_parts.clone(), placements },
+                            InstanceBatch { parts: band_parts.clone(), placements, fade },
                         ));
                         n
                     }
@@ -581,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn a_small_step_changes_nothing_and_each_copy_draws_in_one_band() {
+    fn a_small_step_changes_nothing_and_copies_near_a_lod_edge_draw_in_both_bands() {
         let instances = field();
         let mut batches = FoliageBatches::default();
         let parts = parts_for(50.0, 50.0);
@@ -593,7 +604,8 @@ mod tests {
         batches.terrain(1, 1, &instances, Mat4::IDENTITY, glam::Vec3::new(6.0, 0.0, 0.0), &parts);
         batches.end_frame();
         assert!(batches.changes.set.is_empty() && batches.changes.remove.is_empty());
-        // A near mesh to 150 m and a LOD mesh from it to 400: every copy in reach is in exactly one band's batch.
+        // A near mesh to 150 m and a LOD mesh from it to 400: every copy in reach is in one band's batch, and in both
+        // within HANDOVER of 150 m, where the near batch fades out and the far one in.
         let d = KindDistances { lod_sq: 150.0 * 150.0, ..distances(400.0, 0.0) };
         let mut parts = vec![None; 256];
         parts[130] = Some(kind_parts(130, &[piece(9000, false)], Some(&[piece(800, false)]), d));
@@ -602,11 +614,19 @@ mod tests {
         let copies = batches.terrain(1, 1, &instances, Mat4::IDENTITY, glam::Vec3::ZERO, &parts);
         batches.end_frame();
         let in_reach = instances.iter().filter(|i| i.kind == 130 && Vec2::new(i.position.x, i.position.z).length() < 400.0).count();
-        assert_eq!(copies as usize, in_reach);
         let near: usize = batches.changes.set.iter().filter(|(id, _)| (id & 0xFFFF) >> 13 == 0).map(|(_, b)| b.placements.len()).sum();
         let far: usize = batches.changes.set.iter().filter(|(id, _)| (id & 0xFFFF) >> 13 == 1).map(|(_, b)| b.placements.len()).sum();
-        assert_eq!(near + far, in_reach);
+        let both = instances
+            .iter()
+            .filter(|i| i.kind == 130 && (Vec2::new(i.position.x, i.position.z).length() - 150.0).abs() < HANDOVER)
+            .count();
+        assert_eq!(copies as usize, near + far);
+        assert!(near + far >= in_reach && near + far <= in_reach + both, "{near} + {far} vs {in_reach} (+{both})");
         assert!(near > 0 && far > 0, "{near} near, {far} far");
+        assert!(batches.changes.set.iter().all(|(id, b)| {
+            let fade = if (id & 0xFFFF) >> 13 == 0 { 150.0 } else { -150.0 };
+            b.fade == fade
+        }));
         assert!(batches.changes.set.iter().all(|(id, b)| {
             let mesh = if (id & 0xFFFF) >> 13 == 0 { 9000 } else { 800 };
             b.parts.iter().all(|p| p.index_count == mesh && p.near == 0.0 && p.far == 0.0)

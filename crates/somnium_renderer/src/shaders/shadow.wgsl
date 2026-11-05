@@ -125,6 +125,17 @@ struct View {
 // @group(2) — sampler for the alpha-cutout test (Phase 17E)
 @group(2) @binding(0) var cutout_sampler: sampler;
 
+// LOD hand-over of instance-batch copies (instance.rs `foliage_fade`; visibility.wgsl dithers the same copies).
+// Shadows switch whole at the edge: both copies casting across the dither band would darken it.
+fn foliage_fade_word(packed: u32) -> bool {
+    return (packed >> 14u) != 0u && packed != 0x80000000u && ((packed >> 4u) & 1023u) == 0u;
+}
+
+fn foliage_fade_shown(packed: u32, d: f32) -> bool {
+    let edge = f32((packed >> 14u) & 65535u) / 16.0;
+    return select((d < edge), (d >= edge), (packed & 1u) == 1u);
+}
+
 struct VOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -154,6 +165,10 @@ fn vs_main(
 
     var out: VOut;
     out.clip = vp * world_pos;
+    let packed = instance._padding;
+    if foliage_fade_word(packed) && !foliage_fade_shown(packed, distance(instance.model[3].xz, view.camera_pos.xz)) {
+        out.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+    }
     out.uv = vec2<f32>(vert.u, vert.v);
     out.material_id = instance.material_id;
     return out;
