@@ -3599,14 +3599,14 @@ impl UiManager {
         self.refresh_title();
     }
 
-    /// `Somnium Engine — scene.somnium •` — CONTROL-J's accurate title bar.
+    /// `Lucid — scene.somnium •` — CONTROL-J's accurate title bar.
     ///
     /// The bullet is the convention every editor uses for unsaved work, and
     /// the title bar is the one place that state is visible without looking
     /// down at the status bar. Composed here rather than at the two call
     /// sites so the facts it combines cannot get out of step.
     fn refresh_title(&mut self) {
-        let mut title = "Somnium Engine".to_string();
+        let mut title = "Lucid".to_string();
         if let Some(name) = &self.scene_name {
             title.push_str(" \u{2014} ");
             title.push_str(name);

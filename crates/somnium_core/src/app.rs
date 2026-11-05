@@ -4044,7 +4044,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
 
         let size = LogicalSize::new(self.config.window_size.0, self.config.window_size.1);
         let mut attrs = WindowAttributes::default()
-            .with_title("Somnium Engine")
+            .with_title("Lucid")
             .with_inner_size(size)
             .with_resizable(self.config.resizable)
             // MORROWIND-I. Created invisible and shown at the end of this

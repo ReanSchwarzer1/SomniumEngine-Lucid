@@ -3700,7 +3700,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         project_root: Some(project.root.clone()),
         content_root: project.resolve(&project.manifest.content)?,
         authoring_enabled: true,
-        window_title: "Somnium Engine".into(),
+        window_title: "Lucid".into(),
         window_size: audit_window_size().unwrap_or((1280, 720)),
         target_fps: Some(60),
         ..Default::default()
