@@ -3557,23 +3557,46 @@ impl SomniumRenderer {
     }
 
     /// As [`Self::set_instance_batch`], but each part's copies are one instanced draw (`instance_batch::make_run`):
-    /// one argument draws them all, culled by one box round every copy, and nothing of it is traced. For many small
-    /// copies seen together, as ground cover's cells are: one draw per copy would cost the GPU's front end more than
-    /// the copies themselves. A part's distance band is measured from its first copy.
+    /// one argument draws them all, culled by one box round every copy. For many copies seen together, as ground
+    /// cover's and a forest's cells are: one draw per copy would cost the GPU's front end more than the copies
+    /// themselves. A part's distance band is measured from its first copy. Every copy's instance is written, so the
+    /// copies of a traced mesh join the top level near the eye as a batch's do; a mesh kept out of tracing this frame
+    /// ([`Self::exclude_from_tracing`], ground cover) adds none.
     pub fn set_instanced_batch(&mut self, id: u64, batch: &crate::instance_batch::InstanceBatch) {
         let mut slots = Vec::with_capacity(batch.parts.len() * batch.placements.len());
+        let mut traced = Vec::new();
         for part in &batch.parts {
             if self.material_blend.get(part.material_id as usize).copied().unwrap_or(false) {
                 continue;
             }
             let bounds = self.geometry.mesh_aabb(part.vertex_offset);
             let start = slots.len();
+            if self.raytrace_pass.supported()
+                && self.raytrace_pass.has_blas(part.vertex_offset)
+                && !self.untraced_meshes.contains(&part.vertex_offset)
+            {
+                let half = bounds.map(|(min, max)| (glam::Vec3::from(max) - glam::Vec3::from(min)) * 0.5);
+                for (k, &placement) in batch.placements.iter().enumerate() {
+                    let model = placement * part.local;
+                    let radius = half.map_or(f32::MAX, |half| model.transform_vector3(half).length());
+                    if radius >= TLAS_MIN_RADIUS {
+                        traced.push(crate::instance_batch::TracedCopy {
+                            slot: u32::try_from(start + k).unwrap_or(u32::MAX),
+                            vertex_offset: part.vertex_offset,
+                            model,
+                            shadow: traces_shadow(part.casts_shadow, radius),
+                            near: part.near,
+                            far: part.far,
+                        });
+                    }
+                }
+            }
             slots.extend(
                 batch.placements.iter().map(|&placement| crate::instance_batch::GpuSlot::new(part, placement, bounds)),
             );
             crate::instance_batch::make_run(&mut slots[start..]);
         }
-        self.instance_batches.set(id, slots, Vec::new());
+        self.instance_batches.set(id, slots, traced);
     }
 
     /// Remove instance batch `id`. Returns whether there was one.

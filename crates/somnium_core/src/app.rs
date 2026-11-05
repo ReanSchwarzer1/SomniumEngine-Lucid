@@ -9497,7 +9497,8 @@ impl<G: GameApp> Engine<G> {
                     r.remove_instance_batch(*id);
                 }
                 for (id, batch) in &changes.set {
-                    r.set_instance_batch(*id, batch);
+                    // Painted foliage as runs too (`foliage_batches.rs`): a forest is too many copies for a draw each.
+                    r.set_instanced_batch(*id, batch);
                 }
                 for (id, batch) in &self.cover_batches.set {
                     r.set_instanced_batch(*id, batch);
