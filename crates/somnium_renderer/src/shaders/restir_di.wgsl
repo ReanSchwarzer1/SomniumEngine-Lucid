@@ -140,8 +140,9 @@ fn occluded(origin: vec3<f32>, dir: vec3<f32>, t_min: f32) -> bool {
     // tree's shadow was its cards' solid quads: one dark blot under an open crown, no light dappling through.
     if di_candidate_alpha {
         var aq: ray_query;
-        // ForceNonOpaque (0x2) hands each triangle over to be tested; terminate on the first one covered (0x4).
-        rayQueryInitialize(&aq, accel, RayDesc(0x6u, 0x1u, t_min, 10000.0, origin, dir));
+        // Cut-out meshes' triangles come as candidates to test (their BLAS is non-opaque, raytrace.rs
+        // `mark_cutout`); everything else commits in hardware. Terminate on the first one covered (0x4).
+        rayQueryInitialize(&aq, accel, RayDesc(0x4u, 0x1u, t_min, 10000.0, origin, dir));
         while rayQueryProceed(&aq) {
             if rt_candidate_is_covered(rayQueryGetCandidateIntersection(&aq)) {
                 rayQueryConfirmIntersection(&aq);
@@ -157,7 +158,10 @@ fn occluded(origin: vec3<f32>, dir: vec3<f32>, t_min: f32) -> bool {
         // anything is in the way, not what or how far.
         RayDesc(0x4u, 0x1u, t_min, 10000.0, origin, dir),
     );
-    rayQueryProceed(&rq);
+    // Cut-out meshes are non-opaque: without the test their triangles still block, as before.
+    while rayQueryProceed(&rq) {
+        rayQueryConfirmIntersection(&rq);
+    }
     return rayQueryGetCommittedIntersection(&rq).kind != RAY_QUERY_INTERSECTION_NONE;
 }
 

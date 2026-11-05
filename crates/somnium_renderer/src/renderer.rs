@@ -3553,6 +3553,9 @@ impl SomniumRenderer {
             if self.material_blend.get(part.material_id as usize).copied().unwrap_or(false) {
                 continue;
             }
+            if self.materials_pool.get(part.material_id).is_some_and(|m| m.alpha_cutoff > 0.0 && m.albedo_map >= 0) {
+                self.raytrace_pass.mark_cutout(part.vertex_offset);
+            }
             let bounds = self.geometry.mesh_aabb(part.vertex_offset);
             // Copies the top level may trace: their mesh has a bottom level and they are as big as anything traced.
             if self.raytrace_pass.supported() && self.raytrace_pass.has_blas(part.vertex_offset) {
@@ -3591,6 +3594,9 @@ impl SomniumRenderer {
         for part in &batch.parts {
             if self.material_blend.get(part.material_id as usize).copied().unwrap_or(false) {
                 continue;
+            }
+            if self.materials_pool.get(part.material_id).is_some_and(|m| m.alpha_cutoff > 0.0 && m.albedo_map >= 0) {
+                self.raytrace_pass.mark_cutout(part.vertex_offset);
             }
             let bounds = self.geometry.mesh_aabb(part.vertex_offset);
             let start = slots.len();
@@ -6079,6 +6085,12 @@ impl SomniumRenderer {
             // figures of them. Before this the TLAS took the draw queue in
             // material order and truncated it at its cap, so *which* trees and
             // walls rays could see depended on how materials happened to sort.
+            // Cut-out draws get a non-opaque bottom level (`RaytracePass::mark_cutout`; a set lookup once known).
+            for cmd in self.draw_queue.iter() {
+                if self.materials_pool.get(cmd.material_id).is_some_and(|m| m.alpha_cutoff > 0.0 && m.albedo_map >= 0) {
+                    self.raytrace_pass.mark_cutout(cmd.vertex_offset);
+                }
+            }
             let geometry = &self.geometry;
             let raytrace = &self.raytrace_pass;
             let first_person = &self.first_person_casters;

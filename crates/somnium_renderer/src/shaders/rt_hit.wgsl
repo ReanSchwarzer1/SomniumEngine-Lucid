@@ -19,6 +19,8 @@ struct RtHit {
     metallic: f32,
     /// Material slot for the optional deferred GI terrain lookup; -1 on miss.
     terrain_index: i32,
+    /// How much light a thin leaf passes through (`Material.transmission`); 0 on miss and for terrain.
+    transmission: f32,
     /// Ray `t` of this intersection. 0 on a true miss. A cutout reject keeps
     /// the card's `t` so `rt_trace` can continue through the hole.
     t: f32,
@@ -137,6 +139,7 @@ fn rt_resolve(origin: vec3<f32>, dir: vec3<f32>, isect: RayIntersection) -> RtHi
     out.roughness = clamp(mat.roughness, 0.04, 1.0);
     out.metallic = clamp(mat.metallic, 0.0, 1.0);
     out.terrain_index = mat.terrain_index;
+    out.transmission = select(mat.transmission, 0.0, mat.terrain_index >= 0);
 
     if mat.terrain_index >= 0 {
         out.albedo = vec3<f32>(0.0);
@@ -185,7 +188,8 @@ fn rt_trace(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> RtHit 
         var rq: ray_query;
         // ForceNonOpaque exposes triangle candidates even though existing
         // BLASes were built opaque. All geometries in this scene are triangles.
-        rayQueryInitialize(&rq, accel, RayDesc(0x2u, 0xffu, t_min, t_max, origin, dir));
+        // Cut-out meshes' BLAS are non-opaque (raytrace.rs `mark_cutout`): only their triangles come here.
+        rayQueryInitialize(&rq, accel, RayDesc(0x0u, 0xffu, t_min, t_max, origin, dir));
         while rayQueryProceed(&rq) {
             if rt_candidate_is_covered(rayQueryGetCandidateIntersection(&rq)) {
                 rayQueryConfirmIntersection(&rq);
@@ -197,7 +201,10 @@ fn rt_trace(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> RtHit 
     for (var hop = 0u; hop < 4u; hop++) {
         var rq: ray_query;
         rayQueryInitialize(&rq, accel, RayDesc(0u, 0xffu, t, t_max, origin, dir));
-        rayQueryProceed(&rq);
+        // A cut-out mesh's triangles are candidates: take each, the nearest wins, the resolve below tests alpha.
+        while rayQueryProceed(&rq) {
+            rayQueryConfirmIntersection(&rq);
+        }
         let hit = rt_resolve(origin, dir, rayQueryGetCommittedIntersection(&rq));
         if hit.hit {
             return hit;

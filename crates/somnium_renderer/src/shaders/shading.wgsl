@@ -35,7 +35,9 @@ fn practical_visibility(p: vec3<f32>, geometric_normal: vec3<f32>, emitter: vec3
             // tolerance, not a distance-dependent leak across room partitions.
             rayQueryInitialize(&rq, local_shadow_accel,
                 RayDesc(0x4u, 0x1u, 0.008, distance - 0.06, origin, delta / distance));
-            rayQueryProceed(&rq);
+            while rayQueryProceed(&rq) {
+                rayQueryConfirmIntersection(&rq);   // cut-out meshes are non-opaque
+            }
             return select(0.0, 1.0, rayQueryGetCommittedIntersection(&rq).kind == RAY_QUERY_INTERSECTION_NONE);
         }
     }
@@ -154,7 +156,9 @@ fn skin_visibility(p: vec3<f32>, emitter: vec3<f32>, reach: f32) -> f32 {
             var rq: ray_query;
             rayQueryInitialize(&rq, local_shadow_accel,
                 RayDesc(0x4u, 0x1u, reach, distance - 0.06, p, delta / distance));
-            rayQueryProceed(&rq);
+            while rayQueryProceed(&rq) {
+                rayQueryConfirmIntersection(&rq);   // cut-out meshes are non-opaque
+            }
             return select(0.0, 1.0, rayQueryGetCommittedIntersection(&rq).kind == RAY_QUERY_INTERSECTION_NONE);
         }
         return 1.0;
