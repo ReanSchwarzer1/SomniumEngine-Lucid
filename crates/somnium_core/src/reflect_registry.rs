@@ -1221,6 +1221,8 @@ fn sky_schema() -> ComponentSchema {
             shape_scale { min: 100.0, soft_max: 40000.0, step: 100.0, unit: "m",
                 group: "Shape", display_name: "Shape Scale" },
             ambient { min: 0.0, soft_max: 4.0, step: 0.01, precision: 2, group: "Lighting" },
+            brightness { min: 0.0, soft_max: 2.0, step: 0.01, precision: 2, group: "Lighting",
+                doc: "Scale on the light the clouds scatter. Below 1 brings bright clouds back toward the clear sky between them." },
             phase_forward { min: 0.0, max: 0.95, step: 0.01, precision: 2, group: "Lighting",
                 display_name: "Forward Scattering" },
             phase_backward { min: -0.95, max: 0.0, step: 0.01, precision: 2, group: "Lighting",

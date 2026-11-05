@@ -75,7 +75,8 @@ struct CloudParams {
     /// Range the froxel volume spans, so aerial perspective can be applied to
     /// the cloud layer. Zero disables the lookup.
     volumetric_range: f32,
-    _pad0: f32,
+    /// Scale on the scattered light (`CloudSettings::brightness`).
+    brightness: f32,
     _pad1: f32,
 }
 
@@ -461,7 +462,7 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32) -> CloudRay {
     }
 
     let depth = select(interval.x, depth_accum / max(depth_weight, 1e-6), depth_weight > 1e-6);
-    return CloudRay(scatter, transmittance, depth);
+    return CloudRay(scatter * cp.brightness, transmittance, depth);
 }
 
 @compute @workgroup_size(8, 8, 1)
