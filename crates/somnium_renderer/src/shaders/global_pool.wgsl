@@ -103,6 +103,10 @@ struct View {
     wind:          vec4<f32>,     // offset 224
     // x: the wind clock this frame, y: last frame (for motion vectors).
     wind_time:     vec4<f32>,     // offset 240
+    // inverse(jittered projection * the view's rotation alone): a pixel's ray or point, camera-relative.
+    // `inv_view_proj` cancels to 2^-6 steps in ndc kilometres from the origin (Sunscar, 5 Nov 2026: the
+    // 21.6 px columns at the feet 15 km out). Add camera_pos after the divide for a world position.
+    inv_view_proj_rel: mat4x4<f32>, // offset 256
 }
 
 // GpuDirectionalLight (336 bytes) — matches shadow/mod.rs::GpuDirectionalLight.

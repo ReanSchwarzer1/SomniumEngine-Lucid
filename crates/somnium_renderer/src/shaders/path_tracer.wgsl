@@ -243,10 +243,11 @@ fn pt_g1(n_dot_x: f32, alpha: f32) -> f32 {
 fn pt_bary(p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, c0: vec4<f32>, c1: vec4<f32>, c2: vec4<f32>, near_eye: bool,
            ndc: vec2<f32>) -> vec3<f32> {
     if near_eye {
-        let near = view.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-        let far = view.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
-        let ro = near.xyz / near.w;
-        let rd = far.xyz / far.w - ro;
+        // From the eye, camera-relative (`inv_view_proj_rel`): the absolute inverse cancels to 2^-6 in ndc
+        // kilometres from the origin.
+        let far = view.inv_view_proj_rel * vec4<f32>(ndc, 1.0, 1.0);
+        let ro = view.camera_pos;
+        let rd = far.xyz / far.w;
         let e1 = p1 - p0;
         let e2 = p2 - p0;
         let pv = cross(rd, e2);
