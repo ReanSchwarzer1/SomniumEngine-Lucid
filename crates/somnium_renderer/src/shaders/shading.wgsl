@@ -1005,12 +1005,13 @@ fn vis_barycentric(
 /// and column, a plaid on the Office's entry wall. The ray form has no such division. `None` when the ray runs
 /// along the plane.
 fn ray_barycentric(p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, sample_ndc: vec2<f32>) -> vec4<f32> {
-    // From the eye itself: every ray of a perspective view starts there (this runs only for a vertex within a
-    // metre of the eye's plane, which an orthographic view never has), and the near-plane point through
-    // `inv_view_proj` keeps only millimetres kilometres from the origin, while `origin - p0` below is exact.
-    let far = view.inv_view_proj * vec4<f32>(sample_ndc, 1.0, 1.0);
+    // From the eye itself, with a camera-relative direction: every ray of a perspective view starts at the eye
+    // (this runs only for a vertex within a metre of the eye's plane, which an orthographic view never has), and
+    // `inv_view_proj`'s columns cancel 15 km out (at x -15408: 154087.6 against -154103.0, ulp 2^-6), so a
+    // direction built through it snapped every 21.6 px at 2560 wide: the "blocky ground" (Sunscar, 5 Nov 2026).
+    let far = view.inv_view_proj_rel * vec4<f32>(sample_ndc, 1.0, 1.0);
     let origin = view.camera_pos;
-    let dir = far.xyz / far.w - origin;
+    let dir = far.xyz / far.w;
     let e1 = p1 - p0;
     let e2 = p2 - p0;
     let pv = cross(dir, e2);
@@ -2092,8 +2093,8 @@ fn contact_shadow(
         // shadows across the ground. Reconstruct the sampled surface and do
         // the thickness test in view-space metres instead.
         let scene_ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, scene_z, 1.0);
-        let scene_world_h = view.inv_view_proj * scene_ndc;
-        let scene_world = scene_world_h.xyz / scene_world_h.w;
+        let scene_world_h = view.inv_view_proj_rel * scene_ndc;
+        let scene_world = scene_world_h.xyz / scene_world_h.w + view.camera_pos;
         let ray_view_depth = -(view.view * vec4<f32>(sample_pos, 1.0)).z;
         let scene_view_depth = -(view.view * vec4<f32>(scene_world, 1.0)).z;
         let diff = ray_view_depth - scene_view_depth;
@@ -2228,8 +2229,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             return vec4<f32>(0.0, 0.0, 0.0, 1.0);
         }
         let ndc = (screen_uv * 2.0 - 1.0) * vec2<f32>(1.0, -1.0);
-        let near_plane = view.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-        let far_plane  = view.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+        // Camera-relative: the difference below is the same, without the absolute inverse's 2^-6 steps.
+        let near_plane = view.inv_view_proj_rel * vec4<f32>(ndc, 0.0, 1.0);
+        let far_plane  = view.inv_view_proj_rel * vec4<f32>(ndc, 1.0, 1.0);
         let ray_dir    = normalize(far_plane.xyz / far_plane.w - near_plane.xyz / near_plane.w);
 
         // Phase 24C: sample the environment cubemap rather than evaluating a

@@ -52,8 +52,9 @@ fn scatter_of(coord: vec2<i32>) -> f32 {
 fn distance_at(coord: vec2<i32>, size: vec2<f32>) -> f32 {
     let uv = (vec2<f32>(coord) + 0.5) / size;
     let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, textureLoad(depth_tex, coord, 0), 1.0);
-    let world = view.inv_view_proj * ndc;
-    return length(world.xyz / world.w - view.camera_pos);
+    // Camera-relative already: the distance is its length (`inv_view_proj_rel`).
+    let world = view.inv_view_proj_rel * ndc;
+    return length(world.xyz / world.w);
 }
 
 @fragment

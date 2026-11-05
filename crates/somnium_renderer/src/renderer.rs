@@ -75,7 +75,8 @@ pub struct UploadedNode {
 ///
 /// 224 is what the block holds; 256 is what it is spaced at, because a copy
 /// offset has to be aligned and 256 is the alignment every backend accepts.
-const VIEW_SLOT_BYTES: u64 = 256;
+/// 320 since 5 Nov 2026 (`inv_view_proj_rel`), spaced at 512.
+const VIEW_SLOT_BYTES: u64 = 512;
 
 /// How many view slots a frame may use.
 ///
@@ -340,6 +341,10 @@ pub struct SomniumRenderer {
     pub authored_picture_shift: crate::pass::postprocess::PictureShift,
     /// View-projection without TAA's sub-pixel jitter, for reprojection.
     view_proj_unjittered: glam::Mat4,
+    /// The jittered projection times the view's rotation alone: the view-projection of a camera at the origin.
+    /// Its inverse goes to the shaders as `inv_view_proj_rel`, so a ray or point rebuilt from a pixel is
+    /// camera-relative and keeps its precision kilometres out (`set_view`).
+    view_proj_rel: glam::Mat4,
     /// Current render target size, for computing the jitter offset.
     render_width: u32,
     render_height: u32,
@@ -1608,6 +1613,7 @@ impl SomniumRenderer {
             authored_picture_shift: Default::default(),
             sun_angular_radius: 0.004_654,
             view_proj_unjittered: glam::Mat4::IDENTITY,
+            view_proj_rel: glam::Mat4::IDENTITY,
             render_width: ctx.config.width,
             render_height: ctx.config.height,
             tonemapper: 0,
@@ -2629,6 +2635,11 @@ impl SomniumRenderer {
         jittered.z_axis.y += jitter.y;
 
         self.view_proj = jittered * view;
+        // Built from small numbers only: `jittered * view` holds a translation of camera x 10^1..10^5, and taking
+        // it back out in f32 cancels to the same 2^-6 steps this exists to avoid (Sunscar, 5 Nov 2026).
+        let mut rotation = view;
+        rotation.w_axis = glam::Vec4::W;
+        self.view_proj_rel = jittered * rotation;
         self.camera_pos = camera_pos;
     }
 
@@ -2653,6 +2664,9 @@ impl SomniumRenderer {
         wind.fade_distance *= budget.draw_distance;
         view_data.extend_from_slice(bytemuck::bytes_of(&wind.uniform()));
         view_data.extend_from_slice(bytemuck::bytes_of(&[self.wind_clock.0, self.wind_clock.1, 0.0, 0.0]));
+        // ponytail: the primary camera's, as camera_pos above already is for every view slot; a second
+        // viewport's near-eye rays use it too. Per-slot cameras when a multi-view editor needs them.
+        view_data.extend_from_slice(bytemuck::bytes_of(&self.view_proj_rel.inverse().to_cols_array()));
         view_data
     }
 
@@ -8877,6 +8891,37 @@ mod frame_instance_layout_tests {
         assert!(!beyond_depth_ties(&view, &at(40.0, -5.0, 1.0), crate_box), "40 m off to the side but 5 m deep");
         assert!(!beyond_depth_ties(&view, &at(0.0, -40.0, 40.0), crate_box), "a wall 40 m long, stretched back into reach");
         assert!(!beyond_depth_ties(&view, &at(0.0, -400.0, 1.0), None), "unknown size keeps its tie");
+    }
+
+    #[test]
+    fn a_near_eye_ray_turns_at_every_pixel_kilometres_from_the_origin() {
+        // The camera where the slice's street is (scene x -15408), looking down 30 degrees, 2560 wide.
+        let eye = glam::Vec3::new(-15408.0, 14.4, 358.0);
+        let forward = glam::Vec3::new(0.0, -0.5, -0.866).normalize();
+        let view = glam::Mat4::look_to_rh(eye, forward, glam::Vec3::Y);
+        let proj = glam::Mat4::perspective_rh(55f32.to_radians(), 16.0 / 9.0, 0.1, 1000.0);
+        let mut rotation = view;
+        rotation.w_axis = glam::Vec4::W;
+        let (absolute, relative) = ((proj * view).inverse(), (proj * rotation).inverse());
+        let exact = (proj.as_dmat4() * rotation.as_dmat4()).inverse();
+        let x_of = |m: glam::Mat4, ndc: f32| {
+            let h = m * glam::Vec4::new(ndc, -0.5, 1.0, 1.0);
+            (h.truncate() / h.w).x
+        };
+        let pixels: Vec<f32> = (0..64).map(|i| (1280.0 + i as f32) / 1280.0 - 1.0).collect();
+        let distinct = |m: glam::Mat4, minus: f32| {
+            let mut xs: Vec<u32> = pixels.iter().map(|&n| (x_of(m, n) - minus).to_bits()).collect();
+            xs.dedup();
+            xs.len()
+        };
+        assert_eq!(distinct(relative, 0.0), 64, "every pixel its own direction");
+        assert!(distinct(absolute, eye.x) < 16, "the absolute inverse snaps: {}", distinct(absolute, eye.x));
+        for &n in &pixels {
+            let h = exact * glam::DVec4::new(f64::from(n), -0.5, 1.0, 1.0);
+            let want = (h.truncate() / h.w).x;
+            // 5 cm at the 1 km far plane: 50 microradians, an eighth of a pixel (f32 divides near the far plane).
+            assert!((f64::from(x_of(relative, n)) - want).abs() < 0.05, "{n}: {} against {want}", x_of(relative, n));
+        }
     }
 
     #[test]
