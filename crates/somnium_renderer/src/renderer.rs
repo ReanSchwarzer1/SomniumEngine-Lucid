@@ -671,6 +671,9 @@ pub struct SomniumRenderer {
 
     /// The list of draw commands submitted this frame.
     draw_queue: Vec<DrawCommand>,
+    /// Last frame's opaque draw commands, swapped out of `draw_queue` rather than cleared: the editor clicks and
+    /// stands objects on what games draw themselves (TSF's rooms), which has no mesh component to ask.
+    last_frame_draws: Vec<DrawCommand>,
     /// `sort_draws_stable`'s order and output, kept between frames.
     sort_keys: DrawSortCache,
     /// Copies of mesh parts kept on the GPU between frames (`instance_batch.rs`); empty unless a game sets one.
@@ -1763,6 +1766,7 @@ impl SomniumRenderer {
             clipmap_pass,
             terrain_queue: Vec::with_capacity(4),
             draw_queue: Vec::with_capacity(256),
+            last_frame_draws: Vec::new(),
             sort_keys: DrawSortCache::default(),
             instance_batches: Default::default(),
             sort_scratch: Vec::new(),
@@ -3590,6 +3594,12 @@ impl SomniumRenderer {
     #[must_use]
     pub fn instance_batch_stats(&self) -> (usize, u32) {
         (self.instance_batches.batch_count(), self.instance_batches.slot_end())
+    }
+
+    /// The opaque draws of the last rendered frame, for the editor's picking and ground queries.
+    #[must_use]
+    pub fn last_frame_draws(&self) -> &[DrawCommand] {
+        &self.last_frame_draws
     }
 
     pub fn submit(&mut self, cmd: DrawCommand) {
@@ -7500,6 +7510,7 @@ impl SomniumRenderer {
     /// Must run on *every* path out of `render`, including the ones that bail
     /// before drawing.
     fn clear_frame_queues(&mut self) {
+        std::mem::swap(&mut self.last_frame_draws, &mut self.draw_queue);
         self.draw_queue.clear();
         self.reactive_draws.clear();
         self.first_person_casters.clear();
