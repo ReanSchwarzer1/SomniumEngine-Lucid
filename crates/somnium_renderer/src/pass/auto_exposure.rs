@@ -18,6 +18,23 @@ use wgpu::util::DeviceExt;
 const MIN_LOG_LUM: f32 = -10.0;
 const MAX_LOG_LUM: f32 = 20.0;
 
+/// How the eye adapts: the EV100 range it stays in and its rates per second (`PostProcessComponent`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EyeAdaptation {
+    pub min_ev100: f32,
+    pub max_ev100: f32,
+    /// When the view gets brighter.
+    pub to_bright: f32,
+    /// When the view gets darker.
+    pub to_dark: f32,
+}
+
+impl Default for EyeAdaptation {
+    fn default() -> Self {
+        Self { min_ev100: -8.0, max_ev100: 18.0, to_bright: 3.0, to_dark: 1.0 }
+    }
+}
+
 /// GPU-side settings, matching `ExposureParams` in `auto_exposure.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -175,6 +192,7 @@ impl AutoExposurePass {
         height: u32,
         delta_time: f32,
         exposure_compensation: f32,
+        eye: EyeAdaptation,
     ) {
         let Some(bind_group) = self.bind_group.as_ref() else {
             return;
@@ -189,11 +207,11 @@ impl AutoExposurePass {
                 // A long frame (a hitch, or a breakpoint) must not teleport the
                 // exposure; clamping keeps adaptation smooth across stalls.
                 delta_time: delta_time.clamp(0.0, 0.1),
-                speed_down: 3.0,
-                speed_up: 1.0,
+                speed_down: eye.to_bright,
+                speed_up: eye.to_dark,
                 exposure_compensation,
-                min_ev100: -8.0,
-                max_ev100: 18.0,
+                min_ev100: eye.min_ev100,
+                max_ev100: eye.max_ev100,
                 // Above roughly a sunlit white surface, samples start losing
                 // their vote — a glint should not decide the exposure.
                 highlight_start_nits: 8_000.0,

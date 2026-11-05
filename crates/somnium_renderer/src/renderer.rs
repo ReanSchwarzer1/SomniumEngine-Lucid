@@ -328,6 +328,8 @@ pub struct SomniumRenderer {
     pub exposure: f32,
     /// Meter the frame and adapt exposure to it, rather than using `exposure`.
     pub auto_exposure: bool,
+    /// The range and rates the metered exposure adapts within.
+    pub eye_adaptation: crate::pass::auto_exposure::EyeAdaptation,
     /// Seconds since the previous frame, for exposure adaptation.
     pub frame_delta_time: f32,
     /// Stops applied on top of the metered exposure. Negative darkens.
@@ -1608,6 +1610,7 @@ impl SomniumRenderer {
             // not the other way round — so the value is inlined.
             exposure: 1.0 / (1.2 * 32768.0),
             auto_exposure: true,
+            eye_adaptation: Default::default(),
             frame_delta_time: 1.0 / 60.0,
             exposure_compensation: 0.0,
             grading: crate::pass::postprocess::Grading::default(),
@@ -7200,6 +7203,7 @@ impl SomniumRenderer {
                 self.render_height,
                 self.frame_delta_time,
                 self.exposure_compensation,
+                self.eye_adaptation,
             );
             self.profiler.end(&mut encoder);
         }
