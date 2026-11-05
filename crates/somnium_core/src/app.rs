@@ -8806,6 +8806,7 @@ impl<G: GameApp> Engine<G> {
             r.gtao_pass.enabled = pp.gtao_enabled && budget.gtao && !retro;
             r.bloom_pass.enabled = pp.bloom_enabled;
             r.bloom_pass.intensity = pp.bloom_intensity;
+            r.bloom_pass.threshold_ev = pp.bloom_threshold.max(0.0);
             r.bloom_pass.lens_flare = pp.lens_flare.max(r.lens_flare_requested).max(0.0);
             r.dof_pass.enabled = pp.dof_enabled && budget.camera_effects && !retro;
             r.dof_pass.focus_distance = pp.dof_focus_distance;

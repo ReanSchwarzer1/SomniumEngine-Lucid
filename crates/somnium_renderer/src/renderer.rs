@@ -1265,6 +1265,7 @@ impl SomniumRenderer {
             HDR_FORMAT,
             ctx.config.width,
             ctx.config.height,
+            auto_exposure_pass.exposure_buffer(),
         );
 
         // Phase 11.5K: Post-process pass owns the Rgba16Float HDR render target.
@@ -7283,6 +7284,8 @@ impl SomniumRenderer {
             &mut encoder,
             &self.postprocess_pass.hdr_view,
             (self.render_width, self.render_height),
+            self.exposure,
+            self.auto_exposure,
         );
 
         self.frame_gen_split(ctx, encoder, crate::pass::frame_gen::SPLIT_BEFORE_UPSCALE);

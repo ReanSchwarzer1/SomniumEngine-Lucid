@@ -1218,6 +1218,9 @@ pub struct PostProcessComponent {
     pub bloom_enabled: bool,
     /// Strength of the bloom contribution; zero disables its visible effect.
     pub bloom_intensity: f32,
+    /// Stops above the adapted middle grey where light starts to bloom, soft over the stop below (default 0: all
+    /// light blooms, as a lens does). Keeps bright gaps in a canopy from blooming a wood into milk.
+    pub bloom_threshold: f32,
     /// Screen-space occlusion (Phase 24I).
     pub gtao_enabled: bool,
     /// Depth of field (Phase 24Z). Focus distance is in metres.
@@ -1494,6 +1497,7 @@ impl Default for PostProcessComponent {
             // runtime source of truth after startup.
             bloom_enabled: std::env::var("SOMNIUM_BLOOM").as_deref() != Ok("0"),
             bloom_intensity: 0.04,
+            bloom_threshold: 0.0,
             // `SOMNIUM_GTAO=0` switches screen-space occlusion off for the
             // Phase 25A acceptance test — the same scene either side of the
             // flag has to differ *on terrain*, and before 25A-2 it could not.

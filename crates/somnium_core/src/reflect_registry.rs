@@ -858,6 +858,8 @@ fn post_process_schema() -> ComponentSchema {
             response_curve { group: "Color Grading", display_name: "Response Curve",
                 min: 0.0, max: 1.0, soft_min: 0.0, soft_max: 1.0 },
             bloom_enabled { group: "Bloom" }, bloom_intensity { min: 0.0, step: 0.01, group: "Bloom" },
+            bloom_threshold { min: 0.0, max: 12.0, step: 0.1, precision: 1, unit: "EV", group: "Bloom", display_name: "Bloom Threshold",
+                doc: "Stops above the adapted middle grey where light starts to bloom. 0 blooms all light, as a lens does." },
             gtao_enabled { group: "Ambient Occlusion" }, dof_enabled { group: "Depth of Field" },
             dof_focus_distance { min: 0.0, step: 0.1, unit: "m", group: "Depth of Field" },
             aa { group: "Anti-aliasing" }, restir_enabled { group: "Ray Tracing" },
