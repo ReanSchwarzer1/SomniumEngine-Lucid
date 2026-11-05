@@ -434,8 +434,9 @@ fn gi_primary_surface(coord: vec2<i32>, dims: vec2<u32>) -> GiSurface {
     }
     let uv = (vec2<f32>(coord) + 0.5) * gi.inv_resolution;
     let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    // Camera-relative (`inv_view_proj` is), then moved out.
     let world = gi.inv_view_proj * ndc;
-    s.pos = world.xyz / world.w;
+    s.pos = world.xyz / world.w + gi.camera_pos;
 
     // The normal comes from the visibility buffer's triangle rather than from
     // depth derivatives: a compute shader has no quad to take derivatives

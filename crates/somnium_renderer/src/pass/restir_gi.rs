@@ -41,6 +41,8 @@ const SURFACE_BYTES: u64 = 32;
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct GiParams {
+    /// Camera-relative: inverse(jittered projection x the view's rotation alone); add `camera_pos` for world
+    /// space. The absolute inverse snaps to 2^-7 in ndc 13 km from the origin (Sunscar, 5 Nov 2026).
     inv_view_proj: [[f32; 4]; 4],
     camera_pos: [f32; 3],
     frame: u32,

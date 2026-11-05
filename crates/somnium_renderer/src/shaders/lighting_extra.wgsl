@@ -56,8 +56,9 @@ fn extra_rand(seed: ptr<function, u32>) -> f32 {
 
 fn reconstruct_world(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    // Camera-relative (`inv_view_proj` is), then moved out.
     let world = extra.inv_view_proj * ndc;
-    return world.xyz / world.w;
+    return world.xyz / world.w + extra.camera_pos;
 }
 
 fn cache_coord(pos: vec3<f32>, dims: vec3<u32>) -> vec3<i32> {

@@ -16,12 +16,16 @@ const RESERVOIR_BYTES: u64 = 32;
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct RestirParams {
+    /// Camera-relative: inverse(jittered projection x the view's rotation alone); add `camera_pos` for world
+    /// space. The absolute inverse snaps to 2^-7 in ndc 13 km from the origin (Sunscar, 5 Nov 2026).
     inv_view_proj: [[f32; 4]; 4],
     sun_direction: [f32; 3],
     sun_angular_radius: f32,
     inv_resolution: [f32; 2],
     frame: u32,
     history_valid: f32,
+    camera_pos: [f32; 3],
+    _pad: f32,
 }
 
 pub struct RestirPass {
@@ -376,6 +380,7 @@ impl RestirPass {
         tlas: &wgpu::Tlas,
         depth_view: &wgpu::TextureView,
         view_proj: glam::Mat4,
+        camera_pos: glam::Vec3,
         sun_direction: glam::Vec3,
         sun_angular_radius: f32,
         width: u32,
@@ -405,6 +410,8 @@ impl RestirPass {
                 // existing scalar to keep the uniform layout stable.
                 history_valid: f32::from(u8::from(self.history_valid))
                     + 2.0 * f32::from(u8::from(self.grain_enabled)),
+                camera_pos: camera_pos.to_array(),
+                _pad: 0.0,
             }),
         );
 
