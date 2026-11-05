@@ -6401,7 +6401,13 @@ impl SomniumRenderer {
         );
         self.profiler.end(&mut encoder);
         self.shading_pass
-            .set_volumetric_range(&ctx.queue, self.volumetric_pass.max_distance());
+            .set_volumetric_range(
+                &ctx.queue,
+                self.volumetric_pass.max_distance(),
+                self.volumetric_pass.fog.density,
+                self.volumetric_pass.fog.height_falloff,
+                self.volumetric_pass.fog.base_height,
+            );
 
         // ── 6.9 Volumetric clouds (Phase CONTROL-M) ──────────────────────────
         //

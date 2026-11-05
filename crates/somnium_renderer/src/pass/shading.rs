@@ -1792,11 +1792,13 @@ impl ShadingPass {
         &self.volumetric_range
     }
 
-    pub fn set_volumetric_range(&self, queue: &wgpu::Queue, range: f32) {
+    /// The fog volume's range, and the height fog (`density`, `falloff`, `base`) that aerial perspective carries on
+    /// past it (`shading.wgsl`).
+    pub fn set_volumetric_range(&self, queue: &wgpu::Queue, range: f32, density: f32, falloff: f32, base: f32) {
         queue.write_buffer(
             &self.volumetric_range,
             0,
-            bytemuck::bytes_of(&[range, 0.0, 0.0, 0.0]),
+            bytemuck::bytes_of(&[range, density, falloff, base]),
         );
     }
 

@@ -3671,6 +3671,34 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         result = result * transmittance + inscatter;
         fog_transmittance = transmittance;
+
+        // Aerial perspective past the volume's range. Its last slice held from there on, so a ridge 5 km out had
+        // the haze of one at the range, and the far view read as cut-outs (ENGINE_AUDIT E21, E52: real ridges grow
+        // paler and bluer layer by layer). The rest of the ray loses its light to the air (the atmosphere's own
+        // Rayleigh and Mie extinction at the eye's height) and to the height fog (its exponential, integrated
+        // exactly), and gains the sky's colour toward that horizon, the limit long air scatters toward.
+        let beyond = dist - volumetric_range.x;
+        if beyond > 0.0 {
+            let dir = (hit_point - view.camera_pos) / max(dist, 1e-3);
+            let h_km = max(view.camera_pos.y, 0.0) * 0.001;
+            let air = (RAYLEIGH_SCATTERING * exp(-h_km / RAYLEIGH_SCALE_H)
+                + vec3<f32>(MIE_EXTINCTION * exp(-h_km / MIE_SCALE_H))) * 0.001;
+            var depth = air * beyond;
+            let fog = volumetric_range.y;
+            if fog > 0.0 {
+                let falloff = max(volumetric_range.z, 1.0);
+                let y0 = view.camera_pos.y + dir.y * volumetric_range.x;
+                let start = fog * exp(-max(y0 - volumetric_range.w, 0.0) / falloff);
+                let k = clamp(dir.y * beyond / falloff, -20.0, 20.0);
+                let along = select(beyond * (1.0 - exp(-k)) / k, beyond, abs(k) < 1e-3);
+                depth += vec3<f32>(start * along);
+            }
+            let air_t = exp(-depth);
+            let horizon = normalize(vec3<f32>(dir.x, max(dir.y, 0.02), dir.z));
+            let sky = textureSampleLevel(env_cube, env_sampler, horizon, 0.0).rgb;
+            result = result * air_t + sky * (vec3<f32>(1.0) - air_t);
+            fog_transmittance *= dot(air_t, vec3<f32>(0.2126, 0.7152, 0.0722));
+        }
     }
 
     // The surface lit here, for the path tracer (`path_traced`). A surface whose light is baked into it
