@@ -60,6 +60,10 @@ struct WaterFrameData {
 }
 
 pub struct WaterPass {
+    /// Each body's material and instance uniforms, made once and rewritten each frame. They were made afresh twice a
+    /// frame per body; when the GPU's memory ran short mid-stream, the fresh one came back invalid and writing it
+    /// took the game down (sunscar-places, 6 Nov 2026: Monargent's valley after a 1.2 s load frame).
+    body_buffers: crate::fast_hash::FastMap<u32, (wgpu::Buffer, wgpu::Buffer)>,
     pub prepass_pipeline: wgpu::RenderPipeline,
     pub shade_pipeline: wgpu::RenderPipeline,
     pub view_bind_group_layout: wgpu::BindGroupLayout,
@@ -779,6 +783,7 @@ impl WaterPass {
             last_simulation: [0.0; 4],
             rain_ripple: 0.0,
             spectrum,
+            body_buffers: Default::default(),
         }
     }
 
@@ -1196,7 +1201,7 @@ impl WaterPass {
     }
 
     fn bind_bodies(
-        &self,
+        &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         water_bodies: &crate::water_body::WaterBodyRegistry,
@@ -1204,16 +1209,28 @@ impl WaterPass {
         simulation: [f32; 4],
     ) -> Vec<(wgpu::BindGroup, wgpu::BindGroup, u32, u32, u32)> {
         let mut bodies = Vec::with_capacity(water_queue.len());
+        self.body_buffers.retain(|id, _| water_queue.iter().any(|entry| entry.0 == *id));
         for (water_id, transform, water, v_off, i_off, i_cnt) in water_queue {
             let Some(body) = water_bodies.get(*water_id) else {
                 continue;
             };
-            let mat_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Water Mat Buffer"),
-                size: std::mem::size_of::<WaterMaterialData>() as u64,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
+            let (mat_buffer, inst_buffer) = self
+                .body_buffers
+                .entry(*water_id)
+                .or_insert_with(|| {
+                    let make = |label, size, usage| {
+                        device.create_buffer(&wgpu::BufferDescriptor { label: Some(label), size, usage, mapped_at_creation: false })
+                    };
+                    (
+                        make(
+                            "Water Mat Buffer",
+                            std::mem::size_of::<WaterMaterialData>() as u64,
+                            wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        ),
+                        make("Water Inst Buffer", 80, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST),
+                    )
+                })
+                .clone();
             let mut gpu_water = *water;
             gpu_water.simulation_params = simulation;
             gpu_water.cascade_scales = self.spectrum.map_scales();
@@ -1245,12 +1262,6 @@ impl WaterPass {
             let mut inst_data = Vec::with_capacity(80);
             inst_data.extend_from_slice(bytemuck::bytes_of(&transform.to_cols_array()));
             inst_data.extend_from_slice(bytemuck::bytes_of(&[0.0f32; 4]));
-            let inst_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Water Inst Buffer"),
-                size: 80,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
             queue.write_buffer(&inst_buffer, 0, &inst_data);
             let inst_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Water Inst Bind Group"),
