@@ -1213,7 +1213,7 @@ impl SomniumRenderer {
         // Phase 24L: indirect diffuse on the same acceleration structures.
         // Takes the global pool's layout because it resolves a ray hit through
         // the same scene bindings the shading pass rasterises through.
-        let restir_gi_pass = crate::pass::restir_gi::RestirGiPass::new(
+        let mut restir_gi_pass = crate::pass::restir_gi::RestirGiPass::new(
             &ctx.device,
             &shaders,
             &global_pool.layout,
@@ -1386,6 +1386,8 @@ impl SomniumRenderer {
         );
         // The sky light sees the clouds the camera does (Sunscar, 5 Nov 2026).
         ibl_pass.set_cloud_capture(&ctx.device, cloud_pass.sky_light_view());
+        // What GI's escaped rays see: the sky reaches a surface only through what its rays find open.
+        restir_gi_pass.set_environment(&ibl_pass.cube_view, &ibl_pass.sampler);
 
         // Phase CONTROL-O. Built before the shading pass, like the clouds and
         // for the same reason: shading binds its buffers.

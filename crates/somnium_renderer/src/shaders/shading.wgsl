@@ -1539,8 +1539,10 @@ fn evaluate_ibl_diffuse(surface: Surface, traced_diffuse: vec4<f32>) -> vec3<f32
     let irradiance = textureSampleLevel(env_cube, env_sampler, gather_n, ENV_MAX_MIP).rgb;
     let kd = (vec3<f32>(1.0) - surface.f0) * (1.0 - surface.metallic);
     var diffuse = irradiance * light.ibl_intensity * surface.albedo * kd;
+    // Traced, the estimate holds the sky through the gaps as well as the bounce (restir_gi.wgsl's escaped rays),
+    // so it takes the unshadowed sky's place: the floor of a wood gets the sky its canopy lets through.
     if traced_diffuse.a > 0.5 {
-        diffuse += traced_diffuse.rgb * surface.albedo * kd;
+        diffuse = traced_diffuse.rgb * surface.albedo * kd;
     }
 
     return diffuse * surface.occlusion;
@@ -1632,8 +1634,9 @@ fn evaluate_ibl_ms(surface: Surface, traced_diffuse: vec4<f32>) -> vec3<f32> {
     // hospital's practical-light bounce.
     let gather_n = normalize(mix(n, surface.bent_normal, 0.75));
     var irradiance = textureSampleLevel(env_cube, env_sampler, gather_n, ENV_MAX_MIP).rgb * light.ibl_intensity;
+    // Traced, the estimate holds the sky through the gaps as well as the bounce: it takes the unshadowed sky's place.
     if traced_diffuse.a > 0.5 {
-        irradiance += traced_diffuse.rgb;
+        irradiance = traced_diffuse.rgb;
     }
 
     let fss_ess = k_s * ab.x + ab.y;

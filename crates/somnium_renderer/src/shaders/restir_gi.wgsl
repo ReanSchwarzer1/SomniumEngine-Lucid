@@ -116,6 +116,11 @@ struct GiReservoir {
 // concatenated without `shading.wgsl`, and the pool it *does* share is group 0.
 @group(1) @binding(7) var default_sampler: sampler;
 @group(1) @binding(8) var grain_masks: texture_2d_array<f32>;
+// The environment cube (`ibl.rs`): what an escaped ray sees.
+@group(1) @binding(10) var gi_env: texture_cube<f32>;
+@group(1) @binding(11) var gi_env_sampler: sampler;
+/// Where a sky sample is put, far along its ray: reuse and the visibility ray treat it as a distant emitter.
+const GI_SKY_DISTANCE: f32 = 20000.0;
 
 @group(1) @binding(5) var<storage, read_write> gi_a: array<GiReservoir>;
 @group(1) @binding(6) var<storage, read_write> gi_b: array<GiReservoir>;
@@ -526,10 +531,21 @@ fn initial_and_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
             r.m = 1.0;
         }
     } else {
-        // A ray that escaped carries no bounce. It still counts as a candidate,
-        // or a pixel seeing mostly sky would keep resampling its history for
-        // ever and never darken.
+        // A ray that escaped sees the sky: it carries the sky's radiance that way (the prefiltered cube, clouds
+        // and all), so the traced estimate holds the whole of the diffuse light and the shading pass takes it in
+        // place of the unshadowed sky. Before, misses carried nothing and the sky reached the floor of a closed
+        // wood as if there were no canopy: ~1 stop under the meadow where real woods are 3.5-4.5 (sunscar-look,
+        // 6 Nov 2026).
+        let sky = textureSampleLevel(gi_env, gi_env_sampler, dir, 2.0).rgb * light.ibl_intensity;
+        let p_hat = gi_luma(sky);
         r.m = 1.0;
+        if p_hat > 0.0 && !hit.hit {
+            r.sample_pos = origin + dir * GI_SKY_DISTANCE;
+            r.sample_normal = -dir;
+            r.radiance = sky;
+            r.w_sum = p_hat;
+            r.w = 1.0 / p_hat;
+        }
     }
 
     // ── Temporal reuse ───────────────────────────────────────────────────────
