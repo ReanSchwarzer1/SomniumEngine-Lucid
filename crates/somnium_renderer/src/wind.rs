@@ -121,8 +121,10 @@ pub fn offset(
     // Drag grows with speed and saturates: a gale does not lay a pine flat.
     let drag = (speed * 0.22).min(1.6);
     let sway = 0.7 + 0.3 * (time * 0.9 + phase).sin();
-    let lean = bend * h * h * drag * gust * sway;
-    let mut out = Vec3::new(dir.x * lean, 0.0, dir.y * lean);
+    let turn = 0.7 * (phase * 3.7).sin();
+    let own = Vec2::new(dir.x * turn.cos() - dir.y * turn.sin(), dir.x * turn.sin() + dir.y * turn.cos());
+    let lean = bend * h * h * drag * gust * sway * (0.75 + 0.25 * (phase * 2.3).cos());
+    let mut out = Vec3::new(own.x * lean, 0.0, own.y * lean);
     // A bent stem keeps its length, so its tip drops as it leans.
     out.y = -0.5 * lean * lean / h.max(0.25);
     let q = (p - pivot) * 1.7;
@@ -223,5 +225,21 @@ mod tests {
         let var = |v: &[f32], m: f32| v.iter().map(|x| (x - m) * (x - m)).sum::<f32>().sqrt();
         let corr = cov / (var(&a, ma) * var(&b, mb));
         assert!(corr.abs() < 0.3, "neighbours' sideways flutter correlate {corr}");
+    }
+
+    #[test]
+    fn plants_lean_downwind_each_its_own_way() {
+        // Forty tufts in a row: every lean has a downwind part, and their directions spread rather than all agreeing.
+        let angles: Vec<f32> = (0..40)
+            .map(|i| {
+                let pivot = Vec3::new(-13860.0 + i as f32 * 0.7, 15.0, 360.0);
+                let o = offset(pivot + Vec3::Y * 0.5, pivot, 0.6, 0.0, 1.0, BREEZE, pivot);
+                assert!(o.z > 0.0, "downwind (+z) for every plant: {o}");
+                o.x.atan2(o.z)
+            })
+            .collect();
+        let spread = angles.iter().cloned().fold(f32::MIN, f32::max) - angles.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(spread > 0.8, "directions spread {spread} rad");
+        assert!(angles.iter().all(|a| a.abs() < 0.75), "within about 40 degrees of downwind");
     }
 }
