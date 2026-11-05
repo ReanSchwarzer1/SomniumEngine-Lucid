@@ -1354,7 +1354,7 @@ impl SomniumRenderer {
         // Phase 24C: the atmosphere LUTs must exist before the IBL pass, which
         // binds them to ray-march the sky into the environment cubemap.
         let atmosphere_pass = crate::pass::atmosphere::AtmospherePass::new(&ctx.device, &shaders);
-        let ibl_pass = crate::pass::ibl::IblPass::new(&ctx.device, &shaders, &atmosphere_pass);
+        let mut ibl_pass = crate::pass::ibl::IblPass::new(&ctx.device, &shaders, &atmosphere_pass);
 
         let vis_pass = VisibilityBufferPass::new(
             &ctx.device,
@@ -1383,6 +1383,8 @@ impl SomniumRenderer {
             ctx.config.width,
             ctx.config.height,
         );
+        // The sky light sees the clouds the camera does (Sunscar, 5 Nov 2026).
+        ibl_pass.set_cloud_capture(&ctx.device, cloud_pass.sky_light_view());
 
         // Phase CONTROL-O. Built before the shading pass, like the clouds and
         // for the same reason: shading binds its buffers.
@@ -5200,6 +5202,7 @@ impl SomniumRenderer {
             self.light_direction,
             self.light_color,
             overcast,
+            self.cloud_pass.sky_light_clouds(),
         );
 
         // ── 1. Compute cascades and upload light buffer ───────────────────────

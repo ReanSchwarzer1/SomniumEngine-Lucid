@@ -39,6 +39,8 @@ struct GenParams {
     night: [f32; 4],
     /// `NightSky::tint`, then padding.
     night_tint: [f32; 4],
+    /// x: 1 lays the clouds' capture over the sky (`set_cloud_capture`).
+    clouds: [f32; 4],
 }
 
 /// A night sky with no moon (Rimeborn's Undersun under the Lid), drawn into the environment cubemap so the background,
@@ -76,6 +78,10 @@ pub struct IblPass {
     sky_pipeline: wgpu::RenderPipeline,
     prefilter_pipeline: wgpu::RenderPipeline,
     sky_bind_group: wgpu::BindGroup,
+    /// Kept to rebuild the sky's bind group when the clouds' capture arrives (`set_cloud_capture`).
+    sky_bgl: wgpu::BindGroupLayout,
+    atmosphere_views: (wgpu::TextureView, wgpu::TextureView, wgpu::Sampler),
+    last_clouds: Option<u64>,
     prefilter_bind_group: wgpu::BindGroup,
     params_buffer: wgpu::Buffer,
 
@@ -187,6 +193,16 @@ impl IblPass {
                 lut_entry(3),
                 lut_entry(4),
                 wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
                     binding: 5,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
@@ -228,28 +244,28 @@ impl IblPass {
             ],
         });
 
-        let sky_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("IBL Sky BG"),
-            layout: &sky_bgl,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::TextureView(atmosphere.transmittance_view()),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: wgpu::BindingResource::TextureView(atmosphere.multiscatter_view()),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 5,
-                    resource: wgpu::BindingResource::Sampler(atmosphere.sampler()),
-                },
-            ],
-        });
+        // Until the clouds' capture is set: six 1x1 layers the sky never reads (`clouds.x` 0).
+        let no_clouds = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("IBL No Cloud Capture"),
+                size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 6 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: ENV_FORMAT,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            });
+        let atmosphere_views = (
+            atmosphere.transmittance_view().clone(),
+            atmosphere.multiscatter_view().clone(),
+            atmosphere.sampler().clone(),
+        );
+        let sky_bind_group = Self::sky_bind_group(device, &sky_bgl, &params_buffer, &atmosphere_views, &no_clouds);
 
         let prefilter_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("IBL Prefilter BG"),
@@ -322,6 +338,9 @@ impl IblPass {
             sky_pipeline,
             prefilter_pipeline,
             sky_bind_group,
+            sky_bgl,
+            atmosphere_views,
+            last_clouds: None,
             prefilter_bind_group,
             params_buffer,
             last_sun: None,
@@ -333,6 +352,37 @@ impl IblPass {
     /// Rebuild the cubemap if the sun changed (or it has never been built).
     ///
     /// Returns `true` when work was done.
+    fn sky_bind_group(
+        device: &wgpu::Device,
+        layout: &wgpu::BindGroupLayout,
+        params: &wgpu::Buffer,
+        atmosphere: &(wgpu::TextureView, wgpu::TextureView, wgpu::Sampler),
+        clouds: &wgpu::TextureView,
+    ) -> wgpu::BindGroup {
+        let entry = |binding, resource| wgpu::BindGroupEntry { binding, resource };
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("IBL Sky BG"),
+            layout,
+            entries: &[
+                entry(0, params.as_entire_binding()),
+                entry(3, wgpu::BindingResource::TextureView(&atmosphere.0)),
+                entry(4, wgpu::BindingResource::TextureView(&atmosphere.1)),
+                entry(5, wgpu::BindingResource::Sampler(&atmosphere.2)),
+                entry(6, wgpu::BindingResource::TextureView(clouds)),
+            ],
+        })
+    }
+
+    /// The clouds' capture of the sky (`CloudPass::sky_light_view`), laid over the sky whenever
+    /// `generate_if_needed` is given a capture.
+    pub fn set_cloud_capture(&mut self, device: &wgpu::Device, clouds: &wgpu::TextureView) {
+        self.sky_bind_group =
+            Self::sky_bind_group(device, &self.sky_bgl, &self.params_buffer, &self.atmosphere_views, clouds);
+        self.last_sun = None;
+    }
+
+    /// `clouds`: which capture of the clouds to lay over the sky (`CloudPass::sky_light_clouds`); each new one
+    /// regenerates the cube, and with one the overcast dome stands down.
     pub fn generate_if_needed(
         &mut self,
         device: &wgpu::Device,
@@ -340,14 +390,17 @@ impl IblPass {
         sun_direction: glam::Vec3,
         sun_color: glam::Vec3,
         overcast: f32,
+        clouds: Option<u64>,
     ) -> bool {
-        let overcast = overcast.clamp(0.0, 1.0);
+        let overcast = if clouds.is_some() { 0.0 } else { overcast.clamp(0.0, 1.0) };
         let key = (sun_direction.to_array(), sun_color.to_array(), overcast.to_bits());
-        if self.last_sun == Some(key) && self.last_night == Some(self.night) {
+        if self.last_sun == Some(key) && self.last_night == Some(self.night) && self.last_clouds == clouds {
             return false;
         }
         self.last_sun = Some(key);
         self.last_night = Some(self.night);
+        self.last_clouds = clouds;
+        let clouds_on = f32::from(u8::from(clouds.is_some()));
 
         // One submission per face/mip. `queue.write_buffer` only lands once
         // before a submission executes, so a single command buffer would see
@@ -357,7 +410,7 @@ impl IblPass {
 
         // Mip 0: capture the sky.
         for face in 0..6u32 {
-            self.write_params(queue, face, 0.0, dir, sun_color, overcast);
+            self.write_params(queue, face, 0.0, dir, sun_color, overcast, clouds_on);
             self.run_face(device, queue, 0, face, true);
         }
 
@@ -365,7 +418,7 @@ impl IblPass {
         for mip in 1..MIP_COUNT {
             let roughness = mip as f32 / (MIP_COUNT - 1) as f32;
             for face in 0..6u32 {
-                self.write_params(queue, face, roughness, dir, sun_color, overcast);
+                self.write_params(queue, face, roughness, dir, sun_color, overcast, clouds_on);
                 self.run_face(device, queue, mip, face, false);
             }
         }
@@ -380,6 +433,7 @@ impl IblPass {
         sun_direction: glam::Vec3,
         sun_color: glam::Vec3,
         overcast: f32,
+        clouds: f32,
     ) {
         let p = GenParams {
             face,
@@ -407,6 +461,7 @@ impl IblPass {
             ],
             night: [self.night.glow.max(0.0), self.night.aurora, self.night.halo_road, self.night.thread],
             night_tint: [self.night.tint[0], self.night.tint[1], self.night.tint[2], 0.0],
+            clouds: [clouds, 0.0, 0.0, 0.0],
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&p));
     }

@@ -35,6 +35,8 @@ struct GenParams {
     night: vec4<f32>,
     /// `.rgb` the glow's colour.
     night_tint: vec4<f32>,
+    /// x: 1 lays the sky light's cloud cube over the sky (and `overcast` is 0); yzw unused.
+    clouds: vec4<f32>,
 }
 
 /// The Undersun's night (`NightSky`, Rimeborn): no moon. A glow over the dome, brighter overhead and toward the hidden
@@ -90,6 +92,8 @@ fn undersun_night(dir: vec3<f32>, sun_dir: vec3<f32>) -> vec3<f32> {
 @group(0) @binding(3) var transmittance_lut: texture_2d<f32>;
 @group(0) @binding(4) var multiscatter_lut:  texture_2d<f32>;
 @group(0) @binding(5) var atmos_sampler:     sampler;
+// The cloud layer the camera sees, per cube texel (clouds.wgsl `cloud_env`): in-scatter and transmittance.
+@group(0) @binding(6) var cloud_capture:     texture_2d_array<f32>;
 
 struct VOut {
     @builtin(position) clip: vec4<f32>,
@@ -173,7 +177,14 @@ fn sky(ray_dir: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_sky(in: VOut) -> @location(0) vec4<f32> {
-    return vec4(sky(cube_dir(params.face, in.uv)), 1.0);
+    var radiance = sky(cube_dir(params.face, in.uv));
+    // The clouds over it, as the camera sees them: what the ground's ambient, its specular and every GI miss read
+    // (Sunscar, 5 Nov 2026). Off, the overcast dome in `sky` stands in.
+    if params.clouds.x > 0.5 {
+        let c = textureSampleLevel(cloud_capture, atmos_sampler, in.uv, i32(params.face), 0.0);
+        radiance = radiance * c.a + c.rgb;
+    }
+    return vec4(min(radiance, vec3<f32>(60000.0)), 1.0);
 }
 
 // ─── Prefilter ───────────────────────────────────────────────────────────────

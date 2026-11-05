@@ -298,68 +298,16 @@ fn cloud_aerial(view_uv: vec2<f32>, distance: f32) -> vec4<f32> {
 // The march
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-@compute @workgroup_size(8, 8, 1)
-fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let dims = textureDimensions(scatter_out);
-    if gid.x >= dims.x || gid.y >= dims.y {
-        return;
-    }
-    let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
+/// One ray through the layer from the camera: in-scattered light, transmittance and the transmittance-weighted
+/// depth. `jitter` (0..1) moves the first sample within a long step. Shared by the screen march and the sky
+/// light's capture (`cloud_env`).
+struct CloudRay {
+    scatter: vec3<f32>,
+    transmittance: f32,
+    depth: f32,
+}
 
-    // A clear sky costs one store per quarter-res pixel and nothing else.
-    if cp.density <= 0.0 {
-        textureStore(scatter_out, vec2<i32>(gid.xy), vec4<f32>(0.0, 0.0, 0.0, 1.0));
-        return;
-    }
-
-    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    let near = cp.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-    let far = cp.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
-    let near_ws = near.xyz / near.w;
-    let far_ws = far.xyz / far.w;
-    let ray_dir = normalize(far_ws - near_ws);
-
-    var interval = slab_interval(cp.camera_pos, ray_dir);
-    if interval.y <= interval.x {
-        textureStore(scatter_out, vec2<i32>(gid.xy), vec4<f32>(0.0, 0.0, 0.0, 1.0));
-        return;
-    }
-
-    // Occlusion by geometry, over the texel's whole footprint. The depth buffer
-    // is full resolution and this pass is quarter. A point sample at the texel
-    // centre stamped "no cloud" into every texel whose centre fell on a leaf,
-    // so through a canopy only the few texels centred on sky carried cloud and
-    // the composite rebuilt the sky from them in visible blocks. Now a texel is
-    // clamped by its farthest occluder and left unclamped when any of its
-    // footprint is sky; the composite decides per full-resolution pixel which
-    // geometry the cloud is in front of.
-    let depth_dims = textureDimensions(scene_depth);
-    let footprint = vec2<f32>(depth_dims) / vec2<f32>(dims);
-    let corner = vec2<f32>(gid.xy) * footprint;
-    var sky_seen = false;
-    var farthest = 0.0;
-    var taps = array<vec2<f32>, 5>(vec2(.5, .5), vec2(.1, .1), vec2(.9, .1), vec2(.1, .9), vec2(.9, .9));
-    for (var k = 0; k < 5; k = k + 1) {
-        let o = taps[k];
-        let px = min(vec2<i32>(corner + o * footprint), vec2<i32>(depth_dims) - 1);
-        let d = textureLoad(scene_depth, px, 0);
-        if d <= 0.0 || d >= 1.0 {
-            sky_seen = true;
-            break;
-        }
-        let tap_ndc = (vec2<f32>(px) + .5) / vec2<f32>(depth_dims);
-        let occ_clip = cp.inv_view_proj * vec4<f32>(tap_ndc.x * 2.0 - 1.0, 1.0 - tap_ndc.y * 2.0, d, 1.0);
-        // Camera-relative (`inv_view_proj` is): the distance is the length.
-        farthest = max(farthest, length(occ_clip.xyz / occ_clip.w));
-    }
-    if !sky_seen {
-        interval.y = min(interval.y, farthest);
-        if interval.y <= interval.x {
-            textureStore(scatter_out, vec2<i32>(gid.xy), vec4<f32>(0.0, 0.0, 0.0, 1.0));
-            return;
-        }
-    }
-
+fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32) -> CloudRay {
     let span = interval.y - interval.x;
     let steps = max(i32(cp.max_steps), 8);
 
@@ -393,10 +341,7 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
     // has no motion vector for a sky pixel to reproject — a pattern that moved
     // every frame was not dithering, it was visible shimmer. Frame-stable
     // spatial jitter still breaks up the banding it was added for.
-    var t = interval.x;
-    if cp.jitter_enabled > 0.5 {
-        t += ign(vec2<f32>(gid.xy), cp.frame) * long_step;
-    }
+    var t = interval.x + jitter * long_step;
 
     let sun = normalize(cp.sun_direction);
     let cos_theta = dot(ray_dir, sun);
@@ -479,9 +424,82 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
         t += step_len;
     }
 
+    let depth = select(interval.x, depth_accum / max(depth_weight, 1e-6), depth_weight > 1e-6);
+    return CloudRay(scatter, transmittance, depth);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(scatter_out);
+    if gid.x >= dims.x || gid.y >= dims.y {
+        return;
+    }
+    let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
+
+    // A clear sky costs one store per quarter-res pixel and nothing else.
+    if cp.density <= 0.0 {
+        textureStore(scatter_out, vec2<i32>(gid.xy), vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let near = cp.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
+    let far = cp.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    let near_ws = near.xyz / near.w;
+    let far_ws = far.xyz / far.w;
+    let ray_dir = normalize(far_ws - near_ws);
+
+    var interval = slab_interval(cp.camera_pos, ray_dir);
+    if interval.y <= interval.x {
+        textureStore(scatter_out, vec2<i32>(gid.xy), vec4<f32>(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+
+    // Occlusion by geometry, over the texel's whole footprint. The depth buffer
+    // is full resolution and this pass is quarter. A point sample at the texel
+    // centre stamped "no cloud" into every texel whose centre fell on a leaf,
+    // so through a canopy only the few texels centred on sky carried cloud and
+    // the composite rebuilt the sky from them in visible blocks. Now a texel is
+    // clamped by its farthest occluder and left unclamped when any of its
+    // footprint is sky; the composite decides per full-resolution pixel which
+    // geometry the cloud is in front of.
+    let depth_dims = textureDimensions(scene_depth);
+    let footprint = vec2<f32>(depth_dims) / vec2<f32>(dims);
+    let corner = vec2<f32>(gid.xy) * footprint;
+    var sky_seen = false;
+    var farthest = 0.0;
+    var taps = array<vec2<f32>, 5>(vec2(.5, .5), vec2(.1, .1), vec2(.9, .1), vec2(.1, .9), vec2(.9, .9));
+    for (var k = 0; k < 5; k = k + 1) {
+        let o = taps[k];
+        let px = min(vec2<i32>(corner + o * footprint), vec2<i32>(depth_dims) - 1);
+        let d = textureLoad(scene_depth, px, 0);
+        if d <= 0.0 || d >= 1.0 {
+            sky_seen = true;
+            break;
+        }
+        let tap_ndc = (vec2<f32>(px) + .5) / vec2<f32>(depth_dims);
+        let occ_clip = cp.inv_view_proj * vec4<f32>(tap_ndc.x * 2.0 - 1.0, 1.0 - tap_ndc.y * 2.0, d, 1.0);
+        // Camera-relative (`inv_view_proj` is): the distance is the length.
+        farthest = max(farthest, length(occ_clip.xyz / occ_clip.w));
+    }
+    if !sky_seen {
+        interval.y = min(interval.y, farthest);
+        if interval.y <= interval.x {
+            textureStore(scatter_out, vec2<i32>(gid.xy), vec4<f32>(0.0, 0.0, 0.0, 1.0));
+            return;
+        }
+    }
+
+    var jitter = 0.0;
+    if cp.jitter_enabled > 0.5 {
+        jitter = ign(vec2<f32>(gid.xy), cp.frame);
+    }
+    let cloud = march_ray(ray_dir, interval, jitter);
+    var scatter = cloud.scatter;
+    let transmittance = cloud.transmittance;
+
     // Aerial perspective, at the cloud's own transmittance-weighted depth.
-    let cloud_distance = select(interval.x, depth_accum / max(depth_weight, 1e-6),
-        depth_weight > 1e-6);
+    let cloud_distance = cloud.depth;
     let aerial = cloud_aerial(uv, cloud_distance);
     scatter = scatter * aerial.a + aerial.rgb * (1.0 - transmittance);
 
@@ -490,6 +508,46 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
         vec2<i32>(gid.xy),
         vec4<f32>(scatter, clamp(transmittance, 0.0, 1.0)),
     );
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// The sky light's clouds
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// The march for each texel of a small cube round the camera, which `ibl_gen.wgsl` lays over the sky before it
+// prefilters. The ground's ambient, its specular and every GI miss then see the deck the camera sees. Before, an overcast
+// dome pinned to the clear sky's zenith lit the land 3.5-5 stops under its own clouds (Sunscar, 5 Nov 2026).
+@group(0) @binding(16) var env_out: texture_storage_2d_array<rgba16float, write>;
+
+/// `ibl_gen.wgsl`'s `cube_dir`, so a capture texel and the environment texel it lands on look the same way.
+fn env_cube_dir(face: u32, uv: vec2<f32>) -> vec3<f32> {
+    let st = uv * 2.0 - vec2(1.0);
+    var d: vec3<f32>;
+    switch face {
+        case 0u:  { d = vec3( 1.0,  -st.y, -st.x); }
+        case 1u:  { d = vec3(-1.0,  -st.y,  st.x); }
+        case 2u:  { d = vec3( st.x,  1.0,   st.y); }
+        case 3u:  { d = vec3( st.x, -1.0,  -st.y); }
+        case 4u:  { d = vec3( st.x, -st.y,  1.0);  }
+        default:  { d = vec3(-st.x, -st.y, -1.0);  }
+    }
+    return normalize(d);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cloud_env(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(env_out);
+    if gid.x >= dims.x || gid.y >= dims.y {
+        return;
+    }
+    let dir = env_cube_dir(gid.z, (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims));
+    var out = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    let interval = slab_interval(cp.camera_pos, dir);
+    if cp.density > 0.0 && interval.y > interval.x {
+        let cloud = march_ray(dir, interval, 0.5);
+        out = vec4<f32>(cloud.scatter, clamp(cloud.transmittance, 0.0, 1.0));
+    }
+    textureStore(env_out, vec2<i32>(gid.xy), i32(gid.z), out);
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
