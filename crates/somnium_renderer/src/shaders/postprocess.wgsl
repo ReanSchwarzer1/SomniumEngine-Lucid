@@ -54,7 +54,7 @@ struct PostParams {
     inv_view_proj: mat4x4<f32>,
     /// x painterly amount, y ink-line amount (0 skips each); zw unused.
     stylise: vec4<f32>,
-    /// x how much of the grading LUT to take (0 leaves it unread); yzw unused.
+    /// x how much of the grading LUT to take (0 leaves it unread); y low-light vision (`low_light`); zw unused.
     lut: vec4<f32>,
 }
 
@@ -67,6 +67,26 @@ struct PostParams {
 @group(0) @binding(4) var bloom_tex: texture_2d<f32>;
 // The grading LUT: a .cube, sRGB-encoded in and out as such files are made.
 @group(0) @binding(5) var grade_lut: texture_3d<f32>;
+
+/// Colour as the eye sees it in dim light (ENGINE_AUDIT S6, for the Lid nights): under about 4 cd/m2 the cones give way
+/// to the rods. Chroma fades with the light (Hunt), and toward rod vision everything goes to the rods' blue-grey,
+/// where reds go dark first (Purkinje). Jensen, Premoze, Shirley et al., "A Spatial Post-Processing Algorithm for
+/// Images of Night Scenes" (JGT 2002): scotopic luminance from XYZ, and the mesopic blend linear in log luminance
+/// from 0.01 to about 4 cd/m2. `strength` scales how far it goes (1 the eye's own).
+fn low_light(c: vec3<f32>, strength: f32) -> vec3<f32> {
+    let x = dot(c, vec3<f32>(0.4124, 0.3576, 0.1805));
+    let y = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let z = dot(c, vec3<f32>(0.0193, 0.1192, 0.9505));
+    if y <= 0.0 || x <= 1e-6 {
+        return c;
+    }
+    let scotopic = max(y * (1.33 * (1.0 + (y + z) / x) - 1.68), 0.0);
+    let cones = saturate((log2(y) / log2(10.0) + 2.0) / 2.6);
+    let s = 1.0 - clamp(strength, 0.0, 1.0) * (1.0 - cones);
+    // The rods' blue-grey, at unit luminance (Jensen's chromaticity near x, y = 0.25).
+    let rods = vec3<f32>(0.871, 1.002, 1.362);
+    return c * s + rods * scotopic * (1.0 - s);
+}
 
 fn lut_encode(c: vec3<f32>) -> vec3<f32> {
     let x = clamp(c, vec3(0.0), vec3(1.0));
@@ -568,6 +588,12 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // sensor, not to the picture afterwards.
     let bloom = textureSample(bloom_tex, hdr_samp, view_uv).rgb;
     hdr += bloom * pp.bloom_intensity;
+
+    // Low-light vision, on the scene's own luminance before exposure, because the eye's rods answer to the light
+    // and not to the camera. Off at zero.
+    if pp.lut.y > 0.0 && !retro {
+        hdr = low_light(hdr, pp.lut.y);
+    }
 
     // Exposure. Physical now, not an arbitrary gain: either the value the
     // manual camera settings imply, or what the histogram metered this frame.

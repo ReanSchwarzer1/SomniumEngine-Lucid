@@ -36,6 +36,8 @@ pub struct Grading {
     pub stylise: [f32; 4],
     /// How much of the grading LUT (`PostProcessPass::set_lut`) to take, 0..1; 0 leaves it unread.
     pub lut_strength: f32,
+    /// Low-light vision (`postprocess.wgsl` `low_light`): 0 off, 1 the eye's own Hunt and Purkinje shift.
+    pub low_light: f32,
 }
 
 impl Default for Grading {
@@ -54,6 +56,7 @@ impl Default for Grading {
             response: None,
             stylise: [0.0; 4],
             lut_strength: 0.0,
+            low_light: 0.0,
         }
     }
 }
@@ -625,7 +628,7 @@ impl PostProcessPass {
         data[56..60].copy_from_slice(&[shift.at[0], shift.at[1], shift.at[2], 0.0]);
         data[60..76].copy_from_slice(&inv_view_proj);
         data[76..80].copy_from_slice(&grading.stylise);
-        data[80..84].copy_from_slice(&[grading.lut_strength.clamp(0.0, 1.0), 0.0, 0.0, 0.0]);
+        data[80..84].copy_from_slice(&[grading.lut_strength.clamp(0.0, 1.0), grading.low_light.clamp(0.0, 1.0), 0.0, 0.0]);
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&data));
     }
 

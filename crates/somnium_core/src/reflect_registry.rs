@@ -842,6 +842,8 @@ fn post_process_schema() -> ComponentSchema {
             grade_lut { group: "Color Grading", display_name: "Grading LUT",
                 doc: "A .cube 3-D LUT, project-relative, applied after the grade. Empty for none." },
             grade_lut_strength { min: 0.0, max: 1.0, step: 0.01, group: "Color Grading", display_name: "LUT Strength" },
+            low_light_vision { min: 0.0, max: 1.0, step: 0.01, group: "Color Grading", display_name: "Low-Light Vision",
+                doc: "Colour as the eye sees it in dim light: under about 4 cd/m2 chroma fades toward the rods' blue-grey, reds first." },
             tint { step: 0.01, group: "Color Grading" }, contrast { min: 0.0, step: 0.01, group: "Color Grading" },
             saturation { min: 0.0, step: 0.01, group: "Color Grading" }, gain { min: 0.0, step: 0.01, group: "Color Grading" },
             lift { step: 0.01, group: "Color Grading" }, gamma { min: 0.0, step: 0.01, group: "Color Grading" },
