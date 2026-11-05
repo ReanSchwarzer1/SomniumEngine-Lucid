@@ -8862,6 +8862,9 @@ impl<G: GameApp> Engine<G> {
                 .and_then(|state| state.fog_density)
                 .unwrap_or(pp.fog_density);
             r.volumetric_pass.fog.height_falloff = pp.fog_height_falloff;
+            r.volumetric_pass.fog.base_height = pp.fog_base_height;
+            r.volumetric_pass.fog.top_height = pp.fog_top_height;
+            r.volumetric_pass.fog.top_softness = pp.fog_top_softness.max(0.1);
             r.volumetric_pass.fog.asymmetry = pp.fog_asymmetry;
             r.volumetric_pass.fog.shafts = pp.light_shafts && budget.light_shafts;
             r.volumetric_pass.fog.shaft_intensity = pp.shaft_intensity;

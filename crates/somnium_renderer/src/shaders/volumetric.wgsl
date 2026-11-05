@@ -93,6 +93,9 @@ struct VolumetricParams {
     fog_sky_occlusion: f32,
     /// Scale on the sky light the fog scatters (1 as the sky gives it), apart from the sun's and the lamps'.
     fog_skylight: f32,
+    /// World height where the fog stops, softly over `fog_top_softness` metres; at or under `fog_base_height`, none.
+    fog_top_height: f32,
+    fog_top_softness: f32,
 }
 
 @group(0) @binding(0) var<uniform> vol: VolumetricParams;
@@ -253,7 +256,12 @@ fn fog_density_at(world_y: f32) -> f32 {
         return vol.fog_density;
     }
     let h = max(world_y - vol.fog_base_height, 0.0);
-    return vol.fog_density * exp(-h / vol.fog_height_falloff);
+    var d = vol.fog_density * exp(-h / vol.fog_height_falloff);
+    // Valley fog: a flat top, the ridges standing clear above it.
+    if vol.fog_top_height > vol.fog_base_height {
+        d *= 1.0 - smoothstep(vol.fog_top_height, vol.fog_top_height + vol.fog_top_softness, world_y);
+    }
+    return d;
 }
 
 @compute @workgroup_size(8, 8, 1)

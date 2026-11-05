@@ -60,7 +60,8 @@ struct VolumetricParams {
     grain_enabled: u32,
     fog_sky_occlusion: f32,
     fog_skylight: f32,
-    _pad: [f32; 2],
+    fog_top_height: f32,
+    fog_top_softness: f32,
 }
 
 #[cfg(test)]
@@ -93,6 +94,10 @@ pub struct FogSettings {
     /// Metres over which density falls to 1/e above `base_height`.
     pub height_falloff: f32,
     pub base_height: f32,
+    /// World height where the fog stops, over `top_softness` metres: valley fog under a flat top with the ridges
+    /// clear (Sunscar, 6 Nov 2026). At or under `base_height` there is no top, the default.
+    pub top_height: f32,
+    pub top_softness: f32,
     /// Shadow-test each step, which is what draws light shafts.
     pub shafts: bool,
     /// Shadow-visibility contrast. 0 is neutral; 1 applies full occlusion.
@@ -122,6 +127,8 @@ impl Default for FogSettings {
             asymmetry: 0.6,
             height_falloff: 120.0,
             base_height: 0.0,
+            top_height: 0.0,
+            top_softness: 8.0,
             shafts: true,
             shaft_intensity: 1.5,
             sky_occlusion: 0.0,
@@ -150,7 +157,7 @@ pub struct VolumetricPass {
     prev_camera: glam::Vec3,
     history_valid: bool,
     frame: u32,
-    last_settings: Option<[u32; 9]>,
+    last_settings: Option<[u32; 11]>,
     pub enabled: bool,
     pub fog: FogSettings,
     pub max_distance: f32,
@@ -485,6 +492,8 @@ impl VolumetricPass {
             self.fog.shaft_intensity.to_bits(),
             self.fog.sky_occlusion.to_bits(),
             self.fog.skylight.to_bits(),
+            self.fog.top_height.to_bits(),
+            self.fog.top_softness.to_bits(),
             // A new range moves every slice: last frame's volume no longer lines up.
             self.max_distance.to_bits(),
         ];
@@ -527,7 +536,8 @@ impl VolumetricPass {
                 grain_enabled: u32::from(self.grain_enabled),
                 fog_sky_occlusion: self.fog.sky_occlusion.clamp(0.0, 1.0),
                 fog_skylight: self.fog.skylight.max(0.0),
-                _pad: [0.0; 2],
+                fog_top_height: self.fog.top_height,
+                fog_top_softness: self.fog.top_softness.max(0.1),
             }),
         );
 

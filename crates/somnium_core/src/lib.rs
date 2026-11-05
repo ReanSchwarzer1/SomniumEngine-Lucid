@@ -1396,6 +1396,13 @@ pub struct PostProcessComponent {
     /// sun's and the lamps'. Under 1, a moon can light the ground while the fog
     /// away from the lights stays blue-black.
     pub fog_skylight: f32,
+    /// World height the fog's falloff starts from (default 0, sea level).
+    pub fog_base_height: f32,
+    /// World height where the fog stops, softly over `fog_top_softness` metres: a valley fills to a flat top and the
+    /// ridges stand clear. At or under `fog_base_height` there is no top (the default).
+    pub fog_top_height: f32,
+    /// Metres over which the fog's top fades (default 8).
+    pub fog_top_softness: f32,
     /// How far every vertex-painted layer and every material's authored
     /// weathering is taken back toward the bare material, 0..=1. 0 (default)
     /// is as authored. A whole level shown as it was before it decayed.
@@ -1582,6 +1589,9 @@ impl Default for PostProcessComponent {
             fog_sky_occlusion: 0.0,
             fog_range: 1200.0,
             fog_skylight: 1.0,
+            fog_base_height: 0.0,
+            fog_top_height: 0.0,
+            fog_top_softness: 8.0,
             paint_fade: 0.0,
             foliage_green: 0.0,
             aa,
