@@ -11,7 +11,8 @@ pub struct GpuParticle {
     pub uv_rect: [f32; 4],
     pub rotation: f32,
     pub texture_index: i32,
-    /// Bit 0 additive; bit 1 world-up billboard; bit 2 mirrored sprite UV.
+    /// Bit 0 additive; bit 1 world-up billboard; bit 2 mirrored sprite UV; bit 3 lit by the sun and sky
+    /// (`colour` is then an albedo).
     pub flags: u32,
     /// Tip displacement in sprite-width units; its base stays pinned.
     pub flutter: f32,
@@ -24,6 +25,8 @@ struct ParticleView {
     _pad0: f32,
     camera_up: [f32; 3],
     _pad1: f32,
+    camera_pos: [f32; 3],
+    _pad2: f32,
 }
 const MAX_PARTICLES: usize = 10_000;
 struct ViewBuffers {
@@ -231,6 +234,8 @@ impl ParticlePass {
                 _pad0: 0.0,
                 camera_up: up.to_array(),
                 _pad1: 0.0,
+                camera_pos: view.inverse().w_axis.truncate().to_array(),
+                _pad2: 0.0,
             }),
         );
         let mut sorted: Vec<_> = particles
