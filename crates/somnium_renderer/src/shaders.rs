@@ -168,6 +168,7 @@ impl Shaders {
             "spd.wgsl",
             "taa.wgsl",
             "terrain_material.wgsl",
+            "terrain_morph.wgsl",
             "terrain_splat_core.wgsl",
             "transparent.wgsl",
             "underwater.wgsl",
@@ -417,6 +418,7 @@ mod tests {
             "wind.wgsl",
             "sky_eye.wgsl",
             "shading.wgsl",
+            "terrain_morph.wgsl",
             // 17 Oct 2026: every spot cone's shape and cookie (small, bounded; no noise or parallax).
             "spot_cookie.wgsl",
         ];

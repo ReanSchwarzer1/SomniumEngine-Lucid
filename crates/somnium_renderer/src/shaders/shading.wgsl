@@ -10,6 +10,7 @@
 //!include "atmosphere.wgsl"
 //!include "hextile.wgsl"
 //!include "terrain_material.wgsl"
+//!include "terrain_morph.wgsl"
 //!include "clipmap_shade.wgsl"
 //!include "wind.wgsl"
 //!if LOCAL_SHADOWS
@@ -2292,9 +2293,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let v1 = vertices[instance.vertex_offset + i1];
     let v2 = vertices[instance.vertex_offset + i2];
 
-    var p0 = (instance.model * vec4<f32>(v0.pos_x, v0.pos_y, v0.pos_z, 1.0)).xyz;
-    var p1 = (instance.model * vec4<f32>(v1.pos_x, v1.pos_y, v1.pos_z, 1.0)).xyz;
-    var p2 = (instance.model * vec4<f32>(v2.pos_x, v2.pos_y, v2.pos_z, 1.0)).xyz;
+    // The terrain morph the visibility pass applied (terrain_morph.wgsl): the triangle as it was rasterised.
+    let m0 = terrain_morph(vec3<f32>(v0.pos_x, v0.pos_y, v0.pos_z), i0, instance.vertex_offset, instance._padding,
+                           instance.model, view.camera_pos);
+    let m1 = terrain_morph(vec3<f32>(v1.pos_x, v1.pos_y, v1.pos_z), i1, instance.vertex_offset, instance._padding,
+                           instance.model, view.camera_pos);
+    let m2 = terrain_morph(vec3<f32>(v2.pos_x, v2.pos_y, v2.pos_z), i2, instance.vertex_offset, instance._padding,
+                           instance.model, view.camera_pos);
+    var p0 = (instance.model * vec4<f32>(m0, 1.0)).xyz;
+    var p1 = (instance.model * vec4<f32>(m1, 1.0)).xyz;
+    var p2 = (instance.model * vec4<f32>(m2, 1.0)).xyz;
     // The triangle the visibility pass rasterised, wind included (visibility.wgsl):
     // reconstructing the rest pose would shade a leaf where it is not drawn.
     if material.terrain_index < 0 {

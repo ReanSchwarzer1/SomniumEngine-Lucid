@@ -5215,7 +5215,9 @@ impl SomniumRenderer {
         // off: `jitter_ndc` returns zero when TAA is disabled, so the cascades
         // stopped moving.
         let cascade_candidates =
-            compute_cascades(self.light_direction, self.view_proj_unjittered.inverse());
+            // In f64: the f32 inverse of an absolute view-projection 13 km out puts the fit's corners off by the
+            // same 2^-7 ndc steps the rays had (Sunscar, 5 Nov 2026).
+            compute_cascades(self.light_direction, self.view_proj_unjittered.as_dmat4().inverse());
         let shadow_cache_enabled = std::env::var("SOMNIUM_SHADOW_CACHE").as_deref() != Ok("0");
         let cascade_cache_frame = self.cascade_shadow_cache.begin_frame(
             cascade_candidates,
@@ -7342,12 +7344,15 @@ impl SomniumRenderer {
             },
             if debugging {
                 Default::default()
-            } else if self.picture_shift.kind != 0 {
-                self.picture_shift
             } else {
-                self.authored_picture_shift
+                // Camera-relative, with the inverse below: the wave reads the world back out of the depth buffer, and
+                // the absolute inverse cancels to 2^-7 in ndc 13 km from the origin (Sunscar, 5 Nov 2026).
+                let mut shift =
+                    if self.picture_shift.kind != 0 { self.picture_shift } else { self.authored_picture_shift };
+                shift.at = (glam::Vec3::from(shift.at) - self.camera_pos).to_array();
+                shift
             },
-            self.view_proj.inverse().to_cols_array(),
+            self.view_proj_rel.inverse().to_cols_array(),
         );
         // Phase 15A2: with FXAA on, tone-map into the LDR intermediate and let
         // FXAA resolve it to the swapchain. Editor overlays draw afterwards, so
