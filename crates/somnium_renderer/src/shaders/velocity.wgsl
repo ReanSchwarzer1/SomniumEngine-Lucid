@@ -36,7 +36,8 @@
 // reprojecting wrongly with a still camera when they were not.
 
 struct VelocityParams {
-    /// Un-jittered, current frame. Reconstructs world position from depth.
+    /// Un-jittered, current frame, camera-relative (projection x rotation alone): reconstructs the point
+    /// relative to `view.camera_pos`. `prev_view_proj` takes that same point (it carries the camera's step).
     inv_view_proj: mat4x4<f32>,
     /// Un-jittered, previous frame.
     prev_view_proj: mat4x4<f32>,
@@ -121,7 +122,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
     return out;
 }
 
-/// Un-project an NDC point with the current inverse view-projection.
+/// Un-project an NDC point with the current inverse view-projection: camera-relative.
 fn world_from_ndc(ndc: vec3<f32>) -> vec3<f32> {
     let p = vp.inv_view_proj * vec4<f32>(ndc, 1.0);
     return p.xyz / p.w;
@@ -155,7 +156,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec2<f32> {
     if depth < 1.0 {
         let vis = textureLoad(vis_tex, coord, 0).xy;
         if vis.x != 0u && vis.x - 1u < arrayLength(&motion) && motion[vis.x - 1u].moving != 0u {
-            world = previous_world(vis.x - 1u, vis.y, world);
+            // ponytail: world space for the instance's matrices, ~1 mm steps 15 km out; fine for motion.
+            world = previous_world(vis.x - 1u, vis.y, world + view.camera_pos) - view.camera_pos;
             moved = true;
         }
     }
@@ -171,12 +173,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec2<f32> {
             let m = materials[inst.material_id];
             if m.terrain_index < 0 && (m.wind_bend > 0.0 || m.wind_flutter > 0.0) {
                 let pivot = inst.model[3].xyz;
-                var rest = world - wind_offset(world, pivot, m.wind_bend, m.wind_flutter,
+                let here = world + view.camera_pos;
+                var rest = here - wind_offset(here, pivot, m.wind_bend, m.wind_flutter,
                                                view.wind_time.x, view.wind, view.camera_pos);
-                rest = world - wind_offset(rest, pivot, m.wind_bend, m.wind_flutter,
+                rest = here - wind_offset(rest, pivot, m.wind_bend, m.wind_flutter,
                                            view.wind_time.x, view.wind, view.camera_pos);
                 world = rest + wind_offset(rest, pivot, m.wind_bend, m.wind_flutter,
-                                           view.wind_time.y, view.wind, view.camera_pos);
+                                           view.wind_time.y, view.wind, view.camera_pos) - view.camera_pos;
             }
         }
     }

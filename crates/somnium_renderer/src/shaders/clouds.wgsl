@@ -26,6 +26,7 @@
 //   shadow model, which is what `cloud_shadow` below writes.
 
 struct CloudParams {
+    /// Camera-relative: inverse(projection x the view's rotation alone). Rays start at `camera_pos`.
     inv_view_proj: mat4x4<f32>,
     camera_pos: vec3<f32>,
     /// Metres from the ground to the bottom of the cloud layer.
@@ -348,7 +349,8 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         let tap_ndc = (vec2<f32>(px) + .5) / vec2<f32>(depth_dims);
         let occ_clip = cp.inv_view_proj * vec4<f32>(tap_ndc.x * 2.0 - 1.0, 1.0 - tap_ndc.y * 2.0, d, 1.0);
-        farthest = max(farthest, length(occ_clip.xyz / occ_clip.w - cp.camera_pos));
+        // Camera-relative (`inv_view_proj` is): the distance is the length.
+        farthest = max(farthest, length(occ_clip.xyz / occ_clip.w));
     }
     if !sky_seen {
         interval.y = min(interval.y, farthest);
@@ -641,7 +643,8 @@ fn cloud_resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     let near = rp.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
     let far = rp.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
     let dir = normalize(far.xyz / far.w - near.xyz / near.w);
-    let world = rp.camera_pos + dir * resolve_distance(rp.camera_pos, dir);
+    // Camera-relative, as `prev_view_proj` takes it (it carries the camera's step).
+    let world = dir * resolve_distance(rp.camera_pos, dir);
     let before = rp.prev_view_proj * vec4<f32>(world, 1.0);
     if before.w <= 1e-6 {
         textureStore(resolve_out, here, current);

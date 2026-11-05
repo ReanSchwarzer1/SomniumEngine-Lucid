@@ -432,7 +432,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // makes the history mean the same piece of air.
         if vol.history_valid > 0.5 {
             let slice_t = vol.max_distance * (f32(slice) + 0.5) / f32(slices);
-            let centre_ws = vol.camera_pos + ray_dir * slice_t;
+            // Camera-relative, as `prev_view_proj` takes it (it carries the camera's step).
+            let centre_ws = ray_dir * slice_t;
             let prev_clip = vol.prev_view_proj * vec4<f32>(centre_ws, 1.0);
             if prev_clip.w > 0.0 {
                 let prev_ndc = prev_clip.xy / prev_clip.w;

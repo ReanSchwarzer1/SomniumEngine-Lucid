@@ -57,7 +57,9 @@ pub struct TaaPass {
     bind_groups: Option<[wgpu::BindGroup; 2]>,
     write_index: usize,
 
+    /// Last frame's camera-relative unjittered view-projection and its camera (`record`).
     prev_view_proj: glam::Mat4,
+    prev_camera: glam::Vec3,
     frame_index: u32,
     /// Cleared on resize and on the first frame, when no history exists.
     history_valid: bool,
@@ -198,6 +200,7 @@ impl TaaPass {
             bind_groups: None,
             write_index: 0,
             prev_view_proj: glam::Mat4::IDENTITY,
+            prev_camera: glam::Vec3::ZERO,
             frame_index: 0,
             exposure_buffer: exposure_buffer.clone(),
             reactive_instances: Self::make_reactive_buffer(device, 1),
@@ -452,16 +455,22 @@ impl TaaPass {
     /// 0.776 to 2.018 across three runs of one build — pure noise. Mode 8 is
     /// the measurement that settles it, because it has no run-to-run variance
     /// at all.
+    ///
+    /// **Camera-relative** (Sunscar, 5 Nov 2026): `view_proj_unjittered` is projection x the view's rotation
+    /// alone, so the shader rebuilds each point relative to `camera_pos`. Last frame's matrix is moved by the
+    /// camera's step, which is small and exact in f32. The absolute inverse cancels to 2^-6 in ndc 15 km out.
     pub fn record(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
         queue: &wgpu::Queue,
         view_proj_unjittered: glam::Mat4,
+        camera_pos: glam::Vec3,
         width: u32,
         height: u32,
     ) -> Option<&wgpu::TextureView> {
         if !self.enabled {
             self.prev_view_proj = view_proj_unjittered;
+            self.prev_camera = camera_pos;
             self.history_valid = false;
             return None;
         }
@@ -485,7 +494,9 @@ impl TaaPass {
             0,
             bytemuck::bytes_of(&TaaParams {
                 inv_view_proj: view_proj_unjittered.inverse().to_cols_array_2d(),
-                prev_view_proj: self.prev_view_proj.to_cols_array_2d(),
+                prev_view_proj: (self.prev_view_proj
+                    * glam::Mat4::from_translation(camera_pos - self.prev_camera))
+                .to_cols_array_2d(),
                 inv_resolution: [1.0 / width as f32, 1.0 / height as f32],
                 dilation_epsilon: self.dilation_epsilon,
                 blend_factor: BLEND_FACTOR,
@@ -522,6 +533,7 @@ impl TaaPass {
         let result = self.write_index;
         self.write_index = read;
         self.prev_view_proj = view_proj_unjittered;
+        self.prev_camera = camera_pos;
         self.frame_index = self.frame_index.wrapping_add(1);
         self.history_valid = true;
 

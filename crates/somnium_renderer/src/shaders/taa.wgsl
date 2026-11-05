@@ -15,9 +15,10 @@
 // Reprojection is depth-based rather than velocity-based. See `REPROJECTION`.
 
 struct TaaParams {
-    /// Current-frame inverse view-projection, for reconstructing world position.
+    /// Current-frame inverse view-projection, camera-relative (projection x rotation alone): it rebuilds a
+    /// point relative to the camera, which keeps its precision kilometres from the origin.
     inv_view_proj: mat4x4<f32>,
-    /// Previous frame's view-projection, for finding where that point was.
+    /// Previous frame's view-projection, taking that same camera-relative point (it carries the camera's step).
     prev_view_proj: mat4x4<f32>,
     /// Reciprocal render target size.
     inv_resolution: vec2<f32>,

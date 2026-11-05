@@ -1259,6 +1259,10 @@ impl CloudPass {
     /// Writes the shadow uniform unconditionally, including when the pass is
     /// disabled, so the shading pass always reads a truthful "no shadow"
     /// rather than a stale one.
+    ///
+    /// `inv_view_proj` is camera-relative: inverse(projection x the view's rotation alone). Through the
+    /// absolute inverse every ray snapped to 2^-7 in ndc 7 km from the origin, the clouds' ~10 px blocks of
+    /// one colour (Sunscar, 5 Nov 2026).
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
@@ -1372,7 +1376,11 @@ impl CloudPass {
                 0,
                 bytemuck::bytes_of(&ResolveParams {
                     inv_view_proj: inv_view_proj.to_cols_array_2d(),
-                    prev_view_proj: self.previous.map_or(view_proj, |(m, _)| m).to_cols_array_2d(),
+                    // Last frame's camera-relative matrix, moved by the camera's step (small, exact in f32).
+                    prev_view_proj: self
+                        .previous
+                        .map_or(view_proj, |(m, eye)| m * glam::Mat4::from_translation(camera_pos - eye))
+                        .to_cols_array_2d(),
                     camera_pos: camera_pos.to_array(),
                     keep,
                     layer_bottom: s.altitude.max(1.0),
