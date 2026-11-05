@@ -8944,6 +8944,7 @@ impl<G: GameApp> Engine<G> {
                 }),
                 stylise: [pp.painterly.clamp(0.0, 1.0), pp.ink_lines.clamp(0.0, 1.0), 0.0, 0.0],
                 lut_strength: if r.grade_lut_ready { pp.grade_lut_strength.clamp(0.0, 1.0) } else { 0.0 },
+                low_light: pp.low_light_vision.clamp(0.0, 1.0),
             };
             r.authored_picture_shift = somnium_renderer::pass::postprocess::PictureShift {
                 kind: if pp.picture_shift <= 3 { pp.picture_shift } else { 0 },

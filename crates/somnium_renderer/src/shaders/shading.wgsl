@@ -11,6 +11,7 @@
 //!include "hextile.wgsl"
 //!include "terrain_material.wgsl"
 //!include "terrain_morph.wgsl"
+//!include "froxel_depth.wgsl"
 //!include "clipmap_shade.wgsl"
 //!include "wind.wgsl"
 //!if LOCAL_SHADOWS
@@ -1538,8 +1539,10 @@ fn evaluate_ibl_diffuse(surface: Surface, traced_diffuse: vec4<f32>) -> vec3<f32
     let irradiance = textureSampleLevel(env_cube, env_sampler, gather_n, ENV_MAX_MIP).rgb;
     let kd = (vec3<f32>(1.0) - surface.f0) * (1.0 - surface.metallic);
     var diffuse = irradiance * light.ibl_intensity * surface.albedo * kd;
+    // Traced, the estimate holds the sky through the gaps as well as the bounce (restir_gi.wgsl's escaped rays),
+    // so it takes the unshadowed sky's place: the floor of a wood gets the sky its canopy lets through.
     if traced_diffuse.a > 0.5 {
-        diffuse += traced_diffuse.rgb * surface.albedo * kd;
+        diffuse = traced_diffuse.rgb * surface.albedo * kd;
     }
 
     return diffuse * surface.occlusion;
@@ -1631,8 +1634,9 @@ fn evaluate_ibl_ms(surface: Surface, traced_diffuse: vec4<f32>) -> vec3<f32> {
     // hospital's practical-light bounce.
     let gather_n = normalize(mix(n, surface.bent_normal, 0.75));
     var irradiance = textureSampleLevel(env_cube, env_sampler, gather_n, ENV_MAX_MIP).rgb * light.ibl_intensity;
+    // Traced, the estimate holds the sky through the gaps as well as the bounce: it takes the unshadowed sky's place.
     if traced_diffuse.a > 0.5 {
-        irradiance += traced_diffuse.rgb;
+        irradiance = traced_diffuse.rgb;
     }
 
     let fss_ess = k_s * ab.x + ab.y;
@@ -3658,19 +3662,47 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Each texel is the integral over its *whole* slice, so sampling at a
         // slice boundary needs the previous slice's centre — hence the half
         // slice offset (bevy's aerial_view_lut sampling does the same).
-        let w = saturate(dist / volumetric_range.x - 0.5 / slices);
+        let w = saturate(froxel_w(dist, volumetric_range.x) - 0.5 / slices);
         let sample = textureSampleLevel(
             volumetrics, volumetric_sampler, vec3<f32>(screen_uv, w), 0.0);
 
         // Anything nearer than the first slice centre clamps to that slice, so
         // without this fade the full first-slice scattering would be applied
         // right at the camera — fog appearing on the lens.
-        let fade = saturate(dist / (volumetric_range.x / slices));
+        let fade = saturate(dist / froxel_t(1.0 / slices, volumetric_range.x));
         let inscatter = exp(sample.rgb) * fade;
         let transmittance = mix(1.0, sample.a, fade);
 
         result = result * transmittance + inscatter;
         fog_transmittance = transmittance;
+
+        // Aerial perspective past the volume's range. Its last slice held from there on, so a ridge 5 km out had
+        // the haze of one at the range, and the far view read as cut-outs (ENGINE_AUDIT E21, E52: real ridges grow
+        // paler and bluer layer by layer). The rest of the ray loses its light to the air (the atmosphere's own
+        // Rayleigh and Mie extinction at the eye's height) and to the height fog (its exponential, integrated
+        // exactly), and gains the sky's colour toward that horizon, the limit long air scatters toward.
+        let beyond = dist - volumetric_range.x;
+        if beyond > 0.0 {
+            let dir = (hit_point - view.camera_pos) / max(dist, 1e-3);
+            let h_km = max(view.camera_pos.y, 0.0) * 0.001;
+            let air = (RAYLEIGH_SCATTERING * exp(-h_km / RAYLEIGH_SCALE_H)
+                + vec3<f32>(MIE_EXTINCTION * exp(-h_km / MIE_SCALE_H))) * 0.001;
+            var depth = air * beyond;
+            let fog = volumetric_range.y;
+            if fog > 0.0 {
+                let falloff = max(volumetric_range.z, 1.0);
+                let y0 = view.camera_pos.y + dir.y * volumetric_range.x;
+                let start = fog * exp(-max(y0 - volumetric_range.w, 0.0) / falloff);
+                let k = clamp(dir.y * beyond / falloff, -20.0, 20.0);
+                let along = select(beyond * (1.0 - exp(-k)) / k, beyond, abs(k) < 1e-3);
+                depth += vec3<f32>(start * along);
+            }
+            let air_t = exp(-depth);
+            let horizon = normalize(vec3<f32>(dir.x, max(dir.y, 0.02), dir.z));
+            let sky = textureSampleLevel(env_cube, env_sampler, horizon, 0.0).rgb;
+            result = result * air_t + sky * (vec3<f32>(1.0) - air_t);
+            fog_transmittance *= dot(air_t, vec3<f32>(0.2126, 0.7152, 0.0722));
+        }
     }
 
     // The surface lit here, for the path tracer (`path_traced`). A surface whose light is baked into it

@@ -328,6 +328,8 @@ pub struct GpuTerrainMaterial {
     /// a `vec4` and not the three scalars the shader actually reads plus one
     /// more pad word.
     pub macro_octave_strength: [f32; 4],
+    /// Steepness (1 - |n.y|) where the projected cliff layer starts and where it is whole (x, y); zw unused.
+    pub cliff_band: [f32; 4],
 }
 
 /// Bindless indices of one terrain's textures, filled in at creation.
@@ -485,6 +487,10 @@ pub struct TerrainData {
     /// a whole hillside differs from the next hillside more than one square
     /// metre differs from the one beside it.
     pub macro_octave_strength: [f32; 4],
+    /// Steepness (1 - |n.y|) where the projected cliff layer starts and where it is whole. Defaults 0.45 and 0.7
+    /// (from about 57 to 73 degrees); `SOMNIUM_TERRAIN_CLIFF=start,end` sets it (Sunscar: 0.25,0.45, rock from
+    /// about 40 degrees as real slopes go, so a 60 degree face is cliff and not the splat smeared down it).
+    pub cliff_band: [f32; 2],
 
     /// Shared LOD index spans in the global index pool, keyed by
     /// `(lod, edge_mask)` and holding `(index_offset, index_count)`.
@@ -871,6 +877,7 @@ impl TerrainData {
             // diff move.
             skyvis_tint: env_strength("SOMNIUM_TERRAIN_SKYVIS_TINT", 0.6),
             macro_octave_strength: [0.18, 0.13, 0.09, 0.35],
+            cliff_band: cliff_band_from_env(),
             horizon_dirty: false,
             desc,
             heightmap,
@@ -1330,6 +1337,7 @@ impl TerrainData {
                     self.skyvis_tint.max(0.0),
                 ]
             },
+            cliff_band: [self.cliff_band[0], self.cliff_band[1].max(self.cliff_band[0] + 1e-3), 0.0, 0.0],
         }
     }
 
@@ -2008,7 +2016,7 @@ impl TerrainData {
         model: glam::Mat4,
         geometry_distance: f32,
     ) -> Result<(), String> {
-        let TerrainSidecar { heights, splat, foliage, dims, baked } = sidecar;
+        let TerrainSidecar { heights, splat, foliage, dims, baked, .. } = sidecar;
         let [tx, tz, sw, sh] = dims;
         if dims != self.sidecar_dims()
             || heights.len() != (tx * tz) as usize
@@ -2137,6 +2145,8 @@ pub struct TerrainSidecar {
     pub dims: [u32; 4],
     /// The horizon and relief maps baked from `heights` by [`TerrainSidecar::bake`], if it ran.
     pub baked: Option<(horizon::HorizonMaps, relief::ReliefMaps)>,
+    /// The canopy beside it (`{path}.canopy.png`), which the horizon bake stands on the ground as an occluder.
+    pub canopy: Option<horizon::Canopy>,
 }
 
 impl TerrainSidecar {
@@ -2144,7 +2154,15 @@ impl TerrainSidecar {
     pub fn bake(&mut self, cell_size: f32, height_scale: f32) {
         let [tx, tz, _, _] = self.dims;
         self.baked = Some((
-            horizon::bake(&self.heights, tx, tz, cell_size, height_scale, horizon::HORIZON_SIZE),
+            horizon::bake_with_canopy(
+                &self.heights,
+                tx,
+                tz,
+                cell_size,
+                height_scale,
+                horizon::HORIZON_SIZE,
+                self.canopy.as_ref(),
+            ),
             relief::bake(&self.heights, tx, tz, cell_size, height_scale, relief::RELIEF_SIZE),
         ));
     }
@@ -2191,7 +2209,19 @@ pub fn read_sidecar(path: &str, expected: [u32; 4]) -> Result<TerrainSidecar, St
     let foliage = foliage_paint::load_instances(path)?;
     let heights = bytemuck::cast_slice::<u8, f32>(&body[..h_bytes]).to_vec();
     let splat = splat::migrate_sidecar_splat(version, &body[h_bytes..], texel_count)?;
-    Ok(TerrainSidecar { heights, splat, foliage, dims: expected, baked: None })
+    Ok(TerrainSidecar { heights, splat, foliage, dims: expected, baked: None, canopy: read_canopy(path) })
+}
+
+/// foliage-render's canopy bake beside a sidecar (`{path}.canopy.png`: RGBA8 over the tile's own 1000 m, alpha the
+/// crown top in 0.25 m steps), if there is one and it reads. Optional: a tile without one bakes as before.
+fn read_canopy(path: &str) -> Option<horizon::Canopy> {
+    let image = image::open(format!("{path}.canopy.png")).ok()?.to_rgba8();
+    let size = image.width() as usize;
+    if size == 0 || image.height() as usize != size {
+        return None;
+    }
+    let top = image.pixels().map(|p| f32::from(p[3]) * 0.25).collect();
+    Some(horizon::Canopy { top, size, metres: 1000.0 / size as f32 })
 }
 
 #[cfg(test)]
@@ -2408,4 +2438,13 @@ mod tests {
         scale = held.max(1.0);
         assert_eq!(scale, 1.25);
     }
+}
+
+/// `SOMNIUM_TERRAIN_CLIFF=start,end`, else 0.45 and 0.7 (`TerrainData::cliff_band`).
+fn cliff_band_from_env() -> [f32; 2] {
+    let parsed = std::env::var("SOMNIUM_TERRAIN_CLIFF").ok().and_then(|v| {
+        let mut it = v.split(',').map(|s| s.trim().parse::<f32>().ok());
+        Some([it.next()??, it.next()??]).filter(|[a, b]| (0.0..1.0).contains(a) && b > a && *b <= 1.0)
+    });
+    parsed.unwrap_or([0.45, 0.7])
 }

@@ -129,6 +129,7 @@ impl Shaders {
             "dof.wgsl",
             "ddgi.wgsl",
             "depth_tie.wgsl",
+            "froxel_depth.wgsl",
             "fsr_sanitize.wgsl",
             "fsr_untonemap.wgsl",
             "fxaa.wgsl",
@@ -419,6 +420,7 @@ mod tests {
             "sky_eye.wgsl",
             "shading.wgsl",
             "terrain_morph.wgsl",
+            "froxel_depth.wgsl",
             // 17 Oct 2026: every spot cone's shape and cookie (small, bounded; no noise or parallax).
             "spot_cookie.wgsl",
         ];

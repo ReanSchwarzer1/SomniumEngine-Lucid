@@ -1,3 +1,4 @@
+//!include "froxel_depth.wgsl"
 // Somnium Engine — finite lake surface and physically coherent optics (IV-D/E).
 //
 // Gerstner dispersion/query parity follows the published GPU Gems water pattern;
@@ -145,9 +146,9 @@ fn apply_volumetric_fog(colour: vec3<f32>, world_pos: vec3<f32>, screen_uv: vec2
     }
     let dist = length(world_pos - view.camera_pos);
     let slices = f32(textureDimensions(volumetrics).z);
-    let w = saturate(dist / volumetric_range.x - 0.5 / slices);
+    let w = saturate(froxel_w(dist, volumetric_range.x) - 0.5 / slices);
     let fog = textureSampleLevel(volumetrics, volumetric_sampler, vec3<f32>(screen_uv, w), 0.0);
-    let fade = saturate(dist / (volumetric_range.x / slices));
+    let fade = saturate(dist / froxel_t(1.0 / slices, volumetric_range.x));
     return colour * mix(1.0, fog.a, fade) + exp(fog.rgb) * fade;
 }
 

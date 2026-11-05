@@ -48,6 +48,9 @@ pub struct ParticleEmitter {
     pub aspect: f32,
     /// Add emitted light instead of covering the background.
     pub additive: bool,
+    /// Lit by the sun (a forward-scattering phase) and the sky's fill, the colour taken as an albedo: smoke, dust
+    /// and mist read in the scene's own light at any exposure. Off, the colour is emitted HDR as before.
+    pub lit: bool,
     /// Keep the sprite vertical in world space.
     pub world_up: bool,
     /// Birth positions remain relative to the moving emitter.
@@ -331,6 +334,7 @@ impl Default for ParticleEmitter {
             texture: somnium_asset::database::AssetId::NONE,
             aspect: 1.0,
             additive: false,
+            lit: false,
             world_up: false,
             local_space: false,
             staged_reflection: false,
@@ -523,7 +527,7 @@ pub(crate) fn simulate_particles_reflected(
                 ],
                 rotation: emitter.spin * p.age + emitter.rotation_spread * p.rotation_seed,
                 texture_index: emitter.texture_slot,
-                flags: u32::from(emitter.additive) | (u32::from(emitter.world_up) << 1),
+                flags: u32::from(emitter.additive) | (u32::from(emitter.world_up) << 1) | (u32::from(emitter.lit) << 3),
                 flutter: emitter.flutter.clamp(0.0, 0.4)
                     * ((p.age * emitter.flutter_hz.clamp(0.0, 30.0) * std::f32::consts::TAU
                         + p.rotation_seed * 3.0)

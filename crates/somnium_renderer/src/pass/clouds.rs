@@ -88,6 +88,8 @@ pub struct CloudSettings {
     pub shape_scale: f32,
     /// Ambient contribution from the sky.
     pub ambient: f32,
+    /// Scale on the light the clouds scatter (default 1: physical, as the sky and the sun are).
+    pub brightness: f32,
     /// Henyey–Greenstein forward lobe.
     pub phase_forward: f32,
     /// Henyey–Greenstein backward lobe. Negative.
@@ -136,6 +138,7 @@ impl Default for CloudSettings {
             weather_scale: 24_000.0,
             shape_scale: 6_000.0,
             ambient: 1.0,
+            brightness: 1.0,
             phase_forward: 0.8,
             phase_backward: -0.35,
             phase_blend: 0.4,
@@ -206,7 +209,7 @@ struct CloudParams {
     shadow_strength: f32,
     max_distance: f32,
     volumetric_range: f32,
-    _pad0: f32,
+    brightness: f32,
     _pad1: f32,
 }
 
@@ -1423,7 +1426,7 @@ impl CloudPass {
                 shadow_strength: s.shadow_strength.clamp(0.0, 1.0),
                 max_distance: s.max_distance.max(1.0),
                 volumetric_range,
-                _pad0: 0.0,
+                brightness: s.brightness.max(0.0),
                 _pad1: 0.0,
             }),
         );

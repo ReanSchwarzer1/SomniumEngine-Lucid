@@ -1169,6 +1169,9 @@ pub struct PostProcessComponent {
     pub grade_lut: String,
     /// How much of `grade_lut` to take, 0..1 (default 1).
     pub grade_lut_strength: f32,
+    /// Colour as the eye sees it in dim light, 0..1 (default 0, off): under about 4 cd/m2 chroma fades and the
+    /// picture goes toward the rods' blue-grey, reds first (Hunt and Purkinje). For nights played by eye.
+    pub low_light_vision: f32,
     /// Which tone-mapping curve maps HDR luminance to display (Phase 24B).
     pub tonemapper: Tonemapper,
     /// Colour grading, applied after tone mapping (Phase 24Y).
@@ -1482,6 +1485,7 @@ impl Default for PostProcessComponent {
             adapt_to_dark: 1.0,
             grade_lut: String::new(),
             grade_lut_strength: 1.0,
+            low_light_vision: 0.0,
             tonemapper: Tonemapper::AgX,
             cel_shading: false,
             temperature: 0.0,

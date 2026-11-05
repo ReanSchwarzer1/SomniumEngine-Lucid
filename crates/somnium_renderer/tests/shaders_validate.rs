@@ -373,7 +373,9 @@ fn glass_reads_the_light_grid_its_normal_map_and_the_scene_behind_it() {
 
 #[test]
 fn the_phase_iv_water_modules_validate() {
-    check("water", WATER);
+    // Composed since 6 Nov 2026: it includes froxel_depth.wgsl, as the renderer resolves it.
+    let _ = WATER;
+    check("water", &composed("water.wgsl"));
     check("water_spectrum", WATER_SPECTRUM);
     check("underwater", UNDERWATER);
 }
@@ -401,7 +403,7 @@ fn the_terrain_material_struct_matches_the_rust_layout() {
         panic!("TerrainMaterial is not a struct");
     };
 
-    assert_eq!(*span, 2080, "WGSL size disagrees with GpuTerrainMaterial");
+    assert_eq!(*span, 2096, "WGSL size disagrees with GpuTerrainMaterial");
 
     // Only the members whose offsets the Rust test also pins. Checking every
     // one would just restate the declaration; these are the ones where a
