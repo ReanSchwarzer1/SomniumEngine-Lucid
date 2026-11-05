@@ -2169,7 +2169,7 @@ mod bc7_pack_tests {
         assert!(parse_bc7_chain(&bytes, 4, "t.bc7").is_err());
         bytes.pop();
         assert_eq!(parse_bc7_chain(&bytes, 4, "t.bc7").unwrap().len(), 3);
-    }
+    }
 
     #[test]
     fn far_colours_replace_the_named_layers_means_only() {
