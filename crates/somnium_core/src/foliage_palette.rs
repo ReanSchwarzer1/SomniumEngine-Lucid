@@ -58,6 +58,10 @@ pub(crate) struct ProjectEntry {
     /// Complete, simplified replacement; never delete individual leaf materials.
     #[serde(default)]
     pub lod: Option<ProjectLod>,
+    /// A still cheaper stand-in past `lod` (crossed billboards of the tree, Sunscar 6 Nov 2026): drawn from its
+    /// `distance` to the kind's draw distance, so a wood still stands on the land past the LOD mesh's reach.
+    #[serde(default)]
+    pub impostor: Option<ProjectLod>,
     /// How far this kind draws, metres (horizontal from the camera). Unset: the terrain's
     /// `FoliageComponent::cull_distance`, as before. Grass short, trees far.
     #[serde(default)]
