@@ -578,7 +578,7 @@ impl CloudPass {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(layout),
-                module: if entry == "march" || entry == "cloud_shadow" || entry == "cloud_resolve" {
+                module: if matches!(entry, "march" | "cloud_shadow" | "cloud_resolve" | "cloud_env") {
                     &march_shader
                 } else {
                     &noise_shader
