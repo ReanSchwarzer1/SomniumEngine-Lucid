@@ -6904,7 +6904,7 @@ impl SomniumRenderer {
                     &self.shadow_resources.atlas_depth_view,
                     &self.shadow_resources.comparison_sampler,
                     self.view_matrix,
-                    self.view_proj,
+                    self.view_proj_rel,
                     self.camera_pos,
                     rt_strength,
                     tlas_overflowed,
