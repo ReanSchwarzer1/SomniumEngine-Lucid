@@ -1458,6 +1458,12 @@ impl<G: GameApp> Engine<G> {
                 None if action == "save" => self.handle_editor_event(EditorEvent::SaveScene),
                 // The title bar's X: with unsaved edits, the editor asks before it closes.
                 None if action == "close" => self.handle_editor_event(EditorEvent::CloseWindow),
+                // The launch splash again, held (never told to finish), for a picture of its reveal.
+                None if action == "splash" => {
+                    if let Some(ui) = self.ui_manager.as_mut() {
+                        ui.begin_splash("Loading the world");
+                    }
+                }
                 _ => warn!(action = %action, "editor script: unknown step"),
             }
         }
