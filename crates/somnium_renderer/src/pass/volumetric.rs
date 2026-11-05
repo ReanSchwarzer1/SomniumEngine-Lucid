@@ -23,10 +23,13 @@
 /// Low resolution is the point: in-scattering is smooth, so it is cheap to
 /// integrate coarsely and interpolate. 32³ is the size Bevy and Hillaire both
 /// use, and it costs 32 slices × 2 steps = 64 samples per column.
+/// 48 x 27 x 64 since 6 Nov 2026 (Sunscar): 32 columns across a 2560 px screen were 80 px wide, the "bands on far
+/// hillsides" (ENGINE_AUDIT E42), and 32 even slices were 37.5 m deep; the slices are exponential now
+/// (`froxel_depth.wgsl`), 3.7 m deep at the feet.
 const VOLUME_SIZE: wgpu::Extent3d = wgpu::Extent3d {
-    width: 32,
-    height: 32,
-    depth_or_array_layers: 32,
+    width: 48,
+    height: 27,
+    depth_or_array_layers: 64,
 };
 
 /// How far the volume reaches, in metres, unless a scene asks otherwise

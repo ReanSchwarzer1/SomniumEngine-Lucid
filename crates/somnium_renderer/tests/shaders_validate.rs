@@ -373,7 +373,9 @@ fn glass_reads_the_light_grid_its_normal_map_and_the_scene_behind_it() {
 
 #[test]
 fn the_phase_iv_water_modules_validate() {
-    check("water", WATER);
+    // Composed since 6 Nov 2026: it includes froxel_depth.wgsl, as the renderer resolves it.
+    let _ = WATER;
+    check("water", &composed("water.wgsl"));
     check("water_spectrum", WATER_SPECTRUM);
     check("underwater", UNDERWATER);
 }

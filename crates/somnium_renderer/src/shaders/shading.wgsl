@@ -11,6 +11,7 @@
 //!include "hextile.wgsl"
 //!include "terrain_material.wgsl"
 //!include "terrain_morph.wgsl"
+//!include "froxel_depth.wgsl"
 //!include "clipmap_shade.wgsl"
 //!include "wind.wgsl"
 //!if LOCAL_SHADOWS
@@ -3658,14 +3659,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Each texel is the integral over its *whole* slice, so sampling at a
         // slice boundary needs the previous slice's centre — hence the half
         // slice offset (bevy's aerial_view_lut sampling does the same).
-        let w = saturate(dist / volumetric_range.x - 0.5 / slices);
+        let w = saturate(froxel_w(dist, volumetric_range.x) - 0.5 / slices);
         let sample = textureSampleLevel(
             volumetrics, volumetric_sampler, vec3<f32>(screen_uv, w), 0.0);
 
         // Anything nearer than the first slice centre clamps to that slice, so
         // without this fade the full first-slice scattering would be applied
         // right at the camera — fog appearing on the lens.
-        let fade = saturate(dist / (volumetric_range.x / slices));
+        let fade = saturate(dist / froxel_t(1.0 / slices, volumetric_range.x));
         let inscatter = exp(sample.rgb) * fade;
         let transmittance = mix(1.0, sample.a, fade);
 
