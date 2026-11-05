@@ -34,6 +34,8 @@ pub struct Grading {
     /// Painterly amount and ink-line amount (`PostProcessComponent::painterly`, `ink_lines`), then padding. Zero is
     /// off and the shader skips the stage.
     pub stylise: [f32; 4],
+    /// How much of the grading LUT (`PostProcessPass::set_lut`) to take, 0..1; 0 leaves it unread.
+    pub lut_strength: f32,
 }
 
 impl Default for Grading {
@@ -51,8 +53,49 @@ impl Default for Grading {
             time: 0.0,
             response: None,
             stylise: [0.0; 4],
+            lut_strength: 0.0,
         }
     }
+}
+
+/// A `.cube` 3-D LUT (Resolve, Adobe): its edge and `size`^3 RGBA texels, red fastest, as the file lists them.
+/// Only the 0..1 domain; a 1-D LUT or another domain is an error rather than a wrong picture.
+pub fn parse_cube(text: &str) -> Result<(u32, Vec<[f32; 4]>), String> {
+    let mut size = 0_u32;
+    let mut texels = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("TITLE") {
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        let first = words.next().unwrap_or_default();
+        match first {
+            "LUT_3D_SIZE" => {
+                size = words.next().and_then(|w| w.parse().ok()).filter(|s| (2..=256).contains(s))
+                    .ok_or_else(|| format!("line {}: LUT_3D_SIZE must be 2..256", n + 1))?;
+                texels.reserve((size as usize).pow(3));
+            }
+            "LUT_1D_SIZE" => return Err("a 1-D LUT; grading takes a 3-D one".into()),
+            "DOMAIN_MIN" | "DOMAIN_MAX" => {
+                let want = if first == "DOMAIN_MIN" { 0.0 } else { 1.0 };
+                if !words.all(|w| w.parse::<f32>().is_ok_and(|v| v == want)) {
+                    return Err(format!("line {}: only the 0..1 domain", n + 1));
+                }
+            }
+            _ => {
+                let rgb: Vec<f32> = line.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+                if rgb.len() != 3 {
+                    return Err(format!("line {}: expected three numbers", n + 1));
+                }
+                texels.push([rgb[0], rgb[1], rgb[2], 1.0]);
+            }
+        }
+    }
+    if size == 0 || texels.len() != (size as usize).pow(3) {
+        return Err(format!("{} entries for LUT_3D_SIZE {size}", texels.len()));
+    }
+    Ok((size, texels))
 }
 
 /// A transition drawn over the whole picture, set by the game each frame it runs (The Somnus Fracture's ways into
@@ -71,8 +114,8 @@ pub struct PictureShift {
 }
 
 /// 16 scalars, 32 response samples, the dream-lens vector, the picture shift (two vectors) and the inverse
-/// view-projection the wave reads the world through.
-const POST_PARAM_FLOATS: usize = 80;
+/// view-projection the wave reads the world through, the stylise vector and the LUT vector.
+const POST_PARAM_FLOATS: usize = 84;
 
 /// Post-processing pass: HDR texture → tone-mapped swapchain output.
 pub struct PostProcessPass {
@@ -91,6 +134,8 @@ pub struct PostProcessPass {
     exposure_buffer: wgpu::Buffer,
     /// Bloom chain, kept so the bind group survives a resize.
     bloom_view: wgpu::TextureView,
+    /// The grading LUT (binding 5): an unread 2^3 placeholder until `set_lut`.
+    lut_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     /// Group 1: the visibility buffer and the paint words, from which a pixel is known to belong to a draw kept out
     /// of the retro picture (`vertex_paint::OUTSIDE_RETRO`). Placeholders until `bind_mask`.
@@ -165,6 +210,17 @@ impl PostProcessPass {
                     },
                     count: None,
                 },
+                // The grading LUT (Sunscar, 5 Nov 2026), read through the clamped linear sampler.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -216,6 +272,7 @@ impl PostProcessPass {
         let (hdr_texture, hdr_view) = Self::make_hdr_texture(device, width, height);
         let (scene_copy_texture, scene_copy_view) =
             Self::make_scene_copy_texture(device, width, height);
+        let lut_view = Self::make_lut(device, 2).create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = Self::make_bind_group(
             device,
             &bind_group_layout,
@@ -224,6 +281,7 @@ impl PostProcessPass {
             &params_buffer,
             exposure_buffer,
             bloom_view,
+            &lut_view,
         );
         let exposure_buffer = exposure_buffer.clone();
         let bloom_view = bloom_view.clone();
@@ -349,6 +407,7 @@ impl PostProcessPass {
             scene_copy_view,
             params_buffer,
             sampler,
+            lut_view,
             mask_layout,
             mask_group,
         }
@@ -450,6 +509,7 @@ impl PostProcessPass {
         params_buffer: &wgpu::Buffer,
         exposure_buffer: &wgpu::Buffer,
         bloom_view: &wgpu::TextureView,
+        lut_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("PostProcess Bind Group"),
@@ -474,6 +534,10 @@ impl PostProcessPass {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(bloom_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(lut_view),
                 },
             ],
         })
@@ -506,6 +570,7 @@ impl PostProcessPass {
             &self.params_buffer,
             &self.exposure_buffer,
             &self.bloom_view,
+            &self.lut_view,
         );
     }
 
@@ -560,7 +625,43 @@ impl PostProcessPass {
         data[56..60].copy_from_slice(&[shift.at[0], shift.at[1], shift.at[2], 0.0]);
         data[60..76].copy_from_slice(&inv_view_proj);
         data[76..80].copy_from_slice(&grading.stylise);
+        data[80..84].copy_from_slice(&[grading.lut_strength.clamp(0.0, 1.0), 0.0, 0.0, 0.0]);
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&data));
+    }
+
+    /// A `size`^3 texture for the grading LUT, Rgba16Float.
+    fn make_lut(device: &wgpu::Device, size: u32) -> wgpu::Texture {
+        device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("Grading LUT"),
+                size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: size },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+    }
+
+    /// Upload a grading LUT (`parse_cube`): `size`^3 texels, red fastest. Bound from the next `bind_scene` or
+    /// `bind_color`; read where `Grading::lut_strength` is above zero.
+    pub fn set_lut(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, size: u32, texels: &[[f32; 4]]) {
+        assert_eq!(texels.len(), (size as usize).pow(3), "a LUT is size^3 texels");
+        let texture = Self::make_lut(device, size);
+        let bits: Vec<u16> =
+            texels.iter().flatten().map(|&v| crate::pass::lighting_extra::f32_to_f16_bits(v)).collect();
+        queue.write_texture(
+            texture.as_image_copy(),
+            bytemuck::cast_slice(&bits),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size * 8),
+                rows_per_image: Some(size),
+            },
+            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: size },
+        );
+        self.lut_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     }
 
     /// Point tone-map at a different HDR colour target (FSR output vs scene).
@@ -573,6 +674,7 @@ impl PostProcessPass {
             &self.params_buffer,
             &self.exposure_buffer,
             &self.bloom_view,
+            &self.lut_view,
         );
     }
 
@@ -586,6 +688,7 @@ impl PostProcessPass {
             &self.params_buffer,
             &self.exposure_buffer,
             &self.bloom_view,
+            &self.lut_view,
         );
     }
 
@@ -611,5 +714,41 @@ impl PostProcessPass {
         rpass.set_bind_group(0, &self.bind_group, &[]);
         rpass.set_bind_group(1, &self.mask_group, &[]);
         rpass.draw(0..3, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod lut_tests {
+    use super::parse_cube;
+
+    #[test]
+    fn a_cube_file_reads_red_fastest_and_refuses_what_it_cannot_hold() {
+        let mut text = String::from("TITLE \"identity\"
+# made by hand
+LUT_3D_SIZE 2
+DOMAIN_MIN 0 0 0
+DOMAIN_MAX 1 1 1
+");
+        for b in 0..2 {
+            for g in 0..2 {
+                for r in 0..2 {
+                    text += &format!("{r} {g} {b}
+");
+                }
+            }
+        }
+        let (size, texels) = parse_cube(&text).expect("identity");
+        assert_eq!(size, 2);
+        assert_eq!(texels[1], [1.0, 0.0, 0.0, 1.0], "red fastest");
+        assert_eq!(texels[2], [0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(texels[4], [0.0, 0.0, 1.0, 1.0]);
+        assert!(parse_cube("LUT_3D_SIZE 2
+0 0 0
+").is_err(), "too few entries");
+        assert!(parse_cube("LUT_1D_SIZE 16
+").is_err(), "1-D");
+        assert!(parse_cube("LUT_3D_SIZE 2
+DOMAIN_MAX 2 2 2
+").is_err(), "another domain");
     }
 }

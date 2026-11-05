@@ -1157,11 +1157,18 @@ pub struct PostProcessComponent {
     /// The darkest and brightest EV100 the eye adapts to (defaults -8 and 18). A narrow range keeps a night
     /// dark and a noon from blowing out: the meter stops there and the picture holds what it got.
     pub exposure_min_ev: f32,
+    /// The brightest EV100 the eye adapts to (see `exposure_min_ev`).
     pub exposure_max_ev: f32,
     /// How fast the eye adapts, per second (defaults 3 into brightness, 1 into the dark): a slow dark
     /// adaptation is what makes a cave mouth swallow the player for a moment.
     pub adapt_to_bright: f32,
+    /// How fast the eye adapts into the dark, per second (see `adapt_to_bright`).
     pub adapt_to_dark: f32,
+    /// A `.cube` 3-D LUT, project-relative, applied after the grade below (empty: none). Made in a grading tool
+    /// on a neutral frame from this engine, it carries a whole look in one file.
+    pub grade_lut: String,
+    /// How much of `grade_lut` to take, 0..1 (default 1).
+    pub grade_lut_strength: f32,
     /// Which tone-mapping curve maps HDR luminance to display (Phase 24B).
     pub tonemapper: Tonemapper,
     /// Colour grading, applied after tone mapping (Phase 24Y).
@@ -1463,6 +1470,8 @@ impl Default for PostProcessComponent {
             exposure_max_ev: 18.0,
             adapt_to_bright: 3.0,
             adapt_to_dark: 1.0,
+            grade_lut: String::new(),
+            grade_lut_strength: 1.0,
             tonemapper: Tonemapper::AgX,
             cel_shading: false,
             temperature: 0.0,

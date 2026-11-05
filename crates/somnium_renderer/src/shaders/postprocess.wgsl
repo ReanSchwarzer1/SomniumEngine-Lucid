@@ -54,6 +54,8 @@ struct PostParams {
     inv_view_proj: mat4x4<f32>,
     /// x painterly amount, y ink-line amount (0 skips each); zw unused.
     stylise: vec4<f32>,
+    /// x how much of the grading LUT to take (0 leaves it unread); yzw unused.
+    lut: vec4<f32>,
 }
 
 @group(0) @binding(0) var hdr_tex:  texture_2d<f32>;
@@ -63,6 +65,17 @@ struct PostParams {
 @group(0) @binding(3) var<storage, read> metered: array<f32, 2>;
 /// Blurred bloom chain (Phase 24T).
 @group(0) @binding(4) var bloom_tex: texture_2d<f32>;
+// The grading LUT: a .cube, sRGB-encoded in and out as such files are made.
+@group(0) @binding(5) var grade_lut: texture_3d<f32>;
+
+fn lut_encode(c: vec3<f32>) -> vec3<f32> {
+    let x = clamp(c, vec3(0.0), vec3(1.0));
+    return select(1.055 * pow(x, vec3(1.0 / 2.4)) - 0.055, x * 12.92, x <= vec3(0.0031308));
+}
+
+fn lut_decode(c: vec3<f32>) -> vec3<f32> {
+    return select(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, c <= vec3(0.04045));
+}
 /// The visibility buffer and the paint words: a draw whose paint word carries `OUTSIDE_RETRO` (`vertex_paint.rs`) is
 /// kept out of the retro picture and shown by a look of its own.
 @group(1) @binding(0) var vis_buffer: texture_2d<u32>;
@@ -566,6 +579,15 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
 
     // Phase 24Y: grading, in display space after the curve.
     var graded = apply_grading(ldr);
+
+    // LUT grading (Sunscar, 5 Nov 2026): a look made in a grading tool, over the parametric grade. Texel centres:
+    // 0 and 1 land on the first and last entries.
+    if pp.lut.x > 0.0 && !retro {
+        let n = f32(textureDimensions(grade_lut).x);
+        let uvw = lut_encode(graded) * ((n - 1.0) / n) + 0.5 / n;
+        let looked = lut_decode(textureSampleLevel(grade_lut, hdr_samp, uvw, 0.0).rgb);
+        graded = mix(graded, looked, pp.lut.x);
+    }
 
     // Ink lines over the graded picture: a darkening, so they keep the hue of what they edge. Off at zero.
     if pp.stylise.y > 0.0 && !retro {

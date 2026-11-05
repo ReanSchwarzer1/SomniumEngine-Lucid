@@ -8710,6 +8710,28 @@ impl<G: GameApp> Engine<G> {
                 pp
             });
         if let (Some(pp), Some(r)) = (settings, self.renderer.as_mut()) {
+            // The grading LUT: read when its path changes, kept until it does again.
+            let lut = pp.grade_lut.trim();
+            if r.grade_lut_source != lut {
+                r.grade_lut_source = lut.to_owned();
+                r.grade_lut_ready = false;
+                if !lut.is_empty() {
+                    let read = match self.config.project_root.as_ref() {
+                        Some(root) => resolved_source(root, lut),
+                        None => Ok(std::path::PathBuf::from(lut)),
+                    }
+                    .and_then(|path| std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display())))
+                    .and_then(|text| somnium_renderer::pass::postprocess::parse_cube(&text));
+                    match (read, self.render_ctx.as_ref()) {
+                        (Ok((size, texels)), Some(ctx)) => {
+                            r.set_grade_lut(ctx, size, &texels);
+                            r.grade_lut_ready = true;
+                        }
+                        (Err(e), _) => warn!("grading LUT {lut}: {e}"),
+                        _ => {}
+                    }
+                }
+            }
             // The player's graphics tier: gates and scales what the scene
             // authored, never enables what it left off (see `quality`).
             let budget = r.graphics_budget();
@@ -8917,6 +8939,7 @@ impl<G: GameApp> Engine<G> {
                     table
                 }),
                 stylise: [pp.painterly.clamp(0.0, 1.0), pp.ink_lines.clamp(0.0, 1.0), 0.0, 0.0],
+                lut_strength: if r.grade_lut_ready { pp.grade_lut_strength.clamp(0.0, 1.0) } else { 0.0 },
             };
             r.authored_picture_shift = somnium_renderer::pass::postprocess::PictureShift {
                 kind: if pp.picture_shift <= 3 { pp.picture_shift } else { 0 },

@@ -336,6 +336,9 @@ pub struct SomniumRenderer {
     pub exposure_compensation: f32,
     /// Colour grading and lens settings (Phases 24Y / 24Z).
     pub grading: crate::pass::postprocess::Grading,
+    /// The grading LUT's project path as last asked for, and whether it loaded (`set_grade_lut`).
+    pub grade_lut_source: String,
+    pub grade_lut_ready: bool,
     /// A transition over the whole picture, set by the game each frame it runs; none by default.
     pub picture_shift: crate::pass::postprocess::PictureShift,
     /// The scene's authored picture shift (Post Processing), set by the engine each frame. Drawn only while the
@@ -976,6 +979,11 @@ impl SomniumRenderer {
     /// Start compiling, on worker threads, every shading pipeline the frames could ask for, so no scene's first
     /// frames stop to compile one. Returns at once; call again after changing graphics switches to add what they
     /// need. The renderer starts this itself when it is built.
+    /// Upload the grading LUT (`pass::postprocess::parse_cube`); `grading.lut_strength` decides how much is taken.
+    pub fn set_grade_lut(&mut self, ctx: &RenderContext, size: u32, texels: &[[f32; 4]]) {
+        self.postprocess_pass.set_lut(&ctx.device, &ctx.queue, size, texels);
+    }
+
     pub fn warm_pipelines(&mut self, ctx: &RenderContext) {
         let keys = self.shading_warm_keys();
         self.shading_pass.warm(&ctx.device, keys);
@@ -1614,6 +1622,8 @@ impl SomniumRenderer {
             frame_delta_time: 1.0 / 60.0,
             exposure_compensation: 0.0,
             grading: crate::pass::postprocess::Grading::default(),
+            grade_lut_source: String::new(),
+            grade_lut_ready: false,
             picture_shift: Default::default(),
             authored_picture_shift: Default::default(),
             sun_angular_radius: 0.004_654,
