@@ -225,8 +225,11 @@ fn fs_main(
 
     // A copy across its LOD hand-over: the same per-pixel noise keeps a pixel in the fading-out copy exactly where
     // the fading-in one drops it, so neither a gap nor a double shows (interleaved gradient noise, Jimenez 2014).
+    // The pattern moves every frame (about 60 steps a second of engine time) so TAA blends it: a still one showed as
+    // a stipple over the trees in the band.
     if abs(fade) < 1.0 {
-        let n = fract(52.9829189 * fract(dot(frag.xy, vec2<f32>(0.06711056, 0.00583715))));
+        let step = f32(u32(view.time * 60.0) % 64u);
+        let n = fract(52.9829189 * fract(dot(frag.xy + 5.588238 * step, vec2<f32>(0.06711056, 0.00583715))));
         if (fade >= 0.0 && n >= fade) || (fade < 0.0 && n <= 1.0 + fade) {
             discard;
         }
