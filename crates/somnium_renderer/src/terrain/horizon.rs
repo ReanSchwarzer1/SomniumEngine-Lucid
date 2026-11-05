@@ -264,12 +264,9 @@ impl Canopy {
     }
 }
 
-/// What still reaches the floor of a wood from the sky through its gaps; the bake sees a canopy as solid.
-const CANOPY_SKY_FLOOR: f32 = 0.2;
-
 /// [`bake`], with the canopy standing on the ground as an occluder (Sunscar, 6 Nov 2026; ENGINE_AUDIT item 5): the
 /// ground beside a wood takes its shadow under a low sun and loses its sky, past the 100 m the cascades reach.
-/// Receivers stay on the ground, so the floor of a wood is shaded by its own crowns.
+/// Receivers under a canopy stand on its crowns (the floor itself is the trees' own business).
 pub fn bake_with_canopy(
     heights: &[f32],
     total_x: u32,
@@ -375,7 +372,9 @@ pub fn bake_with_canopy(
         .enumerate()
         .for_each(|(z, ((row_a, row_b), row_sky))| {
             for x in 0..n {
-                let g = ground[z * n + x];
+                // Under a canopy the receiver stands on its crowns: the wood shades the land beside it, not its own
+                // floor, which past the trees' draw distance is all that is drawn there and would go black.
+                let g = ground[z * n + x] + crowns.get(z * n + x).copied().unwrap_or(0.0);
                 let mut horizon = [0.0f32; AZIMUTHS];
                 for (a, &(dx, dz)) in DIRS.iter().enumerate() {
                     let mut best_tan = 0.0f32;
@@ -453,7 +452,6 @@ pub fn bake_with_canopy(
                 row_sky[x * 4] = ((bent[0] * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8;
                 row_sky[x * 4 + 1] = ((bent[1] * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8;
                 row_sky[x * 4 + 2] = ((bent[2] * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8;
-                let vis = if crowns.get(z * n + x).is_some_and(|c| *c > 0.0) { vis.max(CANOPY_SKY_FLOOR) } else { vis };
                 row_sky[x * 4 + 3] = (vis.clamp(0.0, 1.0) * 255.0).round() as u8;
             }
         });
