@@ -201,6 +201,33 @@ fn dual_lobe(cos_theta: f32) -> f32 {
     );
 }
 
+/// The dual lobe with both eccentricities scaled by `k`: a multiple-scattering octave's flatter phase.
+fn dual_lobe_scaled(cos_theta: f32, k: f32) -> f32 {
+    return mix(
+        hg(cos_theta, cp.phase_forward * k),
+        hg(cos_theta, cp.phase_backward * k),
+        clamp(cp.phase_blend, 0.0, 1.0),
+    );
+}
+
+/// Multiple scattering inside the cloud as octaves of the single-scatter sun term (Wrenninge et al., "Oz", 2013;
+/// Hillaire, "Physically Based Sky, Atmosphere and Cloud Rendering in Frostbite", SIGGRAPH 2016). Each octave
+/// halves the scattering, the extinction toward the sun and the phase's eccentricity, so light that has bounced
+/// inside the cloud reaches its body and base. Single scattering alone left an overcast deck's base near black
+/// where real cloud is mid-grey (Sunscar, 6 Nov 2026). The first octave is the old term exactly.
+const CLOUD_MS_OCTAVES: i32 = 3;
+
+fn sun_octaves(optical_depth: f32, cos_theta: f32) -> f32 {
+    var energy = 0.0;
+    var a = 1.0;
+    for (var i = 0; i < CLOUD_MS_OCTAVES; i = i + 1) {
+        let phase = select(dual_lobe_scaled(cos_theta, a), dual_lobe(cos_theta), i == 0);
+        energy += a * beer_powder(optical_depth * a) * phase;
+        a *= 0.5;
+    }
+    return energy;
+}
+
 /// Beer's law with Schneider's powder term.
 ///
 /// Beer alone makes the sun-facing side of a cloud *darker* the denser it is,
@@ -404,9 +431,9 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32) -> CloudRay {
         let weather = sample_weather(p.xz);
         let extinction = density * (1.0 + weather.b * cp.precipitation * 2.0) * 0.05;
         let optical_depth = light_march(p, sun) * 4.0;
-        let sun_energy = beer_powder(optical_depth);
+        let sun_energy = sun_octaves(optical_depth, cos_theta);
 
-        let luminance = sun_transmittance * cp.sun_illuminance * sun_energy * phase
+        let luminance = sun_transmittance * cp.sun_illuminance * sun_energy
             + ambient_sky * cp.ambient * (0.35 + 0.65 * density);
 
         let step_transmittance = exp(-extinction * step_len);
