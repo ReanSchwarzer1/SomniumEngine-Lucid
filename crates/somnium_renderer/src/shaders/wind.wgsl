@@ -54,16 +54,22 @@ fn wind_offset(
     // Drag grows with speed and saturates: a gale does not lay a pine flat.
     let drag = min(speed * 0.22, 1.6);
     let sway = 0.7 + 0.3 * sin(time * 0.9 + phase);
-    let lean = bend * h * h * drag * gust * sway;
-    var out = vec3<f32>(dir.x * lean, 0.0, dir.y * lean);
+    // Each plant leans its own way within about 40 degrees of downwind, and by its own share: one direction for every
+    // tuft combed a meadow into lines running to the horizon when seen along the wind (Sunscar, 5 Nov 2026).
+    let turn = 0.7 * sin(phase * 3.7);
+    let own = vec2<f32>(dir.x * cos(turn) - dir.y * sin(turn), dir.x * sin(turn) + dir.y * cos(turn));
+    let lean = bend * h * h * drag * gust * sway * (0.75 + 0.25 * cos(phase * 2.3));
+    var out = vec3<f32>(own.x * lean, 0.0, own.y * lean);
     // A bent stem keeps its length, so its tip drops as it leans.
     out.y = -0.5 * lean * lean / max(h, 0.25);
-    let q = p * 1.7;
+    // Flutter varies over a plant's own leaves (its offset from the pivot) and between plants (its phase), never with
+    // world position: a world-space wave put every tuft at one z in step, rows 3.7 m apart along x (Sunscar, 5 Nov).
+    let q = (p - pivot) * 1.7;
     let f = flutter * drag * clamp(h * 2.0, 0.0, 1.0) * (0.5 + 0.5 * gust);
     out += vec3<f32>(
         sin(time * 5.3 + q.x + q.y * 0.7 + phase),
-        0.6 * sin(time * 6.7 + q.z * 1.3 + q.x * 0.5),
-        sin(time * 4.9 + q.y + q.z),
+        0.6 * sin(time * 6.7 + q.z * 1.3 + q.x * 0.5 + phase * 1.7),
+        sin(time * 4.9 + q.y + q.z + phase * 2.3),
     ) * f;
     return out * (fade * wind.z);
 }

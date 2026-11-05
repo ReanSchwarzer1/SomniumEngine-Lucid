@@ -1156,6 +1156,24 @@ pub struct PostProcessComponent {
     pub auto_exposure: bool,
     /// Stops added on top of the metered or manual value. Negative darkens.
     pub exposure_compensation: f32,
+    /// The darkest and brightest EV100 the eye adapts to (defaults -8 and 18). A narrow range keeps a night
+    /// dark and a noon from blowing out: the meter stops there and the picture holds what it got.
+    pub exposure_min_ev: f32,
+    /// The brightest EV100 the eye adapts to (see `exposure_min_ev`).
+    pub exposure_max_ev: f32,
+    /// How fast the eye adapts, per second (defaults 3 into brightness, 1 into the dark): a slow dark
+    /// adaptation is what makes a cave mouth swallow the player for a moment.
+    pub adapt_to_bright: f32,
+    /// How fast the eye adapts into the dark, per second (see `adapt_to_bright`).
+    pub adapt_to_dark: f32,
+    /// A `.cube` 3-D LUT, project-relative, applied after the grade below (empty: none). Made in a grading tool
+    /// on a neutral frame from this engine, it carries a whole look in one file.
+    pub grade_lut: String,
+    /// How much of `grade_lut` to take, 0..1 (default 1).
+    pub grade_lut_strength: f32,
+    /// Colour as the eye sees it in dim light, 0..1 (default 0, off): under about 4 cd/m2 chroma fades and the
+    /// picture goes toward the rods' blue-grey, reds first (Hunt and Purkinje). For nights played by eye.
+    pub low_light_vision: f32,
     /// Which tone-mapping curve maps HDR luminance to display (Phase 24B).
     pub tonemapper: Tonemapper,
     /// Colour grading, applied after tone mapping (Phase 24Y).
@@ -1205,6 +1223,9 @@ pub struct PostProcessComponent {
     pub bloom_enabled: bool,
     /// Strength of the bloom contribution; zero disables its visible effect.
     pub bloom_intensity: f32,
+    /// Stops above the adapted middle grey where light starts to bloom, soft over the stop below (default 0: all
+    /// light blooms, as a lens does). Keeps bright gaps in a canopy from blooming a wood into milk.
+    pub bloom_threshold: f32,
     /// Screen-space occlusion (Phase 24I).
     pub gtao_enabled: bool,
     /// Depth of field (Phase 24Z). Focus distance is in metres.
@@ -1380,6 +1401,13 @@ pub struct PostProcessComponent {
     /// sun's and the lamps'. Under 1, a moon can light the ground while the fog
     /// away from the lights stays blue-black.
     pub fog_skylight: f32,
+    /// World height the fog's falloff starts from (default 0, sea level).
+    pub fog_base_height: f32,
+    /// World height where the fog stops, softly over `fog_top_softness` metres: a valley fills to a flat top and the
+    /// ridges stand clear. At or under `fog_base_height` there is no top (the default).
+    pub fog_top_height: f32,
+    /// Metres over which the fog's top fades (default 8).
+    pub fog_top_softness: f32,
     /// How far every vertex-painted layer and every material's authored
     /// weathering is taken back toward the bare material, 0..=1. 0 (default)
     /// is as authored. A whole level shown as it was before it decayed.
@@ -1453,6 +1481,13 @@ impl Default for PostProcessComponent {
             use_physical_camera: false,
             auto_exposure: true,
             exposure_compensation: 0.0,
+            exposure_min_ev: -8.0,
+            exposure_max_ev: 18.0,
+            adapt_to_bright: 3.0,
+            adapt_to_dark: 1.0,
+            grade_lut: String::new(),
+            grade_lut_strength: 1.0,
+            low_light_vision: 0.0,
             tonemapper: Tonemapper::AgX,
             cel_shading: false,
             temperature: 0.0,
@@ -1475,6 +1510,7 @@ impl Default for PostProcessComponent {
             // runtime source of truth after startup.
             bloom_enabled: std::env::var("SOMNIUM_BLOOM").as_deref() != Ok("0"),
             bloom_intensity: 0.04,
+            bloom_threshold: 0.0,
             // `SOMNIUM_GTAO=0` switches screen-space occlusion off for the
             // Phase 25A acceptance test — the same scene either side of the
             // flag has to differ *on terrain*, and before 25A-2 it could not.
@@ -1559,6 +1595,9 @@ impl Default for PostProcessComponent {
             fog_sky_occlusion: 0.0,
             fog_range: 1200.0,
             fog_skylight: 1.0,
+            fog_base_height: 0.0,
+            fog_top_height: 0.0,
+            fog_top_softness: 8.0,
             paint_fade: 0.0,
             foliage_green: 0.0,
             aa,

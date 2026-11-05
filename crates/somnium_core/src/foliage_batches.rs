@@ -8,6 +8,13 @@
 //! path would have: the kind's draw distance, a project entry's LOD mesh, and the legacy leaf and heavy-part drops
 //! at `lod_distance` and `impostor_distance`.
 //!
+//! Each cell's copies of a part are one instanced draw (`SomniumRenderer::set_instanced_batch`, Sunscar, 5 Nov 2026):
+//! a forest of 400-600 stems a hectare is hundreds of thousands of copies, and a draw each would cost the GPU's front
+//! end more than the trees. A run is culled and banded as one, so a cell's copies are split into one batch per
+//! distance band (a near mesh, a LOD mesh) on the CPU, by each copy's distance from the camera snapped to
+//! [`BAND_SNAP`]: a cell straddling a band edge is split again only when the snapped camera moves, at most
+//! [`BUILDS_PER_FRAME`] cells a frame, nearest first.
+//!
 //! Opt-in with `SOMNIUM_FOLIAGE_BATCHES=1`. A terrain with an LOD falloff curve keeps the per-instance path (the
 //! curve scales every copy every frame). What batches do not have is listed in `instance_batch.rs`: no ray-traced
 //! foliage, no virtual shadow pages, two-sided raster.
@@ -22,6 +29,11 @@ const CELL: f32 = 32.0;
 const KEEP: f32 = 32.0;
 /// Batch ids in this namespace are foliage's: the top byte.
 const ID_SPACE: u64 = 0xF0 << 56;
+/// Copies are put in their distance band from the camera snapped to this grid, metres: a band edge moves in steps, so a
+/// cell across one is rebuilt every few seconds of walking rather than every frame (and its shadows with it).
+const BAND_SNAP: f32 = 16.0;
+/// Most (cell, kind, band) batches built in one frame, nearest first; the rest keep their old batch a frame longer.
+const BUILDS_PER_FRAME: usize = 96;
 
 /// Whether `SOMNIUM_FOLIAGE_BATCHES=1` is set.
 pub(crate) fn enabled() -> bool {
@@ -206,7 +218,7 @@ pub(crate) struct Changes {
 #[derive(Default)]
 pub(crate) struct FoliageBatches {
     cells: std::collections::HashMap<u32, Cells>,
-    /// `(terrain, cell, kind)` -> (signature, frame last needed, copies).
+    /// `(terrain, cell, kind and band)` -> (signature, frame last needed, copies).
     live: std::collections::HashMap<(u32, u32, u16), (u64, u64, u32)>,
     frame: u64,
     seen: Vec<u32>,
@@ -214,9 +226,30 @@ pub(crate) struct FoliageBatches {
 }
 
 /// The namespace byte, 16 bits of terrain, 24 of cell (a 131 km square of 32 m cells) and 16 of kind, so every
-/// kind a palette can hold has its own batch in a cell. Runtime only: never saved.
+/// kind a palette can hold has its own batch in a cell. The kind field carries the band in its top three bits
+/// ([`band_kind`]): kinds stop at 13 bits. Runtime only: never saved.
 fn batch_id(terrain: u32, cell: u32, kind: u16) -> u64 {
     ID_SPACE | (u64::from(terrain & 0xFFFF) << 40) | (u64::from(cell & 0xFF_FFFF) << 16) | u64::from(kind)
+}
+
+/// `kind` with distance band `band` (0..8) in its top three bits.
+fn band_kind(kind: u16, band: usize) -> u16 {
+    debug_assert!(kind < 1 << 13 && band < 8);
+    kind | (band as u16) << 13
+}
+
+/// A kind's parts grouped by their distance band `(near, far)` (0 far: no limit), each group's parts drawn without a
+/// band of their own: the copies in a band are chosen on the CPU.
+fn bands(list: &[BatchPart]) -> Vec<(f32, f32, Vec<BatchPart>)> {
+    let mut out: Vec<(f32, f32, Vec<BatchPart>)> = Vec::new();
+    for p in list {
+        let part = BatchPart { near: 0.0, far: 0.0, ..*p };
+        match out.iter_mut().find(|(n, f, _)| *n == p.near && *f == p.far) {
+            Some((_, _, parts)) => parts.push(part),
+            None => out.push((p.near, p.far, vec![part])),
+        }
+    }
+    out
 }
 
 fn mix(h: &mut u64, word: u32) {
@@ -277,7 +310,7 @@ impl FoliageBatches {
         if cells.order.is_empty() {
             return 0;
         }
-        let centre = Vec2::new(camera_local.x, camera_local.z);
+        let centre = (Vec2::new(camera_local.x, camera_local.z) / BAND_SNAP).round() * BAND_SNAP;
         let span = farthest + KEEP;
         let cell_range = |v: f32, lo: f32, n: i32| (((v - lo) / CELL).floor() as i32).clamp(0, n - 1);
         let (x0, x1, z0, z1) = if span.is_finite() {
@@ -290,26 +323,68 @@ impl FoliageBatches {
         } else {
             (0, cells.dims[0] - 1, 0, cells.dims[1] - 1)
         };
+        let grouped: Vec<Option<Vec<(f32, f32, Vec<BatchPart>)>>> =
+            parts.iter().map(|list| list.as_deref().map(bands)).collect();
+        // Every (cell, kind) in reach, nearest first, so a frame's builds go to the nearest.
+        let mut wanted: Vec<(f32, f32, u32, u16, u32, u32)> = Vec::new();
         for cz in z0..=z1 {
             for cx in x0..=x1 {
                 let cell = (cz * cells.dims[0] + cx) as u32;
                 let lo = Vec2::new(cells.min[0] + cx as f32 * CELL, cells.min[1] + cz as f32 * CELL);
                 let gap = (lo - centre).max(centre - (lo + Vec2::splat(CELL))).max(Vec2::ZERO).length();
+                let far_corner = (lo + Vec2::splat(CELL * 0.5) - centre).abs() + Vec2::splat(CELL * 0.5);
                 for &(kind, start, end) in &cells.cells[cell as usize] {
                     let r = reach.get(usize::from(kind)).copied().unwrap_or(f32::NAN);
-                    if r.is_nan() || gap > r + KEEP {
+                    if r.is_nan() || gap > r {
                         continue;
                     }
-                    let key = (terrain, cell, kind);
-                    let current = self.live.get(&key).map(|&(sig, _, _)| sig);
-                    if current.is_none() && gap > r {
+                    wanted.push((gap, far_corner.length(), cell, kind, start, end));
+                }
+            }
+        }
+        wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut builds = 0;
+        let mut copies = 0u32;
+        for (gap, far_corner, cell, kind, start, end) in wanted {
+            let Some(Some(groups)) = grouped.get(usize::from(kind)) else { continue };
+            let members = &cells.order[start as usize..end as usize];
+            for (band, (near, far, band_parts)) in groups.iter().enumerate().take(8) {
+                let whole = *near <= gap && (*far == 0.0 || far_corner < *far);
+                let none = (*far > 0.0 && gap >= *far) || far_corner < *near;
+                if none {
+                    continue;
+                }
+                let inside = |i: &u32| {
+                    let p = instances[*i as usize].position;
+                    let d = Vec2::new(p.x, p.z).distance(centre);
+                    d >= *near && (*far == 0.0 || d < *far)
+                };
+                // Which copies the band holds, folded into the signature: a copy crossing the edge rebuilds it.
+                let mut sig = signature[kind as usize] ^ (band as u64).rotate_left(29);
+                let mut count = 0u32;
+                for i in members.iter().filter(|i| whole || inside(i)) {
+                    mix(&mut sig, *i);
+                    count += 1;
+                }
+                if count == 0 {
+                    continue;
+                }
+                let key = (terrain, cell, band_kind(kind, band));
+                let live = self.live.get(&key).copied();
+                let held = match live {
+                    Some((old, _, n)) if old == sig => n,
+                    // Over this frame's builds: an old batch draws on a frame longer, a new one waits for it.
+                    Some((old, _, n)) if builds >= BUILDS_PER_FRAME => {
+                        self.live.insert(key, (old, self.frame, n));
+                        copies += n;
                         continue;
                     }
-                    let copies;
-                    if current != Some(signature[kind as usize]) {
-                        let list = parts[kind as usize].as_ref().expect("a kind with a reach has parts");
-                        let placements: Vec<Mat4> = cells.order[start as usize..end as usize]
+                    None if builds >= BUILDS_PER_FRAME => continue,
+                    _ => {
+                        builds += 1;
+                        let placements: Vec<Mat4> = members
                             .iter()
+                            .filter(|i| whole || inside(i))
                             .map(|&i| &instances[i as usize])
                             .filter(|inst| inst.scale > 0.0)
                             .map(|inst| {
@@ -321,22 +396,19 @@ impl FoliageBatches {
                                     )
                             })
                             .collect();
-                        copies = placements.len() as u32;
-                        self.changes
-                            .set
-                            .push((batch_id(terrain, cell, kind), InstanceBatch { parts: list.clone(), placements }));
-                    } else {
-                        copies = self.live[&key].2;
+                        let n = placements.len() as u32;
+                        self.changes.set.push((
+                            batch_id(terrain, cell, key.2),
+                            InstanceBatch { parts: band_parts.clone(), placements },
+                        ));
+                        n
                     }
-                    self.live.insert(key, (signature[kind as usize], self.frame, copies));
-                }
+                };
+                self.live.insert(key, (sig, self.frame, held));
+                copies += held;
             }
         }
-        self.live
-            .iter()
-            .filter(|(key, value)| key.0 == terrain && value.1 == self.frame)
-            .map(|(_, value)| value.2)
-            .sum()
+        copies
     }
 
     /// End the frame: every live batch not needed this frame (out of reach, a terrain gone or back on the
@@ -509,17 +581,35 @@ mod tests {
     }
 
     #[test]
-    fn a_cell_just_past_reach_is_kept_until_it_is_well_past() {
+    fn a_small_step_changes_nothing_and_each_copy_draws_in_one_band() {
         let instances = field();
         let mut batches = FoliageBatches::default();
         let parts = parts_for(50.0, 50.0);
         batches.begin_frame();
         batches.terrain(1, 1, &instances, Mat4::IDENTITY, glam::Vec3::ZERO, &parts);
         batches.end_frame();
-        // 20 m on: cells that left the 50 m reach are within the 32 m it is kept for.
+        // 6 m on: the camera snaps to the same place, so no batch is set or removed.
         batches.begin_frame();
-        batches.terrain(1, 1, &instances, Mat4::IDENTITY, glam::Vec3::new(20.0, 0.0, 0.0), &parts);
+        batches.terrain(1, 1, &instances, Mat4::IDENTITY, glam::Vec3::new(6.0, 0.0, 0.0), &parts);
         batches.end_frame();
-        assert!(batches.changes.remove.is_empty());
+        assert!(batches.changes.set.is_empty() && batches.changes.remove.is_empty());
+        // A near mesh to 150 m and a LOD mesh from it to 400: every copy in reach is in exactly one band's batch.
+        let d = KindDistances { lod_sq: 150.0 * 150.0, ..distances(400.0, 0.0) };
+        let mut parts = vec![None; 256];
+        parts[130] = Some(kind_parts(130, &[piece(9000, false)], Some(&[piece(800, false)]), d));
+        let mut batches = FoliageBatches::default();
+        batches.begin_frame();
+        let copies = batches.terrain(1, 1, &instances, Mat4::IDENTITY, glam::Vec3::ZERO, &parts);
+        batches.end_frame();
+        let in_reach = instances.iter().filter(|i| i.kind == 130 && Vec2::new(i.position.x, i.position.z).length() < 400.0).count();
+        assert_eq!(copies as usize, in_reach);
+        let near: usize = batches.changes.set.iter().filter(|(id, _)| (id & 0xFFFF) >> 13 == 0).map(|(_, b)| b.placements.len()).sum();
+        let far: usize = batches.changes.set.iter().filter(|(id, _)| (id & 0xFFFF) >> 13 == 1).map(|(_, b)| b.placements.len()).sum();
+        assert_eq!(near + far, in_reach);
+        assert!(near > 0 && far > 0, "{near} near, {far} far");
+        assert!(batches.changes.set.iter().all(|(id, b)| {
+            let mesh = if (id & 0xFFFF) >> 13 == 0 { 9000 } else { 800 };
+            b.parts.iter().all(|p| p.index_count == mesh && p.near == 0.0 && p.far == 0.0)
+        }));
     }
 }

@@ -328,12 +328,17 @@ pub struct SomniumRenderer {
     pub exposure: f32,
     /// Meter the frame and adapt exposure to it, rather than using `exposure`.
     pub auto_exposure: bool,
+    /// The range and rates the metered exposure adapts within.
+    pub eye_adaptation: crate::pass::auto_exposure::EyeAdaptation,
     /// Seconds since the previous frame, for exposure adaptation.
     pub frame_delta_time: f32,
     /// Stops applied on top of the metered exposure. Negative darkens.
     pub exposure_compensation: f32,
     /// Colour grading and lens settings (Phases 24Y / 24Z).
     pub grading: crate::pass::postprocess::Grading,
+    /// The grading LUT's project path as last asked for, and whether it loaded (`set_grade_lut`).
+    pub grade_lut_source: String,
+    pub grade_lut_ready: bool,
     /// A transition over the whole picture, set by the game each frame it runs; none by default.
     pub picture_shift: crate::pass::postprocess::PictureShift,
     /// The scene's authored picture shift (Post Processing), set by the engine each frame. Drawn only while the
@@ -345,6 +350,8 @@ pub struct SomniumRenderer {
     /// Its inverse goes to the shaders as `inv_view_proj_rel`, so a ray or point rebuilt from a pixel is
     /// camera-relative and keeps its precision kilometres out (`set_view`).
     view_proj_rel: glam::Mat4,
+    /// `view_proj_rel` without the jitter: TAA and velocity reproject with it (`set_view`).
+    view_proj_unjittered_rel: glam::Mat4,
     /// Current render target size, for computing the jitter offset.
     render_width: u32,
     render_height: u32,
@@ -975,6 +982,11 @@ impl SomniumRenderer {
     /// Start compiling, on worker threads, every shading pipeline the frames could ask for, so no scene's first
     /// frames stop to compile one. Returns at once; call again after changing graphics switches to add what they
     /// need. The renderer starts this itself when it is built.
+    /// Upload the grading LUT (`pass::postprocess::parse_cube`); `grading.lut_strength` decides how much is taken.
+    pub fn set_grade_lut(&mut self, ctx: &RenderContext, size: u32, texels: &[[f32; 4]]) {
+        self.postprocess_pass.set_lut(&ctx.device, &ctx.queue, size, texels);
+    }
+
     pub fn warm_pipelines(&mut self, ctx: &RenderContext) {
         let keys = self.shading_warm_keys();
         self.shading_pass.warm(&ctx.device, keys);
@@ -1256,6 +1268,7 @@ impl SomniumRenderer {
             HDR_FORMAT,
             ctx.config.width,
             ctx.config.height,
+            auto_exposure_pass.exposure_buffer(),
         );
 
         // Phase 11.5K: Post-process pass owns the Rgba16Float HDR render target.
@@ -1345,7 +1358,7 @@ impl SomniumRenderer {
         // Phase 24C: the atmosphere LUTs must exist before the IBL pass, which
         // binds them to ray-march the sky into the environment cubemap.
         let atmosphere_pass = crate::pass::atmosphere::AtmospherePass::new(&ctx.device, &shaders);
-        let ibl_pass = crate::pass::ibl::IblPass::new(&ctx.device, &shaders, &atmosphere_pass);
+        let mut ibl_pass = crate::pass::ibl::IblPass::new(&ctx.device, &shaders, &atmosphere_pass);
 
         let vis_pass = VisibilityBufferPass::new(
             &ctx.device,
@@ -1374,6 +1387,8 @@ impl SomniumRenderer {
             ctx.config.width,
             ctx.config.height,
         );
+        // The sky light sees the clouds the camera does (Sunscar, 5 Nov 2026).
+        ibl_pass.set_cloud_capture(&ctx.device, cloud_pass.sky_light_view());
 
         // Phase CONTROL-O. Built before the shading pass, like the clouds and
         // for the same reason: shading binds its buffers.
@@ -1609,14 +1624,18 @@ impl SomniumRenderer {
             // not the other way round — so the value is inlined.
             exposure: 1.0 / (1.2 * 32768.0),
             auto_exposure: true,
+            eye_adaptation: Default::default(),
             frame_delta_time: 1.0 / 60.0,
             exposure_compensation: 0.0,
             grading: crate::pass::postprocess::Grading::default(),
+            grade_lut_source: String::new(),
+            grade_lut_ready: false,
             picture_shift: Default::default(),
             authored_picture_shift: Default::default(),
             sun_angular_radius: 0.004_654,
             view_proj_unjittered: glam::Mat4::IDENTITY,
             view_proj_rel: glam::Mat4::IDENTITY,
+            view_proj_unjittered_rel: glam::Mat4::IDENTITY,
             render_width: ctx.config.width,
             render_height: ctx.config.height,
             tonemapper: 0,
@@ -2644,6 +2663,7 @@ impl SomniumRenderer {
         let mut rotation = view;
         rotation.w_axis = glam::Vec4::W;
         self.view_proj_rel = jittered * rotation;
+        self.view_proj_unjittered_rel = proj * rotation;
         self.camera_pos = camera_pos;
     }
 
@@ -3561,23 +3581,46 @@ impl SomniumRenderer {
     }
 
     /// As [`Self::set_instance_batch`], but each part's copies are one instanced draw (`instance_batch::make_run`):
-    /// one argument draws them all, culled by one box round every copy, and nothing of it is traced. For many small
-    /// copies seen together, as ground cover's cells are: one draw per copy would cost the GPU's front end more than
-    /// the copies themselves. A part's distance band is measured from its first copy.
+    /// one argument draws them all, culled by one box round every copy. For many copies seen together, as ground
+    /// cover's and a forest's cells are: one draw per copy would cost the GPU's front end more than the copies
+    /// themselves. A part's distance band is measured from its first copy. Every copy's instance is written, so the
+    /// copies of a traced mesh join the top level near the eye as a batch's do; a mesh kept out of tracing this frame
+    /// ([`Self::exclude_from_tracing`], ground cover) adds none.
     pub fn set_instanced_batch(&mut self, id: u64, batch: &crate::instance_batch::InstanceBatch) {
         let mut slots = Vec::with_capacity(batch.parts.len() * batch.placements.len());
+        let mut traced = Vec::new();
         for part in &batch.parts {
             if self.material_blend.get(part.material_id as usize).copied().unwrap_or(false) {
                 continue;
             }
             let bounds = self.geometry.mesh_aabb(part.vertex_offset);
             let start = slots.len();
+            if self.raytrace_pass.supported()
+                && self.raytrace_pass.has_blas(part.vertex_offset)
+                && !self.untraced_meshes.contains(&part.vertex_offset)
+            {
+                let half = bounds.map(|(min, max)| (glam::Vec3::from(max) - glam::Vec3::from(min)) * 0.5);
+                for (k, &placement) in batch.placements.iter().enumerate() {
+                    let model = placement * part.local;
+                    let radius = half.map_or(f32::MAX, |half| model.transform_vector3(half).length());
+                    if radius >= TLAS_MIN_RADIUS {
+                        traced.push(crate::instance_batch::TracedCopy {
+                            slot: u32::try_from(start + k).unwrap_or(u32::MAX),
+                            vertex_offset: part.vertex_offset,
+                            model,
+                            shadow: traces_shadow(part.casts_shadow, radius),
+                            near: part.near,
+                            far: part.far,
+                        });
+                    }
+                }
+            }
             slots.extend(
                 batch.placements.iter().map(|&placement| crate::instance_batch::GpuSlot::new(part, placement, bounds)),
             );
             crate::instance_batch::make_run(&mut slots[start..]);
         }
-        self.instance_batches.set(id, slots, Vec::new());
+        self.instance_batches.set(id, slots, traced);
     }
 
     /// Remove instance batch `id`. Returns whether there was one.
@@ -5170,6 +5213,7 @@ impl SomniumRenderer {
             self.light_direction,
             self.light_color,
             overcast,
+            self.cloud_pass.sky_light_clouds(),
         );
 
         // ── 1. Compute cascades and upload light buffer ───────────────────────
@@ -5185,7 +5229,9 @@ impl SomniumRenderer {
         // off: `jitter_ndc` returns zero when TAA is disabled, so the cascades
         // stopped moving.
         let cascade_candidates =
-            compute_cascades(self.light_direction, self.view_proj_unjittered.inverse());
+            // In f64: the f32 inverse of an absolute view-projection 13 km out puts the fit's corners off by the
+            // same 2^-7 ndc steps the rays had (Sunscar, 5 Nov 2026).
+            compute_cascades(self.light_direction, self.view_proj_unjittered.as_dmat4().inverse());
         let shadow_cache_enabled = std::env::var("SOMNIUM_SHADOW_CACHE").as_deref() != Ok("0");
         let cascade_cache_frame = self.cascade_shadow_cache.begin_frame(
             cascade_candidates,
@@ -6119,7 +6165,8 @@ impl SomniumRenderer {
                     &mut encoder,
                     tlas,
                     &self.vis_pass.depth_view,
-                    self.view_proj,
+                    self.view_proj_rel,
+                    self.camera_pos,
                     self.light_direction,
                     self.sun_angular_radius,
                     self.render_width,
@@ -6140,7 +6187,7 @@ impl SomniumRenderer {
                     tlas,
                     &self.vis_pass.depth_view,
                     &self.vis_pass.view,
-                    self.view_proj,
+                    self.view_proj_rel,
                     self.camera_pos,
                     self.light_direction,
                     self.light_color,
@@ -6201,7 +6248,7 @@ impl SomniumRenderer {
                     .expect("ReSTIR GI always allocates its radiance target"),
                 &self.ibl_pass.cube_view,
                 &self.ibl_pass.sampler,
-                self.view_proj,
+                self.view_proj_rel,
                 self.view_matrix,
                 self.proj_matrix,
                 traced_scene_revision,
@@ -6278,7 +6325,8 @@ impl SomniumRenderer {
             &ctx.queue,
             &mut encoder,
             &self.global_pool.lean_bind_group,
-            self.view_proj_unjittered,
+            self.view_proj_unjittered_rel,
+            self.camera_pos,
             self.render_width,
             self.render_height,
         );
@@ -6354,8 +6402,8 @@ impl SomniumRenderer {
         self.volumetric_pass.record(
             &mut encoder,
             &ctx.queue,
-            self.view_proj_unjittered.inverse(),
-            self.view_proj_unjittered,
+            self.view_proj_unjittered_rel.inverse(),
+            self.view_proj_unjittered_rel,
             self.view_matrix,
             self.camera_pos,
             self.light_direction,
@@ -6363,7 +6411,13 @@ impl SomniumRenderer {
         );
         self.profiler.end(&mut encoder);
         self.shading_pass
-            .set_volumetric_range(&ctx.queue, self.volumetric_pass.max_distance());
+            .set_volumetric_range(
+                &ctx.queue,
+                self.volumetric_pass.max_distance(),
+                self.volumetric_pass.fog.density,
+                self.volumetric_pass.fog.height_falloff,
+                self.volumetric_pass.fog.base_height,
+            );
 
         // ── 6.9 Volumetric clouds (Phase CONTROL-M) ──────────────────────────
         //
@@ -6386,7 +6440,7 @@ impl SomniumRenderer {
         self.cloud_pass.record(
             &mut encoder,
             &ctx.queue,
-            self.view_proj_unjittered.inverse(),
+            self.view_proj_unjittered_rel.inverse(),
             self.camera_pos,
             self.light_direction,
             self.light_color,
@@ -6908,7 +6962,7 @@ impl SomniumRenderer {
                     &self.shadow_resources.atlas_depth_view,
                     &self.shadow_resources.comparison_sampler,
                     self.view_matrix,
-                    self.view_proj,
+                    self.view_proj_rel,
                     self.camera_pos,
                     rt_strength,
                     tlas_overflowed,
@@ -7082,7 +7136,8 @@ impl SomniumRenderer {
             .record(
                 &mut encoder,
                 &ctx.queue,
-                self.view_proj_unjittered,
+                self.view_proj_unjittered_rel,
+                self.camera_pos,
                 self.render_width,
                 self.render_height,
             )
@@ -7203,6 +7258,7 @@ impl SomniumRenderer {
                 self.render_height,
                 self.frame_delta_time,
                 self.exposure_compensation,
+                self.eye_adaptation,
             );
             self.profiler.end(&mut encoder);
         }
@@ -7244,6 +7300,8 @@ impl SomniumRenderer {
             &mut encoder,
             &self.postprocess_pass.hdr_view,
             (self.render_width, self.render_height),
+            self.exposure,
+            self.auto_exposure,
         );
 
         self.frame_gen_split(ctx, encoder, crate::pass::frame_gen::SPLIT_BEFORE_UPSCALE);
@@ -7308,12 +7366,15 @@ impl SomniumRenderer {
             },
             if debugging {
                 Default::default()
-            } else if self.picture_shift.kind != 0 {
-                self.picture_shift
             } else {
-                self.authored_picture_shift
+                // Camera-relative, with the inverse below: the wave reads the world back out of the depth buffer, and
+                // the absolute inverse cancels to 2^-7 in ndc 13 km from the origin (Sunscar, 5 Nov 2026).
+                let mut shift =
+                    if self.picture_shift.kind != 0 { self.picture_shift } else { self.authored_picture_shift };
+                shift.at = (glam::Vec3::from(shift.at) - self.camera_pos).to_array();
+                shift
             },
-            self.view_proj.inverse().to_cols_array(),
+            self.view_proj_rel.inverse().to_cols_array(),
         );
         // Phase 15A2: with FXAA on, tone-map into the LDR intermediate and let
         // FXAA resolve it to the swapchain. Editor overlays draw afterwards, so
@@ -8932,6 +8993,38 @@ mod frame_instance_layout_tests {
             let want = (h.truncate() / h.w).x;
             // 5 cm at the 1 km far plane: 50 microradians, an eighth of a pixel (f32 divides near the far plane).
             assert!((f64::from(x_of(relative, n)) - want).abs() < 0.05, "{n}: {} against {want}", x_of(relative, n));
+        }
+    }
+
+    #[test]
+    fn taa_reprojects_camera_relative_kilometres_from_the_origin() {
+        // TaaPass and VelocityPass: rebuild through inverse(proj x rotation), project with last frame's
+        // proj x rotation moved by the camera's step. Checked against f64 at the street, a metre from the eye.
+        let forward = glam::Vec3::new(0.0, -0.5, -0.866).normalize();
+        let proj = glam::Mat4::perspective_rh(55f32.to_radians(), 16.0 / 9.0, 0.1, 1000.0);
+        let rel = |eye: glam::Vec3| {
+            let mut r = glam::Mat4::look_to_rh(eye, forward, glam::Vec3::Y);
+            r.w_axis = glam::Vec4::W;
+            proj * r
+        };
+        let prev_eye = glam::Vec3::new(-15408.0, 14.4, 358.0);
+        for eye in [prev_eye, glam::Vec3::new(-15408.03, 14.4, 357.95)] {
+            let prev = rel(prev_eye) * glam::Mat4::from_translation(eye - prev_eye);
+            let inv = rel(eye).inverse();
+            let exact_prev = proj.as_dmat4() * glam::DMat4::look_to_rh(prev_eye.as_dvec3(), forward.as_dvec3(), glam::DVec3::Y);
+            for i in 0..64 {
+                let ndc = glam::Vec4::new((1280.0 + i as f32) / 1280.0 - 1.0, -0.5, 0.9, 1.0);
+                let h = inv * ndc;
+                let p = h.truncate() / h.w;
+                let c = prev * p.extend(1.0);
+                let want = exact_prev * (eye.as_dvec3() + p.as_dvec3()).extend(1.0);
+                let (got, want) = (f64::from(c.x / c.w), want.x / want.w);
+                // A fiftieth of a pixel at 1280 half-width.
+                assert!((got - want).abs() < 1.5e-5, "{eye} pixel {i}: {got} against {want}");
+                if eye == prev_eye {
+                    assert!((got - f64::from(ndc.x)).abs() < 1.5e-5, "a still camera reprojects onto its own pixel");
+                }
+            }
         }
     }
 

@@ -64,6 +64,8 @@ pub struct SkyComponent {
     pub shape_scale: f32,
     /// Ambient contribution from the sky's own multiscatter term.
     pub ambient: f32,
+    /// Scale on the light the clouds scatter (default 1: physical, as the sky and the sun are).
+    pub brightness: f32,
     /// Henyey–Greenstein forward lobe — the silver lining.
     pub phase_forward: f32,
     /// Henyey–Greenstein backward lobe. Negative.
@@ -188,6 +190,7 @@ impl Default for SkyComponent {
             weather_scale: 24_000.0,
             shape_scale: 6_000.0,
             ambient: 1.0,
+            brightness: 1.0,
             phase_forward: 0.8,
             phase_backward: -0.35,
             phase_blend: 0.4,
@@ -223,6 +226,7 @@ impl SkyComponent {
             weather_scale: self.weather_scale.max(1.0),
             shape_scale: self.shape_scale.max(1.0),
             ambient: self.ambient.max(0.0),
+            brightness: self.brightness.max(0.0),
             phase_forward: self.phase_forward.clamp(0.0, 0.95),
             phase_backward: self.phase_backward.clamp(-0.95, 0.0),
             phase_blend: self.phase_blend.clamp(0.0, 1.0),

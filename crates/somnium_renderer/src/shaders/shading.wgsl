@@ -10,6 +10,8 @@
 //!include "atmosphere.wgsl"
 //!include "hextile.wgsl"
 //!include "terrain_material.wgsl"
+//!include "terrain_morph.wgsl"
+//!include "froxel_depth.wgsl"
 //!include "clipmap_shade.wgsl"
 //!include "wind.wgsl"
 //!if LOCAL_SHADOWS
@@ -2093,8 +2095,8 @@ fn contact_shadow(
         // shadows across the ground. Reconstruct the sampled surface and do
         // the thickness test in view-space metres instead.
         let scene_ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, scene_z, 1.0);
-        let scene_world_h = view.inv_view_proj * scene_ndc;
-        let scene_world = scene_world_h.xyz / scene_world_h.w;
+        let scene_world_h = view.inv_view_proj_rel * scene_ndc;
+        let scene_world = scene_world_h.xyz / scene_world_h.w + view.camera_pos;
         let ray_view_depth = -(view.view * vec4<f32>(sample_pos, 1.0)).z;
         let scene_view_depth = -(view.view * vec4<f32>(scene_world, 1.0)).z;
         let diff = ray_view_depth - scene_view_depth;
@@ -2229,8 +2231,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             return vec4<f32>(0.0, 0.0, 0.0, 1.0);
         }
         let ndc = (screen_uv * 2.0 - 1.0) * vec2<f32>(1.0, -1.0);
-        let near_plane = view.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-        let far_plane  = view.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+        // Camera-relative: the difference below is the same, without the absolute inverse's 2^-6 steps.
+        let near_plane = view.inv_view_proj_rel * vec4<f32>(ndc, 0.0, 1.0);
+        let far_plane  = view.inv_view_proj_rel * vec4<f32>(ndc, 1.0, 1.0);
         let ray_dir    = normalize(far_plane.xyz / far_plane.w - near_plane.xyz / near_plane.w);
 
         // Phase 24C: sample the environment cubemap rather than evaluating a
@@ -2291,9 +2294,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let v1 = vertices[instance.vertex_offset + i1];
     let v2 = vertices[instance.vertex_offset + i2];
 
-    var p0 = (instance.model * vec4<f32>(v0.pos_x, v0.pos_y, v0.pos_z, 1.0)).xyz;
-    var p1 = (instance.model * vec4<f32>(v1.pos_x, v1.pos_y, v1.pos_z, 1.0)).xyz;
-    var p2 = (instance.model * vec4<f32>(v2.pos_x, v2.pos_y, v2.pos_z, 1.0)).xyz;
+    // The terrain morph the visibility pass applied (terrain_morph.wgsl): the triangle as it was rasterised.
+    let m0 = terrain_morph(vec3<f32>(v0.pos_x, v0.pos_y, v0.pos_z), i0, instance.vertex_offset, instance._padding,
+                           instance.model, view.camera_pos);
+    let m1 = terrain_morph(vec3<f32>(v1.pos_x, v1.pos_y, v1.pos_z), i1, instance.vertex_offset, instance._padding,
+                           instance.model, view.camera_pos);
+    let m2 = terrain_morph(vec3<f32>(v2.pos_x, v2.pos_y, v2.pos_z), i2, instance.vertex_offset, instance._padding,
+                           instance.model, view.camera_pos);
+    var p0 = (instance.model * vec4<f32>(m0, 1.0)).xyz;
+    var p1 = (instance.model * vec4<f32>(m1, 1.0)).xyz;
+    var p2 = (instance.model * vec4<f32>(m2, 1.0)).xyz;
     // The triangle the visibility pass rasterised, wind included (visibility.wgsl):
     // reconstructing the rest pose would shade a leaf where it is not drawn.
     if material.terrain_index < 0 {
@@ -3649,19 +3659,47 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Each texel is the integral over its *whole* slice, so sampling at a
         // slice boundary needs the previous slice's centre — hence the half
         // slice offset (bevy's aerial_view_lut sampling does the same).
-        let w = saturate(dist / volumetric_range.x - 0.5 / slices);
+        let w = saturate(froxel_w(dist, volumetric_range.x) - 0.5 / slices);
         let sample = textureSampleLevel(
             volumetrics, volumetric_sampler, vec3<f32>(screen_uv, w), 0.0);
 
         // Anything nearer than the first slice centre clamps to that slice, so
         // without this fade the full first-slice scattering would be applied
         // right at the camera — fog appearing on the lens.
-        let fade = saturate(dist / (volumetric_range.x / slices));
+        let fade = saturate(dist / froxel_t(1.0 / slices, volumetric_range.x));
         let inscatter = exp(sample.rgb) * fade;
         let transmittance = mix(1.0, sample.a, fade);
 
         result = result * transmittance + inscatter;
         fog_transmittance = transmittance;
+
+        // Aerial perspective past the volume's range. Its last slice held from there on, so a ridge 5 km out had
+        // the haze of one at the range, and the far view read as cut-outs (ENGINE_AUDIT E21, E52: real ridges grow
+        // paler and bluer layer by layer). The rest of the ray loses its light to the air (the atmosphere's own
+        // Rayleigh and Mie extinction at the eye's height) and to the height fog (its exponential, integrated
+        // exactly), and gains the sky's colour toward that horizon, the limit long air scatters toward.
+        let beyond = dist - volumetric_range.x;
+        if beyond > 0.0 {
+            let dir = (hit_point - view.camera_pos) / max(dist, 1e-3);
+            let h_km = max(view.camera_pos.y, 0.0) * 0.001;
+            let air = (RAYLEIGH_SCATTERING * exp(-h_km / RAYLEIGH_SCALE_H)
+                + vec3<f32>(MIE_EXTINCTION * exp(-h_km / MIE_SCALE_H))) * 0.001;
+            var depth = air * beyond;
+            let fog = volumetric_range.y;
+            if fog > 0.0 {
+                let falloff = max(volumetric_range.z, 1.0);
+                let y0 = view.camera_pos.y + dir.y * volumetric_range.x;
+                let start = fog * exp(-max(y0 - volumetric_range.w, 0.0) / falloff);
+                let k = clamp(dir.y * beyond / falloff, -20.0, 20.0);
+                let along = select(beyond * (1.0 - exp(-k)) / k, beyond, abs(k) < 1e-3);
+                depth += vec3<f32>(start * along);
+            }
+            let air_t = exp(-depth);
+            let horizon = normalize(vec3<f32>(dir.x, max(dir.y, 0.02), dir.z));
+            let sky = textureSampleLevel(env_cube, env_sampler, horizon, 0.0).rgb;
+            result = result * air_t + sky * (vec3<f32>(1.0) - air_t);
+            fog_transmittance *= dot(air_t, vec3<f32>(0.2126, 0.7152, 0.0722));
+        }
     }
 
     // The surface lit here, for the path tracer (`path_traced`). A surface whose light is baked into it

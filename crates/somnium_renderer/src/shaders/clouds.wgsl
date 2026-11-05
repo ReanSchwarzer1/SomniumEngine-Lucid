@@ -3,6 +3,7 @@
 // resolver (`somnium_shader`) emits each module once, in this order, and
 // hoists every `enable` above everything.
 //!include "atmosphere.wgsl"
+//!include "froxel_depth.wgsl"
 
 // Somnium Engine — Phase CONTROL-M: the volumetric cloud march.
 //
@@ -26,6 +27,7 @@
 //   shadow model, which is what `cloud_shadow` below writes.
 
 struct CloudParams {
+    /// Camera-relative: inverse(projection x the view's rotation alone). Rays start at `camera_pos`.
     inv_view_proj: mat4x4<f32>,
     camera_pos: vec3<f32>,
     /// Metres from the ground to the bottom of the cloud layer.
@@ -73,7 +75,8 @@ struct CloudParams {
     /// Range the froxel volume spans, so aerial perspective can be applied to
     /// the cloud layer. Zero disables the lookup.
     volumetric_range: f32,
-    _pad0: f32,
+    /// Scale on the scattered light (`CloudSettings::brightness`).
+    brightness: f32,
     _pad1: f32,
 }
 
@@ -200,6 +203,46 @@ fn dual_lobe(cos_theta: f32) -> f32 {
     );
 }
 
+/// The dual lobe with both eccentricities scaled by `k`: a multiple-scattering octave's flatter phase.
+fn dual_lobe_scaled(cos_theta: f32, k: f32) -> f32 {
+    return mix(
+        hg(cos_theta, cp.phase_forward * k),
+        hg(cos_theta, cp.phase_backward * k),
+        clamp(cp.phase_blend, 0.0, 1.0),
+    );
+}
+
+/// Multiple scattering inside the cloud as octaves of the single-scatter sun term (Wrenninge et al., "Oz", 2013;
+/// Hillaire, "Physically Based Sky, Atmosphere and Cloud Rendering in Frostbite", SIGGRAPH 2016). Each octave
+/// halves the scattering, the extinction toward the sun and the phase's eccentricity, so light that has bounced
+/// inside the cloud reaches its body and base. Single scattering alone left an overcast deck's base near black
+/// where real cloud is mid-grey (Sunscar, 6 Nov 2026). The first octave is the old term exactly.
+const CLOUD_MS_OCTAVES: i32 = 3;
+/// Weight of the diffusion term (`cloud_diffusion`): 1 the two-stream estimate as it stands.
+const CLOUD_DIFFUSE: f32 = 1.0;
+/// What a cloud droplet scatters of the light it intercepts: water absorbs almost none.
+const CLOUD_ALBEDO: f32 = 0.95;
+/// The clear sky's radiance per lux of sun, as the engine's IBL scale has it (`ibl.rs`: ~8000 cd/m2 under 100 000 lux).
+const CLOUD_SKY_PER_LUX: f32 = 0.08;
+
+fn sun_octaves(optical_depth: f32, cos_theta: f32) -> f32 {
+    var energy = 0.0;
+    var a = 1.0;
+    for (var i = 0; i < CLOUD_MS_OCTAVES; i = i + 1) {
+        let phase = select(dual_lobe_scaled(cos_theta, a), dual_lobe(cos_theta), i == 0);
+        energy += a * beer_powder(optical_depth * a) * phase;
+        a *= 0.5;
+    }
+    return energy;
+}
+
+/// The diffusion limit: deep in a thick cloud, light that has scattered many times falls off as
+/// 1 / (1 + 0.75 tau (1 - g)) (two-stream; Bohren 1987), not exponentially as every octave does. It is why a
+/// cloud is white from every side and an overcast deck's base is grey, not black.
+fn cloud_diffusion(optical_depth: f32) -> f32 {
+    return 1.0 / (1.0 + 0.75 * optical_depth * (1.0 - 0.85));
+}
+
 /// Beer's law with Schneider's powder term.
 ///
 /// Beer alone makes the sun-facing side of a cloud *darker* the denser it is,
@@ -286,7 +329,7 @@ fn cloud_aerial(view_uv: vec2<f32>, distance: f32) -> vec4<f32> {
     if cp.volumetric_range <= 0.0 {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
-    let w = clamp(distance / cp.volumetric_range, 0.0, 1.0);
+    let w = clamp(froxel_w(distance, cp.volumetric_range), 0.0, 1.0);
     let sample = textureSampleLevel(
         cloud_volumetrics, lut_sampler, vec3<f32>(view_uv, w), 0.0);
     // Log-space inscatter, matching `volumetric.wgsl`'s storage.
@@ -296,6 +339,147 @@ fn cloud_aerial(view_uv: vec2<f32>, distance: f32) -> vec4<f32> {
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // The march
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+/// One ray through the layer from the camera: in-scattered light, transmittance and the transmittance-weighted
+/// depth. `jitter` (0..1) moves the first sample within a long step. Shared by the screen march and the sky
+/// light's capture (`cloud_env`).
+struct CloudRay {
+    scatter: vec3<f32>,
+    transmittance: f32,
+    depth: f32,
+}
+
+fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32) -> CloudRay {
+    let span = interval.y - interval.x;
+    let steps = max(i32(cp.max_steps), 8);
+
+    // **The step is a distance in metres, derived from the layer's own
+    // thickness — not `span / steps`.**
+    //
+    // The first cut divided the whole ray, and the whole ray is enormous: a
+    // shallow ray through a slab 2 km thick can span 60 km, so `span / 48` was
+    // a coarse step over a kilometre long and a cloud got sampled three or
+    // four times through its entire depth. That is what the blocky,
+    // stair-stepped cloud edges were — not the quarter-resolution buffer, which
+    // was the obvious suspect and the wrong one.
+    //
+    // Sampling density is now constant in metres however the ray is angled, so
+    // a cloud on the horizon is shaded like a cloud overhead. The cost is
+    // bounded by the iteration cap and the transmittance early-out rather than
+    // by the step count, which is the right way round: a ray that leaves the
+    // slab immediately does almost no work whatever `max_steps` says.
+    let long_step = max(cp.layer_thickness / f32(steps) * 3.0, 1.0);
+    let short_step = long_step * 0.35;
+    // Enough iterations to cross the layer several times at the fine step,
+    // capped so a grazing ray cannot run away.
+    let iteration_cap = steps * 6;
+
+    // Toft & Bowles' jitter. Their measurement is that this can cost
+    // 2.3 → 7.5 ms through texture-cache incoherence, so whether it pays is a
+    // number this engine takes rather than a belief it inherits.
+    //
+    // `cp.frame` is zero unless *temporal* jitter is on, and it defaults off.
+    // With no cloud-history filter — the clouds ride in the TAA buffer, and TAA
+    // has no motion vector for a sky pixel to reproject — a pattern that moved
+    // every frame was not dithering, it was visible shimmer. Frame-stable
+    // spatial jitter still breaks up the banding it was added for.
+    var t = interval.x + jitter * long_step;
+
+    let sun = normalize(cp.sun_direction);
+    let cos_theta = dot(ray_dir, sun);
+
+    // Ambient comes from the same multiscatter LUT the sky uses, so a cloud at
+    // dusk is lit by the dusk sky rather than by a constant.
+    let r = GROUND_RADIUS + max(cp.camera_pos.y, 0.0) * 0.001;
+    var sun_transmittance = vec3<f32>(0.0);
+    var ambient_sky = vec3<f32>(0.0);
+    if !ray_hits_ground(r, sun.y) {
+        sun_transmittance = sample_transmittance(transmittance_lut, lut_sampler, r, sun.y);
+        ambient_sky = sample_multiscatter(multiscatter_lut, lut_sampler, r, sun.y);
+    }
+    // Light on the cloud, in physical units (Sunscar, 6 Nov 2026). The sun's illuminance through the air, and the
+    // clear sky's fill: its colour from the multiscatter LUT, its level the engine's per-lux sky radiance. Before,
+    // the fill had no sun in it (it came to a fraction of a nit) and the march divided by extinction without the
+    // scattering coefficient, so a deck came out ~1/extinction (17x at density 1.15) too bright, the sky light
+    // that captures it lit the land 2 stops over, and the clear sky between clouds read navy.
+    let luma = vec3<f32>(0.2126, 0.7152, 0.0722);
+    let sun_e = sun_transmittance * cp.sun_illuminance;
+    let sky_fill = ambient_sky / max(dot(ambient_sky, luma), 1e-6) * (CLOUD_SKY_PER_LUX * dot(sun_e, luma));
+
+    var scatter = vec3<f32>(0.0);
+    var transmittance = 1.0;
+    var empty_runs = 0;
+    var inside = false;
+    // Transmittance-weighted mean depth: a cloud has no single depth, and this
+    // is what the aerial-perspective fetch and CONTROL-N's motion vectors both
+    // need in place of one.
+    var depth_accum = 0.0;
+    var depth_weight = 0.0;
+
+    for (var i = 0; i < iteration_cap; i = i + 1) {
+        if t >= interval.y || transmittance < CLOUD_MIN_TRANSMITTANCE {
+            break;
+        }
+        let step_len = select(long_step, short_step, inside);
+        let p = cp.camera_pos + ray_dir * (t + step_len * 0.5);
+
+        if !inside {
+            // Searching: cheap density only, long steps.
+            if cloud_density(p, true) > 0.0 {
+                // Step back one long step and switch to fine sampling, or the
+                // cloud's leading edge is cut off flat.
+                inside = true;
+                empty_runs = 0;
+                t = max(t - long_step, interval.x);
+                continue;
+            }
+            t += step_len;
+            continue;
+        }
+
+        let density = cloud_density(p, false);
+        if density <= 0.0 {
+            empty_runs += 1;
+            if empty_runs >= CLOUD_EMPTY_BEFORE_ESCAPE {
+                inside = false;
+            }
+            t += step_len;
+            continue;
+        }
+        empty_runs = 0;
+
+        // Precipitating columns absorb more, which is what makes the base of a
+        // rain cloud read as dark rather than merely thick.
+        let weather = sample_weather(p.xz);
+        let extinction = density * (1.0 + weather.b * cp.precipitation * 2.0) * 0.05;
+        let optical_depth = light_march(p, sun) * 4.0;
+        let sun_energy = sun_octaves(optical_depth, cos_theta);
+
+        // Radiance arriving at the sample: the sun through its octaves, the sun again as diffused light (Lambertian,
+        // half-lit on average, and only where the cloud is dense enough to diffuse: wisps stay single-scatter), and
+        // the sky's fill, which reaches inside as diffused light does.
+        let diffusion = cloud_diffusion(optical_depth);
+        let thick = 1.0 - exp(-4.0 * density);
+        let luminance = sun_e * (sun_energy + CLOUD_DIFFUSE * thick * diffusion * 0.5 / CLOUD_PI)
+            + sky_fill * cp.ambient * diffusion;
+
+        let step_transmittance = exp(-extinction * step_len);
+        // Analytic segment integration with the scattering coefficient in (sigma_s = albedo sigma_t): what the
+        // segment scatters toward the eye is albedo x radiance x its opacity.
+        let integrated = CLOUD_ALBEDO * luminance * (1.0 - step_transmittance);
+        scatter += transmittance * integrated;
+
+        let weight = transmittance * (1.0 - step_transmittance);
+        depth_accum += t * weight;
+        depth_weight += weight;
+
+        transmittance *= step_transmittance;
+        t += step_len;
+    }
+
+    let depth = select(interval.x, depth_accum / max(depth_weight, 1e-6), depth_weight > 1e-6);
+    return CloudRay(scatter * cp.brightness, transmittance, depth);
+}
 
 @compute @workgroup_size(8, 8, 1)
 fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -348,7 +532,8 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
         let tap_ndc = (vec2<f32>(px) + .5) / vec2<f32>(depth_dims);
         let occ_clip = cp.inv_view_proj * vec4<f32>(tap_ndc.x * 2.0 - 1.0, 1.0 - tap_ndc.y * 2.0, d, 1.0);
-        farthest = max(farthest, length(occ_clip.xyz / occ_clip.w - cp.camera_pos));
+        // Camera-relative (`inv_view_proj` is): the distance is the length.
+        farthest = max(farthest, length(occ_clip.xyz / occ_clip.w));
     }
     if !sky_seen {
         interval.y = min(interval.y, farthest);
@@ -358,128 +543,16 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
         }
     }
 
-    let span = interval.y - interval.x;
-    let steps = max(i32(cp.max_steps), 8);
-
-    // **The step is a distance in metres, derived from the layer's own
-    // thickness — not `span / steps`.**
-    //
-    // The first cut divided the whole ray, and the whole ray is enormous: a
-    // shallow ray through a slab 2 km thick can span 60 km, so `span / 48` was
-    // a coarse step over a kilometre long and a cloud got sampled three or
-    // four times through its entire depth. That is what the blocky,
-    // stair-stepped cloud edges were — not the quarter-resolution buffer, which
-    // was the obvious suspect and the wrong one.
-    //
-    // Sampling density is now constant in metres however the ray is angled, so
-    // a cloud on the horizon is shaded like a cloud overhead. The cost is
-    // bounded by the iteration cap and the transmittance early-out rather than
-    // by the step count, which is the right way round: a ray that leaves the
-    // slab immediately does almost no work whatever `max_steps` says.
-    let long_step = max(cp.layer_thickness / f32(steps) * 3.0, 1.0);
-    let short_step = long_step * 0.35;
-    // Enough iterations to cross the layer several times at the fine step,
-    // capped so a grazing ray cannot run away.
-    let iteration_cap = steps * 6;
-
-    // Toft & Bowles' jitter. Their measurement is that this can cost
-    // 2.3 → 7.5 ms through texture-cache incoherence, so whether it pays is a
-    // number this engine takes rather than a belief it inherits.
-    //
-    // `cp.frame` is zero unless *temporal* jitter is on, and it defaults off.
-    // With no cloud-history filter — the clouds ride in the TAA buffer, and TAA
-    // has no motion vector for a sky pixel to reproject — a pattern that moved
-    // every frame was not dithering, it was visible shimmer. Frame-stable
-    // spatial jitter still breaks up the banding it was added for.
-    var t = interval.x;
+    var jitter = 0.0;
     if cp.jitter_enabled > 0.5 {
-        t += ign(vec2<f32>(gid.xy), cp.frame) * long_step;
+        jitter = ign(vec2<f32>(gid.xy), cp.frame);
     }
-
-    let sun = normalize(cp.sun_direction);
-    let cos_theta = dot(ray_dir, sun);
-    let phase = dual_lobe(cos_theta);
-
-    // Ambient comes from the same multiscatter LUT the sky uses, so a cloud at
-    // dusk is lit by the dusk sky rather than by a constant.
-    let r = GROUND_RADIUS + max(cp.camera_pos.y, 0.0) * 0.001;
-    var sun_transmittance = vec3<f32>(0.0);
-    var ambient_sky = vec3<f32>(0.0);
-    if !ray_hits_ground(r, sun.y) {
-        sun_transmittance = sample_transmittance(transmittance_lut, lut_sampler, r, sun.y);
-        ambient_sky = sample_multiscatter(multiscatter_lut, lut_sampler, r, sun.y);
-    }
-
-    var scatter = vec3<f32>(0.0);
-    var transmittance = 1.0;
-    var empty_runs = 0;
-    var inside = false;
-    // Transmittance-weighted mean depth: a cloud has no single depth, and this
-    // is what the aerial-perspective fetch and CONTROL-N's motion vectors both
-    // need in place of one.
-    var depth_accum = 0.0;
-    var depth_weight = 0.0;
-
-    for (var i = 0; i < iteration_cap; i = i + 1) {
-        if t >= interval.y || transmittance < CLOUD_MIN_TRANSMITTANCE {
-            break;
-        }
-        let step_len = select(long_step, short_step, inside);
-        let p = cp.camera_pos + ray_dir * (t + step_len * 0.5);
-
-        if !inside {
-            // Searching: cheap density only, long steps.
-            if cloud_density(p, true) > 0.0 {
-                // Step back one long step and switch to fine sampling, or the
-                // cloud's leading edge is cut off flat.
-                inside = true;
-                empty_runs = 0;
-                t = max(t - long_step, interval.x);
-                continue;
-            }
-            t += step_len;
-            continue;
-        }
-
-        let density = cloud_density(p, false);
-        if density <= 0.0 {
-            empty_runs += 1;
-            if empty_runs >= CLOUD_EMPTY_BEFORE_ESCAPE {
-                inside = false;
-            }
-            t += step_len;
-            continue;
-        }
-        empty_runs = 0;
-
-        // Precipitating columns absorb more, which is what makes the base of a
-        // rain cloud read as dark rather than merely thick.
-        let weather = sample_weather(p.xz);
-        let extinction = density * (1.0 + weather.b * cp.precipitation * 2.0) * 0.05;
-        let optical_depth = light_march(p, sun) * 4.0;
-        let sun_energy = beer_powder(optical_depth);
-
-        let luminance = sun_transmittance * cp.sun_illuminance * sun_energy * phase
-            + ambient_sky * cp.ambient * (0.35 + 0.65 * density);
-
-        let step_transmittance = exp(-extinction * step_len);
-        // Analytic segment integration, as the froxel volume does: the closed
-        // form stops a thin medium being under-counted at low step counts.
-        let integrated = (luminance - luminance * step_transmittance)
-            / max(extinction, 1e-6);
-        scatter += transmittance * integrated;
-
-        let weight = transmittance * (1.0 - step_transmittance);
-        depth_accum += t * weight;
-        depth_weight += weight;
-
-        transmittance *= step_transmittance;
-        t += step_len;
-    }
+    let cloud = march_ray(ray_dir, interval, jitter);
+    var scatter = cloud.scatter;
+    let transmittance = cloud.transmittance;
 
     // Aerial perspective, at the cloud's own transmittance-weighted depth.
-    let cloud_distance = select(interval.x, depth_accum / max(depth_weight, 1e-6),
-        depth_weight > 1e-6);
+    let cloud_distance = cloud.depth;
     let aerial = cloud_aerial(uv, cloud_distance);
     scatter = scatter * aerial.a + aerial.rgb * (1.0 - transmittance);
 
@@ -488,6 +561,46 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
         vec2<i32>(gid.xy),
         vec4<f32>(scatter, clamp(transmittance, 0.0, 1.0)),
     );
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// The sky light's clouds
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+// The march for each texel of a small cube round the camera, which `ibl_gen.wgsl` lays over the sky before it
+// prefilters. The ground's ambient, its specular and every GI miss then see the deck the camera sees. Before, an overcast
+// dome pinned to the clear sky's zenith lit the land 3.5-5 stops under its own clouds (Sunscar, 5 Nov 2026).
+@group(0) @binding(16) var env_out: texture_storage_2d_array<rgba16float, write>;
+
+/// `ibl_gen.wgsl`'s `cube_dir`, so a capture texel and the environment texel it lands on look the same way.
+fn env_cube_dir(face: u32, uv: vec2<f32>) -> vec3<f32> {
+    let st = uv * 2.0 - vec2(1.0);
+    var d: vec3<f32>;
+    switch face {
+        case 0u:  { d = vec3( 1.0,  -st.y, -st.x); }
+        case 1u:  { d = vec3(-1.0,  -st.y,  st.x); }
+        case 2u:  { d = vec3( st.x,  1.0,   st.y); }
+        case 3u:  { d = vec3( st.x, -1.0,  -st.y); }
+        case 4u:  { d = vec3( st.x, -st.y,  1.0);  }
+        default:  { d = vec3(-st.x, -st.y, -1.0);  }
+    }
+    return normalize(d);
+}
+
+@compute @workgroup_size(8, 8, 1)
+fn cloud_env(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let dims = textureDimensions(env_out);
+    if gid.x >= dims.x || gid.y >= dims.y {
+        return;
+    }
+    let dir = env_cube_dir(gid.z, (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims));
+    var out = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    let interval = slab_interval(cp.camera_pos, dir);
+    if cp.density > 0.0 && interval.y > interval.x {
+        let cloud = march_ray(dir, interval, 0.5);
+        out = vec4<f32>(cloud.scatter, clamp(cloud.transmittance, 0.0, 1.0));
+    }
+    textureStore(env_out, vec2<i32>(gid.xy), i32(gid.z), out);
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -641,7 +754,8 @@ fn cloud_resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     let near = rp.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
     let far = rp.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
     let dir = normalize(far.xyz / far.w - near.xyz / near.w);
-    let world = rp.camera_pos + dir * resolve_distance(rp.camera_pos, dir);
+    // Camera-relative, as `prev_view_proj` takes it (it carries the camera's step).
+    let world = dir * resolve_distance(rp.camera_pos, dir);
     let before = rp.prev_view_proj * vec4<f32>(world, 1.0);
     if before.w <= 1e-6 {
         textureStore(resolve_out, here, current);

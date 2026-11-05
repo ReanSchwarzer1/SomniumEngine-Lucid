@@ -1,3 +1,4 @@
+//!include "froxel_depth.wgsl"
 // Somnium Engine — finite lake surface and physically coherent optics (IV-D/E).
 //
 // Gerstner dispersion/query parity follows the published GPU Gems water pattern;
@@ -12,6 +13,10 @@ struct View {
     _padding: f32,
     time: f32,
     _pad1: vec2<f32>,
+    _wind: vec4<f32>,
+    _wind_time: vec4<f32>,
+    // global_pool.wgsl `View.inv_view_proj_rel`, offset 256.
+    inv_view_proj_rel: mat4x4<f32>,
 }
 
 struct DirectionalLight {
@@ -141,9 +146,9 @@ fn apply_volumetric_fog(colour: vec3<f32>, world_pos: vec3<f32>, screen_uv: vec2
     }
     let dist = length(world_pos - view.camera_pos);
     let slices = f32(textureDimensions(volumetrics).z);
-    let w = saturate(dist / volumetric_range.x - 0.5 / slices);
+    let w = saturate(froxel_w(dist, volumetric_range.x) - 0.5 / slices);
     let fog = textureSampleLevel(volumetrics, volumetric_sampler, vec3<f32>(screen_uv, w), 0.0);
-    let fade = saturate(dist / (volumetric_range.x / slices));
+    let fade = saturate(dist / froxel_t(1.0 / slices, volumetric_range.x));
     return colour * mix(1.0, fog.a, fade) + exp(fog.rgb) * fade;
 }
 
@@ -500,8 +505,9 @@ fn sample_shadow(world_pos: vec3<f32>, view_depth: f32) -> f32 {
 
 fn reconstruct_world(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
-    let world = view.inv_view_proj * ndc;
-    return world.xyz / world.w;
+    // Camera-relative, then moved out: the absolute inverse snaps to 2^-6 in ndc kilometres from the origin.
+    let world = view.inv_view_proj_rel * ndc;
+    return world.xyz / world.w + view.camera_pos;
 }
 
 fn project_uv(world: vec3<f32>) -> vec3<f32> {

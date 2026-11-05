@@ -65,7 +65,7 @@ impl Default for CascadeData {
 /// # Arguments
 /// * `light_dir` — World-space direction *toward* the light, normalized.
 /// * `inv_view_proj` — Inverse of the camera's (proj × view) matrix.
-pub fn compute_cascades(light_dir: Vec3, inv_view_proj: Mat4) -> [CascadeData; NUM_CASCADES] {
+pub fn compute_cascades(light_dir: Vec3, inv_view_proj: glam::DMat4) -> [CascadeData; NUM_CASCADES] {
     let splits = compute_pss_splits(CAMERA_NEAR, SHADOW_DISTANCE);
 
     let up = if light_dir.dot(Vec3::Y).abs() > 0.99 {
@@ -119,8 +119,8 @@ fn compute_pss_splits(near: f32, far: f32) -> [f32; NUM_CASCADES] {
 /// Extract the 8 corners of the full camera frustum in world space.
 ///
 /// Uses NDC corners with z ∈ [0,1] (wgpu depth convention).
-fn frustum_corners_world(inv_view_proj: Mat4) -> [Vec3; 8] {
-    let ndc: [[f32; 4]; 8] = [
+fn frustum_corners_world(inv_view_proj: glam::DMat4) -> [Vec3; 8] {
+    let ndc: [[f64; 4]; 8] = [
         [-1.0, -1.0, 0.0, 1.0],
         [1.0, -1.0, 0.0, 1.0],
         [1.0, 1.0, 0.0, 1.0],
@@ -131,8 +131,8 @@ fn frustum_corners_world(inv_view_proj: Mat4) -> [Vec3; 8] {
         [-1.0, 1.0, 1.0, 1.0],
     ];
     ndc.map(|n| {
-        let v = inv_view_proj * Vec4::new(n[0], n[1], n[2], n[3]);
-        v.truncate() / v.w
+        let v = inv_view_proj * glam::DVec4::new(n[0], n[1], n[2], n[3]);
+        (v.truncate() / v.w).as_vec3()
     })
 }
 

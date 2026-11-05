@@ -160,6 +160,7 @@ impl<G: GameApp> Engine<G> {
                 settings.unload_margin,
                 &holds.discs(),
                 |index| streamer.loaded.contains_key(&index) || streamer.reading.contains_key(&index),
+                |index| streamer.loaded.contains_key(&index),
             ),
             Some(_) => (Vec::new(), streamer.loaded.keys().chain(streamer.reading.keys()).copied().collect()),
             None => (Vec::new(), Vec::new()),

@@ -84,6 +84,10 @@ pub struct WeatherComponent {
     /// past damp, and a rate of 0.2 that eventually soaked everything would be
     /// wrong in a way no amount of waiting fixes.
     pub wetness_target: f32,
+    /// How damp the ground stays between showers, `0..1` (default 0: dry weather dries it). Darkens like wet ground
+    /// without the shine or the puddles' growth that only rain brings: a Mediterranean winter's soil (Sunscar, 6 Nov
+    /// 2026).
+    pub ground_wetness: f32,
     /// Seconds for the diffuse term to reach 63% of its target while wetting.
     pub wetting_seconds: f32,
     /// Seconds for the diffuse term to fall to 37% of its value while drying.
@@ -128,6 +132,7 @@ impl Default for WeatherComponent {
             wind_speed: 8.0,
             wind_direction_deg: 45.0,
             wetness_target: 1.0,
+            ground_wetness: 0.0,
             wetting_seconds: 12.0,
             drying_seconds: 90.0,
             specular_dry_ratio: 3.0,
@@ -277,7 +282,9 @@ impl WeatherComponent {
         } else {
             self.drying_seconds.max(0.001)
         };
-        let wet_diffuse = approach(previous.wet_diffuse, target, diffuse_tau, dt);
+        let damp = target.max(self.ground_wetness.clamp(0.0, 1.0));
+        let diffuse_tau = if damp > previous.wet_diffuse { self.wetting_seconds.max(0.001) } else { diffuse_tau };
+        let wet_diffuse = approach(previous.wet_diffuse, damp, diffuse_tau, dt);
 
         // Specular wets at the same speed and dries faster, which is the
         // asymmetry Lagarde measured: a road stops shining long before it
@@ -291,7 +298,8 @@ impl WeatherComponent {
 
         // Standing water lags the surface film: a puddle takes far longer to
         // form and far longer to go than a wet flagstone.
-        let puddle_target = self.puddles.clamp(0.0, 1.0) * wet_diffuse;
+        // Rain's own wetting, not the damp floor: standing water needs rain.
+        let puddle_target = self.puddles.clamp(0.0, 1.0) * wet_diffuse.min(target);
         let puddle_tau = if puddle_target > previous.puddles {
             self.wetting_seconds.max(0.001) * 3.0
         } else {
@@ -439,6 +447,25 @@ mod tests {
             transition_seconds: 1.0,
             ..WeatherComponent::default()
         }
+    }
+
+    #[test]
+    fn damp_ground_darkens_without_shine_or_puddles() {
+        // A Mediterranean winter between showers: no rain, the soil still damp.
+        let damp = WeatherComponent {
+            enabled: true,
+            precipitation: 0.0,
+            ground_wetness: 0.4,
+            puddles: 1.0,
+            ..WeatherComponent::default()
+        };
+        let state = run(&damp, 3600.0);
+        assert!((state.wet_diffuse - 0.4).abs() < 0.01, "darkened to the floor: {}", state.wet_diffuse);
+        assert!(state.wet_specular < 0.01, "no shine without rain: {}", state.wet_specular);
+        assert!(state.puddles < 0.01, "no puddles without rain: {}", state.puddles);
+        // Rain still wets past the floor.
+        let rain = run(&WeatherComponent { ground_wetness: 0.4, ..raining() }, 3600.0);
+        assert!(rain.wet_diffuse > 0.9, "rain past the floor: {}", rain.wet_diffuse);
     }
 
     #[test]

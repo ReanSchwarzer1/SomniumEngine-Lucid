@@ -4,6 +4,16 @@ struct ParticleView {
     view_proj: mat4x4<f32>,
     camera_right: vec3<f32>, _pad0: f32,
     camera_up: vec3<f32>, _pad1: f32,
+    camera_pos: vec3<f32>, _pad2: f32,
+}
+// The sun as the global pool holds it (`DirectionalLight`, its first 312 bytes; a prefix binds the same buffer).
+struct ParticleSun {
+    direction: vec3<f32>, _pad0: f32,
+    color: vec3<f32>, _pad1: f32,
+    view_proj: array<mat4x4<f32>, 4>,
+    cascade_splits: vec4<f32>,
+    shadow_map_size: f32,
+    ibl_intensity: f32,
 }
 struct GpuParticle {
     position: vec3<f32>, size: f32,
@@ -16,6 +26,7 @@ struct GpuParticle {
 @group(0) @binding(1) var<storage, read> particles: array<GpuParticle>;
 @group(0) @binding(2) var sprite_sampler: sampler;
 @group(1) @binding(4) var textures: binding_array<texture_2d<f32>>;
+@group(1) @binding(6) var<storage, read> sun: ParticleSun;
 const UV: array<vec2<f32>,6> = array<vec2<f32>,6>(vec2(0.,1.),vec2(1.,1.),vec2(1.,0.),vec2(0.,1.),vec2(1.,0.),vec2(0.,0.));
 struct Out {
     @builtin(position) position: vec4<f32>,
@@ -27,6 +38,7 @@ struct Out {
     @location(5) local_uv: vec2<f32>,
     @location(6) @interpolate(flat) uv_rect: vec4<f32>,
     @location(7) @interpolate(flat) flutter: f32,
+    @location(8) view_dir: vec3<f32>,
 }
 @vertex fn vs_main(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> Out {
     let p = particles[iid]; let uv = UV[vid];
@@ -41,7 +53,9 @@ struct Out {
         up = vec3(0.,1.,0.);
     }
     var out: Out;
-    out.position = pview.view_proj * vec4(p.position + right*offset.x + up*offset.y,1.);
+    let corner = p.position + right*offset.x + up*offset.y;
+    out.position = pview.view_proj * vec4(corner,1.);
+    out.view_dir = corner - pview.camera_pos;
     out.uv = p.uv_rect.xy + uv*p.uv_rect.zw;
     out.local_uv = uv; out.colour = p.color; out.tip = p.tip_tint;
     out.uv_rect = p.uv_rect; out.flutter = p.flutter;
@@ -70,7 +84,18 @@ struct Fragment {
     }
     let alpha = clamp(in.colour.a * sprite.a,0.,1.);
     let tint = mix(vec3(1.),in.tip,smoothstep(.12,.72,1.-in.local_uv.y));
-    let rgb = max(in.colour.rgb * tint * sprite.rgb,vec3(0.)) * alpha;
+    var rgb = max(in.colour.rgb * tint * sprite.rgb,vec3(0.)) * alpha;
+    // Lit (bit 3: smoke, dust, mist): the colour is an albedo, lit by the sun through a forward-scattering phase
+    // and by the sky's fill (the engine's 0.08 cd/m2 per lux of sun, scaled as the IBL is), so a column of
+    // chimney smoke reads in the scene's own light at any exposure (Sunscar, 6 Nov 2026).
+    if (in.flags & 8u) != 0u {
+        let v = normalize(in.view_dir);
+        let l = normalize(sun.direction);
+        let g = 0.5;
+        let denom = 1. + g*g - 2.*g*dot(v, l);
+        let phase = (1. - g*g) / (12.566371 * max(denom * sqrt(max(denom, 1e-6)), 1e-6));
+        rgb *= sun.color * phase + sun.color * (0.08 * sun.ibl_intensity);
+    }
     var out: Fragment;
     out.colour = vec4(rgb,select(alpha,0.,(in.flags & 1u) != 0u));
     // Texture alpha and scene depth decide actual visible coverage. Empty sprite

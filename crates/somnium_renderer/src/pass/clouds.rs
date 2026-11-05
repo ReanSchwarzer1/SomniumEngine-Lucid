@@ -43,6 +43,10 @@ const BASE_SIZE: u32 = 128;
 const DETAIL_SIZE: u32 = 32;
 /// Weather-map resolution.
 const WEATHER_SIZE: u32 = 512;
+/// Texels per face of the sky light's cloud cube: the IBL's irradiance and rough specular need no more.
+const ENV_SIZE: u32 = 64;
+/// Seconds between sky-light cloud captures while nothing about the sky changes (the deck drifts with the wind).
+const ENV_REFRESH_SECONDS: f32 = 4.0;
 /// World-XZ cloud shadow resolution.
 const SHADOW_SIZE: u32 = 512;
 /// Default fraction of the scene resolution the march runs at.
@@ -84,6 +88,8 @@ pub struct CloudSettings {
     pub shape_scale: f32,
     /// Ambient contribution from the sky.
     pub ambient: f32,
+    /// Scale on the light the clouds scatter (default 1: physical, as the sky and the sun are).
+    pub brightness: f32,
     /// Henyey–Greenstein forward lobe.
     pub phase_forward: f32,
     /// Henyey–Greenstein backward lobe. Negative.
@@ -132,6 +138,7 @@ impl Default for CloudSettings {
             weather_scale: 24_000.0,
             shape_scale: 6_000.0,
             ambient: 1.0,
+            brightness: 1.0,
             phase_forward: 0.8,
             phase_backward: -0.35,
             phase_blend: 0.4,
@@ -202,7 +209,7 @@ struct CloudParams {
     shadow_strength: f32,
     max_distance: f32,
     volumetric_range: f32,
-    _pad0: f32,
+    brightness: f32,
     _pad1: f32,
 }
 
@@ -300,6 +307,16 @@ pub struct CloudPass {
     march_layout: wgpu::BindGroupLayout,
     march_bind_group: Option<wgpu::BindGroup>,
     march_pipeline: wgpu::ComputePipeline,
+    /// The sky light's clouds (`cloud_env`): a small cube round the camera that the IBL lays over the sky. Its own
+    /// layout (the march's bindings 0-7 and the cube at 16), its views, and when it was last marched.
+    env_layout: wgpu::BindGroupLayout,
+    env_pipeline: wgpu::ComputePipeline,
+    env_bind_group: Option<wgpu::BindGroup>,
+    env_storage_view: wgpu::TextureView,
+    env_view: wgpu::TextureView,
+    env_generation: u64,
+    env_at: f32,
+    env_key: Option<(CloudSettings, [f32; 3])>,
     shadow_pipeline: wgpu::ComputePipeline,
 
     composite_layout: wgpu::BindGroupLayout,
@@ -564,7 +581,7 @@ impl CloudPass {
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(label),
                 layout: Some(layout),
-                module: if entry == "march" || entry == "cloud_shadow" || entry == "cloud_resolve" {
+                module: if matches!(entry, "march" | "cloud_shadow" | "cloud_resolve" | "cloud_env") {
                     &march_shader
                 } else {
                     &noise_shader
@@ -664,6 +681,63 @@ impl CloudPass {
             immediate_size: 0,
         });
         let march_pipeline = compute("Cloud March", &march_pl, "march");
+        let env_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Cloud Sky Light BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                tex_3d(1),
+                tex_3d(2),
+                tex_2d(3),
+                samp(4),
+                tex_2d(5),
+                tex_2d(6),
+                samp(7),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let env_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Cloud Sky Light PL"),
+            bind_group_layouts: &[Some(&env_layout)],
+            immediate_size: 0,
+        });
+        let env_pipeline = compute("Cloud Sky Light", &env_pl, "cloud_env");
+        let env_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Cloud Sky Light"),
+            size: wgpu::Extent3d { width: ENV_SIZE, height: ENV_SIZE, depth_or_array_layers: 6 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let env_array = wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2Array),
+            ..Default::default()
+        };
+        let env_storage_view = env_texture.create_view(&env_array);
+        let env_view = env_texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            ..Default::default()
+        });
         let shadow_pipeline = compute("Cloud Shadow", &march_pl, "cloud_shadow");
 
         // ── History ──────────────────────────────────────────────────────────
@@ -830,6 +904,14 @@ impl CloudPass {
             march_layout,
             march_bind_group: None,
             march_pipeline,
+            env_layout,
+            env_pipeline,
+            env_bind_group: None,
+            env_storage_view,
+            env_view,
+            env_generation: 0,
+            env_at: 0.0,
+            env_key: None,
             shadow_pipeline,
             composite_layout,
             composite_bind_groups: [None, None],
@@ -931,6 +1013,24 @@ impl CloudPass {
         depth: &wgpu::TextureView,
         volumetrics: &wgpu::TextureView,
     ) {
+        if self.env_bind_group.is_none() {
+            let entry = |binding, resource| wgpu::BindGroupEntry { binding, resource };
+            self.env_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Cloud Sky Light BG"),
+                layout: &self.env_layout,
+                entries: &[
+                    entry(0, self.cloud_params.as_entire_binding()),
+                    entry(1, wgpu::BindingResource::TextureView(&self.base_view)),
+                    entry(2, wgpu::BindingResource::TextureView(&self.detail_view)),
+                    entry(3, wgpu::BindingResource::TextureView(&self.weather_view)),
+                    entry(4, wgpu::BindingResource::Sampler(&self.sampler)),
+                    entry(5, wgpu::BindingResource::TextureView(transmittance)),
+                    entry(6, wgpu::BindingResource::TextureView(multiscatter)),
+                    entry(7, wgpu::BindingResource::Sampler(lut_sampler)),
+                    entry(16, wgpu::BindingResource::TextureView(&self.env_storage_view)),
+                ],
+            }));
+        }
         if self.march_bind_group.is_none() {
             self.march_bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("Cloud March BG"),
@@ -1259,6 +1359,10 @@ impl CloudPass {
     /// Writes the shadow uniform unconditionally, including when the pass is
     /// disabled, so the shading pass always reads a truthful "no shadow"
     /// rather than a stale one.
+    ///
+    /// `inv_view_proj` is camera-relative: inverse(projection x the view's rotation alone). Through the
+    /// absolute inverse every ray snapped to 2^-7 in ndc 13 km from the origin, the clouds' ~10 px blocks of
+    /// one colour (Sunscar, 5 Nov 2026).
     #[allow(clippy::too_many_arguments)]
     pub fn record(
         &mut self,
@@ -1322,7 +1426,7 @@ impl CloudPass {
                 shadow_strength: s.shadow_strength.clamp(0.0, 1.0),
                 max_distance: s.max_distance.max(1.0),
                 volumetric_range,
-                _pad0: 0.0,
+                brightness: s.brightness.max(0.0),
                 _pad1: 0.0,
             }),
         );
@@ -1372,7 +1476,11 @@ impl CloudPass {
                 0,
                 bytemuck::bytes_of(&ResolveParams {
                     inv_view_proj: inv_view_proj.to_cols_array_2d(),
-                    prev_view_proj: self.previous.map_or(view_proj, |(m, _)| m).to_cols_array_2d(),
+                    // Last frame's camera-relative matrix, moved by the camera's step (small, exact in f32).
+                    prev_view_proj: self
+                        .previous
+                        .map_or(view_proj, |(m, eye)| m * glam::Mat4::from_translation(camera_pos - eye))
+                        .to_cols_array_2d(),
                     camera_pos: camera_pos.to_array(),
                     keep,
                     layer_bottom: s.altitude.max(1.0),
@@ -1389,6 +1497,19 @@ impl CloudPass {
             label: Some("Cloud March"),
             timestamp_writes: None,
         });
+        // The sky light's clouds: when the sky changed, and every few seconds as the deck drifts. The IBL reads the
+        // cube next frame, once this encoder has run (`sky_light_clouds`).
+        let env_key = Some((self.settings, sun_direction.normalize_or_zero().to_array()));
+        if let Some(env) = self.env_bind_group.as_ref()
+            && (self.env_key != env_key || self.env_generation == 0 || !(0.0..ENV_REFRESH_SECONDS).contains(&(self.time - self.env_at)))
+        {
+            pass.set_bind_group(0, env, &[]);
+            pass.set_pipeline(&self.env_pipeline);
+            pass.dispatch_workgroups(ENV_SIZE.div_ceil(8), ENV_SIZE.div_ceil(8), 6);
+            self.env_key = env_key;
+            self.env_at = self.time;
+            self.env_generation += 1;
+        }
         pass.set_bind_group(0, bind_group, &[]);
         pass.set_pipeline(&self.march_pipeline);
         pass.dispatch_workgroups(
@@ -1412,6 +1533,17 @@ impl CloudPass {
         drop(pass);
 
         self.frame = self.frame.wrapping_add(1);
+    }
+
+    /// The sky light's cloud cube (6 layers, `ENV_SIZE` square: in-scattered light and transmittance per direction).
+    pub fn sky_light_view(&self) -> &wgpu::TextureView {
+        &self.env_view
+    }
+
+    /// Which capture the sky light's cube holds, when the clouds are on and one has been marched: the IBL
+    /// regenerates when this changes.
+    pub fn sky_light_clouds(&self) -> Option<u64> {
+        (self.enabled && self.env_generation > 0).then_some(self.env_generation)
     }
 
     /// Composite the marched buffer over the HDR target.

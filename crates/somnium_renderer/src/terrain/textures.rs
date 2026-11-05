@@ -445,6 +445,37 @@ pub fn layer_tiling_at(asset_dir: &Path) -> [f32; TERRAIN_LAYER_COUNT as usize] 
     tiling
 }
 
+/// Each layer's colour seen from afar with what grows on it (`layer_far_colour.json` beside the layers: material name ->
+/// linear RGB), over `mean` (the bare scans' means), for the macro tier. Past the ground cover's reach the terrain is
+/// all there is, and a sward's ground showed its bare soil scan from there: purple-grey and red past the grass
+/// (Sunscar, 5 Nov 2026). A layer the file does not name keeps its scan's mean.
+#[must_use]
+pub fn with_far_colours(
+    mean: &[[f32; 4]; TERRAIN_LAYER_COUNT as usize],
+    asset_dir: &Path,
+) -> [[f32; 4]; TERRAIN_LAYER_COUNT as usize] {
+    let mut out = *mean;
+    let path = asset_dir.join("layer_far_colour.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return out;
+    };
+    let colours: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(&text) {
+        Ok(map) => map,
+        Err(err) => {
+            tracing::warn!("{}: {err}", path.display());
+            return out;
+        }
+    };
+    for (slot, name) in LAYER_MATERIALS.iter().enumerate() {
+        let Some(rgb) = colours.get(*name).and_then(serde_json::Value::as_array) else { continue };
+        let c: Vec<f32> = rgb.iter().filter_map(serde_json::Value::as_f64).map(|v| v as f32).collect();
+        if c.len() == 3 && c.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)) {
+            out[slot] = [c[0], c[1], c[2], out[slot][3]];
+        }
+    }
+    out
+}
+
 /// Moisture affinity 0..1 from the XV-A manifest (porous-wetting weights).
 pub const LAYER_MOISTURE: [f32; TERRAIN_LAYER_COUNT as usize] = [
     0.55, 0.70, 0.25, 0.15, 0.60, 0.95, 0.45, 0.20, 0.35, 0.90, 0.40, 0.50, 0.55, 0.85, 0.20, 0.40,
@@ -2139,4 +2170,20 @@ mod bc7_pack_tests {
         bytes.pop();
         assert_eq!(parse_bc7_chain(&bytes, 4, "t.bc7").unwrap().len(), 3);
     }
+
+    #[test]
+    fn far_colours_replace_the_named_layers_means_only() {
+        let dir = std::env::temp_dir().join(format!("somnium_far_colour_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mean = [[0.3, 0.2, 0.25, 1.0]; TERRAIN_LAYER_COUNT as usize];
+        assert_eq!(with_far_colours(&mean, &dir), mean, "no file: the scans' means");
+        let (a, b) = (LAYER_MATERIALS[0], LAYER_MATERIALS[4]);
+        std::fs::write(dir.join("layer_far_colour.json"), format!(r#"{{"{a}": [0.1, 0.2, 0.05], "{b}": [2.0, 0.0, 0.0]}}"#)).unwrap();
+        let far = with_far_colours(&mean, &dir);
+        assert_eq!(far[0], [0.1, 0.2, 0.05, 1.0]);
+        assert_eq!(far[4], mean[4], "out of 0..1: ignored");
+        assert_eq!(far[1], mean[1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 }

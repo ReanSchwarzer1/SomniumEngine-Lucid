@@ -21,6 +21,10 @@ struct BloomParams {
     src_texel: [f32; 2],
     filter_radius: f32,
     intensity: f32,
+    threshold_ev: f32,
+    first: f32,
+    exposure: f32,
+    auto_exposure: f32,
 }
 
 pub struct BloomPass {
@@ -38,6 +42,11 @@ pub struct BloomPass {
     format: wgpu::TextureFormat,
     pub enabled: bool,
     pub intensity: f32,
+    /// Stops above the adapted middle grey where light starts to bloom (`bloom.wgsl`); 0, the default, blooms all
+    /// light.
+    pub threshold_ev: f32,
+    /// The auto-exposure result the threshold reads.
+    exposure_buffer: wgpu::Buffer,
     /// The lens flare's strength (`bloom.wgsl` `fs_flare`): ghosts and a halo from bright lights. 0 is none, the
     /// engine's default; a game's setting turns it on.
     pub lens_flare: f32,
@@ -50,6 +59,7 @@ impl BloomPass {
         format: wgpu::TextureFormat,
         width: u32,
         height: u32,
+        exposure_buffer: &wgpu::Buffer,
     ) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("bloom.wgsl"),
@@ -80,6 +90,16 @@ impl BloomPass {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -155,6 +175,8 @@ impl BloomPass {
             format,
             enabled: true,
             intensity: 0.04,
+            threshold_ev: 0.0,
+            exposure_buffer: exposure_buffer.clone(),
             lens_flare: 0.0,
         };
         pass.resize(device, width, height);
@@ -210,6 +232,8 @@ impl BloomPass {
         encoder: &mut wgpu::CommandEncoder,
         source: &wgpu::TextureView,
         source_size: (u32, u32),
+        exposure: f32,
+        auto_exposure: bool,
     ) {
         if !self.enabled {
             return;
@@ -221,7 +245,7 @@ impl BloomPass {
         self.params.clear();
         self.binds.clear();
 
-        let make_bind = |src_view: &wgpu::TextureView, texel: [f32; 2], radius: f32| {
+        let make_bind = |src_view: &wgpu::TextureView, texel: [f32; 2], radius: f32, first: bool| {
             let buf = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Bloom params"),
                 size: std::mem::size_of::<BloomParams>() as u64,
@@ -235,6 +259,10 @@ impl BloomPass {
                     src_texel: texel,
                     filter_radius: radius,
                     intensity: self.intensity,
+                    threshold_ev: self.threshold_ev.max(0.0),
+                    first: f32::from(u8::from(first)),
+                    exposure,
+                    auto_exposure: f32::from(u8::from(auto_exposure)),
                 }),
             );
             let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -253,6 +281,10 @@ impl BloomPass {
                         binding: 2,
                         resource: buf.as_entire_binding(),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.exposure_buffer.as_entire_binding(),
+                    },
                 ],
             });
             (buf, bind)
@@ -264,7 +296,7 @@ impl BloomPass {
         for i in 0..self.views.len() {
             let src = if i == 0 { source } else { &self.views[i - 1] };
             let texel = [1.0 / prev_size.0 as f32, 1.0 / prev_size.1 as f32];
-            let (buf, bind) = make_bind(src, texel, 1.0);
+            let (buf, bind) = make_bind(src, texel, 1.0, i == 0);
             self.params.push(buf);
             down_binds.push(bind);
             prev_size = self.sizes[i];
@@ -298,7 +330,7 @@ impl BloomPass {
         for i in (1..self.views.len()).rev() {
             let (sw, sh) = self.sizes[i];
             let texel = [1.0 / sw as f32, 1.0 / sh as f32];
-            let (buf, bind) = make_bind(&self.views[i], texel, 2.0);
+            let (buf, bind) = make_bind(&self.views[i], texel, 2.0, false);
             self.params.push(buf);
             up_binds.push((i - 1, bind));
         }
@@ -332,7 +364,7 @@ impl BloomPass {
         // added onto the top one, which the post pass scales by `intensity`: the strength is divided by it here.
         if self.lens_flare > 0.0 && self.intensity > 0.0 && self.views.len() > 1 {
             let (w, h) = self.sizes[1];
-            let (buf, bind) = make_bind(&self.views[1], [1.0 / w as f32, 1.0 / h as f32], FLARE_SHARE * self.lens_flare / self.intensity);
+            let (buf, bind) = make_bind(&self.views[1], [1.0 / w as f32, 1.0 / h as f32], FLARE_SHARE * self.lens_flare / self.intensity, false);
             self.params.push(buf);
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Lens flare"),

@@ -12,7 +12,7 @@
 //! tilted to the slope under it, so a patch neither floats nor sinks on a hillside.
 //!
 //! First person (Sunscar, 30 Oct 2026: "grass needs to be much much more denser"): a cell is generated once, on
-//! worker threads under a per-frame candidate budget, and drawn as one instance batch per terrain, kind and cell
+//! the calling thread under a per-frame candidate and time budget, and drawn as one instance batch per terrain, kind and cell
 //! whose copies are one instanced draw per part ([`CoverBatches`]). Each copy carries a rank; past [`BAND_NEAR`] a
 //! copy at distance d draws while its rank is below `BAND_NEAR / d` (half the copies per doubling), widened to hold
 //! the ground they cover (AMD's mesh-shader grass drops blades and widens the rest the same way). Measured per copy,
@@ -33,6 +33,9 @@ use crate::foliage_palette::ProjectEntry;
 pub const CELL: f32 = 16.0;
 /// Most candidates generated in one frame, over every cell made then (the rest come next frame); at least one cell.
 const CANDIDATES_PER_FRAME: f32 = 16_000.0;
+/// Most time one terrain's generation takes in a frame, on the calling thread; at least one cell. Worker threads were
+/// starved by the engine's own while tiles installed, and the frame waited on them: 20-500 ms for 4-17 cells (5 Nov).
+const GENERATE_MS_PER_FRAME: f32 = 2.0;
 /// Most copies of parts (slots) set in batches in one frame, nearest cells first (the rest wait a frame): a tile
 /// streaming in beside the player once set 100,000+ in one frame (40 MB of slots, a 350 ms frame).
 const SLOTS_SET_PER_FRAME: i64 = 48_000;
@@ -124,7 +127,7 @@ impl GroundCover {
     pub(crate) fn update(
         &mut self,
         terrain_id: u32,
-        terrain: &(impl Ground + Sync),
+        terrain: &impl Ground,
         palette: &std::collections::BTreeMap<u16, ProjectEntry>,
         camera: Vec3,
         area: Option<glam::Vec4>,
@@ -139,7 +142,7 @@ impl GroundCover {
         &mut self,
         terrain_id: u32,
         seed_key: u64,
-        terrain: &(impl Ground + Sync),
+        terrain: &impl Ground,
         palette: &std::collections::BTreeMap<u16, ProjectEntry>,
         camera: Vec3,
         area: Option<glam::Vec4>,
@@ -154,9 +157,12 @@ impl GroundCover {
             self.terrains.remove(&terrain_id);
             return;
         }
+        let started = std::time::Instant::now();
         let cover = self.terrains.entry(terrain_id).or_default();
         let revision = terrain.edit_revision();
-        if cover.revision != revision || cover.area != area || cover.seed != seed_key || cover.epoch == 0 {
+        let reset = cover.revision != revision || cover.area != area || cover.seed != seed_key || cover.epoch == 0;
+        let why = (cover.revision != revision, cover.area != area, cover.seed != seed_key);
+        if reset {
             static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
             let epoch = EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             *cover = TerrainCover { epoch, revision, seed: seed_key, area, ..TerrainCover::default() };
@@ -196,30 +202,42 @@ impl GroundCover {
             take += 1;
         }
         let jobs = &wanted[..take];
-        let run = |chunk: &[(f32, usize, i32, i32)]| -> Vec<((u16, i32, i32), Vec<Cover>)> {
-            chunk
-                .iter()
-                .map(|&(_, i, cx, cz)| {
-                    let (kind, entry, density, _) = kinds[i];
-                    ((kind, cx, cz), generate(seed_key, terrain, kind, entry, density, cx, cz, area, origin))
-                })
-                .collect()
-        };
-        let threads = std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2)).clamp(1, 6);
-        let made: Vec<((u16, i32, i32), Vec<Cover>)> = if threads == 1 || jobs.len() < 2 {
-            run(jobs)
-        } else {
-            let run = &run;
-            std::thread::scope(|scope| {
-                let handles: Vec<_> =
-                    jobs.chunks(jobs.len().div_ceil(threads)).map(|chunk| scope.spawn(move || run(chunk))).collect();
-                handles.into_iter().flat_map(|h| h.join().expect("ground cover worker")).collect()
-            })
-        };
+        let planned = started.elapsed();
+        // Nearest first, on this thread, until the frame's time is spent (the rest come next frame).
+        let mut made: Vec<((u16, i32, i32), Vec<Cover>)> = Vec::new();
+        for &(_, i, cx, cz) in jobs {
+            if !made.is_empty() && started.elapsed().as_secs_f32() * 1000.0 > GENERATE_MS_PER_FRAME {
+                break;
+            }
+            let (kind, entry, density, _) = kinds[i];
+            made.push(((kind, cx, cz), generate(seed_key, terrain, kind, entry, density, cx, cz, area, origin)));
+        }
         changed |= !made.is_empty();
+        let copies: usize = made.iter().map(|(_, c)| c.len()).sum();
+        let made_cells = made.len();
         cover.cells.extend(made);
         if changed {
             cover.flat_stale = true;
+        }
+        // A slow frame says where it went (the tile-arrival stalls, 31 Oct - 5 Nov).
+        let total = started.elapsed();
+        if total.as_secs_f32() > 0.02 {
+            tracing::warn!(
+                terrain_id,
+                reset,
+                revision_changed = why.0,
+                area_changed = why.1,
+                seed_changed = why.2,
+                kinds = kinds.len(),
+                wanted = wanted.len(),
+                jobs = take,
+                made_cells,
+                copies,
+                cells = cover.cells.len(),
+                plan_ms = planned.as_secs_f32() * 1000.0,
+                total_ms = total.as_secs_f32() * 1000.0,
+                "slow cover generation"
+            );
         }
     }
 
@@ -280,7 +298,7 @@ fn cell_seed(seed_key: u64, kind: u16, cx: i32, cz: i32) -> u64 {
 #[allow(clippy::too_many_arguments)]
 fn generate(
     seed_key: u64,
-    terrain: &(impl Ground + Sync),
+    terrain: &impl Ground,
     kind: u16,
     entry: &ProjectEntry,
     density: f32,

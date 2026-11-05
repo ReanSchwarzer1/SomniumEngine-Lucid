@@ -49,7 +49,9 @@ pub struct VelocityPass {
     vis_view: wgpu::TextureView,
     texture: wgpu::Texture,
     view: wgpu::TextureView,
+    /// Last frame's camera-relative unjittered view-projection and its camera (`record`).
     prev_view_proj: glam::Mat4,
+    prev_camera: glam::Vec3,
     /// False until a previous frame exists to reproject to.
     history_valid: bool,
 }
@@ -172,6 +174,7 @@ impl VelocityPass {
             texture,
             view,
             prev_view_proj: glam::Mat4::IDENTITY,
+            prev_camera: glam::Vec3::ZERO,
             history_valid: false,
         }
     }
@@ -313,13 +316,14 @@ impl VelocityPass {
 
     /// `view_proj_unjittered` must be un-jittered at both ends — see the
     /// shader's note and `TaaPass::record`, which measured what happens when it
-    /// is not.
+    /// is not. Camera-relative like `TaaPass::record`: projection x rotation alone, plus the camera.
     pub fn record(
         &mut self,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         global: &wgpu::BindGroup,
         view_proj_unjittered: glam::Mat4,
+        camera_pos: glam::Vec3,
         width: u32,
         height: u32,
     ) {
@@ -328,7 +332,9 @@ impl VelocityPass {
             0,
             bytemuck::bytes_of(&VelocityParams {
                 inv_view_proj: view_proj_unjittered.inverse().to_cols_array_2d(),
-                prev_view_proj: self.prev_view_proj.to_cols_array_2d(),
+                prev_view_proj: (self.prev_view_proj
+                    * glam::Mat4::from_translation(camera_pos - self.prev_camera))
+                .to_cols_array_2d(),
                 inv_resolution: [1.0 / width as f32, 1.0 / height as f32],
                 valid: f32::from(u8::from(self.history_valid)),
                 _pad: 0.0,
@@ -358,6 +364,7 @@ impl VelocityPass {
         drop(rpass);
 
         self.prev_view_proj = view_proj_unjittered;
+        self.prev_camera = camera_pos;
         self.history_valid = true;
     }
 }

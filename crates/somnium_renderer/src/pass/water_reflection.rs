@@ -13,6 +13,7 @@ const REFLECT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ReflectParams {
+    /// Camera-relative: inverse(jittered projection x the view's rotation alone) (Sunscar, 5 Nov 2026).
     inv_view_proj: [[f32; 4]; 4],
     view: [[f32; 4]; 4],
     camera_pos: [f32; 3],

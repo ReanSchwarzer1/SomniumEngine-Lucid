@@ -23,10 +23,13 @@
 /// Low resolution is the point: in-scattering is smooth, so it is cheap to
 /// integrate coarsely and interpolate. 32³ is the size Bevy and Hillaire both
 /// use, and it costs 32 slices × 2 steps = 64 samples per column.
+/// 48 x 27 x 64 since 6 Nov 2026 (Sunscar): 32 columns across a 2560 px screen were 80 px wide, the "bands on far
+/// hillsides" (ENGINE_AUDIT E42), and 32 even slices were 37.5 m deep; the slices are exponential now
+/// (`froxel_depth.wgsl`), 3.7 m deep at the feet.
 const VOLUME_SIZE: wgpu::Extent3d = wgpu::Extent3d {
-    width: 32,
-    height: 32,
-    depth_or_array_layers: 32,
+    width: 48,
+    height: 27,
+    depth_or_array_layers: 64,
 };
 
 /// How far the volume reaches, in metres, unless a scene asks otherwise
@@ -60,7 +63,8 @@ struct VolumetricParams {
     grain_enabled: u32,
     fog_sky_occlusion: f32,
     fog_skylight: f32,
-    _pad: [f32; 2],
+    fog_top_height: f32,
+    fog_top_softness: f32,
 }
 
 #[cfg(test)]
@@ -93,6 +97,10 @@ pub struct FogSettings {
     /// Metres over which density falls to 1/e above `base_height`.
     pub height_falloff: f32,
     pub base_height: f32,
+    /// World height where the fog stops, over `top_softness` metres: valley fog under a flat top with the ridges
+    /// clear (Sunscar, 6 Nov 2026). At or under `base_height` there is no top, the default.
+    pub top_height: f32,
+    pub top_softness: f32,
     /// Shadow-test each step, which is what draws light shafts.
     pub shafts: bool,
     /// Shadow-visibility contrast. 0 is neutral; 1 applies full occlusion.
@@ -122,6 +130,8 @@ impl Default for FogSettings {
             asymmetry: 0.6,
             height_falloff: 120.0,
             base_height: 0.0,
+            top_height: 0.0,
+            top_softness: 8.0,
             shafts: true,
             shaft_intensity: 1.5,
             sky_occlusion: 0.0,
@@ -145,10 +155,12 @@ pub struct VolumetricPass {
     history_view: wgpu::TextureView,
     grain_view: wgpu::TextureView,
     grain_enabled: bool,
+    /// Last frame's camera-relative view-projection and its camera (`record`).
     prev_view_proj: glam::Mat4,
+    prev_camera: glam::Vec3,
     history_valid: bool,
     frame: u32,
-    last_settings: Option<[u32; 9]>,
+    last_settings: Option<[u32; 11]>,
     pub enabled: bool,
     pub fog: FogSettings,
     pub max_distance: f32,
@@ -344,6 +356,7 @@ impl VolumetricPass {
             grain_view: grain_view.clone(),
             grain_enabled: crate::pass::grain::enabled_by_default("SOMNIUM_DREAMS_GRAIN"),
             prev_view_proj: glam::Mat4::IDENTITY,
+            prev_camera: glam::Vec3::ZERO,
             history_valid: false,
             frame: 0,
             last_settings: None,
@@ -449,6 +462,8 @@ impl VolumetricPass {
     }
 
     /// `view_proj` is the forward matrix, kept for next frame's reprojection.
+    /// `inv_view_proj` and `view_proj` are camera-relative (projection x the view's rotation alone): the absolute
+    /// inverse snaps every froxel ray to 2^-7 in ndc 13 km from the origin (Sunscar, 5 Nov 2026).
     pub fn record(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -480,6 +495,8 @@ impl VolumetricPass {
             self.fog.shaft_intensity.to_bits(),
             self.fog.sky_occlusion.to_bits(),
             self.fog.skylight.to_bits(),
+            self.fog.top_height.to_bits(),
+            self.fog.top_softness.to_bits(),
             // A new range moves every slice: last frame's volume no longer lines up.
             self.max_distance.to_bits(),
         ];
@@ -508,7 +525,10 @@ impl VolumetricPass {
                 } else {
                     1.0
                 },
-                prev_view_proj: self.prev_view_proj.to_cols_array_2d(),
+                // Moved by the camera's step (small, exact in f32), so it takes this frame's camera-relative points.
+                prev_view_proj: (self.prev_view_proj
+                    * glam::Mat4::from_translation(camera_pos - self.prev_camera))
+                .to_cols_array_2d(),
                 history_valid: f32::from(u8::from(self.history_valid)),
                 // A low-discrepancy offset rather than a random one: over any
                 // short window the samples should spread evenly through the
@@ -519,7 +539,8 @@ impl VolumetricPass {
                 grain_enabled: u32::from(self.grain_enabled),
                 fog_sky_occlusion: self.fog.sky_occlusion.clamp(0.0, 1.0),
                 fog_skylight: self.fog.skylight.max(0.0),
-                _pad: [0.0; 2],
+                fog_top_height: self.fog.top_height,
+                fog_top_softness: self.fog.top_softness.max(0.1),
             }),
         );
 
@@ -549,6 +570,7 @@ impl VolumetricPass {
         );
 
         self.prev_view_proj = view_proj;
+        self.prev_camera = camera_pos;
         self.history_valid = true;
         self.frame = self.frame.wrapping_add(1);
     }

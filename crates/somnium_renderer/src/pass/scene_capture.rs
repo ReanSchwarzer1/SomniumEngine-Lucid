@@ -280,7 +280,12 @@ impl SceneCapturePass {
         let view_proj = request.proj * request.view;
         let uniform = Uniform {
             view_proj: view_proj.to_cols_array_2d(),
-            inv_view_proj: view_proj.inverse().to_cols_array_2d(),
+            // Camera-relative (rotation alone): the sky ray stays sharp kilometres from the origin.
+            inv_view_proj: {
+                let mut rotation = request.view;
+                rotation.w_axis = glam::Vec4::W;
+                (request.proj * rotation).inverse().to_cols_array_2d()
+            },
             eye: request.eye.to_array(),
             sun_scale: request.sun_scale,
             fog_density: fog.density.max(0.0),

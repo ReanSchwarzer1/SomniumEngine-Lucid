@@ -20,11 +20,20 @@ struct BloomParams {
     filter_radius: f32,
     /// How much of the blurred chain reaches the final image.
     intensity: f32,
+    /// Stops above the adapted middle grey where light starts to bloom, soft over the stop below; 0 blooms all
+    /// light (the physical lens above). Read by the first downsample only (`first` 1). In the exposure the picture
+    /// is shown at, so it holds as the eye adapts: `exposure` is the manual multiplier, `auto` 1 reads the meter.
+    threshold_ev: f32,
+    first: f32,
+    exposure: f32,
+    auto_exposure: f32,
 }
 
 @group(0) @binding(0) var src_tex:  texture_2d<f32>;
 @group(0) @binding(1) var src_samp: sampler;
 @group(0) @binding(2) var<uniform> params: BloomParams;
+// The auto-exposure result: [0] the multiplier the post pass applies.
+@group(0) @binding(3) var<storage, read> metered: array<f32, 2>;
 
 struct VOut {
     @builtin(position) clip: vec4<f32>,
@@ -76,7 +85,20 @@ fn fs_downsample(in: VOut) -> @location(0) vec4<f32> {
     // Guard the chain against non-finite input for the same reason TAA needs
     // it: one Inf in a blur spreads across everything it touches.
     let finite = select(vec3<f32>(0.0), result, result == result);
-    return vec4<f32>(min(finite, vec3<f32>(60000.0)), 1.0);
+    var out = min(finite, vec3<f32>(60000.0));
+    // An artistic floor on top of the lens (sunscar-look, 5 Nov 2026: bright gaps in a canopy bloomed the wood
+    // into milk): light under `threshold_ev` stops above middle grey, as exposed, stays out of the chain. The soft
+    // knee is the usual quadratic over the stop below (Karis, Unreal Engine 4).
+    if params.first > 0.5 && params.threshold_ev > 0.0 {
+        let exposure = select(params.exposure, metered[0], params.auto_exposure > 0.5);
+        let l = dot(out, vec3<f32>(0.2126, 0.7152, 0.0722)) * exposure;
+        let threshold = 0.18 * exp2(params.threshold_ev);
+        let knee = threshold * 0.5;
+        let soft = clamp(l - threshold + knee, 0.0, 2.0 * knee);
+        let keep = max(soft * soft / (4.0 * knee + 1e-6), l - threshold) / max(l, 1e-6);
+        out *= keep;
+    }
+    return vec4<f32>(out, 1.0);
 }
 
 /// 9-tap tent upsample, added onto the destination mip.

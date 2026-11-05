@@ -35,6 +35,8 @@ struct GenParams {
     night: vec4<f32>,
     /// `.rgb` the glow's colour.
     night_tint: vec4<f32>,
+    /// x: 1 lays the sky light's cloud cube over the sky (and `overcast` is 0); yzw unused.
+    clouds: vec4<f32>,
 }
 
 /// The Undersun's night (`NightSky`, Rimeborn): no moon. A glow over the dome, brighter overhead and toward the hidden
@@ -180,6 +182,10 @@ fn fs_sky(in: VOut) -> @location(0) vec4<f32> {
 
 @group(0) @binding(1) var src_cube: texture_cube<f32>;
 @group(0) @binding(2) var src_samp: sampler;
+// The cloud layer the camera sees (clouds.wgsl `cloud_env`): in-scatter and transmittance per direction. Laid over
+// each sample below, so every prefiltered mip carries the deck and the ground's ambient, its specular and every GI
+// miss see it (Sunscar, 5 Nov 2026); mip 0 stays the bare sky the background draws under the real clouds.
+@group(0) @binding(6) var cloud_capture: texture_cube<f32>;
 
 const PI: f32 = 3.14159265359;
 const SAMPLE_COUNT: u32 = 64u;
@@ -237,7 +243,12 @@ fn fs_prefilter(in: VOut) -> @location(0) vec4<f32> {
         if n_dot_l > 0.0 {
             // Explicit LOD: this is inside a data-dependent branch, so
             // implicit-derivative sampling would be illegal in WGSL.
-            total  += textureSampleLevel(src_cube, src_samp, l, 0.0).rgb * n_dot_l;
+            var radiance = textureSampleLevel(src_cube, src_samp, l, 0.0).rgb;
+            if params.clouds.x > 0.5 {
+                let c = textureSampleLevel(cloud_capture, src_samp, l, 0.0);
+                radiance = radiance * c.a + c.rgb;
+            }
+            total  += radiance * n_dot_l;
             weight += n_dot_l;
         }
     }

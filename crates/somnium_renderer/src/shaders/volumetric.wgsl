@@ -4,6 +4,7 @@
 // resolver (`somnium_shader`) emits each module once, in this order, and
 // hoists every `enable` above everything.
 //!include "atmosphere.wgsl"
+//!include "froxel_depth.wgsl"
 
 // Somnium Engine — Froxel volumetrics: aerial perspective + fog (24U, 25I).
 //
@@ -93,6 +94,9 @@ struct VolumetricParams {
     fog_sky_occlusion: f32,
     /// Scale on the sky light the fog scatters (1 as the sky gives it), apart from the sun's and the lamps'.
     fog_skylight: f32,
+    /// World height where the fog stops, softly over `fog_top_softness` metres; at or under `fog_base_height`, none.
+    fog_top_height: f32,
+    fog_top_softness: f32,
 }
 
 @group(0) @binding(0) var<uniform> vol: VolumetricParams;
@@ -253,7 +257,12 @@ fn fog_density_at(world_y: f32) -> f32 {
         return vol.fog_density;
     }
     let h = max(world_y - vol.fog_base_height, 0.0);
-    return vol.fog_density * exp(-h / vol.fog_height_falloff);
+    var d = vol.fog_density * exp(-h / vol.fog_height_falloff);
+    // Valley fog: a flat top, the ridges standing clear above it.
+    if vol.fog_top_height > vol.fog_base_height {
+        d *= 1.0 - smoothstep(vol.fog_top_height, vol.fog_top_height + vol.fog_top_softness, world_y);
+    }
+    return d;
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -304,7 +313,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // negative extinction amplifies light and erases shafts.
             let frac = (f32(step) + clamp(sample_jitter, 0.001, 0.999))
                 / f32(VOL_STEPS_PER_SLICE);
-            let t = vol.max_distance * (f32(slice) + frac) / f32(slices);
+            let t = froxel_t((f32(slice) + frac) / f32(slices), vol.max_distance);
             let dt = t - prev_t;
             prev_t = t;
 
@@ -431,13 +440,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // identity across a move — reprojecting through world space is what
         // makes the history mean the same piece of air.
         if vol.history_valid > 0.5 {
-            let slice_t = vol.max_distance * (f32(slice) + 0.5) / f32(slices);
-            let centre_ws = vol.camera_pos + ray_dir * slice_t;
+            let slice_t = froxel_t((f32(slice) + 0.5) / f32(slices), vol.max_distance);
+            // Camera-relative, as `prev_view_proj` takes it (it carries the camera's step).
+            let centre_ws = ray_dir * slice_t;
             let prev_clip = vol.prev_view_proj * vec4<f32>(centre_ws, 1.0);
             if prev_clip.w > 0.0 {
                 let prev_ndc = prev_clip.xy / prev_clip.w;
                 let prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
-                let prev_w = slice_t / vol.max_distance;
+                let prev_w = froxel_w(slice_t, vol.max_distance);
                 if all(prev_uv >= vec2<f32>(0.0)) && all(prev_uv <= vec2<f32>(1.0))
                     && prev_w <= 1.0 {
                     let history = textureSampleLevel(

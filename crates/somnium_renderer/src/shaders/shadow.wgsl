@@ -16,6 +16,7 @@
 // lines, so a module that includes this one inherits it.
 enable wgpu_binding_array;
 //!include "wind.wgsl"
+//!include "terrain_morph.wgsl"
 
 struct Vertex {
     pos_x: f32, pos_y: f32, pos_z: f32,
@@ -138,7 +139,10 @@ fn vs_main(
     let instance  = instances[inst_idx];
     let index     = indices[instance.index_offset + v_idx];
     let vert      = vertices[instance.vertex_offset + index];
-    var world_pos = instance.model * vec4<f32>(vert.pos_x, vert.pos_y, vert.pos_z, 1.0);
+    // A terrain chunk casts the ground the camera sees, morph included (terrain_morph.wgsl).
+    let local     = terrain_morph(vec3<f32>(vert.pos_x, vert.pos_y, vert.pos_z), index, instance.vertex_offset,
+                                  instance._padding, instance.model, view.camera_pos);
+    var world_pos = instance.model * vec4<f32>(local, 1.0);
     // Terrain draws through its own pass; everything here may carry wind.
     let m = materials[instance.material_id];
     world_pos = vec4<f32>(world_pos.xyz + wind_offset(world_pos.xyz, instance.model[3].xyz, m.wind_bend,

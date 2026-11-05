@@ -8766,6 +8766,28 @@ impl<G: GameApp> Engine<G> {
                 pp
             });
         if let (Some(pp), Some(r)) = (settings, self.renderer.as_mut()) {
+            // The grading LUT: read when its path changes, kept until it does again.
+            let lut = pp.grade_lut.trim();
+            if r.grade_lut_source != lut {
+                r.grade_lut_source = lut.to_owned();
+                r.grade_lut_ready = false;
+                if !lut.is_empty() {
+                    let read = match self.config.project_root.as_ref() {
+                        Some(root) => resolved_source(root, lut),
+                        None => Ok(std::path::PathBuf::from(lut)),
+                    }
+                    .and_then(|path| std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display())))
+                    .and_then(|text| somnium_renderer::pass::postprocess::parse_cube(&text));
+                    match (read, self.render_ctx.as_ref()) {
+                        (Ok((size, texels)), Some(ctx)) => {
+                            r.set_grade_lut(ctx, size, &texels);
+                            r.grade_lut_ready = true;
+                        }
+                        (Err(e), _) => warn!("grading LUT {lut}: {e}"),
+                        _ => {}
+                    }
+                }
+            }
             // The player's graphics tier: gates and scales what the scene
             // authored, never enables what it left off (see `quality`).
             let budget = r.graphics_budget();
@@ -8775,6 +8797,12 @@ impl<G: GameApp> Engine<G> {
             // and the fallback if metering has not produced a reading yet.
             r.exposure = pp.exposure_multiplier();
             r.auto_exposure = pp.auto_exposure;
+            r.eye_adaptation = somnium_renderer::pass::auto_exposure::EyeAdaptation {
+                min_ev100: pp.exposure_min_ev.min(pp.exposure_max_ev),
+                max_ev100: pp.exposure_max_ev.max(pp.exposure_min_ev),
+                to_bright: pp.adapt_to_bright.max(0.0),
+                to_dark: pp.adapt_to_dark.max(0.0),
+            };
             // Adaptation is per second, so it needs the real frame time or the
             // eye adjusts at a rate that depends on frame rate.
             r.frame_delta_time = self.time.delta_time().as_secs_f32();
@@ -8834,6 +8862,7 @@ impl<G: GameApp> Engine<G> {
             r.gtao_pass.enabled = pp.gtao_enabled && budget.gtao && !retro;
             r.bloom_pass.enabled = pp.bloom_enabled;
             r.bloom_pass.intensity = pp.bloom_intensity;
+            r.bloom_pass.threshold_ev = pp.bloom_threshold.max(0.0);
             r.bloom_pass.lens_flare = pp.lens_flare.max(r.lens_flare_requested).max(0.0);
             r.dof_pass.enabled = pp.dof_enabled && budget.camera_effects && !retro;
             r.dof_pass.focus_distance = pp.dof_focus_distance;
@@ -8889,6 +8918,9 @@ impl<G: GameApp> Engine<G> {
                 .and_then(|state| state.fog_density)
                 .unwrap_or(pp.fog_density);
             r.volumetric_pass.fog.height_falloff = pp.fog_height_falloff;
+            r.volumetric_pass.fog.base_height = pp.fog_base_height;
+            r.volumetric_pass.fog.top_height = pp.fog_top_height;
+            r.volumetric_pass.fog.top_softness = pp.fog_top_softness.max(0.1);
             r.volumetric_pass.fog.asymmetry = pp.fog_asymmetry;
             r.volumetric_pass.fog.shafts = pp.light_shafts && budget.light_shafts;
             r.volumetric_pass.fog.shaft_intensity = pp.shaft_intensity;
@@ -8967,6 +8999,8 @@ impl<G: GameApp> Engine<G> {
                     table
                 }),
                 stylise: [pp.painterly.clamp(0.0, 1.0), pp.ink_lines.clamp(0.0, 1.0), 0.0, 0.0],
+                lut_strength: if r.grade_lut_ready { pp.grade_lut_strength.clamp(0.0, 1.0) } else { 0.0 },
+                low_light: pp.low_light_vision.clamp(0.0, 1.0),
             };
             r.authored_picture_shift = somnium_renderer::pass::postprocess::PictureShift {
                 kind: if pp.picture_shift <= 3 { pp.picture_shift } else { 0 },
@@ -9553,7 +9587,8 @@ impl<G: GameApp> Engine<G> {
                     r.remove_instance_batch(*id);
                 }
                 for (id, batch) in &changes.set {
-                    r.set_instance_batch(*id, batch);
+                    // Painted foliage as runs too (`foliage_batches.rs`): a forest is too many copies for a draw each.
+                    r.set_instanced_batch(*id, batch);
                 }
                 for (id, batch) in &self.cover_batches.set {
                     r.set_instanced_batch(*id, batch);

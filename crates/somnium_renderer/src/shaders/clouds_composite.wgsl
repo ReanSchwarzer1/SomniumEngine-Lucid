@@ -122,7 +122,8 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // clouds) has no cloud in front of it.
     let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
     let wp = comp.inv_view_proj * vec4<f32>(ndc, here, 1.0);
-    let to = wp.xyz / wp.w - comp.camera_pos;
+    // Camera-relative (`inv_view_proj` is, since 5 Nov 2026): already the offset from the eye.
+    let to = wp.xyz / wp.w;
     let distance = length(to);
     if distance <= layer_entry(comp.camera_pos, to / max(distance, 1e-6)) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
