@@ -328,6 +328,8 @@ pub struct SomniumRenderer {
     pub exposure: f32,
     /// Meter the frame and adapt exposure to it, rather than using `exposure`.
     pub auto_exposure: bool,
+    /// The range and rates the metered exposure adapts within.
+    pub eye_adaptation: crate::pass::auto_exposure::EyeAdaptation,
     /// Seconds since the previous frame, for exposure adaptation.
     pub frame_delta_time: f32,
     /// Stops applied on top of the metered exposure. Negative darkens.
@@ -345,6 +347,8 @@ pub struct SomniumRenderer {
     /// Its inverse goes to the shaders as `inv_view_proj_rel`, so a ray or point rebuilt from a pixel is
     /// camera-relative and keeps its precision kilometres out (`set_view`).
     view_proj_rel: glam::Mat4,
+    /// `view_proj_rel` without the jitter: TAA and velocity reproject with it (`set_view`).
+    view_proj_unjittered_rel: glam::Mat4,
     /// Current render target size, for computing the jitter offset.
     render_width: u32,
     render_height: u32,
@@ -1606,6 +1610,7 @@ impl SomniumRenderer {
             // not the other way round — so the value is inlined.
             exposure: 1.0 / (1.2 * 32768.0),
             auto_exposure: true,
+            eye_adaptation: Default::default(),
             frame_delta_time: 1.0 / 60.0,
             exposure_compensation: 0.0,
             grading: crate::pass::postprocess::Grading::default(),
@@ -1614,6 +1619,7 @@ impl SomniumRenderer {
             sun_angular_radius: 0.004_654,
             view_proj_unjittered: glam::Mat4::IDENTITY,
             view_proj_rel: glam::Mat4::IDENTITY,
+            view_proj_unjittered_rel: glam::Mat4::IDENTITY,
             render_width: ctx.config.width,
             render_height: ctx.config.height,
             tonemapper: 0,
@@ -2640,6 +2646,7 @@ impl SomniumRenderer {
         let mut rotation = view;
         rotation.w_axis = glam::Vec4::W;
         self.view_proj_rel = jittered * rotation;
+        self.view_proj_unjittered_rel = proj * rotation;
         self.camera_pos = camera_pos;
     }
 
@@ -6132,7 +6139,8 @@ impl SomniumRenderer {
                     &mut encoder,
                     tlas,
                     &self.vis_pass.depth_view,
-                    self.view_proj,
+                    self.view_proj_rel,
+                    self.camera_pos,
                     self.light_direction,
                     self.sun_angular_radius,
                     self.render_width,
@@ -6153,7 +6161,7 @@ impl SomniumRenderer {
                     tlas,
                     &self.vis_pass.depth_view,
                     &self.vis_pass.view,
-                    self.view_proj,
+                    self.view_proj_rel,
                     self.camera_pos,
                     self.light_direction,
                     self.light_color,
@@ -6214,7 +6222,7 @@ impl SomniumRenderer {
                     .expect("ReSTIR GI always allocates its radiance target"),
                 &self.ibl_pass.cube_view,
                 &self.ibl_pass.sampler,
-                self.view_proj,
+                self.view_proj_rel,
                 self.view_matrix,
                 self.proj_matrix,
                 traced_scene_revision,
@@ -6291,7 +6299,8 @@ impl SomniumRenderer {
             &ctx.queue,
             &mut encoder,
             &self.global_pool.lean_bind_group,
-            self.view_proj_unjittered,
+            self.view_proj_unjittered_rel,
+            self.camera_pos,
             self.render_width,
             self.render_height,
         );
@@ -6367,8 +6376,8 @@ impl SomniumRenderer {
         self.volumetric_pass.record(
             &mut encoder,
             &ctx.queue,
-            self.view_proj_unjittered.inverse(),
-            self.view_proj_unjittered,
+            self.view_proj_unjittered_rel.inverse(),
+            self.view_proj_unjittered_rel,
             self.view_matrix,
             self.camera_pos,
             self.light_direction,
@@ -6399,7 +6408,7 @@ impl SomniumRenderer {
         self.cloud_pass.record(
             &mut encoder,
             &ctx.queue,
-            self.view_proj_unjittered.inverse(),
+            self.view_proj_unjittered_rel.inverse(),
             self.camera_pos,
             self.light_direction,
             self.light_color,
@@ -6921,7 +6930,7 @@ impl SomniumRenderer {
                     &self.shadow_resources.atlas_depth_view,
                     &self.shadow_resources.comparison_sampler,
                     self.view_matrix,
-                    self.view_proj,
+                    self.view_proj_rel,
                     self.camera_pos,
                     rt_strength,
                     tlas_overflowed,
@@ -7095,7 +7104,8 @@ impl SomniumRenderer {
             .record(
                 &mut encoder,
                 &ctx.queue,
-                self.view_proj_unjittered,
+                self.view_proj_unjittered_rel,
+                self.camera_pos,
                 self.render_width,
                 self.render_height,
             )
@@ -7216,6 +7226,7 @@ impl SomniumRenderer {
                 self.render_height,
                 self.frame_delta_time,
                 self.exposure_compensation,
+                self.eye_adaptation,
             );
             self.profiler.end(&mut encoder);
         }
@@ -8944,6 +8955,38 @@ mod frame_instance_layout_tests {
             let want = (h.truncate() / h.w).x;
             // 5 cm at the 1 km far plane: 50 microradians, an eighth of a pixel (f32 divides near the far plane).
             assert!((f64::from(x_of(relative, n)) - want).abs() < 0.05, "{n}: {} against {want}", x_of(relative, n));
+        }
+    }
+
+    #[test]
+    fn taa_reprojects_camera_relative_kilometres_from_the_origin() {
+        // TaaPass and VelocityPass: rebuild through inverse(proj x rotation), project with last frame's
+        // proj x rotation moved by the camera's step. Checked against f64 at the street, a metre from the eye.
+        let forward = glam::Vec3::new(0.0, -0.5, -0.866).normalize();
+        let proj = glam::Mat4::perspective_rh(55f32.to_radians(), 16.0 / 9.0, 0.1, 1000.0);
+        let rel = |eye: glam::Vec3| {
+            let mut r = glam::Mat4::look_to_rh(eye, forward, glam::Vec3::Y);
+            r.w_axis = glam::Vec4::W;
+            proj * r
+        };
+        let prev_eye = glam::Vec3::new(-15408.0, 14.4, 358.0);
+        for eye in [prev_eye, glam::Vec3::new(-15408.03, 14.4, 357.95)] {
+            let prev = rel(prev_eye) * glam::Mat4::from_translation(eye - prev_eye);
+            let inv = rel(eye).inverse();
+            let exact_prev = proj.as_dmat4() * glam::DMat4::look_to_rh(prev_eye.as_dvec3(), forward.as_dvec3(), glam::DVec3::Y);
+            for i in 0..64 {
+                let ndc = glam::Vec4::new((1280.0 + i as f32) / 1280.0 - 1.0, -0.5, 0.9, 1.0);
+                let h = inv * ndc;
+                let p = h.truncate() / h.w;
+                let c = prev * p.extend(1.0);
+                let want = exact_prev * (eye.as_dvec3() + p.as_dvec3()).extend(1.0);
+                let (got, want) = (f64::from(c.x / c.w), want.x / want.w);
+                // A fiftieth of a pixel at 1280 half-width.
+                assert!((got - want).abs() < 1.5e-5, "{eye} pixel {i}: {got} against {want}");
+                if eye == prev_eye {
+                    assert!((got - f64::from(ndc.x)).abs() < 1.5e-5, "a still camera reprojects onto its own pixel");
+                }
+            }
         }
     }
 

@@ -145,7 +145,9 @@ pub struct VolumetricPass {
     history_view: wgpu::TextureView,
     grain_view: wgpu::TextureView,
     grain_enabled: bool,
+    /// Last frame's camera-relative view-projection and its camera (`record`).
     prev_view_proj: glam::Mat4,
+    prev_camera: glam::Vec3,
     history_valid: bool,
     frame: u32,
     last_settings: Option<[u32; 9]>,
@@ -344,6 +346,7 @@ impl VolumetricPass {
             grain_view: grain_view.clone(),
             grain_enabled: crate::pass::grain::enabled_by_default("SOMNIUM_DREAMS_GRAIN"),
             prev_view_proj: glam::Mat4::IDENTITY,
+            prev_camera: glam::Vec3::ZERO,
             history_valid: false,
             frame: 0,
             last_settings: None,
@@ -449,6 +452,8 @@ impl VolumetricPass {
     }
 
     /// `view_proj` is the forward matrix, kept for next frame's reprojection.
+    /// `inv_view_proj` and `view_proj` are camera-relative (projection x the view's rotation alone): the absolute
+    /// inverse snaps every froxel ray to 2^-7 in ndc 13 km from the origin (Sunscar, 5 Nov 2026).
     pub fn record(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -508,7 +513,10 @@ impl VolumetricPass {
                 } else {
                     1.0
                 },
-                prev_view_proj: self.prev_view_proj.to_cols_array_2d(),
+                // Moved by the camera's step (small, exact in f32), so it takes this frame's camera-relative points.
+                prev_view_proj: (self.prev_view_proj
+                    * glam::Mat4::from_translation(camera_pos - self.prev_camera))
+                .to_cols_array_2d(),
                 history_valid: f32::from(u8::from(self.history_valid)),
                 // A low-discrepancy offset rather than a random one: over any
                 // short window the samples should spread evenly through the
@@ -549,6 +557,7 @@ impl VolumetricPass {
         );
 
         self.prev_view_proj = view_proj;
+        self.prev_camera = camera_pos;
         self.history_valid = true;
         self.frame = self.frame.wrapping_add(1);
     }

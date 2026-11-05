@@ -21,6 +21,7 @@ enable wgpu_ray_query;
 // rather than from a filter kernel chosen to look about right.
 
 struct RestirParams {
+    /// Camera-relative: inverse(jittered projection x rotation alone). Add `camera_pos` for world space.
     inv_view_proj: mat4x4<f32>,
     /// Direction toward the sun, world space.
     sun_direction: vec3<f32>,
@@ -30,6 +31,8 @@ struct RestirParams {
     frame: u32,
     /// Zero when history should be ignored.
     history_valid: f32,
+    camera_pos: vec3<f32>,
+    _pad: f32,
 }
 
 /// A reservoir over light samples.
@@ -169,7 +172,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = (vec2<f32>(coord) + 0.5) * params.inv_resolution;
     let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
     let world = params.inv_view_proj * ndc;
-    let origin = world.xyz / world.w;
+    let rel = world.xyz / world.w;
+    let origin = rel + params.camera_pos;
 
     // World size of one pixel at this depth: reconstruct the neighbour and
     // measure. That is the scale of both the reconstruction error and of how
@@ -179,7 +183,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv_dx = (vec2<f32>(coord) + vec2<f32>(1.5, 0.5)) * params.inv_resolution;
     let ndc_dx = vec4<f32>(uv_dx.x * 2.0 - 1.0, 1.0 - uv_dx.y * 2.0, depth, 1.0);
     let world_dx = params.inv_view_proj * ndc_dx;
-    let footprint = length(world_dx.xyz / world_dx.w - origin);
+    let footprint = length(world_dx.xyz / world_dx.w - rel);
     let ray_t_min = max(0.05, footprint * RAY_BIAS_FOOTPRINTS);
 
     var seed = index * 9781u + params.frame * 6271u;

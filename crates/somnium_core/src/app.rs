@@ -8719,6 +8719,12 @@ impl<G: GameApp> Engine<G> {
             // and the fallback if metering has not produced a reading yet.
             r.exposure = pp.exposure_multiplier();
             r.auto_exposure = pp.auto_exposure;
+            r.eye_adaptation = somnium_renderer::pass::auto_exposure::EyeAdaptation {
+                min_ev100: pp.exposure_min_ev.min(pp.exposure_max_ev),
+                max_ev100: pp.exposure_max_ev.max(pp.exposure_min_ev),
+                to_bright: pp.adapt_to_bright.max(0.0),
+                to_dark: pp.adapt_to_dark.max(0.0),
+            };
             // Adaptation is per second, so it needs the real frame time or the
             // eye adjusts at a rate that depends on frame rate.
             r.frame_delta_time = self.time.delta_time().as_secs_f32();
