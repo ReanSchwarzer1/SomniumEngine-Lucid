@@ -218,8 +218,12 @@ fn dual_lobe_scaled(cos_theta: f32, k: f32) -> f32 {
 /// inside the cloud reaches its body and base. Single scattering alone left an overcast deck's base near black
 /// where real cloud is mid-grey (Sunscar, 6 Nov 2026). The first octave is the old term exactly.
 const CLOUD_MS_OCTAVES: i32 = 3;
-/// Weight of the diffusion limit below (1 the two-stream estimate as it stands).
-const CLOUD_DIFFUSE: f32 = 0.5;
+/// Weight of the diffusion term (`cloud_diffusion`): 1 the two-stream estimate as it stands.
+const CLOUD_DIFFUSE: f32 = 1.0;
+/// What a cloud droplet scatters of the light it intercepts: water absorbs almost none.
+const CLOUD_ALBEDO: f32 = 0.95;
+/// The clear sky's radiance per lux of sun, as the engine's IBL scale has it (`ibl.rs`: ~8000 cd/m2 under 100 000 lux).
+const CLOUD_SKY_PER_LUX: f32 = 0.08;
 
 fn sun_octaves(optical_depth: f32, cos_theta: f32) -> f32 {
     var energy = 0.0;
@@ -229,13 +233,14 @@ fn sun_octaves(optical_depth: f32, cos_theta: f32) -> f32 {
         energy += a * beer_powder(optical_depth * a) * phase;
         a *= 0.5;
     }
-    // The diffusion limit. Deep in a thick cloud, light that has scattered many times falls off as
-    // 1 / (1 + 0.75 tau (1 - g)) (two-stream; Bohren 1987), not exponentially as every octave above does, which is
-    // why an overcast deck's base is grey and not black. Isotropic, since such light has forgotten its direction,
-    // and only where the light has come through cloud at all (1 - e^-tau).
-    energy += CLOUD_DIFFUSE * (1.0 - exp(-optical_depth)) / (1.0 + 0.75 * optical_depth * (1.0 - 0.85))
-        / (4.0 * CLOUD_PI);
     return energy;
+}
+
+/// The diffusion limit: deep in a thick cloud, light that has scattered many times falls off as
+/// 1 / (1 + 0.75 tau (1 - g)) (two-stream; Bohren 1987), not exponentially as every octave does. It is why a
+/// cloud is white from every side and an overcast deck's base is grey, not black.
+fn cloud_diffusion(optical_depth: f32) -> f32 {
+    return 1.0 / (1.0 + 0.75 * optical_depth * (1.0 - 0.85));
 }
 
 /// Beer's law with Schneider's powder term.
@@ -382,7 +387,6 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32) -> CloudRay {
 
     let sun = normalize(cp.sun_direction);
     let cos_theta = dot(ray_dir, sun);
-    let phase = dual_lobe(cos_theta);
 
     // Ambient comes from the same multiscatter LUT the sky uses, so a cloud at
     // dusk is lit by the dusk sky rather than by a constant.
@@ -393,6 +397,14 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32) -> CloudRay {
         sun_transmittance = sample_transmittance(transmittance_lut, lut_sampler, r, sun.y);
         ambient_sky = sample_multiscatter(multiscatter_lut, lut_sampler, r, sun.y);
     }
+    // Light on the cloud, in physical units (Sunscar, 6 Nov 2026). The sun's illuminance through the air, and the
+    // clear sky's fill: its colour from the multiscatter LUT, its level the engine's per-lux sky radiance. Before,
+    // the fill had no sun in it (it came to a fraction of a nit) and the march divided by extinction without the
+    // scattering coefficient, so a deck came out ~1/extinction (17x at density 1.15) too bright, the sky light
+    // that captures it lit the land 2 stops over, and the clear sky between clouds read navy.
+    let luma = vec3<f32>(0.2126, 0.7152, 0.0722);
+    let sun_e = sun_transmittance * cp.sun_illuminance;
+    let sky_fill = ambient_sky / max(dot(ambient_sky, luma), 1e-6) * (CLOUD_SKY_PER_LUX * dot(sun_e, luma));
 
     var scatter = vec3<f32>(0.0);
     var transmittance = 1.0;
@@ -443,14 +455,18 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32) -> CloudRay {
         let optical_depth = light_march(p, sun) * 4.0;
         let sun_energy = sun_octaves(optical_depth, cos_theta);
 
-        let luminance = sun_transmittance * cp.sun_illuminance * sun_energy
-            + ambient_sky * cp.ambient * (0.35 + 0.65 * density);
+        // Radiance arriving at the sample: the sun through its octaves, the sun again as diffused light (Lambertian,
+        // half-lit on average, and only where the cloud is dense enough to diffuse: wisps stay single-scatter), and
+        // the sky's fill, which reaches inside as diffused light does.
+        let diffusion = cloud_diffusion(optical_depth);
+        let thick = 1.0 - exp(-4.0 * density);
+        let luminance = sun_e * (sun_energy + CLOUD_DIFFUSE * thick * diffusion * 0.5 / CLOUD_PI)
+            + sky_fill * cp.ambient * diffusion;
 
         let step_transmittance = exp(-extinction * step_len);
-        // Analytic segment integration, as the froxel volume does: the closed
-        // form stops a thin medium being under-counted at low step counts.
-        let integrated = (luminance - luminance * step_transmittance)
-            / max(extinction, 1e-6);
+        // Analytic segment integration with the scattering coefficient in (sigma_s = albedo sigma_t): what the
+        // segment scatters toward the eye is albedo x radiance x its opacity.
+        let integrated = CLOUD_ALBEDO * luminance * (1.0 - step_transmittance);
         scatter += transmittance * integrated;
 
         let weight = transmittance * (1.0 - step_transmittance);

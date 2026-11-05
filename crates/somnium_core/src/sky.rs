@@ -64,9 +64,7 @@ pub struct SkyComponent {
     pub shape_scale: f32,
     /// Ambient contribution from the sky's own multiscatter term.
     pub ambient: f32,
-    /// Scale on the light the clouds scatter (default 1). The march takes in-scatter over extinction without the
-    /// scattering coefficient, so its clouds come out near 1 / extinction (about 17x at density 1.15) brighter than
-    /// a physical deck, and the clear sky between them reads near black; below 1 brings them back toward the sky.
+    /// Scale on the light the clouds scatter (default 1: physical, as the sky and the sun are).
     pub brightness: f32,
     /// Henyey–Greenstein forward lobe — the silver lining.
     pub phase_forward: f32,
