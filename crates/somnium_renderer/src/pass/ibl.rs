@@ -78,9 +78,9 @@ pub struct IblPass {
     sky_pipeline: wgpu::RenderPipeline,
     prefilter_pipeline: wgpu::RenderPipeline,
     sky_bind_group: wgpu::BindGroup,
-    /// Kept to rebuild the sky's bind group when the clouds' capture arrives (`set_cloud_capture`).
-    sky_bgl: wgpu::BindGroupLayout,
-    atmosphere_views: (wgpu::TextureView, wgpu::TextureView, wgpu::Sampler),
+    /// Kept to rebuild the prefilter's bind group when the clouds' capture arrives (`set_cloud_capture`).
+    prefilter_bgl: wgpu::BindGroupLayout,
+    mip0_view: wgpu::TextureView,
     last_clouds: Option<u64>,
     prefilter_bind_group: wgpu::BindGroup,
     params_buffer: wgpu::Buffer,
@@ -193,16 +193,6 @@ impl IblPass {
                 lut_entry(3),
                 lut_entry(4),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 6,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2Array,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
                     binding: 5,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
@@ -241,10 +231,21 @@ impl IblPass {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // The clouds' capture (clouds.wgsl `cloud_env`), laid over every sample the prefilter takes.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::Cube,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
-        // Until the clouds' capture is set: six 1x1 layers the sky never reads (`clouds.x` 0).
+        // Until the clouds' capture is set: a 1x1 cube the prefilter never reads (`clouds.x` 0).
         let no_clouds = device
             .create_texture(&wgpu::TextureDescriptor {
                 label: Some("IBL No Cloud Capture"),
@@ -257,34 +258,23 @@ impl IblPass {
                 view_formats: &[],
             })
             .create_view(&wgpu::TextureViewDescriptor {
-                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                dimension: Some(wgpu::TextureViewDimension::Cube),
                 ..Default::default()
             });
-        let atmosphere_views = (
-            atmosphere.transmittance_view().clone(),
-            atmosphere.multiscatter_view().clone(),
-            atmosphere.sampler().clone(),
-        );
-        let sky_bind_group = Self::sky_bind_group(device, &sky_bgl, &params_buffer, &atmosphere_views, &no_clouds);
-
-        let prefilter_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("IBL Prefilter BG"),
-            layout: &prefilter_bgl,
+        let entry = |binding, resource| wgpu::BindGroupEntry { binding, resource };
+        let sky_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("IBL Sky BG"),
+            layout: &sky_bgl,
             entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: params_buffer.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&mip0_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
-                },
+                entry(0, params_buffer.as_entire_binding()),
+                entry(3, wgpu::BindingResource::TextureView(atmosphere.transmittance_view())),
+                entry(4, wgpu::BindingResource::TextureView(atmosphere.multiscatter_view())),
+                entry(5, wgpu::BindingResource::Sampler(atmosphere.sampler())),
             ],
         });
+
+        let prefilter_bind_group =
+            Self::prefilter_bind_group(device, &prefilter_bgl, &params_buffer, &mip0_view, &sampler, &no_clouds);
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("IBL Gen Shader"),
@@ -338,8 +328,8 @@ impl IblPass {
             sky_pipeline,
             prefilter_pipeline,
             sky_bind_group,
-            sky_bgl,
-            atmosphere_views,
+            prefilter_bgl,
+            mip0_view,
             last_clouds: None,
             prefilter_bind_group,
             params_buffer,
@@ -352,32 +342,39 @@ impl IblPass {
     /// Rebuild the cubemap if the sun changed (or it has never been built).
     ///
     /// Returns `true` when work was done.
-    fn sky_bind_group(
+    fn prefilter_bind_group(
         device: &wgpu::Device,
         layout: &wgpu::BindGroupLayout,
         params: &wgpu::Buffer,
-        atmosphere: &(wgpu::TextureView, wgpu::TextureView, wgpu::Sampler),
+        mip0: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
         clouds: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         let entry = |binding, resource| wgpu::BindGroupEntry { binding, resource };
         device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("IBL Sky BG"),
+            label: Some("IBL Prefilter BG"),
             layout,
             entries: &[
                 entry(0, params.as_entire_binding()),
-                entry(3, wgpu::BindingResource::TextureView(&atmosphere.0)),
-                entry(4, wgpu::BindingResource::TextureView(&atmosphere.1)),
-                entry(5, wgpu::BindingResource::Sampler(&atmosphere.2)),
+                entry(1, wgpu::BindingResource::TextureView(mip0)),
+                entry(2, wgpu::BindingResource::Sampler(sampler)),
                 entry(6, wgpu::BindingResource::TextureView(clouds)),
             ],
         })
     }
 
-    /// The clouds' capture of the sky (`CloudPass::sky_light_view`), laid over the sky whenever
-    /// `generate_if_needed` is given a capture.
+    /// The clouds' capture of the sky as a cube (`CloudPass::sky_light_view`), laid over every prefiltered mip
+    /// whenever `generate_if_needed` is given a capture. Mip 0 stays the bare sky: the background and mirrors draw
+    /// it under the full-resolution clouds, which the 64^2 capture would show through as blocks.
     pub fn set_cloud_capture(&mut self, device: &wgpu::Device, clouds: &wgpu::TextureView) {
-        self.sky_bind_group =
-            Self::sky_bind_group(device, &self.sky_bgl, &self.params_buffer, &self.atmosphere_views, clouds);
+        self.prefilter_bind_group = Self::prefilter_bind_group(
+            device,
+            &self.prefilter_bgl,
+            &self.params_buffer,
+            &self.mip0_view,
+            &self.sampler,
+            clouds,
+        );
         self.last_sun = None;
     }
 

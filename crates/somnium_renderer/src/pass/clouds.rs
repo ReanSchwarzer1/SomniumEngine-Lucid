@@ -731,7 +731,10 @@ impl CloudPass {
             ..Default::default()
         };
         let env_storage_view = env_texture.create_view(&env_array);
-        let env_view = env_texture.create_view(&env_array);
+        let env_view = env_texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::Cube),
+            ..Default::default()
+        });
         let shadow_pipeline = compute("Cloud Shadow", &march_pl, "cloud_shadow");
 
         // ── History ──────────────────────────────────────────────────────────

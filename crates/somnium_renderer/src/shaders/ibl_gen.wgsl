@@ -92,8 +92,6 @@ fn undersun_night(dir: vec3<f32>, sun_dir: vec3<f32>) -> vec3<f32> {
 @group(0) @binding(3) var transmittance_lut: texture_2d<f32>;
 @group(0) @binding(4) var multiscatter_lut:  texture_2d<f32>;
 @group(0) @binding(5) var atmos_sampler:     sampler;
-// The cloud layer the camera sees, per cube texel (clouds.wgsl `cloud_env`): in-scatter and transmittance.
-@group(0) @binding(6) var cloud_capture:     texture_2d_array<f32>;
 
 struct VOut {
     @builtin(position) clip: vec4<f32>,
@@ -177,20 +175,17 @@ fn sky(ray_dir: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_sky(in: VOut) -> @location(0) vec4<f32> {
-    var radiance = sky(cube_dir(params.face, in.uv));
-    // The clouds over it, as the camera sees them: what the ground's ambient, its specular and every GI miss read
-    // (Sunscar, 5 Nov 2026). Off, the overcast dome in `sky` stands in.
-    if params.clouds.x > 0.5 {
-        let c = textureSampleLevel(cloud_capture, atmos_sampler, in.uv, i32(params.face), 0.0);
-        radiance = radiance * c.a + c.rgb;
-    }
-    return vec4(min(radiance, vec3<f32>(60000.0)), 1.0);
+    return vec4(sky(cube_dir(params.face, in.uv)), 1.0);
 }
 
 // ─── Prefilter ───────────────────────────────────────────────────────────────
 
 @group(0) @binding(1) var src_cube: texture_cube<f32>;
 @group(0) @binding(2) var src_samp: sampler;
+// The cloud layer the camera sees (clouds.wgsl `cloud_env`): in-scatter and transmittance per direction. Laid over
+// each sample below, so every prefiltered mip carries the deck and the ground's ambient, its specular and every GI
+// miss see it (Sunscar, 5 Nov 2026); mip 0 stays the bare sky the background draws under the real clouds.
+@group(0) @binding(6) var cloud_capture: texture_cube<f32>;
 
 const PI: f32 = 3.14159265359;
 const SAMPLE_COUNT: u32 = 64u;
@@ -248,7 +243,12 @@ fn fs_prefilter(in: VOut) -> @location(0) vec4<f32> {
         if n_dot_l > 0.0 {
             // Explicit LOD: this is inside a data-dependent branch, so
             // implicit-derivative sampling would be illegal in WGSL.
-            total  += textureSampleLevel(src_cube, src_samp, l, 0.0).rgb * n_dot_l;
+            var radiance = textureSampleLevel(src_cube, src_samp, l, 0.0).rgb;
+            if params.clouds.x > 0.5 {
+                let c = textureSampleLevel(cloud_capture, src_samp, l, 0.0);
+                radiance = radiance * c.a + c.rgb;
+            }
+            total  += radiance * n_dot_l;
             weight += n_dot_l;
         }
     }
