@@ -1336,6 +1336,8 @@ pub struct Engine<G: GameApp> {
     precipitation_entity: Option<somnium_ecs::Entity>,
     /// Title-bar close requested a shutdown.
     ui_wants_exit: bool,
+    /// The author answered "Save changes?" on the way out, so closing no longer asks.
+    quit_confirmed: bool,
     /// Map load completed this frame; game code seeds fly-cam / boat after ECS reset.
     pending_map_load: Option<crate::MapLoadResult>,
     // ── Phase 16-C: scripting ────────────────────────────────────────────
@@ -1957,6 +1959,7 @@ impl<G: GameApp + 'static> Engine<G> {
             weather_state: crate::weather::WeatherState::default(),
             precipitation_entity: None,
             ui_wants_exit: false,
+            quit_confirmed: false,
             pending_map_load: None,
             scripts: crate::script_host::ScriptHost::default(),
             script_input: crate::script_input::ScriptInputTracker::new(),
@@ -5788,7 +5791,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             );
             self.game.on_render(&mut ctx);
 
-            if ctx.should_exit {
+            if ctx.should_exit && self.may_quit() {
                 self.initiate_shutdown(event_loop);
                 return;
             }
@@ -6087,7 +6090,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 self.game.on_map_loaded(&mut ctx, &result);
             }
         }
-        if self.ui_wants_exit {
+        if std::mem::take(&mut self.ui_wants_exit) && self.may_quit() {
             self.initiate_shutdown(event_loop);
             return;
         }
@@ -6932,14 +6935,16 @@ impl<G: GameApp> Engine<G> {
         self.game.on_event(&mut ctx, &engine_event);
         let speed_request = ctx.camera_speed_request;
 
-        if ctx.should_exit {
+        if ctx.should_exit && self.may_quit() {
             self.initiate_shutdown(event_loop);
             return;
         }
 
         if matches!(engine_event, EngineEvent::WindowCloseRequested) {
             self.floating_layout.flush(true);
-            self.initiate_shutdown(event_loop);
+            if self.may_quit() {
+                self.initiate_shutdown(event_loop);
+            }
         }
 
         // Phase 20B: apply a camera-speed change requested by game code
@@ -6951,6 +6956,31 @@ impl<G: GameApp> Engine<G> {
                 ui.update_camera_speed(norm, speed);
             }
         }
+    }
+
+    /// Whether the editor may close now. With unsaved changes it asks "Save changes?" first and says no; the answer
+    /// comes back as `EditorEvent::Quit`. A game run as a game, an automated capture run (`SOMNIUM_CAPTURE_QUIT`) and
+    /// an answered question close at once.
+    fn may_quit(&mut self) -> bool {
+        if self.config.player_mode
+            || self.quit_confirmed
+            || !self.scene_dirty
+            || std::env::var_os("SOMNIUM_CAPTURE_QUIT").is_some()
+        {
+            return true;
+        }
+        if self.ui_manager.is_none() {
+            return true;
+        }
+        if self.play_session_active {
+            // Back to the editor first, so the question is on screen.
+            self.handle_editor_event(EditorEvent::StopSimulation);
+        }
+        if let Some(ui) = self.ui_manager.as_mut() {
+            ui.set_scene_dirty(true);
+            ui.prompt_unsaved_quit();
+        }
+        false
     }
 
     fn initiate_shutdown(&mut self, event_loop: &ActiveEventLoop) {
@@ -13040,6 +13070,18 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::CloseWindow => {
+                self.ui_wants_exit = true;
+            }
+
+            EditorEvent::Quit { after_save } => {
+                if after_save {
+                    self.save_scene_edits();
+                    if self.scene_dirty {
+                        self.toast("Not saved, so the editor stays open");
+                        return;
+                    }
+                }
+                self.quit_confirmed = true;
                 self.ui_wants_exit = true;
             }
 
