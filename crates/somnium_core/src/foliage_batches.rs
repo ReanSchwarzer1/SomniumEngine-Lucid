@@ -161,6 +161,9 @@ struct Cells {
     /// Per cell, `(kind, start, end)` into `order`.
     cells: Vec<Vec<(u16, u32, u32)>>,
     order: Vec<u32>,
+    /// The snapped camera, the kinds' signatures folded, and the copies held, of the last frame that built every
+    /// batch it wanted: a frame that finds the same has nothing to change, and keeps the batches without walking them.
+    steady: Option<(Vec2, u64, u32)>,
 }
 
 impl Cells {
@@ -226,6 +229,8 @@ pub(crate) struct FoliageBatches {
     live: std::collections::HashMap<(u32, u32, u16), (u64, u64, u32)>,
     frame: u64,
     seen: Vec<u32>,
+    /// Terrains whose frame changed nothing ([`Cells::steady`]): their batches are kept as they are.
+    steady: Vec<u32>,
     pub changes: Changes,
 }
 
@@ -265,6 +270,7 @@ impl FoliageBatches {
     pub(crate) fn begin_frame(&mut self) {
         self.frame += 1;
         self.seen.clear();
+        self.steady.clear();
         self.changes = Changes::default();
     }
 
@@ -315,6 +321,19 @@ impl FoliageBatches {
             return 0;
         }
         let centre = (Vec2::new(camera_local.x, camera_local.z) / BAND_SNAP).round() * BAND_SNAP;
+        // At 600,000 trees, walking the copies in reach to find nothing changed cost 3-4 ms a frame.
+        let mut all = 0xcbf2_9ce4_8422_2325u64;
+        for (h, r) in signature.iter().zip(&reach) {
+            mix(&mut all, *h as u32);
+            mix(&mut all, (*h >> 32) as u32);
+            mix(&mut all, r.to_bits());
+        }
+        if let Some((c, a, held)) = cells.steady {
+            if c == centre && a == all {
+                self.steady.push(terrain);
+                return held;
+            }
+        }
         let span = farthest + KEEP;
         let cell_range = |v: f32, lo: f32, n: i32| (((v - lo) / CELL).floor() as i32).clamp(0, n - 1);
         let (x0, x1, z0, z1) = if span.is_finite() {
@@ -349,6 +368,7 @@ impl FoliageBatches {
         wanted.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut builds = 0;
         let mut copies = 0u32;
+        let mut deferred = false;
         for (gap, far_corner, cell, kind, start, end) in wanted {
             let Some(Some(groups)) = grouped.get(usize::from(kind)) else { continue };
             let members = &cells.order[start as usize..end as usize];
@@ -388,9 +408,13 @@ impl FoliageBatches {
                     Some((old, _, n)) if builds >= BUILDS_PER_FRAME => {
                         self.live.insert(key, (old, self.frame, n));
                         copies += n;
+                        deferred = true;
                         continue;
                     }
-                    None if builds >= BUILDS_PER_FRAME => continue,
+                    None if builds >= BUILDS_PER_FRAME => {
+                        deferred = true;
+                        continue;
+                    }
                     _ => {
                         builds += 1;
                         let placements: Vec<Mat4> = members
@@ -419,6 +443,9 @@ impl FoliageBatches {
                 copies += held;
             }
         }
+        if let Some(cells) = self.cells.get_mut(&terrain) {
+            cells.steady = (!deferred).then_some((centre, all, copies));
+        }
         copies
     }
 
@@ -427,8 +454,9 @@ impl FoliageBatches {
     pub(crate) fn end_frame(&mut self) {
         let frame = self.frame;
         let remove = &mut self.changes.remove;
+        let steady = &self.steady;
         self.live.retain(|&(terrain, cell, kind), &mut (_, last, _)| {
-            let keep = last == frame;
+            let keep = last == frame || steady.contains(&terrain);
             if !keep {
                 remove.push(batch_id(terrain, cell, kind));
             }
@@ -589,6 +617,31 @@ mod tests {
         batches.begin_frame();
         batches.end_frame();
         assert_eq!(batches.changes.remove.len(), first);
+    }
+
+    #[test]
+    fn a_frame_that_changes_nothing_keeps_every_batch_without_walking_them() {
+        let instances = field();
+        let parts = parts_for(50.0, 50.0);
+        let mut batches = FoliageBatches::default();
+        batches.begin_frame();
+        let first = batches.terrain(1, 1, &instances, Mat4::IDENTITY, glam::Vec3::ZERO, &parts);
+        batches.end_frame();
+        let live = batches.live.len();
+        assert!(first > 0 && live > 0);
+        // The same snapped camera: the steady path, the same copies, every batch kept, nothing set or removed.
+        batches.begin_frame();
+        let again = batches.terrain(1, 1, &instances, Mat4::IDENTITY, glam::Vec3::new(3.0, 0.0, -2.0), &parts);
+        assert_eq!(batches.steady, vec![1]);
+        batches.end_frame();
+        assert_eq!(again, first);
+        assert_eq!(batches.live.len(), live);
+        assert!(batches.changes.set.is_empty() && batches.changes.remove.is_empty());
+        // A step past the snap: walked again.
+        batches.begin_frame();
+        batches.terrain(1, 1, &instances, Mat4::IDENTITY, glam::Vec3::new(40.0, 0.0, 0.0), &parts);
+        assert!(batches.steady.is_empty());
+        batches.end_frame();
     }
 
     #[test]
