@@ -125,12 +125,12 @@ pub fn offset(
     let mut out = Vec3::new(dir.x * lean, 0.0, dir.y * lean);
     // A bent stem keeps its length, so its tip drops as it leans.
     out.y = -0.5 * lean * lean / h.max(0.25);
-    let q = p * 1.7;
+    let q = (p - pivot) * 1.7;
     let f = flutter * drag * (h * 2.0).clamp(0.0, 1.0) * (0.5 + 0.5 * gust);
     out += Vec3::new(
         (time * 5.3 + q.x + q.y * 0.7 + phase).sin(),
-        0.6 * (time * 6.7 + q.z * 1.3 + q.x * 0.5).sin(),
-        (time * 4.9 + q.y + q.z).sin(),
+        0.6 * (time * 6.7 + q.z * 1.3 + q.x * 0.5 + phase * 1.7).sin(),
+        (time * 4.9 + q.y + q.z + phase * 2.3).sin(),
     ) * f;
     out * (fade * wind[2])
 }
@@ -205,5 +205,23 @@ mod tests {
         assert!((mean_step - std::f32::consts::TAU / 3.0).abs() < 0.35, "{mean_step}");
         assert!(phases.iter().all(|p| (0.0..std::f32::consts::TAU).contains(p)));
         assert_eq!(phase(Vec3::new(5.0, 0.0, 7.0)), phase(Vec3::new(5.0, 9.0, 7.0)), "height is no part of it");
+    }
+
+    #[test]
+    fn tufts_in_a_line_along_x_flutter_out_of_step() {
+        // Flutter alone (no bend), a tuft's tip 0.4 m up, tufts 0.3 m apart along x at one z, 13.9 km out: their sideways
+        // (z) flutter must not move together, or the field shows rows along x.
+        let wind = [0.0, 4.0, 1.0, DEFAULT_FADE_DISTANCE];
+        let z_at = |i: usize, t: f32| {
+            let pivot = Vec3::new(-13860.0 + i as f32 * 0.3, 15.0, 360.0);
+            offset(pivot + Vec3::Y * 0.4, pivot, 0.0, 0.2, t, wind, pivot).z
+        };
+        let (a, b): (Vec<f32>, Vec<f32>) = (0..300).map(|i| (z_at(i, 1.0), z_at(i + 1, 1.0))).unzip();
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+        let (ma, mb) = (mean(&a), mean(&b));
+        let cov: f32 = a.iter().zip(&b).map(|(x, y)| (x - ma) * (y - mb)).sum::<f32>();
+        let var = |v: &[f32], m: f32| v.iter().map(|x| (x - m) * (x - m)).sum::<f32>().sqrt();
+        let corr = cov / (var(&a, ma) * var(&b, mb));
+        assert!(corr.abs() < 0.3, "neighbours' sideways flutter correlate {corr}");
     }
 }

@@ -154,9 +154,12 @@ impl GroundCover {
             self.terrains.remove(&terrain_id);
             return;
         }
+        let started = std::time::Instant::now();
         let cover = self.terrains.entry(terrain_id).or_default();
         let revision = terrain.edit_revision();
-        if cover.revision != revision || cover.area != area || cover.seed != seed_key || cover.epoch == 0 {
+        let reset = cover.revision != revision || cover.area != area || cover.seed != seed_key || cover.epoch == 0;
+        let why = (cover.revision != revision, cover.area != area, cover.seed != seed_key);
+        if reset {
             static EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
             let epoch = EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             *cover = TerrainCover { epoch, revision, seed: seed_key, area, ..TerrainCover::default() };
@@ -196,6 +199,7 @@ impl GroundCover {
             take += 1;
         }
         let jobs = &wanted[..take];
+        let planned = started.elapsed();
         let run = |chunk: &[(f32, usize, i32, i32)]| -> Vec<((u16, i32, i32), Vec<Cover>)> {
             chunk
                 .iter()
@@ -217,9 +221,32 @@ impl GroundCover {
             })
         };
         changed |= !made.is_empty();
+        let copies: usize = made.iter().map(|(_, c)| c.len()).sum();
+        let made_cells = made.len();
         cover.cells.extend(made);
         if changed {
             cover.flat_stale = true;
+        }
+        // A slow frame says where it went (the tile-arrival stalls, 31 Oct - 5 Nov).
+        let total = started.elapsed();
+        if total.as_secs_f32() > 0.02 {
+            tracing::warn!(
+                terrain_id,
+                reset,
+                revision_changed = why.0,
+                area_changed = why.1,
+                seed_changed = why.2,
+                kinds = kinds.len(),
+                wanted = wanted.len(),
+                jobs = take,
+                made_cells,
+                copies,
+                cells = cover.cells.len(),
+                threads,
+                plan_ms = planned.as_secs_f32() * 1000.0,
+                total_ms = total.as_secs_f32() * 1000.0,
+                "slow cover generation"
+            );
         }
     }
 
