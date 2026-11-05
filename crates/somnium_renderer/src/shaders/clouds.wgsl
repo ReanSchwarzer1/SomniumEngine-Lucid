@@ -3,6 +3,7 @@
 // resolver (`somnium_shader`) emits each module once, in this order, and
 // hoists every `enable` above everything.
 //!include "atmosphere.wgsl"
+//!include "froxel_depth.wgsl"
 
 // Somnium Engine — Phase CONTROL-M: the volumetric cloud march.
 //
@@ -216,6 +217,8 @@ fn dual_lobe_scaled(cos_theta: f32, k: f32) -> f32 {
 /// inside the cloud reaches its body and base. Single scattering alone left an overcast deck's base near black
 /// where real cloud is mid-grey (Sunscar, 6 Nov 2026). The first octave is the old term exactly.
 const CLOUD_MS_OCTAVES: i32 = 3;
+/// Weight of the diffusion limit below (1 the two-stream estimate as it stands).
+const CLOUD_DIFFUSE: f32 = 0.5;
 
 fn sun_octaves(optical_depth: f32, cos_theta: f32) -> f32 {
     var energy = 0.0;
@@ -225,6 +228,12 @@ fn sun_octaves(optical_depth: f32, cos_theta: f32) -> f32 {
         energy += a * beer_powder(optical_depth * a) * phase;
         a *= 0.5;
     }
+    // The diffusion limit. Deep in a thick cloud, light that has scattered many times falls off as
+    // 1 / (1 + 0.75 tau (1 - g)) (two-stream; Bohren 1987), not exponentially as every octave above does, which is
+    // why an overcast deck's base is grey and not black. Isotropic, since such light has forgotten its direction,
+    // and only where the light has come through cloud at all (1 - e^-tau).
+    energy += CLOUD_DIFFUSE * (1.0 - exp(-optical_depth)) / (1.0 + 0.75 * optical_depth * (1.0 - 0.85))
+        / (4.0 * CLOUD_PI);
     return energy;
 }
 
@@ -314,7 +323,7 @@ fn cloud_aerial(view_uv: vec2<f32>, distance: f32) -> vec4<f32> {
     if cp.volumetric_range <= 0.0 {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
-    let w = clamp(distance / cp.volumetric_range, 0.0, 1.0);
+    let w = clamp(froxel_w(distance, cp.volumetric_range), 0.0, 1.0);
     let sample = textureSampleLevel(
         cloud_volumetrics, lut_sampler, vec3<f32>(view_uv, w), 0.0);
     // Log-space inscatter, matching `volumetric.wgsl`'s storage.
