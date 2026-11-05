@@ -1458,7 +1458,7 @@ fn evaluate_terrain_material(
     let bitangent = cross(geo_normal, tangent);
 
     let steepness = 1.0 - abs(geo_normal.y);
-    let cliff_blend = smoothstep(0.45, 0.7, steepness);
+    let cliff_blend = smoothstep(tm.cliff_band.x, tm.cliff_band.y, steepness);
     // Projected cliffs cannot POM — the march is UV-space and the projection
     // is world-space. Godot makes the same exclusion.
     let allow_pom = cliff_blend < 0.05;

@@ -488,7 +488,7 @@ mod material_flag_tests {
     }
 
     #[test]
-    fn the_terrain_material_is_the_2080_byte_shader_layout() {
+    fn the_terrain_material_is_the_2096_byte_shader_layout() {
         // Must match `TerrainMaterial` in terrain_material.wgsl. Every vec4
         // member has to land on a 16-byte offset or WGSL and repr(C) disagree
         // and the shader silently decodes the wrong words — the failure mode
@@ -499,9 +499,9 @@ mod material_flag_tests {
         // visibility, appended so every `array<vec4<_>>` above keeps its
         // offset. 2032 + 16 = 2048. TSUSHIMA-E's relief pair took it to 2064,
         // TSUSHIMA-G spent the pad that left, and TSUSHIMA-H's octave vec4
-        // takes it to 2080.
+        // takes it to 2080. The cliff band (Sunscar, 6 Nov 2026) takes it to 2096.
         use crate::terrain::GpuTerrainMaterial;
-        assert_eq!(std::mem::size_of::<GpuTerrainMaterial>(), 2080);
+        assert_eq!(std::mem::size_of::<GpuTerrainMaterial>(), 2096);
         assert_eq!(std::mem::size_of::<GpuTerrainMaterial>() % 16, 0);
 
         let m = GpuTerrainMaterial::zeroed();
