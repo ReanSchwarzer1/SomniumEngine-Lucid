@@ -469,8 +469,9 @@ fn path_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
     // 0 unprojects to a point at infinity whose w comes out negative, which turned every ray round (17 Oct: the
     // surfaces faced away and no lamp lit them); 0.5 is a finite point in front of the eye in either convention.
     // The raster's own camera (global pool `view`), so the tracer works in exactly the space the scene is drawn in.
-    let mid = view.inv_view_proj * vec4<f32>(ndc, 0.5, 1.0);
-    var dir = normalize(mid.xyz / mid.w - view.camera_pos);
+    // Camera-relative (`inv_view_proj_rel`): the absolute inverse cancels to 2^-6 in ndc kilometres out.
+    let mid = view.inv_view_proj_rel * vec4<f32>(ndc, 0.5, 1.0);
+    var dir = normalize(mid.xyz / mid.w);
     var origin = view.camera_pos;
 
     let primary = pt_primary(vec2<i32>(gid.xy), origin, ndc, pt.mode == 1u);

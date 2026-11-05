@@ -10,6 +10,10 @@ struct View {
     _padding: f32,
     time: f32,
     _pad1: vec2<f32>,
+    _wind: vec4<f32>,
+    _wind_time: vec4<f32>,
+    // global_pool.wgsl `View.inv_view_proj_rel`, offset 256.
+    inv_view_proj_rel: mat4x4<f32>,
 }
 
 struct DirectionalLight {
@@ -96,8 +100,9 @@ fn depth_at(local: vec3<f32>) -> f32 {
 
 fn reconstruct_world(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let clip = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
-    let world = view.inv_view_proj * clip;
-    return world.xyz / world.w;
+    // Camera-relative, then moved out: the absolute inverse snaps to 2^-6 in ndc kilometres from the origin.
+    let world = view.inv_view_proj_rel * clip;
+    return world.xyz / world.w + view.camera_pos;
 }
 
 fn hg(g: f32, cosine: f32) -> f32 {

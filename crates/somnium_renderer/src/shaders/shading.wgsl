@@ -2093,8 +2093,8 @@ fn contact_shadow(
         // shadows across the ground. Reconstruct the sampled surface and do
         // the thickness test in view-space metres instead.
         let scene_ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, scene_z, 1.0);
-        let scene_world_h = view.inv_view_proj * scene_ndc;
-        let scene_world = scene_world_h.xyz / scene_world_h.w;
+        let scene_world_h = view.inv_view_proj_rel * scene_ndc;
+        let scene_world = scene_world_h.xyz / scene_world_h.w + view.camera_pos;
         let ray_view_depth = -(view.view * vec4<f32>(sample_pos, 1.0)).z;
         let scene_view_depth = -(view.view * vec4<f32>(scene_world, 1.0)).z;
         let diff = ray_view_depth - scene_view_depth;
@@ -2229,8 +2229,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             return vec4<f32>(0.0, 0.0, 0.0, 1.0);
         }
         let ndc = (screen_uv * 2.0 - 1.0) * vec2<f32>(1.0, -1.0);
-        let near_plane = view.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-        let far_plane  = view.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+        // Camera-relative: the difference below is the same, without the absolute inverse's 2^-6 steps.
+        let near_plane = view.inv_view_proj_rel * vec4<f32>(ndc, 0.0, 1.0);
+        let far_plane  = view.inv_view_proj_rel * vec4<f32>(ndc, 1.0, 1.0);
         let ray_dir    = normalize(far_plane.xyz / far_plane.w - near_plane.xyz / near_plane.w);
 
         // Phase 24C: sample the environment cubemap rather than evaluating a

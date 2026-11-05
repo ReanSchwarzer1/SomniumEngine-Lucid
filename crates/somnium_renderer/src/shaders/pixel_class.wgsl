@@ -24,8 +24,9 @@ struct PixelClass {
 fn pc_world_at(coord: vec2<i32>, depth: f32, dims: vec2<u32>) -> vec3<f32> {
     let uv = (vec2<f32>(coord) + vec2<f32>(0.5)) / vec2<f32>(f32(dims.x), f32(dims.y));
     let ndc = vec3<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth);
-    let h = view.inv_view_proj * vec4<f32>(ndc, 1.0);
-    return h.xyz / h.w;
+    // Camera-relative, then moved out: the absolute inverse snaps to 2^-6 in ndc kilometres from the origin.
+    let h = view.inv_view_proj_rel * vec4<f32>(ndc, 1.0);
+    return h.xyz / h.w + view.camera_pos;
 }
 
 /// Classify one pixel. Mirrors `shading.wgsl`'s branch structure exactly:
