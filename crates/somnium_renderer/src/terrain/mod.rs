@@ -1771,7 +1771,7 @@ impl TerrainData {
                 &self.splatmap.data,
                 self.splatmap.width,
                 self.splatmap.height,
-                &self.layer_textures.mean_albedo,
+                &textures::with_far_colours(&self.layer_textures.mean_albedo, &self.layer_dir),
             );
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
