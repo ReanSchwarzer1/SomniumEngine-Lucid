@@ -2008,7 +2008,7 @@ impl TerrainData {
         model: glam::Mat4,
         geometry_distance: f32,
     ) -> Result<(), String> {
-        let TerrainSidecar { heights, splat, foliage, dims, baked } = sidecar;
+        let TerrainSidecar { heights, splat, foliage, dims, baked, .. } = sidecar;
         let [tx, tz, sw, sh] = dims;
         if dims != self.sidecar_dims()
             || heights.len() != (tx * tz) as usize
@@ -2137,6 +2137,8 @@ pub struct TerrainSidecar {
     pub dims: [u32; 4],
     /// The horizon and relief maps baked from `heights` by [`TerrainSidecar::bake`], if it ran.
     pub baked: Option<(horizon::HorizonMaps, relief::ReliefMaps)>,
+    /// The canopy beside it (`{path}.canopy.png`), which the horizon bake stands on the ground as an occluder.
+    pub canopy: Option<horizon::Canopy>,
 }
 
 impl TerrainSidecar {
@@ -2144,7 +2146,15 @@ impl TerrainSidecar {
     pub fn bake(&mut self, cell_size: f32, height_scale: f32) {
         let [tx, tz, _, _] = self.dims;
         self.baked = Some((
-            horizon::bake(&self.heights, tx, tz, cell_size, height_scale, horizon::HORIZON_SIZE),
+            horizon::bake_with_canopy(
+                &self.heights,
+                tx,
+                tz,
+                cell_size,
+                height_scale,
+                horizon::HORIZON_SIZE,
+                self.canopy.as_ref(),
+            ),
             relief::bake(&self.heights, tx, tz, cell_size, height_scale, relief::RELIEF_SIZE),
         ));
     }
@@ -2191,7 +2201,19 @@ pub fn read_sidecar(path: &str, expected: [u32; 4]) -> Result<TerrainSidecar, St
     let foliage = foliage_paint::load_instances(path)?;
     let heights = bytemuck::cast_slice::<u8, f32>(&body[..h_bytes]).to_vec();
     let splat = splat::migrate_sidecar_splat(version, &body[h_bytes..], texel_count)?;
-    Ok(TerrainSidecar { heights, splat, foliage, dims: expected, baked: None })
+    Ok(TerrainSidecar { heights, splat, foliage, dims: expected, baked: None, canopy: read_canopy(path) })
+}
+
+/// foliage-render's canopy bake beside a sidecar (`{path}.canopy.png`: RGBA8 over the tile's own 1000 m, alpha the
+/// crown top in 0.25 m steps), if there is one and it reads. Optional: a tile without one bakes as before.
+fn read_canopy(path: &str) -> Option<horizon::Canopy> {
+    let image = image::open(format!("{path}.canopy.png")).ok()?.to_rgba8();
+    let size = image.width() as usize;
+    if size == 0 || image.height() as usize != size {
+        return None;
+    }
+    let top = image.pixels().map(|p| f32::from(p[3]) * 0.25).collect();
+    Some(horizon::Canopy { top, size, metres: 1000.0 / size as f32 })
 }
 
 #[cfg(test)]

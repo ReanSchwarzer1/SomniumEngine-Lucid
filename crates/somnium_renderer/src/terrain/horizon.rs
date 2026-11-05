@@ -242,6 +242,43 @@ pub fn bake(
     height_scale: f32,
     size: u32,
 ) -> HorizonMaps {
+    bake_with_canopy(heights, total_x, total_z, cell_size, height_scale, size, None)
+}
+
+/// A tile's canopy for the bake: crown top above the ground in metres, `size` texels square from the tile's corner,
+/// `metres` per texel (foliage-render's `{sidecar}.canopy.png`, `tools/canopy_bake.py`).
+#[derive(Debug, Clone)]
+pub struct Canopy {
+    pub top: Vec<f32>,
+    pub size: usize,
+    pub metres: f32,
+}
+
+impl Canopy {
+    fn at(&self, x_m: f32, z_m: f32) -> f32 {
+        let (i, j) = ((x_m / self.metres) as isize, (z_m / self.metres) as isize);
+        if i < 0 || j < 0 || i >= self.size as isize || j >= self.size as isize {
+            return 0.0;
+        }
+        self.top[j as usize * self.size + i as usize]
+    }
+}
+
+/// What still reaches the floor of a wood from the sky through its gaps; the bake sees a canopy as solid.
+const CANOPY_SKY_FLOOR: f32 = 0.2;
+
+/// [`bake`], with the canopy standing on the ground as an occluder (Sunscar, 6 Nov 2026; ENGINE_AUDIT item 5): the
+/// ground beside a wood takes its shadow under a low sun and loses its sky, past the 100 m the cascades reach.
+/// Receivers stay on the ground, so the floor of a wood is shaded by its own crowns.
+pub fn bake_with_canopy(
+    heights: &[f32],
+    total_x: u32,
+    total_z: u32,
+    cell_size: f32,
+    height_scale: f32,
+    size: u32,
+    canopy: Option<&Canopy>,
+) -> HorizonMaps {
     let n = size as usize;
     let count = n * n;
     if heights.is_empty() || total_x < 2 || total_z < 2 || n == 0 {
@@ -302,7 +339,19 @@ pub fn bake(
         })
         .collect();
 
-    let pyramid = MaxPyramid::build(ground.clone(), n);
+    // The occluders: the ground, and the crowns standing on it.
+    let crowns: Vec<f32> = match canopy {
+        Some(canopy) => (0..count)
+            .map(|i| canopy.at((i % n) as f32 * step_x + step_x * 0.5, (i / n) as f32 * step_z + step_z * 0.5))
+            .collect(),
+        None => Vec::new(),
+    };
+    let occluders = if crowns.is_empty() {
+        ground.clone()
+    } else {
+        ground.iter().zip(&crowns).map(|(g, c)| g + c).collect()
+    };
+    let pyramid = MaxPyramid::build(occluders, n);
     let max_mip = pyramid.max_mip();
 
     // Per-azimuth step length in metres, for the tangent's denominator.
@@ -404,6 +453,7 @@ pub fn bake(
                 row_sky[x * 4] = ((bent[0] * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8;
                 row_sky[x * 4 + 1] = ((bent[1] * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8;
                 row_sky[x * 4 + 2] = ((bent[2] * 0.5 + 0.5).clamp(0.0, 1.0) * 255.0).round() as u8;
+                let vis = if crowns.get(z * n + x).is_some_and(|c| *c > 0.0) { vis.max(CANOPY_SKY_FLOOR) } else { vis };
                 row_sky[x * 4 + 3] = (vis.clamp(0.0, 1.0) * 255.0).round() as u8;
             }
         });
