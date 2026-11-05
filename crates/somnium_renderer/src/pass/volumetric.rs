@@ -453,7 +453,7 @@ impl VolumetricPass {
 
     /// `view_proj` is the forward matrix, kept for next frame's reprojection.
     /// `inv_view_proj` and `view_proj` are camera-relative (projection x the view's rotation alone): the absolute
-    /// inverse snaps every froxel ray to 2^-7 in ndc 7 km from the origin (Sunscar, 5 Nov 2026).
+    /// inverse snaps every froxel ray to 2^-7 in ndc 13 km from the origin (Sunscar, 5 Nov 2026).
     pub fn record(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,

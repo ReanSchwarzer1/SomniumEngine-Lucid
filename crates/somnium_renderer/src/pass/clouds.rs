@@ -1261,7 +1261,7 @@ impl CloudPass {
     /// rather than a stale one.
     ///
     /// `inv_view_proj` is camera-relative: inverse(projection x the view's rotation alone). Through the
-    /// absolute inverse every ray snapped to 2^-7 in ndc 7 km from the origin, the clouds' ~10 px blocks of
+    /// absolute inverse every ray snapped to 2^-7 in ndc 13 km from the origin, the clouds' ~10 px blocks of
     /// one colour (Sunscar, 5 Nov 2026).
     #[allow(clippy::too_many_arguments)]
     pub fn record(
