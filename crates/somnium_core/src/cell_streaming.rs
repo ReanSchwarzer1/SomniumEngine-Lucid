@@ -162,6 +162,17 @@ pub struct CellEntry {
     /// Its own load distance, for cells of big things seen from afar.
     #[serde(default)]
     pub reach: Option<f32>,
+    /// The cell this one stands in for from afar (a tile's far proxy), relative to the manifest. It is wanted
+    /// within its own reach once that cell is out of its reach or not yet in, and that cell keeps until this one is
+    /// installed: no gap while either installs, and at most a frame of both ([`plan_many`]).
+    #[serde(default)]
+    pub stands_for: Option<PathBuf>,
+    /// Index of `stands_for` in the manifest (`read_manifest`).
+    #[serde(skip)]
+    pub partner: Option<usize>,
+    /// Index of the cell standing in for this one (`read_manifest`).
+    #[serde(skip)]
+    pub stand_in: Option<usize>,
 }
 
 #[derive(serde::Deserialize)]
@@ -178,7 +189,33 @@ pub fn read_manifest(path: &Path) -> Result<Vec<CellEntry>, String> {
         return Err(format!("{}: manifest version {} is not 1", path.display(), file.version));
     }
     let folder = path.parent().unwrap_or(Path::new("."));
-    Ok(file.cells.into_iter().map(|cell| CellEntry { file: folder.join(&cell.file), ..cell }).collect())
+    let mut cells: Vec<CellEntry> = file
+        .cells
+        .into_iter()
+        .map(|cell| CellEntry {
+            file: folder.join(&cell.file),
+            stands_for: cell.stands_for.as_ref().map(|other| folder.join(other)),
+            ..cell
+        })
+        .collect();
+    link_stand_ins(&mut cells).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(cells)
+}
+
+/// Point each stand-in at its partner and back. One stand-in per cell; a stand-in stands for a cell that is not one.
+fn link_stand_ins(cells: &mut [CellEntry]) -> Result<(), String> {
+    let index: std::collections::HashMap<PathBuf, usize> =
+        cells.iter().enumerate().map(|(i, cell)| (cell.file.clone(), i)).collect();
+    for i in 0..cells.len() {
+        let Some(other) = cells[i].stands_for.clone() else { continue };
+        let p = *index.get(&other).ok_or_else(|| format!("{} stands for {}, not in the manifest", cells[i].file.display(), other.display()))?;
+        if p == i || cells[p].stands_for.is_some() || cells[p].stand_in.is_some() {
+            return Err(format!("{}: a cell has one stand-in, and a stand-in stands for a plain cell", other.display()));
+        }
+        cells[i].partner = Some(p);
+        cells[p].stand_in = Some(i);
+    }
+    Ok(())
 }
 
 /// Distance in XZ from `point` to a cell's bounds (0 inside).
@@ -218,6 +255,10 @@ pub fn plan(
 /// [`plan`] for the view and the points held ([`hold`]), each held point with its own radius (`holds`: point and
 /// radius). A cell loads when it is within reach of the view (its own `reach`, else `radius`) or within a hold's
 /// radius, nearest first; it unloads only once it is past reach and `margin` from the view and every hold.
+///
+/// `is_resident`: in or being read. `is_installed`: in. A stand-in ([`CellEntry::stands_for`]) is wanted within its
+/// reach while its partner is out of the partner's reach or not installed, and goes once the partner is installed;
+/// the partner keeps past its reach and margin until its stand-in is installed (or out of the stand-in's reach).
 #[must_use]
 pub fn plan_many(
     cells: &[CellEntry],
@@ -226,25 +267,37 @@ pub fn plan_many(
     margin: f32,
     holds: &[([f32; 2], f32)],
     is_resident: impl Fn(usize) -> bool,
+    is_installed: impl Fn(usize) -> bool,
 ) -> (Vec<usize>, Vec<usize>) {
     let mut load = Vec::new();
     let mut unload = Vec::new();
+    // How far inside (negative) or outside its reach each cell is, from the view and from each hold; and nearest.
+    let reach: Vec<(f32, f32)> = cells
+        .iter()
+        .map(|cell| {
+            let view_distance = distance_to(cell, view);
+            let mut over = view_distance - cell.reach.unwrap_or(radius);
+            let mut nearest = view_distance;
+            for &(at, hold_radius) in holds {
+                let distance = distance_to(cell, at);
+                over = over.min(distance - hold_radius);
+                nearest = nearest.min(distance);
+            }
+            (over, nearest)
+        })
+        .collect();
     for (index, cell) in cells.iter().enumerate() {
-        // How far inside (negative) or outside its reach the cell is, from the view and from each hold.
-        let view_reach = cell.reach.unwrap_or(radius);
-        let view_distance = distance_to(cell, view);
-        let mut over = view_distance - view_reach;
-        let mut nearest = view_distance;
-        for &(at, hold_radius) in holds {
-            let distance = distance_to(cell, at);
-            over = over.min(distance - hold_radius);
-            nearest = nearest.min(distance);
-        }
+        let (over, nearest) = reach[index];
+        let wanted = over <= 0.0 && cell.partner.is_none_or(|p| reach[p].0 > 0.0 || !is_installed(p));
         if is_resident(index) {
-            if over > margin {
+            let gone = match cell.partner {
+                Some(p) => !wanted && (over > margin || is_installed(p)),
+                None => over > margin && cell.stand_in.is_none_or(|s| is_installed(s) || reach[s].0 > 0.0),
+            };
+            if gone {
                 unload.push(index);
             }
-        } else if over <= 0.0 {
+        } else if wanted {
             load.push((nearest, index));
         }
     }
@@ -674,7 +727,35 @@ mod tests {
     }
 
     fn cell(min: [f32; 2], max: [f32; 2], reach: Option<f32>) -> CellEntry {
-        CellEntry { file: PathBuf::from("c.json"), min, max, reach }
+        CellEntry { file: PathBuf::from("c.json"), min, max, reach, stands_for: None, partner: None, stand_in: None }
+    }
+
+    #[test]
+    fn a_stand_in_covers_its_tile_from_afar_with_no_gap_either_way() {
+        // A 1 km tile with an 800 m reach, and its far proxy with a 6 km reach.
+        let mut cells = vec![cell([0.0, 0.0], [1000.0, 1000.0], Some(800.0)), cell([0.0, 0.0], [1000.0, 1000.0], Some(6000.0))];
+        cells[1].file = PathBuf::from("far.json");
+        cells[1].stands_for = Some(PathBuf::from("c.json"));
+        link_stand_ins(&mut cells).expect("linked");
+        assert_eq!((cells[0].stand_in, cells[1].partner), (Some(1), Some(0)));
+        let plan_at = |x: f32, resident: &[usize], installed: &[usize]| {
+            plan_many(&cells, [x, 500.0], 600.0, 100.0, &[], |i| resident.contains(&i), |i| installed.contains(&i))
+        };
+        // 3 km out: the proxy only.
+        assert_eq!(plan_at(-3000.0, &[], &[]), (vec![1], vec![]));
+        // Walking in: the tile loads at 800 m; the proxy holds while the tile is read, and goes once it is in.
+        assert_eq!(plan_at(-700.0, &[1], &[1]), (vec![0], vec![]));
+        assert_eq!(plan_at(-700.0, &[0, 1], &[1]), (vec![], vec![]), "the tile is being read: the proxy stays");
+        assert_eq!(plan_at(-700.0, &[0, 1], &[0, 1]), (vec![], vec![1]), "the tile is in: the proxy goes");
+        // Walking out: past the tile's reach the proxy loads; past reach and margin the tile holds until it is in.
+        assert_eq!(plan_at(-850.0, &[0], &[0]), (vec![1], vec![]));
+        assert_eq!(plan_at(-950.0, &[0, 1], &[0]), (vec![], vec![]), "the proxy is being read: the tile stays");
+        assert_eq!(plan_at(-950.0, &[0, 1], &[0, 1]), (vec![], vec![0]), "the proxy is in: the tile goes");
+        // Past the proxy's own reach and margin, nothing.
+        assert_eq!(plan_at(-6200.0, &[1], &[1]), (vec![], vec![1]));
+        // A stand-in for a cell that is not in the manifest is refused.
+        cells[1].stands_for = Some(PathBuf::from("nowhere.json"));
+        assert!(link_stand_ins(&mut cells).is_err());
     }
 
     #[test]
@@ -709,13 +790,13 @@ mod tests {
         ];
         let (view, held) = ([128.0, 128.0], ([5128.0, 128.0], HOLD_RADIUS));
         assert_eq!(
-            plan_many(&cells, view, 600.0, 100.0, &[], |_| false),
+            plan_many(&cells, view, 600.0, 100.0, &[], |_| false, |_| false),
             plan(&cells, view, 600.0, 100.0, |_| false),
             "no holds: the plan it always was"
         );
-        let (load, _) = plan_many(&cells, view, 600.0, 100.0, &[held], |_| false);
+        let (load, _) = plan_many(&cells, view, 600.0, 100.0, &[held], |_| false, |_| false);
         assert_eq!(load, vec![0, 1], "the other town's own cell, not its far edge, the landmark or the land between");
-        let (_, unload) = plan_many(&cells, view, 600.0, 100.0, &[held], |_| true);
+        let (_, unload) = plan_many(&cells, view, 600.0, 100.0, &[held], |_| true, |_| true);
         assert_eq!(unload, vec![2, 3, 4], "only what is near the view or inside the hold stays");
     }
 
