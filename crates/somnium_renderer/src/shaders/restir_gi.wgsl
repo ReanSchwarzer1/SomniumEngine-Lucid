@@ -167,6 +167,19 @@ fn gi_visible(origin: vec3<f32>, to: vec3<f32>, t_min: f32) -> bool {
     if dist <= t_min {
         return true;
     }
+    // Through a leaf card's holes, as the bounce ray that found the sample went (`rt_trace`). Opaque, every card was
+    // a solid quad here: a canopy turned away nearly every sky sample and every sun ray to a hit under it, and the
+    // floor of a wood went black (Sunscar, 6 Nov 2026).
+    if rt_candidate_alpha {
+        var aq: ray_query;
+        rayQueryInitialize(&aq, accel, RayDesc(0x6u, 0x1u, t_min, dist * 0.999, origin, d / dist));
+        while rayQueryProceed(&aq) {
+            if rt_candidate_is_covered(rayQueryGetCandidateIntersection(&aq)) {
+                rayQueryConfirmIntersection(&aq);
+            }
+        }
+        return rayQueryGetCommittedIntersection(&aq).kind == RAY_QUERY_INTERSECTION_NONE;
+    }
     var rq: ray_query;
     rayQueryInitialize(
         &rq,

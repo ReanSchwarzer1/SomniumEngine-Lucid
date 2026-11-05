@@ -1,4 +1,7 @@
 enable wgpu_ray_query;
+// The scene's arrays at group 0 (as `restir_gi.wgsl` has them), for the cut-out test on leaf cards.
+//!include "global_pool.wgsl"
+//!include "rt_alpha.wgsl"
 
 // Phase 24K: ReSTIR direct lighting.
 //
@@ -51,13 +54,17 @@ struct Reservoir {
     _pad: f32,
 }
 
-@group(0) @binding(0) var accel:      acceleration_structure;
-@group(0) @binding(1) var depth_tex:  texture_depth_2d;
-@group(0) @binding(2) var out_tex:    texture_storage_2d<rgba16float, write>;
-@group(0) @binding(3) var<uniform> params: RestirParams;
-@group(0) @binding(4) var<storage, read>       prev_reservoirs: array<Reservoir>;
-@group(0) @binding(5) var<storage, read_write> curr_reservoirs: array<Reservoir>;
-@group(0) @binding(6) var grain_masks: texture_2d_array<f32>;
+@group(1) @binding(0) var accel:      acceleration_structure;
+@group(1) @binding(1) var depth_tex:  texture_depth_2d;
+@group(1) @binding(2) var out_tex:    texture_storage_2d<rgba16float, write>;
+@group(1) @binding(3) var<uniform> params: RestirParams;
+@group(1) @binding(4) var<storage, read>       prev_reservoirs: array<Reservoir>;
+@group(1) @binding(5) var<storage, read_write> curr_reservoirs: array<Reservoir>;
+@group(1) @binding(6) var grain_masks: texture_2d_array<f32>;
+@group(1) @binding(7) var default_sampler: sampler;
+
+/// Test cut-out cards (`rt_alpha.wgsl`) on shadow rays; `SOMNIUM_DI_CANDIDATE_ALPHA=0` turns it off (restir.rs).
+override di_candidate_alpha: bool = true;
 
 fn empty_reservoir() -> Reservoir {
     return Reservoir(vec3<f32>(0.0), 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -129,6 +136,19 @@ const RAY_BIAS_FOOTPRINTS: f32 = 6.0;
 
 /// Trace a shadow ray. True when something blocks it.
 fn occluded(origin: vec3<f32>, dir: vec3<f32>, t_min: f32) -> bool {
+    // Sunlight passes a leaf card's holes (Sunscar, 6 Nov 2026). Every BLAS is built opaque, so without this a
+    // tree's shadow was its cards' solid quads: one dark blot under an open crown, no light dappling through.
+    if di_candidate_alpha {
+        var aq: ray_query;
+        // ForceNonOpaque (0x2) hands each triangle over to be tested; terminate on the first one covered (0x4).
+        rayQueryInitialize(&aq, accel, RayDesc(0x6u, 0x1u, t_min, 10000.0, origin, dir));
+        while rayQueryProceed(&aq) {
+            if rt_candidate_is_covered(rayQueryGetCandidateIntersection(&aq)) {
+                rayQueryConfirmIntersection(&aq);
+            }
+        }
+        return rayQueryGetCommittedIntersection(&aq).kind != RAY_QUERY_INTERSECTION_NONE;
+    }
     var rq: ray_query;
     rayQueryInitialize(
         &rq,
