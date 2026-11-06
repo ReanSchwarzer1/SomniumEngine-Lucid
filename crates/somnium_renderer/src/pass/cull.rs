@@ -256,6 +256,9 @@ impl CullPass {
     /// `aabbs` must be parallel to the indirect argument array — entry `i`
     /// bounds draw `i`. `None` keeps last frame's bounds (the draw list is
     /// unchanged), and only the view-dependent parameters are uploaded.
+    ///
+    /// `view_proj` projects bounds into the Hi-Z pyramid, so it is the scene's reversed-Z one; the planes come from
+    /// `frustum`, the caller's forward finite one, since an infinite projection has no far plane (Sunscar, 6 Nov 2026).
     #[allow(clippy::too_many_arguments)]
     pub fn update(
         &mut self,
@@ -263,6 +266,7 @@ impl CullPass {
         queue: &wgpu::Queue,
         aabbs: Option<&[GpuCullAabb]>,
         view_proj: glam::Mat4,
+        frustum: glam::Mat4,
         disabled: bool,
         hiz_size: (u32, u32),
         hiz_mip_count: u32,
@@ -292,7 +296,7 @@ impl CullPass {
         }
 
         let mut params = GpuCullParams {
-            planes: crate::culling::frustum_planes(view_proj),
+            planes: crate::culling::frustum_planes(frustum),
             draw_count: self.staging.len().max(self.extent) as u32,
             disabled: u32::from(disabled),
             phase: 0,

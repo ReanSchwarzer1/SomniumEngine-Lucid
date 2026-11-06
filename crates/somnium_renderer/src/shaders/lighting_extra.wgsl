@@ -110,7 +110,7 @@ fn cache_from_screen(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let coord = vec2<i32>(gid.xy);
     let depth = textureLoad(depth_tex, coord, 0);
-    if depth >= 1.0 {
+    if depth <= 0.0 {
         return;
     }
     let uv = (vec2<f32>(coord) + 0.5) * extra.inv_res;
@@ -140,7 +140,7 @@ fn specular_gi(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
     let full = vec2<i32>(uv * vec2<f32>(textureDimensions(depth_tex)));
     let depth = textureLoad(depth_tex, full, 0);
-    if depth >= 1.0 {
+    if depth <= 0.0 {
         textureStore(aux_out, gid.xy, vec4<f32>(0.0));
         return;
     }
@@ -229,10 +229,12 @@ fn path_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
     var seed = gid.x * 1103515245u + gid.y * 134775813u + extra.frame * 214013u + 1u;
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    let near = extra.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-    let far = extra.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    // Reversed-Z (Sunscar, 6 Nov 2026): depth 1 is the near plane and 0 infinity, where a perspective's point has
+    // w = 0 and its xyz is the ray's direction (taken undivided, an orthographic view's far plane less its near).
+    let near = extra.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    let far = extra.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
     var origin = extra.camera_pos;
-    var dir = normalize(far.xyz / far.w - near.xyz / near.w);
+    var dir = normalize(far.xyz - near.xyz / near.w * far.w);
     var throughput = vec3<f32>(1.0);
     var radiance = vec3<f32>(0.0);
 

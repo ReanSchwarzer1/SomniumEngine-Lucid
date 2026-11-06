@@ -129,7 +129,8 @@ impl ParticlePass {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: crate::pass::visibility::DEPTH_FORMAT,
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                // Reversed-Z: nearer is larger (renderer.rs `set_view`).
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),

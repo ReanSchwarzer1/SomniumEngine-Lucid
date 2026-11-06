@@ -269,8 +269,9 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // edge is present. Inside a smooth surface the spread is tiny and this
     // pixel keeps its own depth; at a silhouette the spread is large and the
     // nearest sample wins outright, exactly as before.
-    var dmin = 1.0e9;
-    var dmax = -1.0e9;
+    // Reversed-Z (Sunscar, 6 Nov 2026): the nearest is the largest depth.
+    var dnear = -1.0e9;
+    var dfar = 1.0e9;
     var closest = coord;
     let centre_depth = textureLoad(depth_tex, coord, 0);
     // How fast depth changes across one pixel here, from the hardware
@@ -287,20 +288,20 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
         for (var x = -1; x <= 1; x = x + 1) {
             let c = coord + vec2<i32>(x, y);
             let d = textureLoad(depth_tex, c, 0);
-            // Smaller is nearer: this depth buffer has 0 at the near plane.
-            if d < dmin {
-                dmin = d;
+            // Larger is nearer: this depth buffer is reversed, 1 at the near plane.
+            if d > dnear {
+                dnear = d;
                 closest = c;
             }
-            dmax = max(dmax, d);
+            dfar = min(dfar, d);
         }
     }
     // `dilation_epsilon` is now a multiple of the local gradient rather than an
     // absolute depth, so it carries no units and holds at any distance.
     // Setting it to 0 makes every neighbourhood count as an edge, which is the
     // original unconditional dilation.
-    var depth = dmin;
-    if dmax - dmin <= depth_grad * taa.dilation_epsilon {
+    var depth = dnear;
+    if dnear - dfar <= depth_grad * taa.dilation_epsilon {
         depth = centre_depth;
         closest = coord;
     }
@@ -310,10 +311,10 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // produced the offset in the first place.
     let closest_uv = (vec2<f32>(closest) + 0.5) * taa.inv_resolution;
     let ndc = vec4<f32>(closest_uv.x * 2.0 - 1.0, 1.0 - closest_uv.y * 2.0, depth, 1.0);
+    // Projected as it comes, undivided: the same point wherever it is finite, and where the sky's depth 0 puts it at
+    // infinity (w = 0, reversed-Z) a direction, which last frame's matrix turns without its step, as the sky moves.
     let world = taa.inv_view_proj * ndc;
-    let world_pos = world.xyz / world.w;
-
-    let prev_clip = taa.prev_view_proj * vec4<f32>(world_pos, 1.0);
+    let prev_clip = taa.prev_view_proj * world;
     if prev_clip.w <= 0.0 {
         return vec4<f32>(current, reactive);
     }

@@ -275,9 +275,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Ray for this froxel column, from the camera through the pixel centre.
     let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims.xy);
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    let near = vol.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-    let far = vol.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
-    let ray_dir = normalize(far.xyz / far.w - near.xyz / near.w);
+    // Reversed-Z (Sunscar, 6 Nov 2026): depth 1 is the near plane and 0 infinity, where a perspective's point has
+    // w = 0 and its xyz is the ray's direction (taken undivided, an orthographic view's far plane less its near).
+    let near = vol.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    let far = vol.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
+    let ray_dir = normalize(far.xyz - near.xyz / near.w * far.w);
 
     let sun_dir = normalize(vol.sun_direction);
     let cos_theta = dot(ray_dir, sun_dir);

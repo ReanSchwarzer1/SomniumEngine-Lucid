@@ -13,6 +13,13 @@
 // or far from the world's origin the rounding is many times all of that. Faded out from 12 to 24 m: farther off a tie's
 // steps would move whole layers (a rug, a painting) as often as they settle a fight, so faces still in one plane there
 // are the scene's to separate. tests/depth_tie_jitter.rs holds ties one step apart, with steps half the size too.
+//
+// Reversed-Z (Sunscar, 6 Nov 2026): scene depth is near / view depth, so "nearer" is larger and `depth_tie_offset` is
+// added to clip z, not taken off. The constants are unchanged, and that is derived, not left: depth runs with view
+// depth w as near / w^2 both ways (forward's near * far / ((far - near) * w^2) is that within near / far), so a step
+// still moves a face the same distance in metres. What changed is the rounding the floors were sized against: clip z
+// is now the constant near (no products to round) and a float near d rounds to d * 2^-24, under forward's 6e-8 at
+// ~1 wherever d < 1, which is everywhere past the near plane. So the floors still beat the rounding, by more.
 
 const DEPTH_TIE_STEP_MIN: f32 = 6e-8;
 /// What a plane turned from the eye adds to the least step: the depth it rounds to across the screen, whatever the
@@ -42,7 +49,7 @@ fn depth_tie_fade(w: f32) -> f32 {
     return saturate((DEPTH_TIE_FADE_END - w) / (DEPTH_TIE_FADE_END - DEPTH_TIE_FADE_START));
 }
 
-/// What to take off clip-space z (it is already times w) to draw a vertex `tie` steps nearer: `normal` and `world`
+/// What to add to clip-space z (it is already times w; reversed-Z) to draw a vertex `tie` steps nearer: `normal` and `world`
 /// are the vertex's (the normal need not be unit length), `clip_w` its clip-space w.
 fn depth_tie_offset(tie: f32, normal: vec3<f32>, world: vec3<f32>, clip_w: f32, view_matrix: mat4x4<f32>,
                     camera_pos: vec3<f32>, slope: f32) -> f32 {

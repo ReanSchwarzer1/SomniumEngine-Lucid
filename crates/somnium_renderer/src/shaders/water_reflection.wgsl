@@ -69,10 +69,10 @@ fn reconstruct_normal_toward(encoded: vec2<f32>, toward: vec3<f32>) -> vec3<f32>
 
 fn world_from_uv_view_depth(uv: vec2<f32>, view_depth: f32) -> vec3<f32> {
     let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 1.0, 1.0);
-    let far_h = params.inv_view_proj * ndc;
-    let far_w = far_h.xyz / far_h.w;
-    // Camera-relative (`inv_view_proj` is): the far point is already the ray.
-    let ray = normalize(far_w);
+    let near_h = params.inv_view_proj * ndc;
+    let near_w = near_h.xyz / near_h.w;
+    // Camera-relative (`inv_view_proj` is): the near-plane point (depth 1, reversed-Z) is already the ray.
+    let ray = normalize(near_w);
     let ray_view = (params.view * vec4<f32>(ray, 0.0)).xyz;
     let t = view_depth / max(-ray_view.z, 1e-4);
     return params.camera_pos + ray * t;

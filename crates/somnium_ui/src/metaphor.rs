@@ -302,6 +302,7 @@ pub fn tonemap_index(label: &str) -> usize {
     match label {
         "ACES" => 1,
         "Reinhard" => 2,
+        "Photographic" => 3,
         _ => 0,
     }
 }

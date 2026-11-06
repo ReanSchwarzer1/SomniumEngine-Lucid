@@ -187,7 +187,7 @@ fn vs_main(
     }
     if tie > 0.0 {
         let normal = (instance.model * vec4<f32>(vertex.norm_x, vertex.norm_y, vertex.norm_z, 0.0)).xyz;
-        out.clip_pos.z -= depth_tie_offset(tie, normal, world, out.clip_pos.w, view.view, view.camera_pos,
+        out.clip_pos.z += depth_tie_offset(tie, normal, world, out.clip_pos.w, view.view, view.camera_pos,
                                            view.depth_tie_slope);
     }
     out.instance_id = inst_idx;
@@ -253,8 +253,12 @@ fn fs_main(
             let minified = saturate(log2(max(texels, 1.0)) - 1.0);
             if minified > 0.0 {
                 let step = f32(u32(view.time * 60.0) % 64u);
-                let n = fract(52.9829189 * fract(dot(frag.xy + 5.588238 * step + vec2<f32>(13.0, 29.0),
-                                                     vec2<f32>(0.06711056, 0.00583715))));
+                // The screen term alone gave every overlapping card at a pixel the same threshold, so forty layers of
+                // 10%-covered twigs still showed 10% and a far bare willow read as dead poles (lod2, 6 Nov). A hash
+                // of the card's own UV decorrelates the layers, so coverage adds up as 1 - (1 - a)^n.
+                let layer = fract(sin(dot(floor(uv * 4096.0), vec2<f32>(12.9898, 78.233))) * 43758.5453);
+                let n = fract(layer + 52.9829189 * fract(dot(frag.xy + 5.588238 * step + vec2<f32>(13.0, 29.0),
+                                                             vec2<f32>(0.06711056, 0.00583715))));
                 cutoff = mix(cutoff, clamp(n, 0.02, 0.98), minified);
             }
         }

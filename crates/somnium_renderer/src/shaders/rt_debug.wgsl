@@ -38,9 +38,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let coord = vec2<i32>(gid.xy);
     let depth = textureLoad(depth_tex, coord, 0);
 
-    // Sky: nothing to shadow, and reconstructing a position on the far plane
-    // would put the ray origin somewhere arbitrary.
-    if depth >= 1.0 {
+    // Sky (reversed-Z's cleared 0): nothing to shadow, and reconstructing a
+    // position at infinity would put the ray origin nowhere.
+    if depth <= 0.0 {
         textureStore(out_tex, coord, vec4<f32>(0.25, 0.4, 0.8, 1.0));
         return;
     }

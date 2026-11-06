@@ -991,9 +991,10 @@ impl ShadingPass {
             //
             // The fullscreen triangle is emitted at the clip-space depth of the
             // aerial distance, and the test against the scene's own depth buffer
-            // decides which half of the screen this pipeline covers: `Greater`
-            // keeps everything nearer than the split, `LessEqual` everything at
-            // or beyond it (sky included, at the cleared far value). Two draws,
+            // decides which half of the screen this pipeline covers. Depth is
+            // reversed (Sunscar, 6 Nov 2026): `Less` keeps everything nearer than
+            // the split, `GreaterEqual` everything at or beyond it (sky included,
+            // at the cleared 0). Two draws,
             // no overlap, complete coverage — and early-Z rejects the other half
             // before a single fragment of the expensive shader runs.
             //
@@ -1184,7 +1185,7 @@ impl ShadingPass {
         aerial: ShadingSpec,
     ) {
         if self.split_near.as_ref().is_none_or(|(s, _)| *s != near) {
-            let pipeline = self.variant(device, (near, "vs_main", Some(wgpu::CompareFunction::Greater)));
+            let pipeline = self.variant(device, (near, "vs_main", Some(wgpu::CompareFunction::Less)));
             self.split_near = Some((near, pipeline));
         }
         if self.split_aerial.as_ref().is_none_or(|(s, _)| *s != aerial) {
@@ -1194,7 +1195,7 @@ impl ShadingPass {
                 terrain_scan = aerial.terrain_scan,
                 "aerial shading pipeline spec changed"
             );
-            let pipeline = self.variant(device, (aerial, "vs_main", Some(wgpu::CompareFunction::LessEqual)));
+            let pipeline = self.variant(device, (aerial, "vs_main", Some(wgpu::CompareFunction::GreaterEqual)));
             self.split_aerial = Some((aerial, pipeline));
         }
     }

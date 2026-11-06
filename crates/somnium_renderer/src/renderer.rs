@@ -209,7 +209,8 @@ pub struct SomniumRenderer {
 
     /// The current camera view matrix (world → view).
     pub view_matrix: glam::Mat4,
-    /// The current projection matrix.
+    /// The current projection matrix, as the caller gave it: forward and finite. The scene draws with
+    /// `view::reversed_z` of it (`set_view`).
     pub proj_matrix: glam::Mat4,
     /// The current combined view-projection matrix.
     pub view_proj: glam::Mat4,
@@ -346,6 +347,10 @@ pub struct SomniumRenderer {
     pub authored_picture_shift: crate::pass::postprocess::PictureShift,
     /// View-projection without TAA's sub-pixel jitter, for reprojection.
     view_proj_unjittered: glam::Mat4,
+    /// The caller's forward, finite projection times the view, unjittered: for what needs a far plane or forward
+    /// depth on the CPU (shadow cascades, frustum planes, picking). Everything drawn into scene depth uses the
+    /// reversed matrices above (`set_view`).
+    view_proj_forward: glam::Mat4,
     /// The jittered projection times the view's rotation alone: the view-projection of a camera at the origin.
     /// Its inverse goes to the shaders as `inv_view_proj_rel`, so a ray or point rebuilt from a pixel is
     /// camera-relative and keeps its precision kilometres out (`set_view`).
@@ -764,8 +769,8 @@ impl ShadingPlan {
     fn keys(&self) -> Vec<crate::pass::shading::ShadingKey> {
         let mut keys = vec![(self.main, "vs_main", None)];
         if let Some((near, aerial)) = self.split {
-            keys.push((near, "vs_main", Some(wgpu::CompareFunction::Greater)));
-            keys.push((aerial, "vs_main", Some(wgpu::CompareFunction::LessEqual)));
+            keys.push((near, "vs_main", Some(wgpu::CompareFunction::Less)));
+            keys.push((aerial, "vs_main", Some(wgpu::CompareFunction::GreaterEqual)));
         }
         keys.extend(self.bins.iter().flatten().map(|&spec| (spec, "vs_tile", None)));
         keys
@@ -1281,7 +1286,6 @@ impl SomniumRenderer {
             auto_exposure_pass.exposure_buffer(),
             bloom_pass.result_view(),
         );
-        auto_exposure_pass.resize(&ctx.device, &postprocess_pass.hdr_view);
 
         // Phase 24I: screen-space occlusion, consumed by the shading pass.
         let gtao_pass = crate::pass::gtao::GtaoPass::new(
@@ -1367,6 +1371,7 @@ impl SomniumRenderer {
             ctx.config.height,
             &global_pool.layout,
         );
+        auto_exposure_pass.resize(&ctx.device, &postprocess_pass.hdr_view, &vis_pass.view);
         let hiz_pass = crate::pass::hiz::HiZPass::new(
             &ctx.device,
             &shaders,
@@ -1636,6 +1641,7 @@ impl SomniumRenderer {
             authored_picture_shift: Default::default(),
             sun_angular_radius: 0.004_654,
             view_proj_unjittered: glam::Mat4::IDENTITY,
+            view_proj_forward: glam::Mat4::IDENTITY,
             view_proj_rel: glam::Mat4::IDENTITY,
             view_proj_unjittered_rel: glam::Mat4::IDENTITY,
             render_width: ctx.config.width,
@@ -2638,11 +2644,17 @@ impl SomniumRenderer {
     /// Set the camera matrices for this frame.
     ///
     /// `view`  — world-to-camera (look_at matrix)
-    /// `proj`  — camera projection (perspective / orthographic)
+    /// `proj`  — camera projection (perspective / orthographic), forward and finite (`perspective_rh`)
     /// `camera_pos` — camera world-space position
+    ///
+    /// Scene depth is reversed and, for a perspective, infinite (Sunscar, 6 Nov 2026): `proj` is kept as given in
+    /// `proj_matrix` and the scene draws with `view::reversed_z` of it, so a view handed back through
+    /// `primary_scene_view` converts once, not twice.
     pub fn set_view(&mut self, view: glam::Mat4, proj: glam::Mat4, camera_pos: glam::Vec3) {
         self.view_matrix = view;
         self.proj_matrix = proj;
+        self.view_proj_forward = proj * view;
+        let proj = crate::view::reversed_z(proj);
         // Unjittered, for TAA's own reprojection: it has to compare like with
         // like across frames, and each frame's jitter is different.
         self.view_proj_unjittered = proj * view;
@@ -2900,9 +2912,12 @@ impl SomniumRenderer {
     /// jitter FSR and TAA need. Editor overlays — the gizmo included — are
     /// drawn with the unjittered matrix, so picking must use it too or the
     /// ray and the arrow the user aimed at disagree by the jitter.
+    ///
+    /// Forward and finite, as the caller's projection is: picking unprojects fixed depths and wants a far plane.
+    /// It puts every point at the same pixel as the reversed matrix the overlays draw with (`set_view`).
     #[must_use]
     pub fn picking_view_proj(&self) -> glam::Mat4 {
-        self.view_proj_unjittered
+        self.view_proj_forward
     }
 
     pub fn editor_overlays_enabled(&self) -> bool {
@@ -3312,7 +3327,8 @@ impl SomniumRenderer {
             wgpu::LoadOp::Load
         };
         let depth_load = if clear {
-            wgpu::LoadOp::Clear(1.0)
+            // Reversed-Z: 0 is infinitely far, the sky (`set_view`).
+            wgpu::LoadOp::Clear(0.0)
         } else {
             wgpu::LoadOp::Load
         };
@@ -3431,7 +3447,7 @@ impl SomniumRenderer {
             self.postprocess_pass
                 .resize(&ctx.device, width, height, self.bloom_pass.result_view());
             self.auto_exposure_pass
-                .resize(&ctx.device, &self.postprocess_pass.hdr_view);
+                .resize(&ctx.device, &self.postprocess_pass.hdr_view, &self.vis_pass.view);
             self.render_width = width;
             self.render_height = height;
             self.gtao_pass.resize(&ctx.device, width, height);
@@ -3512,8 +3528,8 @@ impl SomniumRenderer {
                 height,
                 &self.vis_pass.depth_view,
             );
-            // The new texture is zero-filled, i.e. everything at the near
-            // plane, so occlusion has to stand down until it is rebuilt.
+            // The new texture is zero-filled, i.e. everything at infinity under reversed-Z, which occludes
+            // nothing; occlusion still stands down until it is rebuilt from real geometry.
             self.hiz_ready = false;
         }
     }
@@ -5282,7 +5298,7 @@ impl SomniumRenderer {
         let cascade_candidates =
             // In f64: the f32 inverse of an absolute view-projection 13 km out puts the fit's corners off by the
             // same 2^-7 ndc steps the rays had (Sunscar, 5 Nov 2026).
-            compute_cascades(self.light_direction, self.view_proj_unjittered.as_dmat4().inverse());
+            compute_cascades(self.light_direction, self.view_proj_forward.as_dmat4().inverse());
         let shadow_cache_enabled = std::env::var("SOMNIUM_SHADOW_CACHE").as_deref() != Ok("0");
         let cascade_cache_frame = self.cascade_shadow_cache.begin_frame(
             cascade_candidates,
@@ -5356,7 +5372,7 @@ impl SomniumRenderer {
         self.profiler.cpu_begin("Terrain");
         // Keep explicit shadow-only submissions; all queues clear at frame end.
         self.terrain_lod_by_vertex.clear();
-        let cam_planes = crate::culling::frustum_planes(self.view_proj_unjittered);
+        let cam_planes = crate::culling::frustum_planes(self.view_proj_forward);
         let cascade_planes: [_; crate::shadow::NUM_CASCADES] =
             self.cascade_view_projs.map(crate::culling::frustum_planes);
         let cpu_frustum = self.cpu_frustum_active();
@@ -5828,6 +5844,7 @@ impl SomniumRenderer {
                 // hardest because it is thousands of small clusters all near
                 // the threshold at once.
                 self.view_proj_unjittered,
+                self.view_proj_forward,
                 !self.culling_enabled,
                 self.hiz_pass.size(),
                 self.hiz_pass.mip_count(),
@@ -6070,8 +6087,8 @@ impl SomniumRenderer {
         }
 
         // Occlusion culling stays off until a pyramid has been built from real
-        // geometry. wgpu zero-fills a new texture, and zero is the near plane,
-        // which would read as "everything is occluded" on the first frame.
+        // geometry. wgpu zero-fills a new texture; zero is infinitely far under
+        // reversed-Z, which occludes nothing, but stale is still stale.
         self.hiz_ready = true;
 
         // The Phase 25A-1 terrain depth prepass stood here. It is gone with
@@ -6435,7 +6452,8 @@ impl SomniumRenderer {
         self.gtao_pass.record(
             &mut encoder,
             &ctx.queue,
-            self.proj_matrix,
+            // Unprojects scene depth, so the reversed-Z projection it was drawn with (`set_view`).
+            crate::view::reversed_z(self.proj_matrix),
             self.render_width,
             self.render_height,
             0.1,
@@ -6731,12 +6749,13 @@ impl SomniumRenderer {
         // census and the tile classifier measure radial distance — they differ
         // slightly toward the screen corners, which is immaterial for a level
         // of detail split and would be worth stating if it ever were not.
+        // Reversed-Z, as the scene depth it is tested against: 0 (the sky's) when there is no perspective to divide.
         let split_depth = {
-            let clip = self.proj_matrix * glam::Vec4::new(0.0, 0.0, -self.aerial_split, 1.0);
+            let clip = crate::view::reversed_z(self.proj_matrix) * glam::Vec4::new(0.0, 0.0, -self.aerial_split, 1.0);
             if clip.w.abs() > 1e-6 {
                 (clip.z / clip.w).clamp(0.0, 1.0)
             } else {
-                1.0
+                0.0
             }
         };
         if self.aerial_split_active {
@@ -7336,7 +7355,8 @@ impl SomniumRenderer {
             &ctx.queue,
             self.render_width,
             self.render_height,
-            0.1,
+            // The camera's own near plane: reversed, infinite depth is near / view depth (dof.wgsl `linear_depth`).
+            crate::view::near_plane(self.proj_matrix),
             1000.0,
         ) {
             encoder.copy_texture_to_texture(
@@ -7408,7 +7428,7 @@ impl SomniumRenderer {
             } else {
                 self.chromatic_aberration
             },
-            if debugging { 3 } else { self.tonemapper },
+            if debugging { crate::pass::postprocess::TONEMAP_PASSTHROUGH } else { self.tonemapper },
             self.auto_exposure && !debugging,
             if debugging {
                 0.0
@@ -7420,7 +7440,12 @@ impl SomniumRenderer {
             if debugging {
                 crate::pass::postprocess::Grading::default()
             } else {
-                self.grading
+                // The lens's fall-off needs the field of view and the aspect: tan(half fov) = 1 / proj[1][1].
+                let mut grading = self.grading;
+                let fy = self.proj_matrix.y_axis.y.abs().max(1e-6);
+                grading.lens = [1.0 / fy, fy / self.proj_matrix.x_axis.x.abs().max(1e-6)];
+                grading.view_proj = self.view_proj_rel.to_cols_array();
+                grading
             },
             if debugging {
                 Default::default()
@@ -9069,7 +9094,8 @@ mod frame_instance_layout_tests {
         let eye = glam::Vec3::new(-15408.0, 14.4, 358.0);
         let forward = glam::Vec3::new(0.0, -0.5, -0.866).normalize();
         let view = glam::Mat4::look_to_rh(eye, forward, glam::Vec3::Y);
-        let proj = glam::Mat4::perspective_rh(55f32.to_radians(), 16.0 / 9.0, 0.1, 1000.0);
+        // Reversed-Z, as `set_view` draws: depth 1 below is the near plane, 0.1 m from the eye.
+        let proj = crate::view::reversed_z(glam::Mat4::perspective_rh(55f32.to_radians(), 16.0 / 9.0, 0.1, 1000.0));
         let mut rotation = view;
         rotation.w_axis = glam::Vec4::W;
         let (absolute, relative) = ((proj * view).inverse(), (proj * rotation).inverse());
@@ -9089,8 +9115,8 @@ mod frame_instance_layout_tests {
         for &n in &pixels {
             let h = exact * glam::DVec4::new(f64::from(n), -0.5, 1.0, 1.0);
             let want = (h.truncate() / h.w).x;
-            // 5 cm at the 1 km far plane: 50 microradians, an eighth of a pixel (f32 divides near the far plane).
-            assert!((f64::from(x_of(relative, n)) - want).abs() < 0.05, "{n}: {} against {want}", x_of(relative, n));
+            // 50 microradians, an eighth of a pixel: 5 microns at the 0.1 m near plane.
+            assert!((f64::from(x_of(relative, n)) - want).abs() < 5e-6, "{n}: {} against {want}", x_of(relative, n));
         }
     }
 
@@ -9099,7 +9125,8 @@ mod frame_instance_layout_tests {
         // TaaPass and VelocityPass: rebuild through inverse(proj x rotation), project with last frame's
         // proj x rotation moved by the camera's step. Checked against f64 at the street, a metre from the eye.
         let forward = glam::Vec3::new(0.0, -0.5, -0.866).normalize();
-        let proj = glam::Mat4::perspective_rh(55f32.to_radians(), 16.0 / 9.0, 0.1, 1000.0);
+        // Reversed-Z, as `set_view` draws (depth 0.1 below is 1 m from the eye).
+        let proj = crate::view::reversed_z(glam::Mat4::perspective_rh(55f32.to_radians(), 16.0 / 9.0, 0.1, 1000.0));
         let rel = |eye: glam::Vec3| {
             let mut r = glam::Mat4::look_to_rh(eye, forward, glam::Vec3::Y);
             r.w_axis = glam::Vec4::W;
@@ -9111,7 +9138,7 @@ mod frame_instance_layout_tests {
             let inv = rel(eye).inverse();
             let exact_prev = proj.as_dmat4() * glam::DMat4::look_to_rh(prev_eye.as_dvec3(), forward.as_dvec3(), glam::DVec3::Y);
             for i in 0..64 {
-                let ndc = glam::Vec4::new((1280.0 + i as f32) / 1280.0 - 1.0, -0.5, 0.9, 1.0);
+                let ndc = glam::Vec4::new((1280.0 + i as f32) / 1280.0 - 1.0, -0.5, 0.1, 1.0);
                 let h = inv * ndc;
                 let p = h.truncate() / h.w;
                 let c = prev * p.extend(1.0);

@@ -162,8 +162,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let index = gid.y * dims.x + gid.x;
     let depth = textureLoad(depth_tex, coord, 0);
 
-    if depth >= 1.0 {
-        // Sky is unshadowed by definition.
+    if depth <= 0.0 {
+        // Sky (reversed-Z's cleared 0) is unshadowed by definition.
         textureStore(out_tex, coord, vec4<f32>(1.0, 1.0, 1.0, 1.0));
         curr_reservoirs[index] = empty_reservoir();
         return;

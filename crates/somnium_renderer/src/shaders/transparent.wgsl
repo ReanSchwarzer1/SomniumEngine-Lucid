@@ -184,7 +184,7 @@ fn vs_main(
     out.clip        = depth_tie_clip(view.view_proj, world.xyz, view.camera_pos);
     // One tie above every opaque draw (depth_tie.wgsl): the opaque depth it is tested against has been drawn nearer
     // by its ties, which hid a picture's glass a millimetre over its print from 5 m off (F's check, 29 Oct).
-    out.clip.z     -= depth_tie_offset(DEPTH_TIE_GLASS, normal, world.xyz, out.clip.w, view.view, view.camera_pos,
+    out.clip.z     += depth_tie_offset(DEPTH_TIE_GLASS, normal, world.xyz, out.clip.w, view.view, view.camera_pos,
                                        view.depth_tie_slope);
     out.world_pos   = world.xyz;
     out.normal      = normal;
@@ -430,7 +430,8 @@ struct OitOut {
 /// `1e-5 .. 3e3` clamp is what keeps a distant, nearly-transparent fragment
 /// from underflowing to zero and a close, nearly-opaque one from overflowing.
 fn oit_weight(z: f32, a: f32) -> f32 {
-    let d = 1.0 - z;
+    // Reversed-Z (Sunscar, 6 Nov 2026): z is near / view depth, which is what `1 - z` was with forward depth.
+    let d = z;
     return clamp(pow(a + 0.01, 4.0) + max(0.01, 3.0e3 * d * d * d), 1.0e-5, 3.0e3);
 }
 

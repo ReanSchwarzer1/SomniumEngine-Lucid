@@ -496,11 +496,11 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    let near = cp.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-    let far = cp.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
-    let near_ws = near.xyz / near.w;
-    let far_ws = far.xyz / far.w;
-    let ray_dir = normalize(far_ws - near_ws);
+    // Reversed-Z (Sunscar, 6 Nov 2026): depth 1 is the near plane and 0 infinity, where a perspective's point has
+    // w = 0 and its xyz is the ray's direction (taken undivided, an orthographic view's far plane less its near).
+    let near = cp.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    let far = cp.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
+    let ray_dir = normalize(far.xyz - near.xyz / near.w * far.w);
 
     var interval = slab_interval(cp.camera_pos, ray_dir);
     if interval.y <= interval.x {
@@ -751,9 +751,10 @@ fn cloud_resolve(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Where this texel's cloud was on the screen a frame ago.
     let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(size);
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    let near = rp.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-    let far = rp.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
-    let dir = normalize(far.xyz / far.w - near.xyz / near.w);
+    // Reversed-Z: the near plane at 1, the ray's direction at 0 (as in the march above).
+    let near = rp.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    let far = rp.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
+    let dir = normalize(far.xyz - near.xyz / near.w * far.w);
     // Camera-relative, as `prev_view_proj` takes it (it carries the camera's step).
     let world = dir * resolve_distance(rp.camera_pos, dir);
     let before = rp.prev_view_proj * vec4<f32>(world, 1.0);

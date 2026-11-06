@@ -80,8 +80,8 @@ fn a_moving_square_lands_half_way() {
     let motion = upload(&device, &queue, wgpu::TextureFormat::Rg16Float, wgpu::TextureFormat::Rg16Float, 4, &motion);
     let depth = depth_square(&device, &queue);
 
-    let proj = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1000.0 / (0.1 - 1000.0), -1.0],
-        [0.0, 0.0, 0.1 * 1000.0 / (0.1 - 1000.0), 0.0]];
+    // Reversed and infinite, near 0.1: depth = 0.1 / view depth.
+    let proj = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, -1.0], [0.0, 0.0, 0.1, 0.0]];
     let mut fi = FrameInterpolator::new(&device, &queue, [SIZE, SIZE], [SIZE, SIZE]);
     // Scene change detection marks the first frames; let its four history bits clear.
     for frame in 0..8 {
@@ -140,8 +140,8 @@ fn optical_flow_alone_follows_a_pan() {
     let still = upload(&device, &queue, wgpu::TextureFormat::Rg16Float, wgpu::TextureFormat::Rg16Float, 4,
         &vec![0_u8; (SIZE * SIZE * 4) as usize]);
     let depth = depth_square(&device, &queue);
-    let proj = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1000.0 / (0.1 - 1000.0), -1.0],
-        [0.0, 0.0, 0.1 * 1000.0 / (0.1 - 1000.0), 0.0]];
+    // Reversed and infinite, near 0.1: depth = 0.1 / view depth.
+    let proj = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, -1.0], [0.0, 0.0, 0.1, 0.0]];
     let mut fi = FrameInterpolator::new(&device, &queue, [SIZE, SIZE], [SIZE, SIZE]);
     for frame in 0..15 {
         let (previous, current) = if frame % 2 == 0 { (&a, &b) } else { (&b, &a) };
@@ -203,7 +203,7 @@ fn half_bits(v: f32) -> u16 {
     if v == 0.0 { 0 } else { sign | ((exponent as u16) << 10) | mantissa }
 }
 
-/// Depth 0.5 on the square's pixels now, 0.9 elsewhere (depth formats take no queue writes).
+/// Depth 0.5 on the square's pixels now, 0.1 (farther, reversed) elsewhere (depth formats take no queue writes).
 fn depth_square(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView {
     let depth = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
@@ -224,7 +224,7 @@ fn depth_square(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView
              }
              @fragment fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 {
                  let inside = p.x >= 128.0 && p.x < 160.0 && p.y >= 112.0 && p.y < 144.0;
-                 return select(0.9, 0.5, inside);
+                 return select(0.1, 0.5, inside);
              }"
             .into(),
         ),
@@ -254,7 +254,7 @@ fn depth_square(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView
             color_attachments: &[],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                 view: &view,
-                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
                 stencil_ops: None,
             }),
             timestamp_writes: None,
@@ -338,8 +338,8 @@ fn cost_at_1440p() {
         usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC, mapped_at_creation: false });
     let readback = device.create_buffer(&wgpu::BufferDescriptor { label: None, size: 16,
         usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ, mapped_at_creation: false });
-    let proj = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1000.0 / (0.1 - 1000.0), -1.0],
-        [0.0, 0.0, 0.1 * 1000.0 / (0.1 - 1000.0), 0.0]];
+    // Reversed and infinite, near 0.1: depth = 0.1 / view depth.
+    let proj = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, -1.0], [0.0, 0.0, 0.1, 0.0]];
     let mut fi = FrameInterpolator::new(&device, &queue, display, render);
     let mut times = Vec::new();
     let mut cpu = Vec::new();
@@ -449,7 +449,7 @@ fn fast_post_review() {
                  return vec4<f32>(p * 4.0 - 1.0, 0.0, 1.0);
              }}
              @fragment fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 {{
-                 return select(0.95, 0.2, p.x >= {}.0 && p.x < {}.0);
+                 return select(0.05, 0.8, p.x >= {}.0 && p.x < {}.0);
              }}",
             post_r0,
             post_r1
@@ -483,7 +483,7 @@ fn fast_post_review() {
                 color_attachments: &[],
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &dv,
-                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                    depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
                     stencil_ops: None,
                 }),
                 timestamp_writes: None,
@@ -496,8 +496,8 @@ fn fast_post_review() {
         queue.submit([e.finish()]);
     }
     let depth = depth.create_view(&wgpu::TextureViewDescriptor { aspect: wgpu::TextureAspect::DepthOnly, ..Default::default() });
-    let proj = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1000.0 / (0.1 - 1000.0), -1.0],
-        [0.0, 0.0, 0.1 * 1000.0 / (0.1 - 1000.0), 0.0]];
+    // Reversed and infinite, near 0.1: depth = 0.1 / view depth.
+    let proj = [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, -1.0], [0.0, 0.0, 0.1, 0.0]];
     let mut fi = FrameInterpolator::new(&device, &queue, [W, H], [rw, rh]);
     for frame in 0..8 {
         let mut e = device.create_command_encoder(&Default::default());

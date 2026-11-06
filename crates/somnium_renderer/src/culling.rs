@@ -478,8 +478,8 @@ pub struct ScreenBounds {
     /// Screen-space rect in UV units, `[min_x, min_y, max_x, max_y]`, clamped
     /// to `0..1`.
     pub rect: [f32; 4],
-    /// Nearest NDC depth of the box, `0` at the near plane.
-    pub min_depth: f32,
+    /// Nearest NDC depth of the box: reversed-Z, so the largest, `1` at the near plane (Sunscar, 6 Nov 2026).
+    pub max_depth: f32,
     /// Nearest view depth of the box (clip-space w), for how much of a depth tie is left there.
     pub min_w: f32,
 }
@@ -496,7 +496,7 @@ pub fn project_aabb_to_screen(
 ) -> Option<ScreenBounds> {
     let mut lo = [f32::INFINITY; 2];
     let mut hi = [f32::NEG_INFINITY; 2];
-    let mut min_depth = f32::INFINITY;
+    let mut max_depth = f32::NEG_INFINITY;
     let mut min_w = f32::INFINITY;
 
     for i in 0..8 {
@@ -518,11 +518,11 @@ pub fn project_aabb_to_screen(
         lo[1] = lo[1].min(v);
         hi[0] = hi[0].max(u);
         hi[1] = hi[1].max(v);
-        min_depth = min_depth.min(ndc.z);
+        max_depth = max_depth.max(ndc.z);
         min_w = min_w.min(clip.w);
     }
 
-    if !min_depth.is_finite() {
+    if !max_depth.is_finite() {
         return None;
     }
 
@@ -533,7 +533,7 @@ pub fn project_aabb_to_screen(
             hi[0].clamp(0.0, 1.0),
             hi[1].clamp(0.0, 1.0),
         ],
-        min_depth: min_depth.max(0.0),
+        max_depth: max_depth.min(1.0),
         min_w,
     })
 }
@@ -555,12 +555,12 @@ pub fn hiz_mip_level(rect: [f32; 4], width: u32, height: u32, mip_count: u32) ->
 
 /// Decide whether a candidate is hidden.
 ///
-/// `furthest_depth` is the maximum of the (up to) four Hi-Z texels covering the
-/// footprint. Occluded means the candidate's nearest point is strictly behind
-/// everything recorded there.
+/// `furthest_depth` is the minimum (reversed-Z) of the (up to) four Hi-Z texels
+/// covering the footprint. Occluded means the candidate's nearest point is
+/// strictly behind everything recorded there.
 pub fn is_occluded(bounds: &ScreenBounds, furthest_depth: f32) -> bool {
-    // A cleared pyramid holds 1.0, the far plane, which occludes nothing.
-    if furthest_depth >= 1.0 {
+    // A cleared pyramid holds 0.0, infinity, which occludes nothing.
+    if furthest_depth <= 0.0 {
         return false;
     }
     // Matches cull.wgsl: a candidate that covers a quarter of the screen is
@@ -571,7 +571,7 @@ pub fn is_occluded(bounds: &ScreenBounds, furthest_depth: f32) -> bool {
     }
     // Matches cull.wgsl: a depth tie can draw the candidate up to its reach nearer than its box, less as ties fade.
     use crate::pass::visibility::{depth_tie_fade, DEPTH_TIE_REACH};
-    bounds.min_depth - DEPTH_TIE_REACH * depth_tie_fade(bounds.min_w) > furthest_depth
+    bounds.max_depth + DEPTH_TIE_REACH * depth_tie_fade(bounds.min_w) < furthest_depth
 }
 
 #[cfg(test)]
@@ -579,7 +579,8 @@ mod hiz_tests {
     use super::*;
 
     fn persp() -> glam::Mat4 {
-        let proj = glam::Mat4::perspective_rh(60f32.to_radians(), 16.0 / 9.0, 0.1, 1000.0);
+        // As the scene draws: reversed and infinite (renderer.rs `set_view`).
+        let proj = crate::view::reversed_z(glam::Mat4::perspective_rh(60f32.to_radians(), 16.0 / 9.0, 0.1, 1000.0));
         let view = glam::Mat4::look_at_rh(
             glam::Vec3::new(0.0, 0.0, 10.0),
             glam::Vec3::ZERO,
@@ -594,9 +595,9 @@ mod hiz_tests {
         assert!(b.rect[0] < 0.5 && b.rect[2] > 0.5, "rect {:?}", b.rect);
         assert!(b.rect[1] < 0.5 && b.rect[3] > 0.5, "rect {:?}", b.rect);
         assert!(
-            b.min_depth > 0.0 && b.min_depth < 1.0,
+            b.max_depth > 0.0 && b.max_depth < 1.0,
             "depth {}",
-            b.min_depth
+            b.max_depth
         );
     }
 
@@ -614,10 +615,10 @@ mod hiz_tests {
     }
 
     #[test]
-    fn a_nearer_box_reports_a_smaller_depth() {
+    fn a_nearer_box_reports_a_larger_depth() {
         let near = project_aabb_to_screen([-1.0, -1.0, 4.0], [1.0, 1.0, 5.0], persp()).unwrap();
         let far = project_aabb_to_screen([-1.0, -1.0, -50.0], [1.0, 1.0, -49.0], persp()).unwrap();
-        assert!(near.min_depth < far.min_depth);
+        assert!(near.max_depth > far.max_depth);
     }
 
     #[test]
@@ -656,7 +657,7 @@ mod hiz_tests {
     fn a_candidate_behind_the_recorded_depth_is_occluded() {
         let b = ScreenBounds {
             rect: [0.0, 0.0, 0.1, 0.1],
-            min_depth: 0.8,
+            max_depth: 0.2,
             min_w: 5.0,
         };
         assert!(is_occluded(&b, 0.5));
@@ -666,7 +667,7 @@ mod hiz_tests {
     fn a_candidate_in_front_of_the_recorded_depth_is_visible() {
         let b = ScreenBounds {
             rect: [0.0, 0.0, 0.1, 0.1],
-            min_depth: 0.3,
+            max_depth: 0.7,
             min_w: 5.0,
         };
         assert!(!is_occluded(&b, 0.5));
@@ -674,14 +675,14 @@ mod hiz_tests {
 
     #[test]
     fn an_empty_region_never_occludes() {
-        // Cleared depth is 1.0. Even a candidate at the far plane must survive,
-        // or the first frame would cull the entire scene.
+        // Cleared depth is 0.0 (reversed-Z). Even a candidate at infinity must
+        // survive, or the first frame would cull the entire scene.
         let b = ScreenBounds {
-            rect: [0.0, 0.0, 1.0, 1.0],
-            min_depth: 1.0,
+            rect: [0.0, 0.0, 0.1, 0.1],
+            max_depth: 0.0,
             min_w: 5.0,
         };
-        assert!(!is_occluded(&b, 1.0));
+        assert!(!is_occluded(&b, 0.0));
     }
 
     #[test]
@@ -690,7 +691,7 @@ mod hiz_tests {
         // the next frame; rejecting it would make geometry flicker out.
         let b = ScreenBounds {
             rect: [0.0, 0.0, 0.1, 0.1],
-            min_depth: 0.5,
+            max_depth: 0.5,
             min_w: 5.0,
         };
         assert!(!is_occluded(&b, 0.5));
@@ -702,17 +703,17 @@ mod hiz_tests {
         // would otherwise hit neighbouring geometry and delete the tree.
         let b = ScreenBounds {
             rect: [0.0, 0.0, 0.6, 0.6],
-            min_depth: 0.8,
+            max_depth: 0.2,
             min_w: 5.0,
         };
-        assert!(!is_occluded(&b, 0.2));
+        assert!(!is_occluded(&b, 0.8));
     }
 
     #[test]
     fn a_depth_tie_keeps_a_candidate_just_behind_near_and_not_far() {
         // A tie can draw a thing nearer than its box, so near the eye it is kept until it is behind by more than a tie
         // reaches; ties are gone past 24 m, and so is that allowance (F's check, 29 Oct).
-        let just_behind = |min_w: f32| ScreenBounds { rect: [0.0, 0.0, 0.1, 0.1], min_depth: 0.5 + 1e-5, min_w };
+        let just_behind = |min_w: f32| ScreenBounds { rect: [0.0, 0.0, 0.1, 0.1], max_depth: 0.5 - 1e-5, min_w };
         assert!(!is_occluded(&just_behind(5.0), 0.5), "within a tie's reach at 5 m");
         assert!(is_occluded(&just_behind(30.0), 0.5), "past the ties at 30 m");
     }

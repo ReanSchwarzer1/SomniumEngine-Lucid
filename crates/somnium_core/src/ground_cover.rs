@@ -39,8 +39,10 @@ const GENERATE_MS_PER_FRAME: f32 = 2.0;
 /// Most copies of parts (slots) set in batches in one frame, nearest cells first (the rest wait a frame): a tile
 /// streaming in beside the player once set 100,000+ in one frame (40 MB of slots, a 350 ms frame).
 const SLOTS_SET_PER_FRAME: i64 = 48_000;
-/// Inside this distance every copy draws; past it each doubling keeps half ([`keep_at`]).
-pub const BAND_NEAR: f32 = 12.0;
+/// Inside this distance every copy draws; past it each doubling keeps half ([`keep_at`]). 24 m (was 12): the developer,
+/// 6 Nov, "even grass is too aggressive ... in immediate view they should appear real"; at 12 m a meadow 30 m off kept
+/// 40% of its blades. Copies cost the visibility pass (1.5 ms of a 25 ms frame), not shading.
+pub const BAND_NEAR: f32 = 24.0;
 /// The widest a thinned copy is drawn, against its own width.
 pub(crate) const MOST_WIDEN: f32 = 2.5;
 
@@ -134,7 +136,7 @@ impl GroundCover {
         camera: Vec3,
         area: Option<glam::Vec4>,
     ) {
-        self.update_seeded(terrain_id, u64::from(terrain_id), terrain, palette, camera, area, glam::Vec2::ZERO);
+        self.update_seeded(terrain_id, u64::from(terrain_id), terrain, palette, camera, area, glam::Vec2::ZERO, "");
     }
 
     /// As [`Self::update`], with the instances hashed from `seed_key` rather than the terrain's id: a streamed tile's
@@ -149,11 +151,19 @@ impl GroundCover {
         camera: Vec3,
         area: Option<glam::Vec4>,
         origin: glam::Vec2,
+        layer_set: &str,
     ) {
         let scale = density_scale();
+        // Only the kinds this terrain's layer set grows (`GroundCoverRules::layer_sets`; unset grows everywhere).
         let kinds: Vec<(u16, &ProjectEntry, f32, f32)> = palette
             .iter()
-            .filter_map(|(kind, entry)| entry.ground_cover.as_ref().map(|g| (*kind, entry, g.density * scale, g.radius)))
+            .filter_map(|(kind, entry)| {
+                entry
+                    .ground_cover
+                    .as_ref()
+                    .filter(|g| g.grows_on(layer_set))
+                    .map(|g| (*kind, entry, g.density * scale, g.radius))
+            })
             .collect();
         if kinds.is_empty() {
             self.terrains.remove(&terrain_id);
@@ -714,7 +724,7 @@ mod tests {
         for _ in 0..8 {
             let camera = Vec3::new(64.0, 2.0, 64.0);
             match seed_key {
-                Some(key) => cover.update_seeded(id, key, ground, &palette, camera, None, glam::Vec2::ZERO),
+                Some(key) => cover.update_seeded(id, key, ground, &palette, camera, None, glam::Vec2::ZERO, ""),
                 None => cover.update(id, ground, &palette, camera, None),
             }
         }

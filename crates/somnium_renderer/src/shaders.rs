@@ -137,6 +137,7 @@ impl Shaders {
             "gizmo.wgsl",
             "global_pool.wgsl",
             "dream_lens.wgsl",
+            "tone_curves.wgsl",
             "game_highlight.wgsl",
             "game_highlight_mask.wgsl",
             "editor_glow.wgsl",
