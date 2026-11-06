@@ -782,6 +782,15 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
             graded = mix(graded, vec3(luma) * vec3(0.92, 1.0, 0.9), 0.45);
         }
         graded = floor(clamp(graded, vec3(0.0), vec3(1.0)) * levels + 0.5 + threshold) / levels;
+    } else if photo {
+        // The photographic camera dithers in the encoded picture, where the sRGB target quantises: a triangular ±1
+        // step, new every frame. Half a step in linear light (below) is a quarter of a step in a bright sky, which
+        // is why overcast skies banded (the lead's review, 6 Nov).
+        let px = vec2<u32>(max(in.clip.xy, vec2<f32>(0.0)));
+        let frame = u32(fract(pp.time / 4096.0) * 4096.0 * 60.0);
+        let h = pcg_hash(px.x + pcg_hash(px.y + pcg_hash(frame * 8u + 5u)));
+        let tri = (f32(h & 0xffffu) + f32(h >> 16u)) / 65535.0 - 1.0;
+        graded = lut_decode(clamp(lut_encode(graded) + vec3<f32>(tri / 255.0), vec3<f32>(0.0), vec3<f32>(1.0)));
     } else {
         let dither = (hash21(in.uv * 2048.0) - 0.5) / 255.0;
         graded += dither;

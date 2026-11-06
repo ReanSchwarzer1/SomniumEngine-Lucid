@@ -78,19 +78,20 @@ fn reinhard(x: vec3<f32>) -> vec3<f32> {
 //
 // A tone response measured off a camera, in AgX's working space. Per channel, in stops from middle grey, two halves
 // of the smooth clamp u / (1 + u^p)^(1/p) meet at the pivot: the toe below it, the shoulder above. Fitted (rimeborn-fp
-// tools/photoreal) to a digital camera's JPEG response: within a tenth of a stop from 7 stops under middle grey to 2
-// over, so a dim wood keeps the detail a photograph keeps, and it never reaches black (10 stops under is still about
-// 1/255). The shoulder is a third of a stop softer than a camera's at +3 to +4, which keeps the form of bright cloud,
-// and AgX's matrices keep hue as AgX does: a fire's orange drifts +12 degrees two stops over (ACES: +29).
+// tools/photoreal) to a digital camera's JPEG response: within 0.08 stop from 7 stops under middle grey to 2 over, so a
+// dim wood keeps the detail a photograph keeps, and it never reaches black (10 stops under is still about 1/255). The
+// shoulder is a fifth of a stop softer than a camera's at +3 to +4 (an overcast sky and pale straw reach 0.75-0.9,
+// cloud keeps its form), and AgX's matrices keep hue as AgX does: a fire's orange drifts +12 degrees two stops over
+// (ACES: +29). Firmed from shoulder 3 / 0.14 a stop after the lead's review (6 Nov): open land read dull.
 
-/// Middle grey on the curve, display-encoded (gamma 2.2): 0.4647^2.2 = 0.185.
-const PHOTO_PIVOT: f32 = 0.4647;
+/// Middle grey on the curve, display-encoded (gamma 2.2): 0.4606^2.2 = 0.182.
+const PHOTO_PIVOT: f32 = 0.4606;
 /// Display-encoded rise per stop just below and just above middle grey.
-const PHOTO_SLOPE_LO: f32 = 0.1242;
-const PHOTO_SLOPE_HI: f32 = 0.1400;
+const PHOTO_SLOPE_LO: f32 = 0.1224;
+const PHOTO_SLOPE_HI: f32 = 0.1500;
 /// How sharply the toe and the shoulder turn (the clamp's p).
 const PHOTO_TOE: f32 = 2.146;
-const PHOTO_SHOULDER: f32 = 3.0;
+const PHOTO_SHOULDER: f32 = 4.0;
 
 fn photo_clamp(u: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
     let v = max(u, vec3<f32>(0.0));
