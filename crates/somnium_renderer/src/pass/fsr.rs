@@ -17,9 +17,23 @@ use wgpu_ffx::{
 
 use crate::pass::postprocess::HDR_FORMAT;
 
-/// Matches hello_engine / clustered lighting.
+/// Matches hello_engine / clustered lighting: the fallback when a projection gives no planes (`near_far_from_proj`).
 const CAMERA_NEAR: f32 = 0.1;
 const CAMERA_FAR: f32 = 1000.0;
+
+/// The near and far planes of a right-handed, 0..1 depth projection (`glam::Mat4::perspective_rh`, or its infinite
+/// form, whose far is held at 10^7 m). FSR reconstructs view depth from these; fixed at 0.1 and 1000 they put every
+/// surface past 1 km of Sunscar's 8 km view at the wrong depth for its disocclusion test (Sunscar, 6 Nov 2026).
+fn near_far_from_proj(proj: glam::Mat4) -> (f32, f32) {
+    // perspective_rh: z.z = far / (near - far), w.z = near * far / (near - far); infinite: z.z = -1, w.z = -near.
+    let (a, b) = (proj.z_axis.z, proj.w_axis.z);
+    if !a.is_finite() || !b.is_finite() || a.abs() < 1.0e-9 {
+        return (CAMERA_NEAR, CAMERA_FAR);
+    }
+    let near = b / a;
+    let far = if (a + 1.0).abs() < 1.0e-7 { 1.0e7 } else { (b / (a + 1.0)).min(1.0e7) };
+    if near > 0.0 && far > near { (near, far) } else { (CAMERA_NEAR, CAMERA_FAR) }
+}
 
 struct FsrGpu {
     context: FsrContext,
@@ -343,8 +357,8 @@ impl FsrPass {
             // half floats flush to zero, which may be the low-light black band.
             pre_exposure: if pre_exposure_one() { 1.0 } else { exposure.max(1e-8) },
             reset_history: reset_history || gpu.frame_index == 0,
-            camera_near: CAMERA_NEAR,
-            camera_far: CAMERA_FAR,
+            camera_near: near_far_from_proj(proj).0,
+            camera_far: near_far_from_proj(proj).1,
             camera_fov_y: fov_y,
             view_space_to_meters_factor: 1.0,
             flags: FsrDispatchFlags::empty(),
@@ -723,3 +737,18 @@ fn pre_exposure_one() -> bool {
 #[cfg(test)]
 #[path = "fsr_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod near_far_tests {
+    use super::near_far_from_proj;
+
+    #[test]
+    fn planes_come_back_from_the_projection() {
+        let (n, f) = near_far_from_proj(glam::Mat4::perspective_rh(1.0, 16.0 / 9.0, 0.1, 8000.0));
+        // f32: far / (near - far) + 1 keeps about two digits at 80 000:1, so the far plane is good to ~1%.
+        assert!((n - 0.1).abs() < 1.0e-5 && (f - 8000.0).abs() < 160.0, "{n} {f}");
+        let (n, f) = near_far_from_proj(glam::Mat4::perspective_infinite_rh(1.0, 1.5, 0.05));
+        assert!((n - 0.05).abs() < 1.0e-6 && f >= 1.0e6, "{n} {f}");
+        assert_eq!(near_far_from_proj(glam::Mat4::IDENTITY), (super::CAMERA_NEAR, super::CAMERA_FAR));
+    }
+}
