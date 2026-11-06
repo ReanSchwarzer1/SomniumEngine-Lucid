@@ -450,7 +450,7 @@ fn picture_wave(uv: vec2<f32>, p: f32) -> vec2<f32> {
     let texel = min(vec2<u32>(uv * vec2<f32>(dims)), dims - vec2<u32>(1u));
     let z = textureLoad(scene_depth, texel, 0);
     var d = 1.0e5;
-    if z < 0.99999 {
+    if !depth_is_sky(z) {
         let h = pp.inv_view_proj * vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, z, 1.0);
         d = distance(h.xyz / h.w, pp.shift_at.xyz);
     }
@@ -531,7 +531,7 @@ fn nearest_inverse_depth(p: vec2<i32>, dims: vec2<i32>) -> f32 {
 /// 1 / view depth at a depth texel (0 for the sky).
 fn inverse_depth(p: vec2<i32>, dims: vec2<i32>) -> f32 {
     let z = textureLoad(scene_depth, p, 0);
-    if z >= 0.99999 {
+    if depth_is_sky(z) {
         return 0.0;
     }
     let uv = (vec2<f32>(p) + 0.5) / vec2<f32>(dims);
