@@ -550,6 +550,8 @@ impl InstanceBatches {
         dirty: [bool; crate::shadow::NUM_CASCADES],
         compact: bool,
         radius_threshold: f32,
+        // The traced sun shades opaque traced copies (`GpuSlot::shadow[3]`): the cascades leave them out.
+        rays_shade_opaque: bool,
     ) {
         self.shadow_culled = None;
         let Some(gpu) = self.gpu.as_ref() else { return };
@@ -564,7 +566,7 @@ impl InstanceBatches {
         }
         let params = ShadowParams {
             planes: flat,
-            camera: [camera.x, camera.y, camera.z, 0.0],
+            camera: [camera.x, camera.y, camera.z, f32::from(u8::from(rays_shade_opaque))],
             slots,
             capacity: gpu.capacity,
             dirty: mask,

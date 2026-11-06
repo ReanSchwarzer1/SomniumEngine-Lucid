@@ -38,8 +38,6 @@ pub struct RestirPass {
     binds: Vec<wgpu::BindGroup>,
     grain_view: wgpu::TextureView,
     grain_enabled: bool,
-    /// For the cut-out test on leaf cards (binding 7).
-    sampler: Option<wgpu::Sampler>,
     vis_view: Option<wgpu::TextureView>,
     vis_tex: Option<wgpu::Texture>,
     /// Set once the pass has written the target, so a disabled pass knows it
@@ -56,7 +54,6 @@ impl RestirPass {
     pub fn new(
         device: &wgpu::Device,
         shaders: &crate::shaders::Shaders,
-        global_layout: &wgpu::BindGroupLayout,
         supported: bool,
         grain_view: &wgpu::TextureView,
         width: u32,
@@ -75,7 +72,6 @@ impl RestirPass {
                 binds: Vec::new(),
                 grain_view: grain_view.clone(),
                 grain_enabled: false,
-                sampler: None,
                 vis_view: None,
                 vis_tex: None,
                 vis_dirty: false,
@@ -158,18 +154,12 @@ impl RestirPass {
                     },
                     count: None,
                 },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 7,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
             ],
         });
 
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ReSTIR PL"),
-            bind_group_layouts: &[Some(global_layout), Some(&layout)],
+            bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
 
@@ -178,13 +168,7 @@ impl RestirPass {
             layout: Some(&pl),
             module: &shader,
             entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions {
-                constants: &[(
-                    "di_candidate_alpha",
-                    f64::from(u8::from(std::env::var("SOMNIUM_DI_CANDIDATE_ALPHA").as_deref() != Ok("0"))),
-                )],
-                ..Default::default()
-            },
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
 
@@ -201,12 +185,6 @@ impl RestirPass {
             binds: Vec::new(),
             grain_view: grain_view.clone(),
             grain_enabled: crate::pass::grain::enabled_by_default("SOMNIUM_DREAMS_GRAIN"),
-            sampler: Some(device.create_sampler(&wgpu::SamplerDescriptor {
-                label: Some("ReSTIR DI sampler"),
-                mag_filter: wgpu::FilterMode::Linear,
-                min_filter: wgpu::FilterMode::Linear,
-                ..Default::default()
-            })),
             vis_view: None,
             vis_tex: None,
             vis_dirty: false,
@@ -303,11 +281,10 @@ impl RestirPass {
         if !self.binds.is_empty() {
             return;
         }
-        let (Some(layout), Some(params), Some(vis), Some(sampler)) = (
+        let (Some(layout), Some(params), Some(vis)) = (
             self.layout.as_ref(),
             self.params.as_ref(),
             self.vis_view.as_ref(),
-            self.sampler.as_ref(),
         ) else {
             return;
         };
@@ -348,10 +325,6 @@ impl RestirPass {
                         wgpu::BindGroupEntry {
                             binding: 6,
                             resource: wgpu::BindingResource::TextureView(&self.grain_view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 7,
-                            resource: wgpu::BindingResource::Sampler(sampler),
                         },
                     ],
                 }));
@@ -404,7 +377,6 @@ impl RestirPass {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
-        global_bind: &wgpu::BindGroup,
         tlas: &wgpu::Tlas,
         depth_view: &wgpu::TextureView,
         view_proj: glam::Mat4,
@@ -448,8 +420,7 @@ impl RestirPass {
             timestamp_writes: None,
         });
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, global_bind, &[]);
-        pass.set_bind_group(1, &self.binds[self.write_index], &[]);
+        pass.set_bind_group(0, &self.binds[self.write_index], &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
         drop(pass);
 

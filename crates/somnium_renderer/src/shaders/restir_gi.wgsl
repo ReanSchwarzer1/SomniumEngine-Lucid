@@ -172,7 +172,7 @@ fn gi_visible(origin: vec3<f32>, to: vec3<f32>, t_min: f32) -> bool {
     // floor of a wood went black (Sunscar, 6 Nov 2026).
     if rt_candidate_alpha {
         var aq: ray_query;
-        rayQueryInitialize(&aq, accel, RayDesc(0x4u, 0x1u, t_min, dist * 0.999, origin, d / dist));
+        rayQueryInitialize(&aq, accel, RayDesc(0x6u, 0x5u, t_min, dist * 0.999, origin, d / dist));
         while rayQueryProceed(&aq) {
             if rt_candidate_is_covered(rayQueryGetCandidateIntersection(&aq)) {
                 rayQueryConfirmIntersection(&aq);
@@ -188,11 +188,10 @@ fn gi_visible(origin: vec3<f32>, to: vec3<f32>, t_min: f32) -> bool {
         // surface at `to` is not its own occluder.
         // Visibility rays see shadow casters; bounce-hit rays keep the full
         // geometry mask in rt_trace so non-casters still receive indirect light.
-        RayDesc(0x4u, 0x1u, t_min, dist * 0.999, origin, d / dist),
+        // 0x1 opaque casters, 0x4 cut-out cards (raytrace.rs): leaves block GI's light too.
+        RayDesc(0x4u, 0x5u, t_min, dist * 0.999, origin, d / dist),
     );
-    while rayQueryProceed(&rq) {
-        rayQueryConfirmIntersection(&rq);
-    }
+    rayQueryProceed(&rq);
     return rayQueryGetCommittedIntersection(&rq).kind == RAY_QUERY_INTERSECTION_NONE;
 }
 
@@ -322,8 +321,7 @@ fn gi_direct_at(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>, terrain_index: i3
         irradiance += light.color * (ndl * light.ibl_intensity);
     }
     // A leaf lit from the far side passes light through (thin Lambertian translucency, `Material.transmission`):
-    // a canopy's underside glows green, and that, not the sky, is most of the light on a wood's floor. Without it
-    // a sunlit crown seen from below sent nothing, and shade under trees was the blue of the gaps alone (Sunscar,
+    // a canopy's underside glows green, and that, not the sky, is most of the light on a wood's floor (Sunscar,
     // 6 Nov 2026). The normal faces the ray, so the sun is behind it when ndl < 0.
     if ndl < 0.0 && transmission > 0.0 && gi_luma(light.color) > 1.0e-6
         && gi_visible(p - n * 0.02, p + l * 4000.0, 0.02) {

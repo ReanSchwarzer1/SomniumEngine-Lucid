@@ -188,8 +188,7 @@ fn rt_trace(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> RtHit 
         var rq: ray_query;
         // ForceNonOpaque exposes triangle candidates even though existing
         // BLASes were built opaque. All geometries in this scene are triangles.
-        // Cut-out meshes' BLAS are non-opaque (raytrace.rs `mark_cutout`): only their triangles come here.
-        rayQueryInitialize(&rq, accel, RayDesc(0x0u, 0xffu, t_min, t_max, origin, dir));
+        rayQueryInitialize(&rq, accel, RayDesc(0x2u, 0xffu, t_min, t_max, origin, dir));
         while rayQueryProceed(&rq) {
             if rt_candidate_is_covered(rayQueryGetCandidateIntersection(&rq)) {
                 rayQueryConfirmIntersection(&rq);
@@ -201,10 +200,7 @@ fn rt_trace(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> RtHit 
     for (var hop = 0u; hop < 4u; hop++) {
         var rq: ray_query;
         rayQueryInitialize(&rq, accel, RayDesc(0u, 0xffu, t, t_max, origin, dir));
-        // A cut-out mesh's triangles are candidates: take each, the nearest wins, the resolve below tests alpha.
-        while rayQueryProceed(&rq) {
-            rayQueryConfirmIntersection(&rq);
-        }
+        rayQueryProceed(&rq);
         let hit = rt_resolve(origin, dir, rayQueryGetCommittedIntersection(&rq));
         if hit.hit {
             return hit;

@@ -34,10 +34,8 @@ fn practical_visibility(p: vec3<f32>, geometric_normal: vec3<f32>, emitter: vec3
             // shadow its own authored source. This is a world-space fixture
             // tolerance, not a distance-dependent leak across room partitions.
             rayQueryInitialize(&rq, local_shadow_accel,
-                RayDesc(0x4u, 0x1u, 0.008, distance - 0.06, origin, delta / distance));
-            while rayQueryProceed(&rq) {
-                rayQueryConfirmIntersection(&rq);   // cut-out meshes are non-opaque
-            }
+                RayDesc(0x4u, 0x5u, 0.008, distance - 0.06, origin, delta / distance));   // 0x4: cut-out casters
+            rayQueryProceed(&rq);
             return select(0.0, 1.0, rayQueryGetCommittedIntersection(&rq).kind == RAY_QUERY_INTERSECTION_NONE);
         }
     }
@@ -155,10 +153,8 @@ fn skin_visibility(p: vec3<f32>, emitter: vec3<f32>, reach: f32) -> f32 {
         if distance > reach + 0.07 {
             var rq: ray_query;
             rayQueryInitialize(&rq, local_shadow_accel,
-                RayDesc(0x4u, 0x1u, reach, distance - 0.06, p, delta / distance));
-            while rayQueryProceed(&rq) {
-                rayQueryConfirmIntersection(&rq);   // cut-out meshes are non-opaque
-            }
+                RayDesc(0x4u, 0x5u, reach, distance - 0.06, p, delta / distance));   // 0x4: cut-out casters
+            rayQueryProceed(&rq);
             return select(0.0, 1.0, rayQueryGetCommittedIntersection(&rq).kind == RAY_QUERY_INTERSECTION_NONE);
         }
         return 1.0;
@@ -3133,7 +3129,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let traced = textureLoad(restir_vis, pixel_coords, 0);
     var shadow_factor: f32;
     if (cluster_params.shading_mode & 16u) != 0u {
-        shadow_factor = traced.r * terrain_parallax_shadow_factor;
+        // Hybrid (Sunscar, 6 Nov 2026): the traced sun covers opaque casters (TLAS mask 0x1); the cascades hold only
+        // what it does not: cut-out leaf and grass cards (alpha-tested in the shadow pass, so light dapples through
+        // them at a fraction of an alpha-tested ray's cost) and whatever is left out of the traced scene, as ground
+        // cover is (`rays_shade_opaque`, renderer.rs). Faded out over the last cascade's last 15%.
+        let raster = sample_shadow(hit_point, shadow_normal, view_depth, in.clip_pos.xy);
+        let reach = smoothstep(0.85, 1.0, view_depth / max(light.cascade_splits.w, 1.0));
+        shadow_factor = traced.r * mix(raster, 1.0, reach) * terrain_parallax_shadow_factor;
     } else {
         shadow_factor = sample_shadow(hit_point, shadow_normal, view_depth, in.clip_pos.xy)
             * terrain_parallax_shadow_factor;
