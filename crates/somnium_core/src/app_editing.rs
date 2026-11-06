@@ -2250,7 +2250,8 @@ impl<G: GameApp> Engine<G> {
     /// `SOMNIUM_EDITOR_SCRIPT`: scripted editor input for proof captures in a background window, inert unless set.
     /// Steps are `<frame>:<action>`, separated by `;`: `pick=<x>,<y>` (a click at that fraction of the window),
     /// `select=<name part>` (the first entity whose name contains it), `cmd=<command id>`, `save`, `close`, `splash`,
-    /// `gpu_error`, and `eye=<x>,<z>,<yaw>,<pitch>` (the editor camera 1.7 m over the loaded ground at scene x, z).
+    /// `gpu_error`, `panic` (a crash on the main thread), and `eye=<x>,<z>,<yaw>,<pitch>` (the editor camera 1.7 m over
+    /// the loaded ground at scene x, z).
     pub(super) fn run_editor_script(&mut self) {
         static SCRIPT: std::sync::LazyLock<Vec<(u64, String)>> = std::sync::LazyLock::new(|| {
             std::env::var("SOMNIUM_EDITOR_SCRIPT")
@@ -2283,6 +2284,10 @@ impl<G: GameApp> Engine<G> {
                     self.selection.set_single(hit);
                     self.after_selection_change();
                     self.reveal_selection_in_outliner(true);
+                }
+                None if action == "panic" => {
+                    // A crash on the main thread, for the crash report's proof run.
+                    panic!("editor script: a panic on the main thread, asked for by the proof run");
                 }
                 Some(("eye", at)) => {
                     // The editor camera 1.7 m over the ground at scene x, z, turned to yaw and pitch (degrees).
