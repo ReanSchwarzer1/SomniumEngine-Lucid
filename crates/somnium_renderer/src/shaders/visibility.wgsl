@@ -242,7 +242,23 @@ fn fs_main(
         let alpha = textureSampleGrad(
             textures[material.albedo_map], cutout_sampler, uv, ddx_uv, ddy_uv,
         ).a;
-        if alpha < material.alpha_cutoff {
+        var cutoff = material.alpha_cutoff;
+        // Hashed alpha where minified (`MATERIAL_FLAG_HASHED_ALPHA`, bare twigs; Wyman & McGuire 2017): a twig a
+        // texel wide is a fraction of a pixel far off, and a fixed cut-off keeps only the few texels that clear it,
+        // so a bare crown broke into dark flecks. Past 2 texels a pixel the cut-off blends toward a per-pixel noise
+        // that moves every frame, so each pixel shows its share of twig and TAA turns it into a haze.
+        if (material.flags & 32u) != 0u {
+            let size = vec2<f32>(textureDimensions(textures[material.albedo_map]));
+            let texels = max(length(ddx_uv * size), length(ddy_uv * size));
+            let minified = saturate(log2(max(texels, 1.0)) - 1.0);
+            if minified > 0.0 {
+                let step = f32(u32(view.time * 60.0) % 64u);
+                let n = fract(52.9829189 * fract(dot(frag.xy + 5.588238 * step + vec2<f32>(13.0, 29.0),
+                                                     vec2<f32>(0.06711056, 0.00583715))));
+                cutoff = mix(cutoff, clamp(n, 0.02, 0.98), minified);
+            }
+        }
+        if alpha < cutoff {
             discard;
         }
     }

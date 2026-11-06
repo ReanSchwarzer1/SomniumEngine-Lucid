@@ -2238,6 +2238,10 @@ impl SomniumRenderer {
                             crate::material::pool::MATERIAL_FLAG_HAIR
                         } else {
                             0
+                        } | if mat.hashed_alpha {
+                            crate::material::pool::MATERIAL_FLAG_HASHED_ALPHA
+                        } else {
+                            0
                         },
                         // Linear, not colour: listed with the data maps above.
                         height_map: resolve_tex(mat.height_map),

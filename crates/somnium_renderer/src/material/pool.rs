@@ -110,6 +110,10 @@ pub const MATERIAL_FLAG_EYE: u32 = 1 << 3;
 /// `shading.wgsl` `hair_strand`.
 pub const MATERIAL_FLAG_HAIR: u32 = 1 << 4;
 
+/// `GpuMaterial::flags` bit 5 — hashed alpha where minified (glTF extras `somnium_hashed_alpha`): bare twigs. The
+/// visibility pass tests `(flags & 32u)`.
+pub const MATERIAL_FLAG_HASHED_ALPHA: u32 = 1 << 5;
+
 impl GpuMaterial {
     /// Rebuild the frozen 80-byte runtime payload from an authored material.
     /// Texture asset ids are resolved by the caller because only the runtime
