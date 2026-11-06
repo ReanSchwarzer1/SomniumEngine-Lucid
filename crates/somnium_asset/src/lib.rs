@@ -252,6 +252,116 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<LoadedScene, String> {
     load_gltf_for(path, None)
 }
 
+// ─── Validation before upload ───────────────────────────────────────────────
+//
+// A model the importer refuses is skipped: one log line names the file and the reason, the engine's editor shows it
+// in a toast ([`take_refused`]), and nothing of it reaches the GPU. Sunscar, 6 Nov 2026: 84 paving models whose .gltf
+// and .bin came from two different writes lost the GPU device twice as they streamed in.
+
+thread_local! {
+    /// Set while this thread runs the importer under its panic guard.
+    static GUARDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread is inside a guarded model load: a panic here is caught, and the model skipped (a crash hook
+/// shows no "stopped" box for it).
+#[must_use]
+pub fn in_guarded_load() -> bool {
+    GUARDED.with(std::cell::Cell::get)
+}
+
+/// Models refused this run: every file seen once, and the ones not yet taken by [`take_refused`].
+static REFUSED: std::sync::LazyLock<std::sync::Mutex<(HashSet<std::path::PathBuf>, Vec<(std::path::PathBuf, String)>)>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The models refused since the last call, each file once a run, with why: what the editor's toast says.
+#[must_use]
+pub fn take_refused() -> Vec<(std::path::PathBuf, String)> {
+    std::mem::take(&mut REFUSED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).1)
+}
+
+/// Whether `path` was refused this run, and how many of its refusals wait for [`take_refused`] (tests look without
+/// taking, so two tests never take each other's).
+#[cfg(test)]
+fn refused_state(path: &Path) -> (bool, usize) {
+    let refused = REFUSED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    (refused.0.contains(path), refused.1.iter().filter(|(p, _)| p == path).count())
+}
+
+/// One log line for a refused model, the first time this run, and a place in the editor's toast.
+fn refuse(path: &Path, reason: &str) {
+    let mut refused = REFUSED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if refused.0.insert(path.to_path_buf()) {
+        warn!(file = %path.display(), "Skipped a broken model; nothing of it reaches the GPU: {reason}");
+        refused.1.push((path.to_path_buf(), reason.to_owned()));
+    }
+}
+
+/// Each buffer's file against the length the glTF declares, before it is read: a `.bin` from another write than its
+/// `.gltf` is refused (a buffer may be padded to four bytes, no more). A file that cannot be read is left to the
+/// importer, which names it.
+fn check_buffer_files(document: &gltf::Document, base_dir: &Path, blob: Option<&[u8]>) -> Result<(), String> {
+    for buffer in document.buffers() {
+        let declared = buffer.length();
+        let (actual, what) = match buffer.source() {
+            gltf::buffer::Source::Bin => (blob.map_or(0, <[u8]>::len), "binary chunk".to_owned()),
+            gltf::buffer::Source::Uri(uri) if uri.starts_with("data:") => continue,
+            gltf::buffer::Source::Uri(uri) => {
+                let file = base_dir.join(uri.replace("%20", " "));
+                let Ok(meta) = std::fs::metadata(&file) else { continue };
+                (meta.len() as usize, uri.to_owned())
+            }
+        };
+        if actual < declared || actual > declared + 3 {
+            return Err(format!(
+                "buffer {}: the glTF declares {declared} bytes and its {what} has {actual}: the two come from different \
+                 writes",
+                buffer.index()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every buffer view inside its buffer, and every accessor (sparse parts too) inside its view: a `.gltf` from another
+/// write than its `.bin` points past it, where the reader finds nothing or the GPU garbage.
+fn check_accessors(document: &gltf::Document, buffers: &[gltf::buffer::Data]) -> Result<(), String> {
+    for view in document.views() {
+        let length = buffers.get(view.buffer().index()).map_or(0, |b| b.len());
+        let end = view.offset() + view.length();
+        if end > length {
+            return Err(format!("buffer view {} ends at byte {end}, past its buffer's {length} bytes", view.index()));
+        }
+    }
+    let past = |accessor: usize, part: &str, end: usize, length: usize| {
+        Err(format!("accessor {accessor}{part} reads to byte {end}, past its buffer view's {length} bytes"))
+    };
+    for accessor in document.accessors() {
+        let element = accessor.size();
+        if let Some(view) = accessor.view() {
+            if accessor.count() > 0 {
+                let stride = view.stride().unwrap_or(element);
+                let end = accessor.offset() + stride * (accessor.count() - 1) + element;
+                if end > view.length() {
+                    return past(accessor.index(), "", end, view.length());
+                }
+            }
+        }
+        if let Some(sparse) = accessor.sparse() {
+            let (indices, values) = (sparse.indices(), sparse.values());
+            let end = indices.offset() + sparse.count() * indices.index_type().size();
+            if end > indices.view().length() {
+                return past(accessor.index(), "'s sparse indices", end, indices.view().length());
+            }
+            let end = values.offset() + sparse.count() * element;
+            if end > values.view().length() {
+                return past(accessor.index(), "'s sparse values", end, values.view().length());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// [`load_gltf`] for a level that draws only `parts` of the file (uploaded-node
 /// ordinals, the order of [`LoadedScene::nodes`]): only the images their
 /// materials read are decoded. Every other image is a 1×1 magenta stand-in, so
@@ -263,15 +373,43 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<LoadedScene, String> {
 /// 172 parts from (dev record `texture_memory_2026-10-12.md`). Images now
 /// decode on every core, each by `gltf::image::Data::from_source`, the call
 /// `gltf::import` makes, so formats and errors are as before.
+///
+/// Validated before anything is uploaded: buffer files against their declared lengths, every view and accessor inside
+/// its buffer, index bounds and corners ([`check_primitive`]), every image decoded. A panic in the importer is caught.
+/// A refused model is logged once a run (the file and the reason) and kept for the editor's toast ([`take_refused`]).
 pub fn load_gltf_for(path: impl AsRef<Path>, parts: Option<&HashSet<usize>>) -> Result<LoadedScene, String> {
     let path = path.as_ref();
+    let outer = GUARDED.with(|g| g.replace(true));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_gltf_checked(path, parts)))
+        .unwrap_or_else(|panic| {
+            let text = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "(no message)".to_owned());
+            Err(format!("the importer stopped on a panic: {text}"))
+        });
+    GUARDED.with(|g| g.set(outer));
+    // A file that is there and broken is refused; a missing one (an impostor not made yet, a renamed piece) is its
+    // caller's to report, as before, and Check Meshes lists it.
+    if let Err(reason) = &result {
+        if path.is_file() {
+            refuse(path, reason);
+        }
+    }
+    result
+}
+
+fn load_gltf_checked(path: &Path, parts: Option<&HashSet<usize>>) -> Result<LoadedScene, String> {
     info!("Loading glTF: {:?}", path);
 
     let base_dir = path.parent().unwrap_or_else(|| Path::new("./"));
     let gltf::Gltf { document, blob } =
         gltf::Gltf::open(path).map_err(|e| format!("glTF import failed: {e}"))?;
+    check_buffer_files(&document, base_dir, blob.as_deref())?;
     let buffers = gltf::import_buffers(&document, Some(base_dir), blob)
         .map_err(|e| format!("glTF import failed: {e}"))?;
+    check_accessors(&document, &buffers)?;
     let wanted = parts.map(|parts| images_for_parts(&document, parts));
 
     let mut scene = LoadedScene::default();
@@ -895,8 +1033,10 @@ pub fn gltf_problems(path: &Path) -> Vec<String> {
     let geometry = || -> Result<(), String> {
         let base_dir = path.parent().unwrap_or_else(|| Path::new("./"));
         let gltf::Gltf { document, blob } = gltf::Gltf::open(path).map_err(|e| format!("glTF import failed: {e}"))?;
+        check_buffer_files(&document, base_dir, blob.as_deref())?;
         let buffers =
             gltf::import_buffers(&document, Some(base_dir), blob).map_err(|e| format!("glTF import failed: {e}"))?;
+        check_accessors(&document, &buffers)?;
         for mesh in document.meshes() {
             let name = mesh.name().unwrap_or("?");
             for (index, primitive) in mesh.primitives().enumerate() {
@@ -1057,7 +1197,7 @@ fn decode_images(
     let todo: Vec<usize> = (0..images.len()).filter(|i| wanted.is_none_or(|w| w.contains(i))).collect();
     let next = AtomicUsize::new(0);
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(todo.len()).max(1);
-    let decoded: Vec<(usize, Result<LoadedTexture, String>)> = std::thread::scope(|scope| {
+    let decoded: Result<Vec<(usize, Result<LoadedTexture, String>)>, String> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
@@ -1072,9 +1212,16 @@ fn decode_images(
                 })
             })
             .collect();
-        handles.into_iter().flat_map(|h| h.join().expect("image decode thread panicked")).collect()
+        let mut all = Vec::new();
+        for handle in handles {
+            match handle.join() {
+                Ok(done) => all.extend(done),
+                Err(_) => return Err("glTF import failed: an image decode stopped on a panic".to_owned()),
+            }
+        }
+        Ok(all)
     });
-    let mut decoded = decoded;
+    let mut decoded = decoded?;
     decoded.sort_by_key(|(index, _)| *index); // the same first error every time
     let mut textures: Vec<LoadedTexture> = (0..images.len())
         .map(|_| LoadedTexture { data: vec![255, 0, 255, 255], width: 1, height: 1 })
@@ -1676,6 +1823,68 @@ mod broken_file_tests {
         let nan = super::load_gltf(triangle(&dir, "nan", nan, [0, 1, 2])).err().unwrap();
         assert!(nan.contains("vertex 1 is not a number"), "{nan}");
         assert_eq!(super::gltf_problems(&dir.join("nan.gltf")), vec![nan]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The triangle's .bin rewritten `by` bytes shorter (negative) or longer.
+    fn resize_bin(dir: &Path, name: &str, by: isize) {
+        let file = dir.join(format!("{name}.bin"));
+        let mut bin = std::fs::read(&file).unwrap();
+        let length = (bin.len() as isize + by).max(0) as usize;
+        bin.resize(length, 0);
+        std::fs::write(&file, bin).unwrap();
+    }
+
+    #[test]
+    fn a_truncated_or_overlong_bin_is_refused_before_anything_is_read() {
+        let dir = std::env::temp_dir().join(format!("somnium-bin-sizes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let flat = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let cut = triangle(&dir, "cut", flat, [0, 1, 2]);
+        resize_bin(&dir, "cut", -8);
+        let why = super::load_gltf(&cut).err().expect("a truncated .bin is refused");
+        assert!(why.contains("declares 44 bytes") && why.contains("has 36") && why.contains("different writes"), "{why}");
+        assert_eq!(super::gltf_problems(&cut).len(), 1, "the quick check refuses it too");
+        let long = triangle(&dir, "long", flat, [0, 1, 2]);
+        resize_bin(&dir, "long", 16);
+        assert!(super::load_gltf(&long).err().unwrap().contains("has 60"));
+        let padded = triangle(&dir, "padded", flat, [0, 1, 2]);
+        resize_bin(&dir, "padded", 0);
+        assert!(super::load_gltf(&padded).is_ok(), "an exact .bin loads");
+        // Refused once a run: one log line and one toast per file, however often it is asked for. (The only test that
+        // takes the list: the others look.)
+        assert!(super::load_gltf(&cut).is_err());
+        assert_eq!(super::refused_state(&cut), (true, 1));
+        let taken = super::take_refused();
+        assert_eq!(taken.iter().filter(|(p, _)| *p == cut).count(), 1, "{taken:?}");
+        assert_eq!(super::refused_state(&cut), (true, 0), "taken, and still known: no second line");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_accessor_past_its_view_and_an_image_that_will_not_decode_are_refused() {
+        let dir = std::env::temp_dir().join(format!("somnium-accessors-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let flat = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        // Four corners claimed in a view of three: the reader would run past it.
+        let path = triangle(&dir, "four", flat, [0, 1, 2]);
+        let text = std::fs::read_to_string(&path).unwrap().replacen("\"count\":3", "\"count\":4", 1);
+        std::fs::write(&path, text).unwrap();
+        let why = super::load_gltf(&path).err().expect("refused");
+        assert!(why.contains("accessor 0 reads to byte 48, past its buffer view's 36 bytes"), "{why}");
+        // A texture that is not a picture.
+        std::fs::write(dir.join("noise.png"), b"not a png at all").unwrap();
+        let path = triangle(&dir, "noisy", flat, [0, 1, 2]);
+        let mut document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        document["images"] = serde_json::json!([{"uri": "noise.png"}]);
+        std::fs::write(&path, document.to_string()).unwrap();
+        let why = super::load_gltf(&path).err().expect("refused");
+        assert!(why.contains("image 0"), "{why}");
+        assert!(!super::in_guarded_load(), "the guard is off outside a load");
+        // A missing model is its caller's to report: refused, but no toast.
+        let missing = dir.join("never_written.gltf");
+        assert!(super::load_gltf(&missing).is_err());
+        assert_eq!(super::refused_state(&missing), (false, 0));
         let _ = std::fs::remove_dir_all(dir);
     }
 

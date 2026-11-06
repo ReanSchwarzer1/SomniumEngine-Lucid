@@ -1504,6 +1504,31 @@ impl<G: GameApp> Engine<G> {
         }
     }
 
+    /// Models the importer refused since the last frame (`somnium_asset::take_refused`; it logged each once): one
+    /// toast in the editor naming the first and the count. A game alone only drains the list: its log has them.
+    pub(super) fn report_refused_models(&mut self) {
+        let refused = somnium_asset::take_refused();
+        let Some((file, reason)) = refused.first() else { return };
+        if self.config.player_mode {
+            return;
+        }
+        let name = project_relative(self.config.project_root.as_deref(), file);
+        let reason: String = if reason.chars().count() > 160 {
+            reason.chars().take(157).chain("...".chars()).collect()
+        } else {
+            reason.clone()
+        };
+        self.toast(&if refused.len() == 1 {
+            format!("Skipped a broken model, kept off the GPU: {name}: {reason}")
+        } else {
+            format!(
+                "Skipped {} broken models, kept off the GPU (the log names each): {name}: {reason}; and {} more",
+                refused.len(),
+                refused.len() - 1
+            )
+        });
+    }
+
     /// The height of the loaded ground at world x, z, from the first terrain that covers the point.
     fn ground_height(&self, x: f32, z: f32) -> Option<f32> {
         let renderer = self.renderer.as_ref()?;

@@ -5550,6 +5550,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             };
             self.zone_end();
             self.run_editor_script();
+            self.report_refused_models();
             self.touch_selection();
             let selection_card = self.selection_card();
             self.zone_begin("Panel: hand to UI");

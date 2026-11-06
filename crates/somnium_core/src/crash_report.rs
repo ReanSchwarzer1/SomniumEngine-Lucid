@@ -99,7 +99,9 @@ pub(crate) fn install(program: &str, project: Option<&Path>) {
     std::panic::set_hook(Box::new(move |info| {
         usual(info);
         let on_main = std::thread::current().id() == main;
-        if REPORTS.fetch_add(1, Ordering::Relaxed) >= MOST_REPORTS && !on_main {
+        // A panic inside a model load is caught there and the model skipped: reported, never a "stopped" box.
+        let caught = somnium_asset::in_guarded_load();
+        if REPORTS.fetch_add(1, Ordering::Relaxed) >= MOST_REPORTS && (!on_main || caught) {
             return;
         }
         let payload = info.payload();
@@ -118,6 +120,7 @@ pub(crate) fn install(program: &str, project: Option<&Path>) {
             at: &at,
             thread: thread.name().unwrap_or("unnamed"),
             on_main,
+            caught,
             build: build(),
             gpu: somnium_renderer::context::gpu_in_use().unwrap_or("none yet (it stopped before the GPU started)"),
             log: LOG_PATH.get().map_or_else(|| "none".to_owned(), |p| p.display().to_string()),
@@ -125,7 +128,9 @@ pub(crate) fn install(program: &str, project: Option<&Path>) {
         let text = facts.report(&std::backtrace::Backtrace::force_capture().to_string());
         let written = folders.iter().find_map(|dir| write_report(dir, secs, &text));
         let saved = written.as_ref().map_or_else(|| "its report could not be saved".to_owned(), |p| format!("report {}", p.display()));
-        if on_main {
+        if caught {
+            tracing::error!("the importer stopped on a panic and the model was skipped; {program} goes on: {message} ({at}); {saved}");
+        } else if on_main {
             tracing::error!("{program} stopped: {message} ({at}); {saved}");
             if watched() {
                 tell(&program, &crash_text(&program, written.as_deref()));
@@ -196,6 +201,8 @@ struct Facts<'a> {
     at: &'a str,
     thread: &'a str,
     on_main: bool,
+    /// Inside a model load, whose guard caught it: the model was skipped.
+    caught: bool,
     build: String,
     gpu: &'a str,
     log: String,
@@ -222,7 +229,11 @@ impl Facts<'_> {
             self.message,
             self.at,
             self.thread,
-            if self.on_main { "the main thread: the program stopped" } else { "a worker: the program went on" },
+            match (self.caught, self.on_main) {
+                (true, _) => "inside a model load: the model was skipped, the program went on",
+                (false, true) => "the main thread: the program stopped",
+                (false, false) => "a worker: the program went on",
+            },
             self.build,
             env!("CARGO_PKG_VERSION"),
             self.gpu,
@@ -587,6 +598,7 @@ mod tests {
             at: "src/lib.rs:10:5",
             thread: "main",
             on_main: true,
+            caught: false,
             build: "F:/game/sunscar.exe, 57860096 bytes, built 2023-11-14 22:13 UTC".to_owned(),
             gpu: "NVIDIA GeForce RTX 4090 (Vulkan, NVIDIA 581.57)",
             log: "F:/game/logs/editor.log".to_owned(),
@@ -606,8 +618,10 @@ mod tests {
         ] {
             assert!(text.contains(part), "{part} missing from:\n{text}");
         }
-        let worker = Facts { on_main: false, thread: "somnium-job-3", ..facts };
+        let worker = Facts { on_main: false, thread: "somnium-job-3", build: facts.build.clone(), log: facts.log.clone(), ..facts };
         assert!(worker.report("").contains("a worker: the program went on"));
+        let caught = Facts { caught: true, ..worker };
+        assert!(caught.report("").contains("inside a model load: the model was skipped"));
     }
 
     #[test]
