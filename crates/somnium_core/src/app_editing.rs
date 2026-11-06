@@ -439,7 +439,12 @@ impl<G: GameApp> Engine<G> {
     /// After the scene spawned: say what its layer did.
     pub(super) fn edits_after_scene_spawn(&mut self) {
         if let Some(summary) = self.editing.summary.take() {
-            self.toast(&summary);
+            // A player is never told about the editor's edit layer; the log keeps the line.
+            if self.config.player_mode {
+                info!("{summary}");
+            } else {
+                self.toast(&summary);
+            }
         }
     }
 

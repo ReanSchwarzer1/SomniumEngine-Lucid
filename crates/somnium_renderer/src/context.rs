@@ -59,7 +59,12 @@ fn watch_gpu_errors(device: &wgpu::Device, info: &wgpu::AdapterInfo) {
         }
     }));
     device.set_device_lost_callback(move |reason, message| {
-        tracing::error!(?reason, "GPU device lost on {gpu}: {message}");
+        // `Destroyed` is the program letting its device go at exit, not a lost GPU.
+        if reason == wgpu::DeviceLostReason::Destroyed {
+            tracing::debug!("GPU device released on {gpu}");
+        } else {
+            tracing::error!(?reason, "GPU device lost on {gpu}: {message}");
+        }
     });
 }
 
