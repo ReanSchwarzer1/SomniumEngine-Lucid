@@ -6472,6 +6472,9 @@ impl SomniumRenderer {
             &self.global_pool.light_buffer,
             &self.shadow_resources.atlas_depth_view,
             &self.global_pool.cluster_grid,
+            self.cloud_pass.sky_light_view(),
+            &self.cloud_pass.shadow_view,
+            &self.cloud_pass.shadow_params,
         );
         self.profiler.end(&mut encoder);
         self.profiler.begin(&mut encoder, "Volumetrics");
@@ -6484,6 +6487,7 @@ impl SomniumRenderer {
             self.camera_pos,
             self.light_direction,
             self.light_color,
+            self.cloud_pass.sky_light_clouds().is_some(),
         );
         self.profiler.end(&mut encoder);
         self.shading_pass
