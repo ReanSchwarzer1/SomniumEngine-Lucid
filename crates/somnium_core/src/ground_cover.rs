@@ -39,8 +39,10 @@ const GENERATE_MS_PER_FRAME: f32 = 2.0;
 /// Most copies of parts (slots) set in batches in one frame, nearest cells first (the rest wait a frame): a tile
 /// streaming in beside the player once set 100,000+ in one frame (40 MB of slots, a 350 ms frame).
 const SLOTS_SET_PER_FRAME: i64 = 48_000;
-/// Inside this distance every copy draws; past it each doubling keeps half ([`keep_at`]).
-pub const BAND_NEAR: f32 = 12.0;
+/// Inside this distance every copy draws; past it each doubling keeps half ([`keep_at`]). 24 m (was 12): the developer,
+/// 6 Nov, "even grass is too aggressive ... in immediate view they should appear real"; at 12 m a meadow 30 m off kept
+/// 40% of its blades. Copies cost the visibility pass (1.5 ms of a 25 ms frame), not shading.
+pub const BAND_NEAR: f32 = 24.0;
 /// The widest a thinned copy is drawn, against its own width.
 const MOST_WIDEN: f32 = 2.5;
 
