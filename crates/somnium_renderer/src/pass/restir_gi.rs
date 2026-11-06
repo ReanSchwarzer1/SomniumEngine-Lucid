@@ -145,6 +145,8 @@ fn classify_light_change(
 }
 
 pub struct RestirGiPass {
+    /// The environment cube and sampler escaped rays read (`set_environment`).
+    environment: Option<(wgpu::TextureView, wgpu::Sampler)>,
     initial: Option<wgpu::ComputePipeline>,
     spatial: Option<wgpu::ComputePipeline>,
     layout: Option<wgpu::BindGroupLayout>,
@@ -214,6 +216,7 @@ impl RestirGiPass {
             surfaces: None,
             cache_surfaces: std::env::var("SOMNIUM_GI_SURFACE_CACHE").as_deref() == Ok("1"),
             bind: None,
+            environment: None,
             grain_view: grain_view.clone(),
             grain_enabled: supported
                 && crate::pass::grain::enabled_by_default("SOMNIUM_DREAMS_GRAIN"),
@@ -335,6 +338,23 @@ impl RestirGiPass {
                         view_dimension: wgpu::TextureViewDimension::D2Array,
                         multisampled: false,
                     },
+                    count: None,
+                },
+                // The environment cube an escaped ray sees, and its sampler.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 10,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::Cube,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 11,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -524,13 +544,14 @@ impl RestirGiPass {
         if self.bind.is_some() {
             return;
         }
-        let (Some(layout), Some(params), Some(out), Some(a), Some(b), Some(surfaces)) = (
+        let (Some(layout), Some(params), Some(out), Some(a), Some(b), Some(surfaces), Some((env, env_sampler))) = (
             self.layout.as_ref(),
             self.params.as_ref(),
             self.out_view.as_ref(),
             self.gi_a.as_ref(),
             self.gi_b.as_ref(),
             self.surfaces.as_ref(),
+            self.environment.as_ref(),
         ) else {
             return;
         };
@@ -578,8 +599,22 @@ impl RestirGiPass {
                     binding: 9,
                     resource: surfaces.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 10,
+                    resource: wgpu::BindingResource::TextureView(env),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 11,
+                    resource: wgpu::BindingResource::Sampler(env_sampler),
+                },
             ],
         }));
+    }
+
+    /// The environment cube an escaped ray sees (`IblPass::cube_view`). Until it is set the pass binds nothing.
+    pub fn set_environment(&mut self, cube: &wgpu::TextureView, sampler: &wgpu::Sampler) {
+        self.environment = Some((cube.clone(), sampler.clone()));
+        self.bind = None;
     }
 
     /// Zero the radiance target when the pass is switched off.

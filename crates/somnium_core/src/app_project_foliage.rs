@@ -90,49 +90,60 @@ impl<G: GameApp> Engine<G> {
         }
         info!(kind,name=%entry.name,parts=parts.len(),"Project foliage palette entry ready");
         self.foliage_meshes[index] = Some(parts);
-        if let Some(lod) = entry.lod {
-            if !self.project_foliage_sources.contains_key(&lod.source) {
-                let Some((renderer, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref())
-                else {
-                    return;
-                };
-                match somnium_asset::load_gltf(&lod.source) {
-                    Ok(scene) => {
-                        let nodes = renderer.upload_scene(ctx, &scene);
-                        let parts = nodes
-                            .iter()
-                            .map(|node| FoliagePart {
-                                vertex_offset: node.vertex_offset,
-                                index_offset: node.index_offset,
-                                index_count: node.index_count,
-                                material_id: node.material_id,
-                                local: node.transform,
-                                is_leaf: false,
-                            })
-                            .collect();
-                        self.project_foliage_sources
-                            .insert(lod.source.clone(), parts);
-                    }
-                    Err(error) => {
-                        warn!(%error,kind,"Foliage LOD import failed; retaining full geometry");
-                        return;
-                    }
+        if let Some(lod) = &entry.lod {
+            self.foliage_lod_meshes[index] = self.alternate_foliage_mesh(kind, lod, adjustment, "LOD");
+        }
+        if let Some(impostor) = &entry.impostor {
+            self.foliage_impostor_meshes[index] = self.alternate_foliage_mesh(kind, impostor, adjustment, "impostor");
+        }
+    }
+
+    /// A palette entry's LOD or impostor mesh: its source uploaded once, its primitives in order. `None` when it
+    /// cannot be had; the entry then keeps drawing what it has.
+    fn alternate_foliage_mesh(
+        &mut self,
+        kind: u16,
+        alt: &crate::foliage_palette::ProjectLod,
+        adjustment: glam::Mat4,
+        what: &str,
+    ) -> Option<Vec<FoliagePart>> {
+        if !self.project_foliage_sources.contains_key(&alt.source) {
+            let (renderer, ctx) = self.renderer.as_mut().zip(self.render_ctx.as_ref())?;
+            match somnium_asset::load_gltf(&alt.source) {
+                Ok(scene) => {
+                    let nodes = renderer.upload_scene(ctx, &scene);
+                    let parts = nodes
+                        .iter()
+                        .map(|node| FoliagePart {
+                            vertex_offset: node.vertex_offset,
+                            index_offset: node.index_offset,
+                            index_count: node.index_count,
+                            material_id: node.material_id,
+                            local: node.transform,
+                            is_leaf: false,
+                        })
+                        .collect();
+                    self.project_foliage_sources.insert(alt.source.clone(), parts);
+                }
+                Err(error) => {
+                    warn!(%error, kind, what, "Foliage alternate mesh import failed; retaining full geometry");
+                    return None;
                 }
             }
-            let source = &self.project_foliage_sources[&lod.source];
-            let parts: Option<Vec<_>> = lod
-                .primitives
-                .iter()
-                .map(|ordinal| {
-                    let mut part = *source.get(*ordinal as usize)?;
-                    part.local = adjustment * part.local;
-                    Some(part)
-                })
-                .collect();
-            if parts.is_none() {
-                warn!(kind, "Foliage LOD ordinal missing; retaining full geometry");
-            }
-            self.foliage_lod_meshes[index] = parts;
         }
+        let source = &self.project_foliage_sources[&alt.source];
+        let parts: Option<Vec<_>> = alt
+            .primitives
+            .iter()
+            .map(|ordinal| {
+                let mut part = *source.get(*ordinal as usize)?;
+                part.local = adjustment * part.local;
+                Some(part)
+            })
+            .collect();
+        if parts.is_none() {
+            warn!(kind, what, "Foliage alternate mesh ordinal missing; retaining full geometry");
+        }
+        parts
     }
 }

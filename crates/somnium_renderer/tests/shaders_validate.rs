@@ -70,6 +70,8 @@ fn every_composed_root_validates() {
     for root in [
         "shading.wgsl",
         "restir_gi.wgsl",
+        // 6 Nov 2026: the traced sun composes the global pool and the cut-out test for leaf cards.
+        "restir_di.wgsl",
         "lighting_extra.wgsl",
         // 17 Oct 2026: the real-time path tracer and its denoiser.
         "path_tracer.wgsl",
@@ -403,7 +405,7 @@ fn the_terrain_material_struct_matches_the_rust_layout() {
         panic!("TerrainMaterial is not a struct");
     };
 
-    assert_eq!(*span, 2080, "WGSL size disagrees with GpuTerrainMaterial");
+    assert_eq!(*span, 2096, "WGSL size disagrees with GpuTerrainMaterial");
 
     // Only the members whose offsets the Rust test also pins. Checking every
     // one would just restate the declaration; these are the ones where a

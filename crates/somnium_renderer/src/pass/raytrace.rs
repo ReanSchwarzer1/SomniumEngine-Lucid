@@ -28,7 +28,15 @@ struct MeshBlas {
     size: wgpu::BlasTriangleGeometrySizeDescriptor,
     vertex_offset: u32,
     index_offset: u32,
+    /// Built at least once, so the TLAS may name it (`BLAS_TRIANGLES_PER_FRAME`).
+    ready: bool,
 }
+
+/// The most BLAS triangles one frame builds. A burst of new meshes (a region's tree kinds streaming in at once)
+/// built in one submission can run past the driver's GPU timeout and lose the device (sunscar-look, 6 Nov 2026:
+/// ~130 new tree kinds in one frame). The rest wait for the next frames, and their instances join the TLAS when
+/// their BLAS is built.
+const BLAS_TRIANGLES_PER_FRAME: u64 = 2_000_000;
 
 pub struct RaytracePass {
     /// `None` when the device did not grant ray query.
@@ -53,6 +61,10 @@ pub struct RaytracePass {
     overflowed: bool,
     /// Hash of the instance list the current TLAS was built from.
     built: Option<u64>,
+    /// Meshes drawn with a cut-out material (leaf and grass cards). As casters they go on mask 0x4, not 0x1: the
+    /// traced sun (restir_di, mask 0x1) leaves them to the shadow cascades, which alpha-test them cheaply; GI and
+    /// lamp rays ask for 0x5 and test or block on them as before (Sunscar, 6 Nov 2026).
+    cutout: crate::fast_hash::FastSet<u32>,
 }
 
 /// FNV-1a over the words that decide a TLAS, including shadow participation.
@@ -92,6 +104,7 @@ impl RaytracePass {
                 max_instances: 0,
                 overflowed: false,
                 built: None,
+                cutout: Default::default(),
             };
         }
 
@@ -131,6 +144,7 @@ impl RaytracePass {
             max_instances,
             overflowed: false,
             built: None,
+                cutout: Default::default(),
         }
     }
 
@@ -219,6 +233,7 @@ impl RaytracePass {
                 size,
                 vertex_offset,
                 index_offset,
+                ready: false,
             },
         );
         self.pending_blas.push(vertex_offset);
@@ -242,7 +257,15 @@ impl RaytracePass {
     }
 
     /// Remove acceleration data before a scene-owned vertex reservation is reused.
+    /// The mesh at `vertex_offset` is drawn with a cut-out material (see `cutout`).
+    pub fn mark_cutout(&mut self, vertex_offset: u32) {
+        if self.supported && self.cutout.insert(vertex_offset) {
+            self.built = None;
+        }
+    }
+
     pub fn unregister_mesh(&mut self, vertex_offset: u32) {
+        self.cutout.remove(&vertex_offset);
         if self.blas.remove(&vertex_offset).is_some() {
             // The TLAS may still name this BLAS; force the next build to
             // re-encode even if the new scene's instance words happen to match.
@@ -297,7 +320,22 @@ impl RaytracePass {
         // A BLAS is described by offsets into the engine's single global
         // vertex and index pools rather than owning any memory of its own, so
         // rebuilding one is just re-reading the range it was registered with.
-        let pending = std::mem::take(&mut self.pending_blas);
+        let mut pending = Vec::new();
+        let mut used = 0u64;
+        for offset in std::mem::take(&mut self.pending_blas) {
+            let triangles = self.blas.get(&offset).map_or(0, |mesh| u64::from(mesh.index_count / 3));
+            if used > 0 && used + triangles > BLAS_TRIANGLES_PER_FRAME {
+                self.pending_blas.push(offset);
+            } else {
+                used += triangles;
+                pending.push(offset);
+            }
+        }
+        for offset in &pending {
+            if let Some(mesh) = self.blas.get_mut(offset) {
+                mesh.ready = true;
+            }
+        }
         let entries: Vec<wgpu::BlasBuildEntry> = pending
             .iter()
             .filter_map(|offset| self.blas.get(offset))
@@ -340,7 +378,7 @@ impl RaytracePass {
             let Some(mesh) = self.blas.get(vertex_offset) else {
                 continue;
             };
-            if mesh.index_count == 0 {
+            if mesh.index_count == 0 || !mesh.ready {
                 continue;
             }
             if count >= self.max_instances {
@@ -364,8 +402,8 @@ impl RaytracePass {
                 // visibility buffer uses — one resolve path, not two.
                 *instance_index,
                 // Keep non-casters visible to GI and reflection intersections.
-                // Shadow-only queries use mask 0x1; general queries use 0xff.
-                0x2 | u8::from(*casts_shadow),
+                // Shadow-only queries use mask 0x1 (opaque casters) or 0x5 (and cut-out cards); general queries 0xff.
+                0x2 | if !*casts_shadow { 0 } else if self.cutout.contains(vertex_offset) { 0x4 } else { 0x1 },
             ));
             count += 1;
         }

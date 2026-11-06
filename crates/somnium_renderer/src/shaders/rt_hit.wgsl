@@ -6,6 +6,7 @@
 // `accel` plus `default_sampler`; `global_pool.wgsl` and
 // `terrain_splat_core.wgsl` supply the scene arrays and bounded terrain-hit
 // helpers. Declarations are order-independent.
+//!include "rt_alpha.wgsl"
 
 /// What a ray hit turned out to be.
 struct RtHit {
@@ -18,6 +19,8 @@ struct RtHit {
     metallic: f32,
     /// Material slot for the optional deferred GI terrain lookup; -1 on miss.
     terrain_index: i32,
+    /// How much light a thin leaf passes through (`Material.transmission`); 0 on miss and for terrain.
+    transmission: f32,
     /// Ray `t` of this intersection. 0 on a true miss. A cutout reject keeps
     /// the card's `t` so `rt_trace` can continue through the hole.
     t: f32,
@@ -136,6 +139,7 @@ fn rt_resolve(origin: vec3<f32>, dir: vec3<f32>, isect: RayIntersection) -> RtHi
     out.roughness = clamp(mat.roughness, 0.04, 1.0);
     out.metallic = clamp(mat.metallic, 0.0, 1.0);
     out.terrain_index = mat.terrain_index;
+    out.transmission = select(mat.transmission, 0.0, mat.terrain_index >= 0);
 
     if mat.terrain_index >= 0 {
         out.albedo = vec3<f32>(0.0);
@@ -178,21 +182,6 @@ fn rt_resolve(origin: vec3<f32>, dir: vec3<f32>, isect: RayIntersection) -> RtHi
 // turns this on (see restir_gi.rs); other users keep the hop loop.
 override rt_candidate_alpha: bool = false;
 
-fn rt_candidate_is_covered(isect: RayIntersection) -> bool {
-    let inst = instances[isect.instance_custom_data];
-    let mat = materials[inst.material_id];
-    if mat.terrain_index >= 0 || mat.alpha_cutoff <= 0.0 || mat.albedo_map < 0 {
-        return true;
-    }
-    let base = inst.index_offset + isect.primitive_index * 3u;
-    let v0 = vertices[inst.vertex_offset + indices[base]];
-    let v1 = vertices[inst.vertex_offset + indices[base + 1u]];
-    let v2 = vertices[inst.vertex_offset + indices[base + 2u]];
-    let b = isect.barycentrics;
-    let uv = vec2<f32>(v0.u, v0.v) * (1.0 - b.x - b.y)
-        + vec2<f32>(v1.u, v1.v) * b.x + vec2<f32>(v2.u, v2.v) * b.y;
-    return textureSampleLevel(textures[mat.albedo_map], default_sampler, uv, 0.0).a >= mat.alpha_cutoff;
-}
 
 fn rt_trace(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, t_max: f32) -> RtHit {
     if rt_candidate_alpha {

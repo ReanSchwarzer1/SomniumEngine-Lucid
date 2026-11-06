@@ -328,6 +328,8 @@ pub struct GpuTerrainMaterial {
     /// a `vec4` and not the three scalars the shader actually reads plus one
     /// more pad word.
     pub macro_octave_strength: [f32; 4],
+    /// Steepness (1 - |n.y|) where the projected cliff layer starts and where it is whole (x, y); zw unused.
+    pub cliff_band: [f32; 4],
 }
 
 /// Bindless indices of one terrain's textures, filled in at creation.
@@ -485,6 +487,10 @@ pub struct TerrainData {
     /// a whole hillside differs from the next hillside more than one square
     /// metre differs from the one beside it.
     pub macro_octave_strength: [f32; 4],
+    /// Steepness (1 - |n.y|) where the projected cliff layer starts and where it is whole. Defaults 0.45 and 0.7
+    /// (from about 57 to 73 degrees); `SOMNIUM_TERRAIN_CLIFF=start,end` sets it (Sunscar: 0.25,0.45, rock from
+    /// about 40 degrees as real slopes go, so a 60 degree face is cliff and not the splat smeared down it).
+    pub cliff_band: [f32; 2],
 
     /// Shared LOD index spans in the global index pool, keyed by
     /// `(lod, edge_mask)` and holding `(index_offset, index_count)`.
@@ -871,6 +877,7 @@ impl TerrainData {
             // diff move.
             skyvis_tint: env_strength("SOMNIUM_TERRAIN_SKYVIS_TINT", 0.6),
             macro_octave_strength: [0.18, 0.13, 0.09, 0.35],
+            cliff_band: cliff_band_from_env(),
             horizon_dirty: false,
             desc,
             heightmap,
@@ -1330,6 +1337,7 @@ impl TerrainData {
                     self.skyvis_tint.max(0.0),
                 ]
             },
+            cliff_band: [self.cliff_band[0], self.cliff_band[1].max(self.cliff_band[0] + 1e-3), 0.0, 0.0],
         }
     }
 
@@ -2430,4 +2438,13 @@ mod tests {
         scale = held.max(1.0);
         assert_eq!(scale, 1.25);
     }
+}
+
+/// `SOMNIUM_TERRAIN_CLIFF=start,end`, else 0.45 and 0.7 (`TerrainData::cliff_band`).
+fn cliff_band_from_env() -> [f32; 2] {
+    let parsed = std::env::var("SOMNIUM_TERRAIN_CLIFF").ok().and_then(|v| {
+        let mut it = v.split(',').map(|s| s.trim().parse::<f32>().ok());
+        Some([it.next()??, it.next()??]).filter(|[a, b]| (0.0..1.0).contains(a) && b > a && *b <= 1.0)
+    });
+    parsed.unwrap_or([0.45, 0.7])
 }

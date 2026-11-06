@@ -116,6 +116,11 @@ struct GiReservoir {
 // concatenated without `shading.wgsl`, and the pool it *does* share is group 0.
 @group(1) @binding(7) var default_sampler: sampler;
 @group(1) @binding(8) var grain_masks: texture_2d_array<f32>;
+// The environment cube (`ibl.rs`): what an escaped ray sees.
+@group(1) @binding(10) var gi_env: texture_cube<f32>;
+@group(1) @binding(11) var gi_env_sampler: sampler;
+/// Where a sky sample is put, far along its ray: reuse and the visibility ray treat it as a distant emitter.
+const GI_SKY_DISTANCE: f32 = 20000.0;
 
 @group(1) @binding(5) var<storage, read_write> gi_a: array<GiReservoir>;
 @group(1) @binding(6) var<storage, read_write> gi_b: array<GiReservoir>;
@@ -162,6 +167,19 @@ fn gi_visible(origin: vec3<f32>, to: vec3<f32>, t_min: f32) -> bool {
     if dist <= t_min {
         return true;
     }
+    // Through a leaf card's holes, as the bounce ray that found the sample went (`rt_trace`). Opaque, every card was
+    // a solid quad here: a canopy turned away nearly every sky sample and every sun ray to a hit under it, and the
+    // floor of a wood went black (Sunscar, 6 Nov 2026).
+    if rt_candidate_alpha {
+        var aq: ray_query;
+        rayQueryInitialize(&aq, accel, RayDesc(0x6u, 0x5u, t_min, dist * 0.999, origin, d / dist));
+        while rayQueryProceed(&aq) {
+            if rt_candidate_is_covered(rayQueryGetCandidateIntersection(&aq)) {
+                rayQueryConfirmIntersection(&aq);
+            }
+        }
+        return rayQueryGetCommittedIntersection(&aq).kind == RAY_QUERY_INTERSECTION_NONE;
+    }
     var rq: ray_query;
     rayQueryInitialize(
         &rq,
@@ -170,7 +188,8 @@ fn gi_visible(origin: vec3<f32>, to: vec3<f32>, t_min: f32) -> bool {
         // surface at `to` is not its own occluder.
         // Visibility rays see shadow casters; bounce-hit rays keep the full
         // geometry mask in rt_trace so non-casters still receive indirect light.
-        RayDesc(0x4u, 0x1u, t_min, dist * 0.999, origin, d / dist),
+        // 0x1 opaque casters, 0x4 cut-out cards (raytrace.rs): leaves block GI's light too.
+        RayDesc(0x4u, 0x5u, t_min, dist * 0.999, origin, d / dist),
     );
     rayQueryProceed(&rq);
     return rayQueryGetCommittedIntersection(&rq).kind == RAY_QUERY_INTERSECTION_NONE;
@@ -289,7 +308,8 @@ fn gi_local_irradiance(p: vec3<f32>, n: vec3<f32>, seed: ptr<function, u32>) -> 
 
 /// Direct radiance leaving a secondary hit: sun plus shadowed local fixtures.
 /// One sun ray and at most one local-light shadow ray, independent of count.
-fn gi_direct_at(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>, terrain_index: i32, seed: ptr<function, u32>) -> vec3<f32> {
+fn gi_direct_at(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>, terrain_index: i32, transmission: f32,
+    seed: ptr<function, u32>) -> vec3<f32> {
     let l = normalize(light.direction);
     let ndl = dot(n, l);
     var irradiance = gi_local_irradiance(p, n, seed);
@@ -299,6 +319,13 @@ fn gi_direct_at(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>, terrain_index: i3
         // applying it here preserves that sun response while keeping practical
         // bounce independent of the sky-fill control.
         irradiance += light.color * (ndl * light.ibl_intensity);
+    }
+    // A leaf lit from the far side passes light through (thin Lambertian translucency, `Material.transmission`):
+    // a canopy's underside glows green, and that, not the sky, is most of the light on a wood's floor (Sunscar,
+    // 6 Nov 2026). The normal faces the ray, so the sun is behind it when ndl < 0.
+    if ndl < 0.0 && transmission > 0.0 && gi_luma(light.color) > 1.0e-6
+        && gi_visible(p - n * 0.02, p + l * 4000.0, 0.02) {
+        irradiance += light.color * (-ndl * transmission * light.ibl_intensity);
     }
     var direct_albedo = albedo;
     if rt_gi_deferred_terrain_albedo && terrain_index >= 0 {
@@ -510,7 +537,7 @@ fn initial_and_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
     // rare hits produces high-variance fireflies that wander under temporal
     // and spatial reuse. Emissive GI needs a light-sampling strategy of its own.
     if hit.hit && all(hit.emissive <= vec3<f32>(0.0)) {
-        let radiance = gi_direct_at(hit.pos, hit.normal, hit.albedo, hit.terrain_index, &seed);
+        let radiance = gi_direct_at(hit.pos, hit.normal, hit.albedo, hit.terrain_index, hit.transmission, &seed);
         let p_hat = gi_luma(radiance);
         if p_hat > 0.0 {
             r.sample_pos = hit.pos;
@@ -526,10 +553,21 @@ fn initial_and_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
             r.m = 1.0;
         }
     } else {
-        // A ray that escaped carries no bounce. It still counts as a candidate,
-        // or a pixel seeing mostly sky would keep resampling its history for
-        // ever and never darken.
+        // A ray that escaped sees the sky: it carries the sky's radiance that way (the prefiltered cube, clouds
+        // and all), so the traced estimate holds the whole of the diffuse light and the shading pass takes it in
+        // place of the unshadowed sky. Before, misses carried nothing and the sky reached the floor of a closed
+        // wood as if there were no canopy: ~1 stop under the meadow where real woods are 3.5-4.5 (sunscar-look,
+        // 6 Nov 2026).
+        let sky = textureSampleLevel(gi_env, gi_env_sampler, dir, 2.0).rgb * light.ibl_intensity;
+        let p_hat = gi_luma(sky);
         r.m = 1.0;
+        if p_hat > 0.0 && !hit.hit {
+            r.sample_pos = origin + dir * GI_SKY_DISTANCE;
+            r.sample_normal = -dir;
+            r.radiance = sky;
+            r.w_sum = p_hat;
+            r.w = 1.0 / p_hat;
+        }
     }
 
     // ── Temporal reuse ───────────────────────────────────────────────────────

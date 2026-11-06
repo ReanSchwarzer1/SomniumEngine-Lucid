@@ -45,6 +45,10 @@ pub struct InstanceBatch {
     pub parts: Vec<BatchPart>,
     /// World transforms, one per copy.
     pub placements: Vec<Mat4>,
+    /// A LOD hand-over at a band edge, horizontal metres from the camera (`instance::foliage_fade`): > 0 these copies
+    /// fade out past it, < 0 they fade in past `-fade`, 0 none. The batch on the other side of the edge carries the
+    /// opposite sign and both hold the copies near it, so one dithers in as the other dithers out.
+    pub fade: f32,
 }
 
 /// A copy whose mesh has a bottom level: what the top level needs to trace it.
@@ -82,7 +86,8 @@ pub(crate) struct GpuSlot {
     /// Local bounds; `w`s are the far and near draw distances.
     pub aabb_min: [f32; 4],
     pub aabb_max: [f32; 4],
-    /// Shadow distance, casts (0 or 1), run: 0 one copy, n > 0 the head of n copies drawn as one instanced draw,
+    /// Shadow distance, casts (0, 1, or 2: casts, but the traced sun shades it or it is too flat to matter, so the
+    /// cascades skip it while rays own the sun), run: 0 one copy, n > 0 the head of n copies drawn as one instanced draw,
     /// -1 a later copy of a run (drawn by its head).
     pub shadow: [f32; 4],
 }
@@ -550,6 +555,8 @@ impl InstanceBatches {
         dirty: [bool; crate::shadow::NUM_CASCADES],
         compact: bool,
         radius_threshold: f32,
+        // The traced sun shades opaque traced copies (`GpuSlot::shadow[1]` = 2): the cascades leave them out.
+        rays_shade_opaque: bool,
     ) {
         self.shadow_culled = None;
         let Some(gpu) = self.gpu.as_ref() else { return };
@@ -564,7 +571,7 @@ impl InstanceBatches {
         }
         let params = ShadowParams {
             planes: flat,
-            camera: [camera.x, camera.y, camera.z, 0.0],
+            camera: [camera.x, camera.y, camera.z, f32::from(u8::from(rays_shade_opaque))],
             slots,
             capacity: gpu.capacity,
             dirty: mask,

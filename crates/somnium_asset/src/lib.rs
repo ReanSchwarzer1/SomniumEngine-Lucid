@@ -151,6 +151,10 @@ pub struct LoadedMaterial {
     /// `somnium_hair`): the shading pass adds the highlight that runs across
     /// strands, which a card's own flat normal cannot give.
     pub hair: bool,
+    /// Cut out against a moving noise threshold where its texture is minified (extras `somnium_hashed_alpha`):
+    /// bare twigs a texel wide break into flecks at a fixed 0.5 cut-off, and a hashed test turns them into the
+    /// soft, see-through haze a bare crown is from afar (TAA averages it).
+    pub hashed_alpha: bool,
     /// This material is painted on **flat cut-out cards whose `uv.x` runs
     /// across the blade**, which is what `shading.wgsl`'s curved-card normal
     /// needs to be true.
@@ -312,6 +316,7 @@ pub fn load_gltf_for(path: impl AsRef<Path>, parts: Option<&HashSet<usize>>) -> 
             subsurface: material_extra(&mat, "somnium_subsurface"),
             eye: material_extra(&mat, "somnium_eye") > 0.5,
             hair: material_extra(&mat, "somnium_hair") > 0.5,
+            hashed_alpha: material_extra(&mat, "somnium_hashed_alpha") > 0.5,
             // Authored only: see the field's own note on why no import can
             // honestly infer it.
             foliage_card: false,
@@ -394,6 +399,7 @@ pub fn load_gltf_for(path: impl AsRef<Path>, parts: Option<&HashSet<usize>>) -> 
             subsurface: 0.0,
             eye: false,
             hair: false,
+            hashed_alpha: false,
             foliage_card: false,
             emissive: [0.0; 3],
             emissive_intensity: 1.0,
@@ -1422,7 +1428,7 @@ mod normal_scale_tests {
             "asset":{"version":"2.0"},
             "materials":[{"extras":{"somnium_wind_bend":0.00035,"somnium_wind_flutter":0.02}},
                          {"extras":{"somnium_subsurface":0.7}},
-                         {"extras":{"somnium_eye":1}}, {"extras":{"somnium_hair":1}}]
+                         {"extras":{"somnium_eye":1}}, {"extras":{"somnium_hair":1,"somnium_hashed_alpha":1}}]
         });
         std::fs::write(&path, document.to_string()).unwrap();
         let loaded = super::load_gltf(&path).unwrap();
@@ -1431,6 +1437,7 @@ mod normal_scale_tests {
         assert_eq!(loaded.materials[1].subsurface, 0.7, "skin");
         assert_eq!(loaded.materials.iter().map(|m| (m.eye, m.hair)).collect::<Vec<_>>(),
             [(false, false), (false, false), (true, false), (false, true)]);
+        assert_eq!(loaded.materials.iter().map(|m| m.hashed_alpha).collect::<Vec<_>>(), [false, false, false, true]);
         assert_eq!(loaded.materials[0].height_depth, 0.0, "no extras, no room");
         std::fs::remove_file(&path).unwrap();
         // A window onto a room carries the room's depth as a negative height depth.

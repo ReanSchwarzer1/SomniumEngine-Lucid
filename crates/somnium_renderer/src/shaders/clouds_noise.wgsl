@@ -249,7 +249,12 @@ fn weather_map(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Coverage is the authored bias remapped through a noise field rather than
     // multiplied by it: at coverage 1 the sky must be *solid*, and a multiply
     // can never reach solid because the noise never reaches one everywhere.
-    let field = value2_fbm(uv, np.seed);
+    // Warped by a field of the same period, so the map still tiles: value noise thresholded high leaves only its
+    // lattice peaks, and fair-weather cumulus came out as squares with flat sides, lined up with the grid (Sunscar,
+    // 6 Nov 2026). The warp rounds and scatters them; the 64-cell octave frays their edges.
+    let warp = vec2<f32>(value2(uv, 8.0, np.seed + 101.0), value2(uv, 8.0, np.seed + 131.0)) - vec2<f32>(0.5);
+    let q = fract(uv + warp * (2.0 / 8.0));   // value2 wraps its lattice with %, which goes wrong below 0
+    let field = value2_fbm(q, np.seed) * 0.94 + value2(q, 64.0, np.seed + 53.0) * 0.06;
     let coverage = clamp(remap(field, 1.0 - np.coverage, 1.0, 0.0, 1.0), 0.0, 1.0);
 
     // Type is a slower field, so a bank of cumulus does not turn into stratus

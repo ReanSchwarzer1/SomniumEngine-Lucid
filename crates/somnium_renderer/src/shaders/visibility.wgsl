@@ -128,6 +128,27 @@ struct VertexOutput {
     @location(1) @interpolate(flat) prim_id: u32,
     @location(2) uv: vec2<f32>,
     @location(3) @interpolate(flat) material_id: u32,
+    // How much of an instance-batch copy shows across its LOD hand-over: 1 all (no hand-over), w in 0..1 a copy
+    // fading out, -w one fading in (`foliage_fade_weight`). Alpha-tested parts dither by it in `fs_main`.
+    @location(4) @interpolate(flat) fade: f32,
+}
+
+// LOD hand-over of instance-batch copies (Sunscar, 6 Nov 2026; instance.rs `foliage_fade`, kept in step with
+// shadow.wgsl): a copy near its band's edge is in both batches, the near one fading out across FADE_WIDTH metres as
+// the far one fades in, measured from the copy's origin to the eye, horizontally, as the bands are.
+const FADE_WIDTH: f32 = 8.0;
+
+/// Whether an instance's spare word is a hand-over: an edge set (the terrain LOD debug view writes 1..5 here), not
+/// the contact-shadow flag, not a terrain chunk (which always carries a vertex count in bits 4..13).
+fn foliage_fade_word(packed: u32) -> bool {
+    return (packed >> 14u) != 0u && packed != 0x80000000u && ((packed >> 4u) & 1023u) == 0u;
+}
+
+/// How much of the copy shows at horizontal distance `d` from the eye: 1 inside its band, 0 past the edge.
+fn foliage_fade_weight(packed: u32, d: f32) -> f32 {
+    let edge = f32((packed >> 14u) & 65535u) / 16.0;
+    let s = smoothstep(edge - FADE_WIDTH * 0.5, edge + FADE_WIDTH * 0.5, d);
+    return select(1.0 - s, s, (packed & 1u) == 1u);
 }
 
 @vertex
@@ -151,7 +172,8 @@ fn vs_main(
     var world = (instance.model * vec4<f32>(pos, 1.0)).xyz;
     // Foliage wind. Terrain (packed != 0) never sways. The same displacement
     // runs in shadow.wgsl, the shading pass's reconstruction and velocity.wgsl.
-    if packed == 0u {
+    let handover = foliage_fade_word(packed);
+    if packed == 0u || handover {
         let m = materials[instance.material_id];
         world += wind_offset(world, instance.model[3].xyz, m.wind_bend, m.wind_flutter,
                              view.wind_time.x, view.wind, view.camera_pos);
@@ -170,16 +192,29 @@ fn vs_main(
     }
     out.instance_id = inst_idx;
     out.prim_id = v_idx / 3u;
+    out.fade = 1.0;
+    if handover {
+        let w = foliage_fade_weight(packed, distance(instance.model[3].xz, view.camera_pos.xz));
+        // Opaque parts (bark) switch at the edge, whole: two trunks dithered into each other would only shimmer,
+        // and a discard in an opaque draw is not worth it. Past the edge the copy goes outside the clip box.
+        if w <= 0.0 || (materials[instance.material_id].alpha_cutoff <= 0.0 && w < 0.5) {
+            out.clip_pos = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+        } else if materials[instance.material_id].alpha_cutoff > 0.0 {
+            out.fade = select(w, -w, (packed & 1u) == 1u);
+        }
+    }
     
     return out;
 }
 
 @fragment
 fn fs_main(
+    @builtin(position) frag: vec4<f32>,
     @location(0) @interpolate(flat) instance_id: u32,
     @location(1) @interpolate(flat) prim_idx: u32,
     @location(2) uv: vec2<f32>,
-    @location(3) @interpolate(flat) material_id: u32
+    @location(3) @interpolate(flat) material_id: u32,
+    @location(4) @interpolate(flat) fade: f32,
 ) -> @location(0) vec2<u32> {
     // Derivatives are taken at top level, where control flow is uniform, and
     // fed to textureSampleGrad below. Sampling inside the branch directly would
@@ -188,6 +223,18 @@ fn fs_main(
     let ddx_uv = dpdx(uv) * view.lod_scale;
     let ddy_uv = dpdy(uv) * view.lod_scale;
 
+    // A copy across its LOD hand-over: the same per-pixel noise keeps a pixel in the fading-out copy exactly where
+    // the fading-in one drops it, so neither a gap nor a double shows (interleaved gradient noise, Jimenez 2014).
+    // The pattern moves every frame (about 60 steps a second of engine time) so TAA blends it: a still one showed as
+    // a stipple over the trees in the band.
+    if abs(fade) < 1.0 {
+        let step = f32(u32(view.time * 60.0) % 64u);
+        let n = fract(52.9829189 * fract(dot(frag.xy + 5.588238 * step, vec2<f32>(0.06711056, 0.00583715))));
+        if (fade >= 0.0 && n >= fade) || (fade < 0.0 && n <= 1.0 + fade) {
+            discard;
+        }
+    }
+
     let material = materials[material_id];
     // Cutoff is 0 for OPAQUE and BLEND, so this costs one compare for
     // everything that is not alpha-tested.
@@ -195,7 +242,23 @@ fn fs_main(
         let alpha = textureSampleGrad(
             textures[material.albedo_map], cutout_sampler, uv, ddx_uv, ddy_uv,
         ).a;
-        if alpha < material.alpha_cutoff {
+        var cutoff = material.alpha_cutoff;
+        // Hashed alpha where minified (`MATERIAL_FLAG_HASHED_ALPHA`, bare twigs; Wyman & McGuire 2017): a twig a
+        // texel wide is a fraction of a pixel far off, and a fixed cut-off keeps only the few texels that clear it,
+        // so a bare crown broke into dark flecks. Past 2 texels a pixel the cut-off blends toward a per-pixel noise
+        // that moves every frame, so each pixel shows its share of twig and TAA turns it into a haze.
+        if (material.flags & 32u) != 0u {
+            let size = vec2<f32>(textureDimensions(textures[material.albedo_map]));
+            let texels = max(length(ddx_uv * size), length(ddy_uv * size));
+            let minified = saturate(log2(max(texels, 1.0)) - 1.0);
+            if minified > 0.0 {
+                let step = f32(u32(view.time * 60.0) % 64u);
+                let n = fract(52.9829189 * fract(dot(frag.xy + 5.588238 * step + vec2<f32>(13.0, 29.0),
+                                                     vec2<f32>(0.06711056, 0.00583715))));
+                cutoff = mix(cutoff, clamp(n, 0.02, 0.98), minified);
+            }
+        }
+        if alpha < cutoff {
             discard;
         }
     }

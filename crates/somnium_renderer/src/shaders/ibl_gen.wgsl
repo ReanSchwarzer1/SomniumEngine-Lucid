@@ -189,6 +189,29 @@ fn fs_sky(in: VOut) -> @location(0) vec4<f32> {
 
 const PI: f32 = 3.14159265359;
 const SAMPLE_COUNT: u32 = 64u;
+/// The land's albedo seen from afar below the horizon: grass, scrub and soil run 0.15 to 0.25.
+const GROUND_ALBEDO: f32 = 0.18;
+
+/// What the land below the horizon sends back (Lambertian, albedo / pi x its irradiance), for the prefiltered mips:
+/// the sun on it, through the clouds' capture when that is laid over, and the sky above it. Before, mip 0's ground
+/// was the air's in-scatter alone, near black, so the lower half of the sky light was dark and whatever faced down
+/// or sideways had no light from the ground (Sunscar, 6 Nov 2026). Mip 0, the background, stays as it was. Under the
+/// overcast dome (no capture) the dome's own floor stands in, so this stands down with it.
+fn ground_radiance() -> vec3<f32> {
+    let sun = normalize(params.sun_direction.xyz);
+    let up = vec3<f32>(0.0, 1.0, 0.0);
+    var sky_up = textureSampleLevel(src_cube, src_samp, up, 0.0).rgb;
+    var sun_through = 1.0;
+    if params.clouds.x > 0.5 {
+        let c = textureSampleLevel(cloud_capture, src_samp, up, 0.0);
+        sky_up = sky_up * c.a + c.rgb;
+        sun_through = textureSampleLevel(cloud_capture, src_samp, sun, 0.0).a;
+    }
+    // The sky's irradiance on level ground is about pi times its zenith radiance times 0.85 (the CIE overcast's
+    // cosine-weighted mean against its zenith; a clear sky's brighter horizon makes up its lower zenith).
+    let e = params.sun_color.rgb * max(sun.y, 0.0) * sun_through + 0.85 * PI * sky_up;
+    return GROUND_ALBEDO / PI * e * (1.0 - smoothstep(0.35, 0.95, params.overcast));
+}
 
 /// Van der Corput radical inverse — the low-discrepancy half of Hammersley.
 fn radical_inverse_vdc(bits_in: u32) -> f32 {
@@ -232,6 +255,8 @@ fn fs_prefilter(in: VOut) -> @location(0) vec4<f32> {
     // which is what makes a single prefiltered map usable from any angle.
     let v = n;
 
+    let ground = ground_radiance();
+    let view_r = GROUND_RADIUS + 0.5;
     var total  = vec3(0.0);
     var weight = 0.0;
     for (var i = 0u; i < SAMPLE_COUNT; i = i + 1u) {
@@ -244,6 +269,10 @@ fn fs_prefilter(in: VOut) -> @location(0) vec4<f32> {
             // Explicit LOD: this is inside a data-dependent branch, so
             // implicit-derivative sampling would be illegal in WGSL.
             var radiance = textureSampleLevel(src_cube, src_samp, l, 0.0).rgb;
+            // Below the horizon the ray ends on the land, seen through the air near the ground (sky(): 0.5 km up).
+            if ray_hits_ground(view_r, l.y) {
+                radiance += ground * exp(-atmosphere_extinction(0.25) * distance_to_ground(view_r, l.y));
+            }
             if params.clouds.x > 0.5 {
                 let c = textureSampleLevel(cloud_capture, src_samp, l, 0.0);
                 radiance = radiance * c.a + c.rgb;

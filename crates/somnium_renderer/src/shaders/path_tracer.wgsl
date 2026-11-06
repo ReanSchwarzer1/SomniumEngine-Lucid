@@ -150,7 +150,8 @@ fn pt_clear(origin: vec3<f32>, dir: vec3<f32>, dist: f32) -> bool {
         return true;
     }
     var rq: ray_query;
-    rayQueryInitialize(&rq, accel, RayDesc(0x6u, 0x1u, 0.01, dist - 0.02, origin, dir));
+    // 0x1 opaque casters, 0x4 cut-out cards (raytrace.rs).
+    rayQueryInitialize(&rq, accel, RayDesc(0x6u, 0x5u, 0.01, dist - 0.02, origin, dir));
     while rayQueryProceed(&rq) {
         if rt_candidate_is_covered(rayQueryGetCandidateIntersection(&rq)) {
             rayQueryConfirmIntersection(&rq);
