@@ -113,7 +113,8 @@ fn expand(@builtin(global_invocation_id) gid: vec3<u32>) {
         args[a] = DrawArgs(s.index_count, copies, 0u, i);
     }
     if expand_params.write_static != 0u {
-        instances[i] = Instance(s.model, s.material_id, s.vertex_offset, s.index_offset, 0u);
+        // `shadow.w` holds the copy's LOD hand-over (instance.rs `foliage_fade`), as the instance's spare word.
+        instances[i] = Instance(s.model, s.material_id, s.vertex_offset, s.index_offset, bitcast<u32>(s.shadow.w));
         if copies == 0u {
             // A later copy of a run: drawn by its head, never culled on its own.
             aabbs[a] = CullAabb(vec4<f32>(1.0, 1.0, 1.0, 0.0), vec4<f32>(-1.0, -1.0, -1.0, 0.0),
@@ -133,10 +134,10 @@ fn shadow_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let s = slots[j];
     let copies = run_copies(s);
-    // camera.w = 1: the traced sun shades opaque traced copies (shadow.w = 1), so the cascades skip them and hold
-    // the cut-out cards and untraced copies alone (Sunscar, 6 Nov 2026).
+    // camera.w = 1: the traced sun shades opaque traced copies and flat ones are not worth a shadow (casts = 2), so
+    // the cascades skip them and hold the cut-out cards and untraced copies alone (Sunscar, 6 Nov 2026).
     var casts = s.index_count != 0u && s.shadow.y != 0.0 && copies != 0u
-        && !(shadow_params.camera.w > 0.5 && s.shadow.w > 0.5);
+        && !(shadow_params.camera.w > 0.5 && s.shadow.y > 1.5);
     if casts && s.shadow.x > 0.0 {
         // Horizontal, like the draw distance: climbing a hill does not switch the shadows below back on.
         let d = s.model[3].xz - shadow_params.camera.xz;

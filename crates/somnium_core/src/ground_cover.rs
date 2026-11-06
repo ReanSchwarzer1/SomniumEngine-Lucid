@@ -558,7 +558,7 @@ impl CoverBatches {
                     if !casts {
                         parts.iter_mut().for_each(|p| p.casts_shadow = false);
                     }
-                    self.set.push((id, InstanceBatch { parts, placements }));
+                    self.set.push((id, InstanceBatch { parts, placements, fade: 0.0 }));
                     n
                 }
             };

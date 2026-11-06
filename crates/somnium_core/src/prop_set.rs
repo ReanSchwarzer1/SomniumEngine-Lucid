@@ -208,7 +208,7 @@ pub(crate) fn batches(
                     shadow_far,
                 })
                 .collect();
-            (batch_id(entity, g), InstanceBatch { parts, placements })
+            (batch_id(entity, g), InstanceBatch { parts, placements, fade: 0.0 })
         })
         .collect()
 }

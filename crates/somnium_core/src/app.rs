@@ -1196,6 +1196,8 @@ pub struct Engine<G: GameApp> {
     /// startup for meshes the user may never place. `FOLIAGE_KINDS` long, by kind.
     foliage_meshes: Vec<Option<Vec<FoliagePart>>>,
     foliage_lod_meshes: Vec<Option<Vec<FoliagePart>>>,
+    /// A project entry's impostor past its LOD mesh (`ProjectEntry::impostor`): instance batches only.
+    foliage_impostor_meshes: Vec<Option<Vec<FoliagePart>>>,
     /// Palette entries whose import failed, so we stop retrying them.
     foliage_failed: Vec<bool>,
     project_foliage: std::collections::BTreeMap<u16, crate::foliage_palette::ProjectEntry>,
@@ -1872,6 +1874,7 @@ impl<G: GameApp + 'static> Engine<G> {
             marquee: None,
             foliage_meshes: vec![None; FOLIAGE_KINDS],
             foliage_lod_meshes: vec![None; FOLIAGE_KINDS],
+            foliage_impostor_meshes: vec![None; FOLIAGE_KINDS],
             foliage_failed: vec![false; FOLIAGE_KINDS],
             project_foliage,
             project_foliage_sources: std::collections::HashMap::new(),
@@ -2708,6 +2711,7 @@ impl<G: GameApp> Engine<G> {
             .flat_map(|(_, parts)| parts)
             .chain(self.foliage_meshes.iter_mut().filter_map(Option::take).flatten())
             .chain(self.foliage_lod_meshes.iter_mut().filter_map(Option::take).flatten())
+            .chain(self.foliage_impostor_meshes.iter_mut().filter_map(Option::take).flatten())
             .collect::<Vec<_>>();
         self.foliage_failed.fill(false);
         self.ground_cover.clear();
@@ -4085,6 +4089,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 self.project_foliage_sources.clear();
                 self.foliage_meshes.fill(None);
                 self.foliage_lod_meshes.fill(None);
+                self.foliage_impostor_meshes.fill(None);
                 self.foliage_failed.fill(false);
                 // A new renderer holds no batches.
                 self.foliage_batches = Default::default();
@@ -9220,6 +9225,7 @@ impl<G: GameApp> Engine<G> {
             let mut kind_cull = vec![cull_sq; span];
             let mut kind_shadow = vec![shadow_sq; span];
             let mut kind_lod = vec![f32::INFINITY; span];
+            let mut kind_impostor = vec![f32::INFINITY; span];
             let mut kind_reach = vec![cull_distance; span];
             for (kind, entry) in &self.project_foliage {
                 let k = *kind as usize;
@@ -9232,6 +9238,9 @@ impl<G: GameApp> Engine<G> {
                 }
                 if let Some(lod) = &entry.lod {
                     kind_lod[k] = lod.distance * lod.distance;
+                }
+                if let Some(impostor) = &entry.impostor {
+                    kind_impostor[k] = impostor.distance * impostor.distance;
                 }
             }
             // `SOMNIUM_FOLIAGE_BATCHES=1`: this terrain's foliage as instance batches, one per ground cell and kind,
@@ -9256,14 +9265,18 @@ impl<G: GameApp> Engine<G> {
                     };
                     let near: Vec<_> = near.iter().map(piece).collect();
                     let lod: Option<Vec<_>> = self.foliage_lod_meshes[k].as_ref().map(|m| m.iter().map(piece).collect());
+                    let impostor: Option<Vec<_>> =
+                        self.foliage_impostor_meshes[k].as_ref().map(|m| m.iter().map(piece).collect());
                     parts[k] = Some(crate::foliage_batches::kind_parts(
                         kind,
                         &near,
                         lod.as_deref(),
+                        impostor.as_deref(),
                         crate::foliage_batches::KindDistances {
                             cull_sq: kind_cull[k],
                             shadow_sq: kind_shadow[k],
                             lod_sq: kind_lod[k],
+                            impostor_sq: kind_impostor[k],
                             legacy_lod: lod_distance,
                             legacy_impostor: impostor_distance,
                         },
@@ -9326,10 +9339,12 @@ impl<G: GameApp> Engine<G> {
                         kind,
                         &near,
                         None,
+                        None,
                         crate::foliage_batches::KindDistances {
                             cull_sq: f32::MAX,
                             shadow_sq: kind_shadow[k],
                             lod_sq: f32::INFINITY,
+                            impostor_sq: f32::INFINITY,
                             legacy_lod: 0.0,
                             legacy_impostor: 0.0,
                         },

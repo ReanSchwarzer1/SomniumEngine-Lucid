@@ -3546,6 +3546,7 @@ impl SomniumRenderer {
     /// on the GPU-driven path only; a part with a blended material is left out (the visibility buffer cannot
     /// blend).
     pub fn set_instance_batch(&mut self, id: u64, batch: &crate::instance_batch::InstanceBatch) {
+        let fade = crate::instance::foliage_fade(batch.fade);
         let mut slots = Vec::with_capacity(batch.parts.len() * batch.placements.len());
         let mut traced = Vec::new();
         for part in &batch.parts {
@@ -3577,22 +3578,24 @@ impl SomniumRenderer {
                 }
             }
             let first = slots.len();
-            slots.extend(
-                batch.placements.iter().map(|&placement| crate::instance_batch::GpuSlot::new(part, placement, bounds)),
-            );
+            slots.extend(batch.placements.iter().map(|&placement| {
+                let mut slot = crate::instance_batch::GpuSlot::new(part, placement, bounds);
+                slot.shadow[3] = f32::from_bits(fade);
+                slot
+            }));
             // Flat parts (litter, floor cards) and opaque copies the top level traces: with the traced sun the
-            // cascades skip them (`flat_caster`, `rays_shade_opaque`).
+            // cascades skip them (`flat_caster`, `rays_shade_opaque`). Marked by casts = 2 (`GpuSlot::shadow[1]`).
             let flat = bounds.is_some_and(|(min, max)| {
                 part.local.transform_vector3(glam::Vec3::new(0.0, max[1] - min[1], 0.0)).length() < FLAT_CASTER_M
             });
             if flat {
                 for slot in &mut slots[first..] {
-                    slot.shadow[3] = 1.0;
+                    slot.shadow[1] *= 2.0;
                 }
             } else if !cutout {
                 for copy in traced.iter().filter(|c| c.vertex_offset == part.vertex_offset) {
                     if let Some(slot) = slots.get_mut(copy.slot as usize).filter(|_| copy.slot as usize >= first) {
-                        slot.shadow[3] = 1.0;
+                        slot.shadow[1] *= 2.0;
                     }
                 }
             }
@@ -3607,6 +3610,7 @@ impl SomniumRenderer {
     /// copies of a traced mesh join the top level near the eye as a batch's do; a mesh kept out of tracing this frame
     /// ([`Self::exclude_from_tracing`], ground cover) adds none.
     pub fn set_instanced_batch(&mut self, id: u64, batch: &crate::instance_batch::InstanceBatch) {
+        let fade = crate::instance::foliage_fade(batch.fade);
         let mut slots = Vec::with_capacity(batch.parts.len() * batch.placements.len());
         let mut traced = Vec::new();
         for part in &batch.parts {
@@ -3640,11 +3644,13 @@ impl SomniumRenderer {
                     }
                 }
             }
-            slots.extend(
-                batch.placements.iter().map(|&placement| crate::instance_batch::GpuSlot::new(part, placement, bounds)),
-            );
+            slots.extend(batch.placements.iter().map(|&placement| {
+                let mut slot = crate::instance_batch::GpuSlot::new(part, placement, bounds);
+                slot.shadow[3] = f32::from_bits(fade);
+                slot
+            }));
             // A run draws every copy at once: the cascades may skip it if it is flat, or if the top level traces all
-            // of its copies.
+            // of its copies (casts = 2, `GpuSlot::shadow[1]`).
             let flat = bounds.is_some_and(|(min, max)| {
                 part.local.transform_vector3(glam::Vec3::new(0.0, max[1] - min[1], 0.0)).length() < FLAT_CASTER_M
             });
@@ -3652,7 +3658,7 @@ impl SomniumRenderer {
                 || (!cutout && traced.iter().filter(|c| c.slot as usize >= start).count() == batch.placements.len())
             {
                 for slot in &mut slots[start..] {
-                    slot.shadow[3] = 1.0;
+                    slot.shadow[1] *= 2.0;
                 }
             }
             crate::instance_batch::make_run(&mut slots[start..]);
