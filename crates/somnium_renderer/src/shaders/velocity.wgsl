@@ -140,20 +140,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec2<f32> {
     let depth = textureLoad(depth_tex, coord, 0);
 
     var world: vec3<f32>;
-    if depth >= 1.0 {
+    if depth <= 0.0 {
         // No geometry. Take a point far along this pixel's ray rather than
         // returning zero: the sky does move on screen when the camera turns,
         // and a zero there would leave it the only unblurred part of a whip pan.
-        // Just inside the far plane, because exactly 1.0 un-projects to a point
-        // at infinity whose previous-frame projection is a division by ~0.
-        world = world_from_ndc(vec3<f32>(ndc_xy, 0.9999));
+        // At depth 1e-7, some 350 km out at the game's near plane: reversed-Z's
+        // 0 un-projects to a point at infinity whose w is 0 (Sunscar, 6 Nov 2026).
+        world = world_from_ndc(vec3<f32>(ndc_xy, 1e-7));
     } else {
         world = world_from_ndc(vec3<f32>(ndc_xy, depth));
     }
 
     // A point that moved on its own: where the same point of its triangle was last frame.
     var moved = false;
-    if depth < 1.0 {
+    if depth > 0.0 {
         let vis = textureLoad(vis_tex, coord, 0).xy;
         if vis.x != 0u && vis.x - 1u < arrayLength(&motion) && motion[vis.x - 1u].moving != 0u {
             // ponytail: world space for the instance's matrices, ~1 mm steps 15 km out; fine for motion.
@@ -166,7 +166,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec2<f32> {
     // swayed position back to its rest pose (two fixed-point steps; the sway
     // barely depends on where along it the point is) and forward to where the
     // wind had it last frame. Same `wind_offset` as every raster pass.
-    if depth < 1.0 && !moved {
+    if depth > 0.0 && !moved {
         let vis = textureLoad(vis_tex, coord, 0).xy;
         if vis.x != 0u {
             let inst = instances[vis.x - 1u];

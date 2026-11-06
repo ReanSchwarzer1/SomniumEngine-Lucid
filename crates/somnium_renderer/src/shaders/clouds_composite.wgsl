@@ -105,9 +105,11 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
             return cloud;
         }
         let sky_ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
-        let near_p = comp.inv_view_proj * vec4<f32>(sky_ndc, 0.0, 1.0);
-        let far_p = comp.inv_view_proj * vec4<f32>(sky_ndc, 1.0, 1.0);
-        let dir = normalize(far_p.xyz / far_p.w - near_p.xyz / near_p.w);
+        // Reversed-Z (Sunscar, 6 Nov 2026): depth 1 is the near plane and 0 infinity, where a perspective's point
+        // has w = 0 and its xyz is the ray's direction (undivided, an orthographic view's far plane less its near).
+        let near_p = comp.inv_view_proj * vec4<f32>(sky_ndc, 1.0, 1.0);
+        let far_p = comp.inv_view_proj * vec4<f32>(sky_ndc, 0.0, 1.0);
+        let dir = normalize(far_p.xyz - near_p.xyz / near_p.w * far_p.w);
         let eye = sky_eye(dir, normalize(comp.eye_direction), comp.eye_tan_half_width, comp.eye_color,
                           comp.eye_intensity, comp.eye_shape, comp.eye_time);
         // Through the deck: the cloud is darkened where the eye covers the sky

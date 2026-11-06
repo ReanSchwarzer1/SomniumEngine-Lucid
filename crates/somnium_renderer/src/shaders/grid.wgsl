@@ -46,19 +46,21 @@ fn aa_grid(xz: vec2<f32>, cell: f32) -> f32 {
 
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
-    // Reconstruct world-space near/far points from NDC via inv_view_proj.
-    let np   = gv.inv_view_proj * vec4(in.ndc, 0.0, 1.0);
-    let fp   = gv.inv_view_proj * vec4(in.ndc, 1.0, 1.0);
+    // Reconstruct the world-space near point and the ray from NDC via inv_view_proj. Reversed-Z (Sunscar,
+    // 6 Nov 2026): depth 1 is the near plane and 0 infinity, where a perspective's point has w = 0 and its xyz is the
+    // ray's direction (taken undivided, an orthographic view's far plane less its near).
+    let np   = gv.inv_view_proj * vec4(in.ndc, 1.0, 1.0);
+    let fp   = gv.inv_view_proj * vec4(in.ndc, 0.0, 1.0);
     let near = np.xyz / np.w;
-    let far  = fp.xyz / fp.w;
+    let dir  = fp.xyz - near * fp.w;
 
     // Ray–XZ-plane (y = 0) intersection.
-    let denom = far.y - near.y;
+    let denom = dir.y;
     if abs(denom) < 1e-5 { return vec4(0.0); }
     let t = -near.y / denom;
     if t < 0.0 { return vec4(0.0); }
 
-    let hit = near + t * (far - near);
+    let hit = near + t * dir;
 
     // Fade with horizontal distance from camera (unaffected by camera height).
     let dist = length(hit.xz - gv.camera_pos.xz);

@@ -541,7 +541,8 @@ fn trace_ssr(origin: vec3<f32>, direction: vec3<f32>) -> vec4<f32> {
         let dimensions = textureDimensions(depth_texture);
         let coord = body_texel(projected.xy, dimensions);
         let scene_depth = textureLoad(depth_texture, coord, 0);
-        if scene_depth < 0.9999 {
+        // Not the sky (reversed-Z's cleared 0, Sunscar, 6 Nov 2026).
+        if scene_depth > 0.0 {
             let scene_world = reconstruct_world(projected.xy, scene_depth);
             let delta = view_depth(ray_point) - view_depth(scene_world);
             let thickness = 0.12 + distance_along * 0.012;
@@ -793,8 +794,8 @@ fn soft_edge(clip_pos: vec4<f32>, world_position: vec3<f32>) -> f32 {
     );
     let scene = textureLoad(depth_texture, coord, 0);
     // Nothing behind this pixel: open water against the sky needs no fade, and
-    // reconstructing a world position from a cleared depth would be nonsense.
-    if scene >= 0.9999 {
+    // reconstructing a world position from a cleared depth (reversed-Z's 0) would be nonsense.
+    if scene <= 0.0 {
         return 1.0;
     }
     let uv = (vec2<f32>(coord) + vec2<f32>(0.5)) / vec2<f32>(dimensions);
@@ -885,9 +886,10 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> Sh
     let screen_size = vec2<f32>(textureDimensions(depth_texture));
     let screen_uv = input.clip_pos.xy / screen_size;
     let coord = vec2<i32>(input.clip_pos.xy);
+    // Reversed-Z: the sky is 0, and a hair above it keeps the point finite.
     let base_depth = textureLoad(depth_texture, coord, 0);
-    let base_has_backdrop = base_depth < 0.9999;
-    let base_world = reconstruct_world(screen_uv, min(base_depth, 0.9999));
+    let base_has_backdrop = base_depth > 0.0;
+    let base_world = reconstruct_world(screen_uv, max(base_depth, 1e-7));
 
     // Refract, then reject samples that are sky, in front of the surface, or
     // reveal foreground. Invalid displacement falls back to the unperturbed UV.
@@ -895,8 +897,8 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> Sh
     let candidate_uv = clamp(screen_uv + refract_offset, vec2<f32>(0.0), vec2<f32>(1.0));
     let candidate_coord = body_texel(candidate_uv, textureDimensions(depth_texture));
     let candidate_depth = textureLoad(depth_texture, candidate_coord, 0);
-    let candidate_world = reconstruct_world(candidate_uv, min(candidate_depth, 0.9999));
-    let candidate_valid = candidate_depth < 0.9999
+    let candidate_world = reconstruct_world(candidate_uv, max(candidate_depth, 1e-7));
+    let candidate_valid = candidate_depth > 0.0
         && view_depth(candidate_world) > water_view_depth + 0.03;
     let refr_uv = select(screen_uv, candidate_uv, candidate_valid);
     var refracted = textureSampleLevel(scene_color, sampler_linear, refr_uv, 0.0).rgb;
@@ -1201,10 +1203,10 @@ fn fs_prepass(input: VertexOutput, @builtin(front_facing) front_facing: bool) ->
     let shore_band = 1.0 - smoothstep(0.0, foam_width, shore_distance);
     let coord = vec2<i32>(input.clip_pos.xy);
     let base_depth = textureLoad(depth_texture, coord, 0);
-    let base_has_backdrop = base_depth < 0.9999;
+    let base_has_backdrop = base_depth > 0.0;
     let screen_size = vec2<f32>(textureDimensions(depth_texture));
     let screen_uv = input.clip_pos.xy / screen_size;
-    let base_world = reconstruct_world(screen_uv, min(base_depth, 0.9999));
+    let base_world = reconstruct_world(screen_uv, max(base_depth, 1e-7));
     let backdrop_distance = select(authored_depth, distance(input.world_position, base_world), base_has_backdrop);
     let depth_contact = select(
         0.0,

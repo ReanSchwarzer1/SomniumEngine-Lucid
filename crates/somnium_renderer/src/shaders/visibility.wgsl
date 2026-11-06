@@ -187,7 +187,7 @@ fn vs_main(
     }
     if tie > 0.0 {
         let normal = (instance.model * vec4<f32>(vertex.norm_x, vertex.norm_y, vertex.norm_z, 0.0)).xyz;
-        out.clip_pos.z -= depth_tie_offset(tie, normal, world, out.clip_pos.w, view.view, view.camera_pos,
+        out.clip_pos.z += depth_tie_offset(tie, normal, world, out.clip_pos.w, view.view, view.camera_pos,
                                            view.depth_tie_slope);
     }
     out.instance_id = inst_idx;

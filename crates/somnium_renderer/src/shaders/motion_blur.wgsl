@@ -73,11 +73,13 @@ fn mb_dither(p: vec2<f32>) -> f32 {
 
 /// Foreground / background classification, from Jimenez via Wicked's `DepthCmp`.
 ///
-/// Returns `(is_sample_in_front, is_sample_behind)` as a soft pair rather than
+/// Returns `(is_sample_behind, is_sample_in_front)` as a soft pair rather than
 /// a branch, so the two are blended near the depth of the centre instead of
-/// switching hard along a silhouette.
+/// switching hard along a silhouette. Scene depth is reversed (Sunscar, 6 Nov
+/// 2026), larger nearer, so the difference is taken centre less sample to keep
+/// the pairing it had with forward depth.
 fn depth_cmp(centre: f32, sample_depth: f32, scale: f32) -> vec2<f32> {
-    return saturate(vec2<f32>(0.5) + vec2<f32>(scale, -scale) * (sample_depth - centre));
+    return saturate(vec2<f32>(0.5) + vec2<f32>(scale, -scale) * (centre - sample_depth));
 }
 
 /// Does a blur of length `spread` reach `offset` pixels away?

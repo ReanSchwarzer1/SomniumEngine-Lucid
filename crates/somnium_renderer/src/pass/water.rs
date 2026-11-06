@@ -648,7 +648,8 @@ impl WaterPass {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                // Scene depth is reversed-Z: nearer is larger (renderer.rs `set_view`).
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -696,7 +697,8 @@ impl WaterPass {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                // Scene depth is reversed-Z: nearer is larger (renderer.rs `set_view`).
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),

@@ -456,7 +456,7 @@ fn gi_primary_surface(coord: vec2<i32>, dims: vec2<u32>) -> GiSurface {
     s.normal = vec3<f32>(0.0, 1.0, 0.0);
 
     let depth = textureLoad(depth_tex, coord, 0);
-    if depth >= 1.0 {
+    if depth <= 0.0 {
         return s;
     }
     let uv = (vec2<f32>(coord) + 0.5) * gi.inv_resolution;
@@ -657,8 +657,10 @@ fn spatial_and_shade(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Reject neighbours on different geometry. Without this a reservoir
         // crosses a silhouette and the background's bounce light bleeds onto
         // the foreground — the classic ReSTIR halo.
+        // Reversed-Z (Sunscar, 6 Nov 2026): sky is 0, and `1 - depth` is what forward depth was within near / far,
+        // so the tolerance is the one this was tuned with.
         let nd = textureLoad(depth_tex, nc, 0);
-        if nd >= 1.0 || abs(nd - depth_here) > depth_here * 0.02 {
+        if nd <= 0.0 || abs(nd - depth_here) > (1.0 - depth_here) * 0.02 {
             continue;
         }
         let ns = gi_spatial_surface(u32(ng.y) * dims.x + u32(ng.x), nc, full);

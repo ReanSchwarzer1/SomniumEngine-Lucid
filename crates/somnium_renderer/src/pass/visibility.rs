@@ -225,7 +225,8 @@ impl VisibilityBufferPass {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
+                // Reversed-Z: nearer is larger (renderer.rs `set_view`).
+                depth_compare: Some(wgpu::CompareFunction::Greater),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -272,7 +273,8 @@ impl VisibilityBufferPass {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
+                // Reversed-Z: nearer is larger (renderer.rs `set_view`).
+                depth_compare: Some(wgpu::CompareFunction::Greater),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),

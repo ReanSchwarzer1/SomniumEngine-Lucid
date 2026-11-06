@@ -88,7 +88,8 @@ fn emit_visible(i: u32) {
 fn is_occluded(world_min: vec3<f32>, world_max: vec3<f32>) -> bool {
     var lo = vec2<f32>(1e30);
     var hi = vec2<f32>(-1e30);
-    var min_z = 1e30;
+    // Nearest NDC depth: the largest, under reversed-Z (Sunscar, 6 Nov 2026).
+    var max_z = -1e30;
     var min_w = 1e30;
 
     for (var c = 0u; c < 8u; c = c + 1u) {
@@ -108,13 +109,13 @@ fn is_occluded(world_min: vec3<f32>, world_max: vec3<f32>) -> bool {
         let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 1.0 - (ndc.y * 0.5 + 0.5));
         lo = min(lo, uv);
         hi = max(hi, uv);
-        min_z = min(min_z, ndc.z);
+        max_z = max(max_z, ndc.z);
         min_w = min(min_w, clip.w);
     }
 
     lo = clamp(lo, vec2<f32>(0.0), vec2<f32>(1.0));
     hi = clamp(hi, vec2<f32>(0.0), vec2<f32>(1.0));
-    min_z = max(min_z, 0.0);
+    max_z = min(max_z, 1.0);
 
     // A tree filling the view (camera in the canopy, or standing next to a
     // scaled sapling) covers most of the screen. Four coarse Hi-Z samples
@@ -134,20 +135,20 @@ fn is_occluded(world_min: vec3<f32>, world_max: vec3<f32>) -> bool {
     let t0 = vec2<i32>(clamp(lo * dims, vec2<f32>(0.0), dims - vec2<f32>(1.0)));
     let t1 = vec2<i32>(clamp(hi * dims, vec2<f32>(0.0), dims - vec2<f32>(1.0)));
 
-    var furthest = 0.0;
-    furthest = max(furthest, textureLoad(hiz, vec2<i32>(t0.x, t0.y), level).r);
-    furthest = max(furthest, textureLoad(hiz, vec2<i32>(t1.x, t0.y), level).r);
-    furthest = max(furthest, textureLoad(hiz, vec2<i32>(t0.x, t1.y), level).r);
-    furthest = max(furthest, textureLoad(hiz, vec2<i32>(t1.x, t1.y), level).r);
+    var furthest = 1.0;
+    furthest = min(furthest, textureLoad(hiz, vec2<i32>(t0.x, t0.y), level).r);
+    furthest = min(furthest, textureLoad(hiz, vec2<i32>(t1.x, t0.y), level).r);
+    furthest = min(furthest, textureLoad(hiz, vec2<i32>(t0.x, t1.y), level).r);
+    furthest = min(furthest, textureLoad(hiz, vec2<i32>(t1.x, t1.y), level).r);
 
-    // A region still at the far plane records no occluder at all.
-    if furthest >= 1.0 {
+    // A region still at infinity (the cleared 0) records no occluder at all.
+    if furthest <= 0.0 {
         return false;
     }
     // A draw's depth tie (depth_tie.wgsl) can draw it up to `DEPTH_TIE_REACH` nearer than its box, in front of what
     // the pyramid recorded, so it is kept until it is behind by more than that; ties fade out by 24 m, and so does the
     // allowance, from the box's nearest point (F's check, 29 Oct: a constant one cost far culling metres of depth).
-    return min_z - DEPTH_TIE_REACH * depth_tie_fade(min_w) > furthest;
+    return max_z + DEPTH_TIE_REACH * depth_tie_fade(min_w) < furthest;
 }
 
 // Both phases run this entry point; `params.phase` selects the behaviour.

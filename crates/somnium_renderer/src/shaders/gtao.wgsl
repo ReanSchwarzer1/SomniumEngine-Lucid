@@ -152,9 +152,9 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let coord = vec2<i32>(gid.xy);
     let depth = textureLoad(depth_tex, coord, 0);
 
-    // Nothing drawn here: sky is unoccluded by definition, and a
-    // reconstructed position on the far plane is meaningless anyway.
-    if depth >= 1.0 || params.intensity <= 0.0 {
+    // Nothing drawn here: sky is unoccluded by definition, and a position
+    // reconstructed at reversed-Z's cleared 0 is at infinity anyway.
+    if depth <= 0.0 || params.intensity <= 0.0 {
         // Zero direction asks shading to use the actual geometric normal.
         textureStore(gtao_out, coord, vec4<f32>(0.5, 0.5, 0.5, 1.0));
         return;
@@ -207,14 +207,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         for (var step = 1; step <= GTAO_STEPS; step = step + 1) {
             let offset = dir * (f32(step) + noise) * step_px;
 
-            // OOB textureLoad returns zero, which reconstructs as a near-plane
-            // occluder. This is common for hands/faces when radius exceeds the
+            // Off the screen there is nothing to read (an OOB textureLoad returns
+            // zero). This is common for hands/faces when radius exceeds the
             // viewport. Missing screen/sky samples contain no occlusion data;
             // skip them rather than inventing depth or repeating an edge texel.
             for (var side = 0; side < 2; side = side + 1) {
                 let c = coord + select(vec2<i32>(offset), -vec2<i32>(offset), side == 0);
                 if !inside_depth(c) { continue; }
-                if textureLoad(depth_tex, c, 0) >= 1.0 { continue; }
+                if textureLoad(depth_tex, c, 0) <= 0.0 { continue; }
                 let delta = load_view_position(c) - centre;
                 let distance = length(delta);
                 if distance > 1e-4 && distance < params.radius

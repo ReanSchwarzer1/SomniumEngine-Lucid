@@ -156,6 +156,37 @@ impl SceneView {
     }
 }
 
+/// The projection the scene draws with, from the forward one a caller gives `set_view` (Sunscar, 6 Nov 2026).
+///
+/// Scene depth is reversed: the near plane is 1 and far is 0, so float depth keeps its precision kilometres out
+/// (forward depth with a 3.5 cm near plane rounds to 140 m at 8 km). A perspective also loses its far plane: depth is
+/// `near / view depth`, 0 at infinity, which is where the sky sits. The near plane is read back from the matrix
+/// (`perspective_rh` holds `near * far / (near - far)` over `far / (near - far)`), and x, y and w are untouched, so
+/// every point lands on the same pixel as before. An orthographic projection keeps both planes, swapped.
+#[must_use]
+pub fn reversed_z(proj: Mat4) -> Mat4 {
+    let mut m = proj;
+    if proj.z_axis.w != 0.0 {
+        let near = near_plane(proj);
+        m.x_axis.z = 0.0;
+        m.y_axis.z = 0.0;
+        m.z_axis.z = 0.0;
+        m.w_axis.z = near;
+    } else {
+        // z' = w - z.
+        for c in [&mut m.x_axis, &mut m.y_axis, &mut m.z_axis, &mut m.w_axis] {
+            c.z = c.w - c.z;
+        }
+    }
+    m
+}
+
+/// The near plane of a forward perspective projection (`perspective_rh` or its infinite form): `w.z / z.z`.
+#[must_use]
+pub fn near_plane(proj: Mat4) -> f32 {
+    proj.w_axis.z / proj.z_axis.z
+}
+
 /// The views a layout draws, given the primary camera and the region to fill.
 ///
 /// The secondaries are the three orthographic elevations every DCC tool ships —
@@ -346,6 +377,40 @@ mod tests {
             extent > 100.0,
             "a 45-degree view 335 m from its subject frames ~139 m: {extent}"
         );
+    }
+
+    #[test]
+    fn the_scene_projection_is_reversed_and_infinite_and_survives_the_round_trip() {
+        // The game's camera (Sunscar, 6 Nov 2026): 74 degrees, near 3.5 cm, far 80 km.
+        let (fov, aspect, near) = (74f32.to_radians(), 16.0 / 9.0, 0.035);
+        let forward = Mat4::perspective_rh(fov, aspect, near, 80_000.0);
+        let reversed = reversed_z(forward);
+        let depth = |m: Mat4, view_depth: f32| m.project_point3(Vec3::new(0.3, -0.2, -view_depth)).z;
+        assert!((depth(reversed, near) - 1.0).abs() < 1e-6, "near plane at 1: {}", depth(reversed, near));
+        assert!((depth(reversed, 2.0 * near) - 0.5).abs() < 1e-6, "near / view depth");
+        assert_eq!((reversed * glam::Vec4::new(0.0, 0.0, -1.0, 0.0)).z, 0.0, "infinity at 0");
+        let far = depth(reversed, 1.0e9);
+        assert!(far > 0.0 && far < 1e-10, "far toward 0, never past it: {far}");
+        assert!(reversed.abs_diff_eq(Mat4::perspective_infinite_reverse_rh(fov, aspect, near), 1e-5), "{reversed}");
+        // Every point lands on the pixel it did.
+        let p = Vec3::new(3.0, 1.5, -40.0);
+        assert!(forward.project_point3(p).truncate().abs_diff_eq(reversed.project_point3(p).truncate(), 1e-6));
+        // What it is for: a metre apart 60 km out, one depth forward, two reversed.
+        assert_eq!(depth(forward, 60_000.0), depth(forward, 60_001.0), "forward depth rounds them together");
+        assert!(depth(reversed, 60_000.0) > depth(reversed, 60_001.0), "reversed keeps them apart");
+        // The round trip: `primary_scene_view` hands back the forward matrix `set_view` stored, an editor layout
+        // passes it back through `standard_views`, and `set_view` converts it once more to the same thing.
+        let eye = Vec3::new(-15408.0, 14.4, 358.0);
+        let primary = SceneView::full(Mat4::look_at_rh(eye, eye + Vec3::new(0.0, -0.5, -1.0), Vec3::Y), forward, eye);
+        let views = standard_views(&[(0, 0, 1600, 900), (1600, 0, 800, 900)], primary);
+        assert!(reversed_z(views[0].proj).abs_diff_eq(reversed, 1e-6), "the primary view converts as it did");
+        // Converting the converted matrix is not the same, which is why `set_view` keeps the caller's.
+        assert!(!reversed_z(reversed).abs_diff_eq(reversed, 1e-3), "reversed_z is not idempotent");
+        // An orthographic tile keeps both planes, swapped.
+        let ortho = reversed_z(views[1].proj);
+        let tile_depth = |d: f32| ortho.project_point3(Vec3::new(0.0, 0.0, -d)).z;
+        let (n, f) = (0.1, 0.1 + 1.0 / views[1].proj.z_axis.z.abs());
+        assert!((tile_depth(n) - 1.0).abs() < 1e-5 && tile_depth(f).abs() < 1e-5, "{} {}", tile_depth(n), tile_depth(f));
     }
 
     #[test]
