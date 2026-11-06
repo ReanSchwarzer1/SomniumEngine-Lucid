@@ -7408,7 +7408,7 @@ impl SomniumRenderer {
             } else {
                 self.chromatic_aberration
             },
-            if debugging { 3 } else { self.tonemapper },
+            if debugging { crate::pass::postprocess::TONEMAP_PASSTHROUGH } else { self.tonemapper },
             self.auto_exposure && !debugging,
             if debugging {
                 0.0
@@ -7420,7 +7420,11 @@ impl SomniumRenderer {
             if debugging {
                 crate::pass::postprocess::Grading::default()
             } else {
-                self.grading
+                // The lens's fall-off needs the field of view and the aspect: tan(half fov) = 1 / proj[1][1].
+                let mut grading = self.grading;
+                let fy = self.proj_matrix.y_axis.y.abs().max(1e-6);
+                grading.lens = [1.0 / fy, fy / self.proj_matrix.x_axis.x.abs().max(1e-6)];
+                grading
             },
             if debugging {
                 Default::default()

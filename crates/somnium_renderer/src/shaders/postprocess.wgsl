@@ -5,6 +5,7 @@
 // Applied after the shading pass and grid overlay, before the UI overlay.
 
 //!include "dream_lens.wgsl"
+//!include "tone_curves.wgsl"
 
 struct PostParams {
     /// Linear multiplier from scene luminance (cd/m²) to display range.
@@ -56,6 +57,15 @@ struct PostParams {
     stylise: vec4<f32>,
     /// x how much of the grading LUT to take (0 leaves it unread); y low-light vision (`low_light`); zw unused.
     lut: vec4<f32>,
+    /// The photographic camera (sunscar-photoreal, 6 Nov 2026; `PostProcessComponent::photographic`): x 1 on (0: the
+    /// chain as it was, untouched); y the lens's glare share; z sensor noise (1 a real sensor's); w unused.
+    photo: vec4<f32>,
+    /// x tan(half the vertical field of view), y aspect (width / height), for the lens's cos^4 fall-off; zw unused.
+    lens: vec4<f32>,
+    /// The camera's white balance: a linear-RGB matrix by rows (w unused); the identity when off.
+    wb_r: vec4<f32>,
+    wb_g: vec4<f32>,
+    wb_b: vec4<f32>,
 }
 
 @group(0) @binding(0) var hdr_tex:  texture_2d<f32>;
@@ -136,77 +146,74 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VOut {
     return VOut(vec4(p, 0.0, 1.0), uv);
 }
 
-// ACES filmic tone-mapping approximation (Narkowicz 2015).
-fn aces_film(x: vec3<f32>) -> vec3<f32> {
-    return clamp(
-        (x * (2.51 * x + vec3(0.03))) / (x * (2.43 * x + vec3(0.59)) + vec3(0.14)),
-        vec3(0.0), vec3(1.0)
-    );
+/// The lens's own fall-off toward the corners (natural vignetting): cos^4 of the angle off the axis, taken
+/// `vignette_strength` of the way (0 none; 1 an uncorrected lens, about 2 stops in a 55-degree view's corners).
+fn lens_falloff(uv: vec2<f32>) -> f32 {
+    let ndc = uv * 2.0 - vec2<f32>(1.0);
+    let t = vec2<f32>(ndc.x * pp.lens.x * pp.lens.y, ndc.y * pp.lens.x);
+    let cos2 = 1.0 / (1.0 + dot(t, t));
+    return mix(1.0, cos2 * cos2, clamp(pp.vignette_strength, 0.0, 1.0));
 }
 
-// ── AgX (Phase 24B) ─────────────────────────────────────────────────────────
-//
-// Troy Sobotka's AgX, as the analytic form rather than the 3-D LUT the
-// reference implementation ships. A LUT would mean shipping and binding a KTX2
-// asset for what is a closed-form curve; the polynomial below matches it to
-// well within 8-bit output precision.
-//
-// Why replace ACES: ACES pushes very bright saturated colours toward the
-// primaries, so an intense warm light skews orange and then clips to white
-// rather than desaturating the way film does. That was tolerable when the sun
-// was an arbitrary 3.0, and stops being tolerable at 100 000 lux with a sun
-// disc in frame. AgX desaturates smoothly into the highlight instead, which is
-// what keeps a sunrise looking photographed.
-
-// Rec.709 → AgX working space. Columns, matching WGSL's mat3x3 constructor.
-const AGX_INSET = mat3x3<f32>(
-    vec3<f32>(0.8566271533, 0.1373189729, 0.1118982130),
-    vec3<f32>(0.0951212405, 0.7612419906, 0.0767994186),
-    vec3<f32>(0.0482516061, 0.1014390365, 0.8113023684),
-);
-
-// Inverse of the above, back to Rec.709.
-const AGX_OUTSET = mat3x3<f32>(
-    vec3<f32>( 1.1271005818, -0.1413297635, -0.1413297635),
-    vec3<f32>(-0.1106066431,  1.1578237022, -0.1106066431),
-    vec3<f32>(-0.0164939387, -0.0164939387,  1.2519364066),
-);
-
-/// Dynamic range AgX maps, in stops around middle grey.
-const AGX_MIN_EV: f32 = -12.47393;
-const AGX_MAX_EV: f32 = 4.026069;
-
-/// Sixth-order fit to AgX's default contrast sigmoid.
-fn agx_contrast(x: vec3<f32>) -> vec3<f32> {
-    let x2 = x * x;
-    let x4 = x2 * x2;
-    return 15.5 * x4 * x2
-         - 40.14 * x4 * x
-         + 31.96 * x4
-         - 6.868 * x2 * x
-         + 0.4298 * x2
-         + 0.1191 * x
-         - 0.00232;
+/// PCG hash (O'Neill; Jarzynski and Olano, JCGT 2020): one well-mixed u32 from another. Integer, so it does not
+/// lose its randomness at large pixel coordinates as a float hash does.
+fn pcg_hash(v: u32) -> u32 {
+    let state = v * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
 }
 
-fn agx(color_in: vec3<f32>) -> vec3<f32> {
-    var color = AGX_INSET * max(color_in, vec3(0.0));
-
-    // Log-encode across AgX's range. The floor keeps log2 finite on black.
-    color = clamp(log2(max(color, vec3(1e-10))), vec3(AGX_MIN_EV), vec3(AGX_MAX_EV));
-    color = (color - AGX_MIN_EV) / (AGX_MAX_EV - AGX_MIN_EV);
-
-    color = agx_contrast(color);
-    color = AGX_OUTSET * color;
-
-    // AgX emits display-encoded values, but this pass writes to an sRGB target
-    // that applies its own encode. Undo AgX's so the two do not compound.
-    return clamp(pow(max(color, vec3(0.0)), vec3(2.2)), vec3(0.0), vec3(1.0));
+/// A standard normal number for a pixel, a frame and a stream (Box-Muller on two PCG draws).
+fn gauss(pixel: vec2<u32>, frame: u32, stream: u32) -> f32 {
+    let base = pcg_hash(pixel.x + pcg_hash(pixel.y + pcg_hash(frame * 8u + stream)));
+    let u1 = max(f32(base) * 2.3283064e-10, 1e-7);
+    let u2 = f32(pcg_hash(base)) * 2.3283064e-10;
+    return sqrt(-2.0 * log(u1)) * cos(6.2831853 * u2);
 }
 
-/// Plain Reinhard, kept as a neutral reference point for comparisons.
-fn reinhard(x: vec3<f32>) -> vec3<f32> {
-    return clamp(x / (vec3(1.0) + x), vec3(0.0), vec3(1.0));
+/// Sensor noise on the exposed light (middle grey 0.18), as a camera makes it: photon noise, the square root of the
+/// light gathered, and 3 electrons of read noise. The camera holds ISO 100 down to EV 10 and raises it a stop for
+/// each stop less light, so a bright day is clean and a dim wood or a night grows grain. At ISO 100 middle grey
+/// gathers about 5,000 electrons, as a full-frame sensor's photosite does; `strength` 1 is that sensor. The noise
+/// is mostly luminance, with a third as much colour, as after a camera's own noise reduction.
+fn sensor_noise(x: vec3<f32>, pixel: vec2<u32>, strength: f32, ev: f32) -> vec3<f32> {
+    let electrons = 27800.0 / exp2(clamp(10.0 - ev, 0.0, 14.0));
+    let luma = max(dot(x, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0);
+    let sigma = sqrt(luma * electrons + 9.0) / electrons;
+    // A new draw every 60th of a second: noise moves with time, as a sensor's does, and never sits as a pattern.
+    let frame = u32(fract(pp.time / 4096.0) * 4096.0 * 60.0);
+    let n = gauss(pixel, frame, 0u);
+    let colour = vec3<f32>(gauss(pixel, frame, 1u), gauss(pixel, frame, 2u), gauss(pixel, frame, 3u));
+    let noise = vec3<f32>(n) + 0.33 * (colour - vec3<f32>(n));
+    // In each channel's own share of the light, so a coloured surface keeps its colour; grey in the near-black.
+    let share = select(vec3<f32>(1.0), x / max(luma, 1e-6), luma > 1e-4);
+    return max(x + strength * sigma * noise * share, vec3<f32>(0.0));
+}
+
+/// The camera's grade on the scene's own light, after exposure and before the curve: the lens's fall-off, white
+/// balance (a chromatic adaptation made on the CPU), temperature and tint as channel gains, gain, saturation about
+/// the light's luminance, and contrast in log light about middle grey where the curve does not take it.
+fn photo_grade(x_in: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    var x = x_in * lens_falloff(uv);
+    x = vec3<f32>(dot(pp.wb_r.xyz, x), dot(pp.wb_g.xyz, x), dot(pp.wb_b.xyz, x));
+    let t = clamp(pp.temperature, -1.0, 1.0);
+    let g = clamp(pp.tint, -1.0, 1.0);
+    x = max(x * vec3<f32>(1.0 + t * 0.2, 1.0 + g * 0.1, 1.0 - t * 0.2) * pp.gain, vec3<f32>(0.0));
+    let luma = dot(x, vec3<f32>(0.2126, 0.7152, 0.0722));
+    x = max(vec3<f32>(luma) + (x - vec3<f32>(luma)) * pp.saturation, vec3<f32>(0.0));
+    if pp.tonemapper != 3u && abs(pp.contrast - 1.0) > 1e-4 {
+        x = 0.18 * pow(x / 0.18, vec3<f32>(max(pp.contrast, 0.05)));
+    }
+    return x;
+}
+
+/// What the photographic camera leaves to the display: the CDL's offset and power, then the authored response.
+fn photo_display_grade(c_in: vec3<f32>) -> vec3<f32> {
+    var c = pow(max(c_in + vec3<f32>(pp.lift), vec3<f32>(0.0)), vec3<f32>(max(pp.gamma, 1e-3)));
+    if (pp.response_enabled > 0.5) {
+        c = vec3<f32>(response_at(c.r), response_at(c.g), response_at(c.b));
+    }
+    return clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
 // ── Colour grading (Phase 24Y) ──────────────────────────────────────────────
@@ -468,9 +475,11 @@ fn tonemap(hdr: vec3<f32>) -> vec3<f32> {
     switch pp.tonemapper {
         case 1u: { return aces_film(hdr); }
         case 2u: { return reinhard(hdr); }
-        // 3: passthrough, for debug views. A curve would grade the very values
-        // being inspected, and exposure would crush a 0/1 flag image to black.
-        case 3u: { return clamp(hdr, vec3(0.0), vec3(1.0)); }
+        // The photographic curve; under the photographic camera its slope takes `contrast`.
+        case 3u: { return photographic(hdr, select(1.0, pp.contrast, pp.photo.x > 0.5)); }
+        // 15: passthrough, for debug views (`postprocess::TONEMAP_PASSTHROUGH`). A curve would grade the very
+        // values being inspected, and exposure would crush a 0/1 flag image to black.
+        case 15u: { return clamp(hdr, vec3(0.0), vec3(1.0)); }
         default: { return agx(hdr); }
     }
 }
@@ -526,6 +535,17 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
         textureSample(hdr_tex, hdr_samp, scene_uv).g,
         textureSample(hdr_tex, hdr_samp, scene_uv + ca_off).b,
     );
+    // The photographic camera (`pp.photo`). Its lateral chromatic aberration spreads along the spectrum rather than
+    // in three hard copies: red and blue each read across their half of the offset, so a fringe softens into its
+    // colour as a lens's does.
+    let photo = pp.photo.x > 0.5 && !retro;
+    if photo && pp.ca_strength > 0.0 {
+        hdr = vec3(
+            0.5 * (hdr.r + textureSampleLevel(hdr_tex, hdr_samp, scene_uv - 0.5 * ca_off, 0.0).r),
+            hdr.g,
+            0.5 * (hdr.b + textureSampleLevel(hdr_tex, hdr_samp, scene_uv + 0.5 * ca_off, 0.0).b),
+        );
+    }
     if apart {
         // Kept out of the retro picture, and shown wrong: its channels slip apart and back, and now and then a band of
         // it tears sideways, a signal that does not belong in this picture.
@@ -587,7 +607,9 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // scattering inside the lens — it happens to the light on its way to the
     // sensor, not to the picture afterwards.
     let bloom = textureSample(bloom_tex, hdr_samp, view_uv).rgb;
-    hdr += bloom * pp.bloom_intensity;
+    // The photographic camera's lens keeps the energy: the share it spreads into the glare halo (the chain, which the
+    // CPU scales by that share over its level count) leaves the image it came from. No threshold there.
+    hdr = hdr * select(1.0, 1.0 - pp.photo.y, photo) + bloom * pp.bloom_intensity;
 
     // Low-light vision, on the scene's own luminance before exposure, because the eye's rods answer to the light
     // and not to the camera. Off at zero.
@@ -599,12 +621,22 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // manual camera settings imply, or what the histogram metered this frame.
     let exposure = select(pp.exposure, metered[0], pp.auto_exposure != 0u);
     hdr *= exposure;
+    // The photographic camera grades the exposed light before the curve, then the sensor adds its noise at the ISO
+    // this exposure would take.
+    if photo {
+        hdr = photo_grade(hdr, in.uv);
+        if pp.photo.z > 0.0 {
+            let ev = select(log2(1.0 / (1.2 * max(pp.exposure, 1e-12))), metered[1], pp.auto_exposure != 0u);
+            hdr = sensor_noise(hdr, vec2<u32>(max(in.clip.xy, vec2<f32>(0.0))), pp.photo.z, ev);
+        }
+    }
 
     // Tone map → LDR in [0, 1].
     let ldr = tonemap(hdr);
 
-    // Phase 24Y: grading, in display space after the curve.
-    var graded = apply_grading(ldr);
+    // Phase 24Y: grading, in display space after the curve. The photographic camera graded the light already and
+    // keeps only the CDL's offset and power and the authored response here.
+    var graded = select(apply_grading(ldr), photo_display_grade(ldr), photo);
 
     // LUT grading (Sunscar, 5 Nov 2026): a look made in a grading tool, over the parametric grade. Texel centres:
     // 0 and 1 land on the first and last entries.
@@ -623,7 +655,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // Radial vignette: darkens screen edges.
     let uv_c = in.uv - vec2(0.5);
     let vign  = 1.0 - smoothstep(0.35, 0.75, length(uv_c) * 1.4 * pp.vignette_strength);
-    graded *= vign;
+    graded *= select(vign, 1.0, photo);
     if shift_kind == 1u {
         graded = screen_mask(graded, in.uv, shift_p);
     } else if shift_kind == 2u {
@@ -637,7 +669,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // Phase 24Z: film grain. Scaled by how dark the pixel is, because sensor
     // noise is most visible in shadows — applying it flat looks like dirt on
     // the lens rather than like film.
-    if pp.grain > 0.0 {
+    if pp.grain > 0.0 && !photo {
         let n = hash21(in.uv * 1024.0 + fract(pp.time) * 137.0) - 0.5;
         let luma = dot(graded, vec3(0.2126, 0.7152, 0.0722));
         graded += n * pp.grain * (1.0 - smoothstep(0.0, 0.7, luma));

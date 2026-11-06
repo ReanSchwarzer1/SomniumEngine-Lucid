@@ -34,8 +34,10 @@ struct ExposureParams {
     highlight_start_nits: f32,
     /// Luminance where a sample's weight bottoms out.
     highlight_end_nits:   f32,
-    _pad0: f32,
-    _pad1: f32,
+    /// How much of the meter's swing from `anchor_ev` the eye follows: 1 all of it (sunscar-photoreal, 6 Nov 2026).
+    adaptation:      f32,
+    /// The EV100 partial adaptation pivots on.
+    anchor_ev:       f32,
 }
 
 @group(0) @binding(0) var          hdr_tex:   texture_2d<f32>;
@@ -154,6 +156,11 @@ fn resolve_exposure(@builtin(local_invocation_index) lid: u32) {
     // Saturation-based metering (Lagarde & de Rousiers): the EV that places
     // this average luminance at middle grey.
     var target_ev = log2(max(avg_luminance, 1e-5) * 100.0 / 12.5);
+    // Partial adaptation: the eye follows only part of the meter's swing from the anchor, so a dark wood stays
+    // darker than open land on screen, as in a photograph. At 1 (the default) this is the meter's own reading.
+    if params.adaptation < 1.0 {
+        target_ev = params.anchor_ev + params.adaptation * (target_ev - params.anchor_ev);
+    }
     target_ev = clamp(target_ev - params.exposure_compensation,
                       params.min_ev100, params.max_ev100);
 

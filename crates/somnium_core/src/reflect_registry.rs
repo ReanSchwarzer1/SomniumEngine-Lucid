@@ -327,7 +327,7 @@ impl ReflectField for UiCanvasSpace {
     }
 }
 
-const TONEMAPPER_NAMES: &[&str] = &["AgX", "ACES", "Reinhard"];
+const TONEMAPPER_NAMES: &[&str] = &["AgX", "ACES", "Reinhard", "Photographic"];
 
 /// MORROWIND-AC. The order is [`AntiAliasing::as_index`], and the labels are
 /// what the Details combo shows — so "SMAA 1x" and "SMAA T2x" name the two
@@ -434,10 +434,11 @@ impl ReflectField for Tonemapper {
             ReflectValue::I64(0) => Ok(Self::AgX),
             ReflectValue::I64(1) => Ok(Self::Aces),
             ReflectValue::I64(2) => Ok(Self::Reinhard),
+            ReflectValue::I64(3) => Ok(Self::Photographic),
             ReflectValue::I64(_) => Err(ReflectError::OutOfRange {
                 field,
                 min: Some(0.0),
-                max: Some(2.0),
+                max: Some(3.0),
             }),
             other => Err(ReflectError::TypeMismatch {
                 field,
@@ -946,6 +947,19 @@ fn post_process_schema() -> ComponentSchema {
                 doc: "Darkens silhouettes and creases found in the depth buffer into soft lines that fade with distance. 0 is off and costs nothing." },
             light_ramp { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Stylization", display_name: "Light Ramp",
                 doc: "The sun's light follows a soft painterly ramp: lit faces come up flat, the terminator is a narrow soft band. GI, reflections and shadows stay physical. 0 is off." },
+            // The photographic camera (sunscar-photoreal, 6 Nov 2026).
+            photographic { group: "Camera", display_name: "Photographic Camera",
+                doc: "The grade works on the scene's light before the tone curve (it cannot crush the darks), bloom becomes the lens's glare, the vignette is the lens's own fall-off, and sensor noise follows the exposure. Off is the picture as before." },
+            exposure_adaptation { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Exposure", display_name: "Eye Adaptation",
+                doc: "How much of the meter's swing the eye follows: 1 all of it; 0.7 shows a dark wood darker than open land, as a photograph does. Pivots on the anchor EV." },
+            exposure_anchor_ev { min: -16.0, max: 24.0, step: 0.1, precision: 1, unit: "EV", group: "Exposure", display_name: "Adaptation Anchor",
+                doc: "The EV that partial adaptation pivots on: what the eye holds when the meter agrees with it." },
+            lens_glare { min: 0.0, max: 0.2, step: 0.005, precision: 3, group: "Camera", display_name: "Lens Glare",
+                doc: "With the photographic camera: the share of light the lens spreads into its wide halo, energy kept (0.03 a good lens). Replaces bloom intensity and threshold there." },
+            sensor_noise { min: 0.0, max: 2.0, step: 0.05, precision: 2, group: "Camera", display_name: "Sensor Noise",
+                doc: "With the photographic camera: photon and read noise as a real sensor's at this exposure (1). A bright day is clean; a dim wood or a night grows grain." },
+            white_balance { min: 0.0, max: 15000.0, step: 50.0, precision: 0, unit: "K", group: "Camera", display_name: "White Balance",
+                doc: "With the photographic camera: the white the camera is set for, in kelvin. 0 leaves the light as rendered (D65). Lower is cooler, higher warmer." },
         }
     };
     if let Some(field) = schema.fields.iter_mut().find(|f| f.name == "dream_mode") {

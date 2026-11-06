@@ -450,6 +450,36 @@ fn the_terrain_material_struct_matches_the_rust_layout() {
     assert_eq!(offset("macro_octave_strength"), 2064);
 }
 
+/// The post pass's uniform, as Rust packs it (`postprocess.rs` `POST_PARAM_FLOATS`): the photographic camera's
+/// vectors sit after the LUT vector, 16-byte aligned (sunscar-photoreal, 6 Nov 2026).
+#[test]
+fn the_post_params_struct_matches_the_rust_layout() {
+    let source = composed("postprocess.wgsl");
+    let module = naga::front::wgsl::parse_str(&source).expect("post module parses");
+    let (_, ty) = module
+        .types
+        .iter()
+        .find(|(_, t)| t.name.as_deref() == Some("PostParams"))
+        .expect("PostParams is declared");
+    let naga::TypeInner::Struct { members, span } = &ty.inner else {
+        panic!("PostParams is not a struct");
+    };
+    assert_eq!(*span, 104 * 4, "WGSL size disagrees with POST_PARAM_FLOATS");
+    let offset = |name: &str| {
+        members
+            .iter()
+            .find(|m| m.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("no member {name}"))
+            .offset
+    };
+    assert_eq!(offset("lut"), 80 * 4);
+    assert_eq!(offset("photo"), 84 * 4);
+    assert_eq!(offset("lens"), 88 * 4);
+    assert_eq!(offset("wb_r"), 92 * 4);
+    assert_eq!(offset("wb_g"), 96 * 4);
+    assert_eq!(offset("wb_b"), 100 * 4);
+}
+
 /// The `enable` directives survive composition and end up first.
 ///
 /// `restir_gi.wgsl` and `lighting_extra.wgsl` both declare

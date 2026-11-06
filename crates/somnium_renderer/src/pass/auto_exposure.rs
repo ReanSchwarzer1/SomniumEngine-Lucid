@@ -27,11 +27,16 @@ pub struct EyeAdaptation {
     pub to_bright: f32,
     /// When the view gets darker.
     pub to_dark: f32,
+    /// How much of the meter's swing from `anchor_ev` the eye follows (1 all of it; `PostProcessComponent::
+    /// exposure_adaptation`). Below 1 a dark wood is shown darker than the open land, by the stops it keeps.
+    pub adaptation: f32,
+    /// The EV100 partial adaptation pivots on.
+    pub anchor_ev: f32,
 }
 
 impl Default for EyeAdaptation {
     fn default() -> Self {
-        Self { min_ev100: -8.0, max_ev100: 18.0, to_bright: 3.0, to_dark: 1.0 }
+        Self { min_ev100: -8.0, max_ev100: 18.0, to_bright: 3.0, to_dark: 1.0, adaptation: 1.0, anchor_ev: 12.0 }
     }
 }
 
@@ -49,8 +54,8 @@ struct ExposureParams {
     max_ev100: f32,
     highlight_start_nits: f32,
     highlight_end_nits: f32,
-    _pad0: f32,
-    _pad1: f32,
+    adaptation: f32,
+    anchor_ev: f32,
 }
 
 /// Histogram build + resolve, plus the two-float exposure result buffer.
@@ -216,8 +221,8 @@ impl AutoExposurePass {
                 // their vote — a glint should not decide the exposure.
                 highlight_start_nits: 8_000.0,
                 highlight_end_nits: 40_000.0,
-                _pad0: 0.0,
-                _pad1: 0.0,
+                adaptation: eye.adaptation.clamp(0.0, 1.0),
+                anchor_ev: eye.anchor_ev,
             }),
         );
 

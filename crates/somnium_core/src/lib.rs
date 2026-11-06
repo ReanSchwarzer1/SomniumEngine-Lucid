@@ -1444,6 +1444,30 @@ pub struct PostProcessComponent {
     /// Light ramp, 0 off ..= 1 full: the sun's light on a surface follows a soft painterly ramp (lit faces come up
     /// flat, the terminator is a narrow soft band) while GI, reflections and shadows stay physical. 0 skips it.
     pub light_ramp: f32,
+    // ── The photographic camera (sunscar-photoreal, 6 Nov 2026) ───────────────────────────────────────────────
+    // Fields after this line belong to the photoreal block; append other new fields above it.
+    /// The photographic camera, off by default (the picture exactly as before). On: the grade works on the scene's
+    /// own light before the tone curve (white balance, temperature and tint, gain, saturation and contrast, which
+    /// can no longer crush the darks), the bloom becomes the lens's glare (a share of the light spread into a wide
+    /// halo, energy kept, no threshold), the vignette is the lens's own cos^4 fall-off, chromatic aberration splits
+    /// along the spectrum, and `sensor_noise` grains the picture as a sensor does at that exposure. Lift, gamma, the
+    /// response curve and the LUT stay on the display picture.
+    pub photographic: bool,
+    /// How much of the meter's swing the eye follows, 0..1 (default 1: all of it, as before). Below 1, exposure
+    /// pivots on `exposure_anchor_ev`: at 0.7 a wood metered 3 stops darker than open land is shown 0.9 stops
+    /// darker, as a photograph shows it. `exposure_min_ev` / `exposure_max_ev` still bound the result.
+    pub exposure_adaptation: f32,
+    /// The EV100 that partial adaptation pivots on (default 12, open land under broken cloud).
+    pub exposure_anchor_ev: f32,
+    /// Lens glare with `photographic`: the share of the light the lens spreads into its wide halo, 0..0.2 (default
+    /// 0.03, a good lens). Replaces `bloom_intensity` and `bloom_threshold` there; `bloom_enabled` still gates it.
+    pub lens_glare: f32,
+    /// Sensor noise with `photographic`, 0 off ..= 1 a real camera's (default 0): photon and read noise on the
+    /// exposed light, so a bright day is clean and a dim wood or a night grows grain, as a camera raising its ISO.
+    pub sensor_noise: f32,
+    /// Camera white balance in kelvin with `photographic` (default 0: the light as rendered, which is balanced for
+    /// D65 daylight). The white the camera is set for: below 6500 the picture goes cooler, above it warmer.
+    pub white_balance: f32,
 }
 
 impl Default for PostProcessComponent {
@@ -1616,6 +1640,12 @@ impl Default for PostProcessComponent {
             painterly: 0.0,
             ink_lines: 0.0,
             light_ramp: 0.0,
+            photographic: false,
+            exposure_adaptation: 1.0,
+            exposure_anchor_ev: 12.0,
+            lens_glare: 0.03,
+            sensor_noise: 0.0,
+            white_balance: 0.0,
         }
     }
 }
@@ -1788,6 +1818,12 @@ pub enum Tonemapper {
     Aces,
     /// Plain Reinhard. Mostly useful as a reference point when comparing.
     Reinhard,
+    /// A camera's tone response in AgX's working space (sunscar-photoreal, 6 Nov 2026): fitted to a digital
+    /// camera's JPEG curve from 7 stops under middle grey to 2 over, within a tenth of a stop, so the darks keep
+    /// their detail as a photograph's do; AgX's hue handling, so bright colour fades toward white without
+    /// skewing; a shoulder half a stop softer than a camera's, so cloud keeps its form. `contrast` scales its
+    /// slope with `photographic` on.
+    Photographic,
 }
 
 impl Tonemapper {
@@ -1798,6 +1834,7 @@ impl Tonemapper {
             Self::AgX => 0,
             Self::Aces => 1,
             Self::Reinhard => 2,
+            Self::Photographic => 3,
         }
     }
 
@@ -1807,7 +1844,8 @@ impl Tonemapper {
         match self {
             Self::AgX => Self::Aces,
             Self::Aces => Self::Reinhard,
-            Self::Reinhard => Self::AgX,
+            Self::Reinhard => Self::Photographic,
+            Self::Photographic => Self::AgX,
         }
     }
 
@@ -1818,6 +1856,7 @@ impl Tonemapper {
             Self::AgX => "AgX",
             Self::Aces => "ACES",
             Self::Reinhard => "Reinhard",
+            Self::Photographic => "Photographic",
         }
     }
 }
