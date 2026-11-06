@@ -161,8 +161,8 @@ struct VolClusterParams {
 /// `[centre_x, centre_z, extent_metres, strength]`; strength 0: no clouds, the field is not read.
 @group(0) @binding(16) var<uniform> cloud_shadow_params: vec4<f32>;
 
-/// How much sun reaches this air through the deck. Past the field's edge its edge holds: the deck over the far air
-/// is as dense as over the near, where shading's ground (`cloud_shadow_at`) takes the full sun.
+/// How much sun reaches this air through the deck. Past the field's edge its edge holds: the volume reaches ~1 km,
+/// well inside the field, so this only guards a short field (shading's `cloud_shadow_at` fades to the field's mean).
 fn cloud_sun_at(p: vec3<f32>) -> f32 {
     if cloud_shadow_params.w <= 0.0 {
         return 1.0;
