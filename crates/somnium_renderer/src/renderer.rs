@@ -7424,6 +7424,7 @@ impl SomniumRenderer {
                 let mut grading = self.grading;
                 let fy = self.proj_matrix.y_axis.y.abs().max(1e-6);
                 grading.lens = [1.0 / fy, fy / self.proj_matrix.x_axis.x.abs().max(1e-6)];
+                grading.view_proj = self.view_proj_rel.to_cols_array();
                 grading
             },
             if debugging {

@@ -8862,6 +8862,7 @@ impl<G: GameApp> Engine<G> {
                 adaptation: pp.exposure_adaptation.clamp(0.0, 1.0),
                 anchor_ev: pp.exposure_anchor_ev,
                 sky_weight: pp.exposure_sky_weight.clamp(0.0, 1.0),
+                adaptation_bright: pp.exposure_adaptation_bright.clamp(0.0, 1.0),
             };
             // Adaptation is per second, so it needs the real frame time or the
             // eye adjusts at a rate that depends on frame rate.
@@ -9074,6 +9075,12 @@ impl<G: GameApp> Engine<G> {
                     if pp.photographic { pp.white_balance } else { 0.0 },
                 ),
                 lens: [0.5, 16.0 / 9.0],
+                heat: [
+                    pp.heat_shimmer.max(0.0),
+                    pp.mirage.max(0.0),
+                    pp.mirage_dip_deg.clamp(0.0, 5.0).to_radians().sin(),
+                ],
+                view_proj: glam::Mat4::IDENTITY.to_cols_array(),
             };
             r.authored_picture_shift = somnium_renderer::pass::postprocess::PictureShift {
                 kind: if pp.picture_shift <= 3 { pp.picture_shift } else { 0 },

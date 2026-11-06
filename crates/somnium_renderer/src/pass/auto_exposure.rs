@@ -34,6 +34,8 @@ pub struct EyeAdaptation {
     pub anchor_ev: f32,
     /// How much an open-sky pixel counts in the meter (`PostProcessComponent::exposure_sky_weight`; 1 as any other).
     pub sky_weight: f32,
+    /// The share followed when the meter reads brighter than `anchor_ev` (`exposure_adaptation_bright`; 1 all).
+    pub adaptation_bright: f32,
 }
 
 impl Default for EyeAdaptation {
@@ -46,6 +48,7 @@ impl Default for EyeAdaptation {
             adaptation: 1.0,
             anchor_ev: 12.0,
             sky_weight: 1.0,
+            adaptation_bright: 1.0,
         }
     }
 }
@@ -67,7 +70,8 @@ struct ExposureParams {
     adaptation: f32,
     anchor_ev: f32,
     sky_weight: f32,
-    _pad: [f32; 3],
+    adaptation_bright: f32,
+    _pad: [f32; 2],
 }
 
 /// Histogram build + resolve, plus the two-float exposure result buffer.
@@ -251,7 +255,8 @@ impl AutoExposurePass {
                 adaptation: eye.adaptation.clamp(0.0, 1.0),
                 anchor_ev: eye.anchor_ev,
                 sky_weight: eye.sky_weight.clamp(0.0, 1.0),
-                _pad: [0.0; 3],
+                adaptation_bright: eye.adaptation_bright.clamp(0.0, 1.0),
+                _pad: [0.0; 2],
             }),
         );
 

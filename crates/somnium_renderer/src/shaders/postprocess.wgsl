@@ -66,6 +66,11 @@ struct PostParams {
     wb_r: vec4<f32>,
     wb_g: vec4<f32>,
     wb_b: vec4<f32>,
+    /// Heat over hot ground (sunscar-photoreal, BIOMES 2.7): x shimmer, y the inferior mirage (0 skips each), z the sine
+    /// of the vanishing line's dip below the horizon; w unused.
+    heat: vec4<f32>,
+    /// The camera-relative view-projection, to find where a bent ray's direction falls on the screen.
+    view_proj: mat4x4<f32>,
 }
 
 @group(0) @binding(0) var hdr_tex:  texture_2d<f32>;
@@ -189,6 +194,67 @@ fn sensor_noise(x: vec3<f32>, pixel: vec2<u32>, strength: f32, ev: f32) -> vec3<
     // In each channel's own share of the light, so a coloured surface keeps its colour; grey in the near-black.
     let share = select(vec3<f32>(1.0), x / max(luma, 1e-6), luma > 1e-4);
     return max(x + strength * sigma * noise * share, vec3<f32>(0.0));
+}
+
+/// Whether a depth-buffer value is the open sky (nothing drawn). One place, so a change of depth convention flips it once.
+fn depth_is_sky(z: f32) -> bool {
+    return z >= 0.99999;
+}
+
+/// The camera-relative view ray through `uv`, and how far the drawn surface there is (1e5 for the sky).
+fn view_ray(uv: vec2<f32>) -> vec4<f32> {
+    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
+    let mid = pp.inv_view_proj * vec4<f32>(ndc, 0.5, 1.0);
+    let dir = normalize(mid.xyz / mid.w);
+    let dims = textureDimensions(scene_depth);
+    let z = textureLoad(scene_depth, min(vec2<u32>(uv * vec2<f32>(dims)), dims - vec2<u32>(1u)), 0);
+    var dist = 1.0e5;
+    if !depth_is_sky(z) {
+        let h = pp.inv_view_proj * vec4<f32>(ndc, z, 1.0);
+        dist = length(h.xyz / h.w);
+    }
+    return vec4<f32>(dir, dist);
+}
+
+/// Heat shimmer (BIOMES 2.7): turbulent hot air refracts the light, so far ground seen along grazing rays wobbles at a
+/// few hertz. The offset grows with distance and with how close the ray runs to the horizon; up to about 3 px at
+/// strength 1 on far ground at eye level. Returns where to read the scene.
+fn heat_shimmer(uv: vec2<f32>, ray: vec4<f32>) -> vec2<f32> {
+    if ray.w >= 1.0e5 {
+        return uv;
+    }
+    let graze = 1.0 - smoothstep(0.0, 0.12, abs(ray.y));
+    let reach = smoothstep(20.0, 600.0, ray.w);
+    let a = pp.heat.x * graze * reach * 0.0012;
+    let t = pp.time;
+    let wobble = vec2<f32>(sin(uv.y * 900.0 + t * 23.0 + 2.0 * sin(uv.x * 140.0 + t * 7.0)),
+                           0.35 * sin(uv.x * 700.0 - t * 19.0 + 2.0 * sin(uv.y * 210.0 - t * 9.0)));
+    return uv + wobble * a;
+}
+
+/// The inferior mirage (BIOMES 2.7): over hot flat ground, rays dipping less than the vanishing line (`pp.heat.z`, the
+/// sine of its dip) are bent back up before they reach it, so the band between the horizon and that line shows the
+/// sky and the far land above the horizon, mirrored about the line and shimmering, as a lake would. Only on drawn
+/// ground past 80 m. Returns the light to show.
+fn inferior_mirage(hdr: vec3<f32>, ray: vec4<f32>) -> vec3<f32> {
+    let dip = pp.heat.z;
+    if ray.w < 80.0 || ray.w >= 1.0e5 || ray.y > 0.0 || ray.y < -dip {
+        return hdr;
+    }
+    // At the vanishing line the mirrored ray leaves level; toward the horizon it climbs to the dip's height above it.
+    let up = (dip + ray.y) * (1.0 + 0.6 * sin(pp.time * 11.0 + ray.x * 4000.0));
+    let flat = normalize(vec3<f32>(ray.x, 0.0, ray.z));
+    let src = normalize(flat + vec3<f32>(0.0, max(up, 0.0), 0.0));
+    let clip = pp.view_proj * vec4<f32>(src, 0.0);
+    if clip.w <= 0.0 {
+        return hdr;
+    }
+    let ndc = clip.xy / clip.w;
+    let suv = clamp(vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5), vec2<f32>(0.0), vec2<f32>(1.0));
+    let mirrored = textureSampleLevel(hdr_tex, hdr_samp, suv, 0.0).rgb;
+    // Fades in from the vanishing line and out at the horizon, never a hard mirror.
+    let w = pp.heat.y * smoothstep(-dip, -0.6 * dip, ray.y) * (1.0 - smoothstep(-0.15 * dip, 0.0, ray.y)) * 0.85;
+    return mix(hdr, mirrored, clamp(w, 0.0, 1.0));
 }
 
 /// The camera's grade on the scene's own light, after exposure and before the curve: the lens's fall-off, white
@@ -526,7 +592,16 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
         base_uv = (floor(view_uv * grid) + 0.5) / grid;
     }
     let mapped = dream_coordinates(base_uv, pp.dream, pp.time, vec2<f32>(textureDimensions(hdr_tex)));
-    let scene_uv = mapped.uv;
+    var scene_uv = mapped.uv;
+    // Heat over hot ground (`pp.heat`): the shimmer moves where the scene is read. Off at zero.
+    let heated = (pp.heat.x > 0.0 || pp.heat.y > 0.0) && !retro;
+    var ray = vec4<f32>(0.0, 0.0, 1.0, 1.0e5);
+    if heated {
+        ray = view_ray(scene_uv);
+        if pp.heat.x > 0.0 {
+            scene_uv = heat_shimmer(scene_uv, ray);
+        }
+    }
     let fracture = mapped.fracture;
     let crack = mapped.crack;
     let ca_dir = scene_uv - vec2(0.5);
@@ -607,6 +682,9 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // Phase 24T: bloom added *before* exposure and tone mapping, because it is
     // scattering inside the lens — it happens to the light on its way to the
     // sensor, not to the picture afterwards.
+    if heated && pp.heat.y > 0.0 {
+        hdr = inferior_mirage(hdr, ray);
+    }
     let bloom = textureSample(bloom_tex, hdr_samp, view_uv).rgb;
     // The photographic camera's lens keeps the energy: the share it spreads into the glare halo (the chain, which the
     // CPU scales by that share over its level count) leaves the image it came from. No threshold there.

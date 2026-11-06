@@ -51,6 +51,11 @@ pub struct Grading {
     /// tan(half the vertical field of view) and the aspect (width / height), for the lens's fall-off. The renderer
     /// fills these from its projection each frame.
     pub lens: [f32; 2],
+    /// Heat over hot ground: shimmer, the inferior mirage (0 skips each) and the sine of the mirage's vanishing-line
+    /// dip (`PostProcessComponent::heat_shimmer`, `mirage`, `mirage_dip_deg`).
+    pub heat: [f32; 3],
+    /// The camera-relative view-projection (the renderer fills it), for the mirage's bent rays.
+    pub view_proj: [f32; 16],
 }
 
 /// The tone-map index of the debug passthrough (`postprocess.wgsl` `tonemap`): no curve, so a debug view reaches the
@@ -125,6 +130,8 @@ impl Default for Grading {
             sensor_noise: 0.0,
             white_balance: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
             lens: [0.5, 16.0 / 9.0],
+            heat: [0.0; 3],
+            view_proj: glam::Mat4::IDENTITY.to_cols_array(),
         }
     }
 }
@@ -186,8 +193,8 @@ pub struct PictureShift {
 
 /// 16 scalars, 32 response samples, the dream-lens vector, the picture shift (two vectors) and the inverse
 /// view-projection the wave reads the world through, the stylise vector and the LUT vector; then the photographic
-/// camera's vector, its lens and its white balance (three rows).
-const POST_PARAM_FLOATS: usize = 104;
+/// camera's vector, its lens and its white balance (three rows); then heat over hot ground and the view-projection.
+const POST_PARAM_FLOATS: usize = 124;
 
 /// Post-processing pass: HDR texture → tone-mapped swapchain output.
 pub struct PostProcessPass {
@@ -710,6 +717,8 @@ impl PostProcessPass {
         for (i, row) in grading.white_balance.iter().enumerate() {
             data[92 + i * 4..95 + i * 4].copy_from_slice(row);
         }
+        data[104..108].copy_from_slice(&[grading.heat[0].max(0.0), grading.heat[1].max(0.0), grading.heat[2].max(0.0), 0.0]);
+        data[108..124].copy_from_slice(&grading.view_proj);
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&data));
     }
 

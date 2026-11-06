@@ -464,7 +464,7 @@ fn the_post_params_struct_matches_the_rust_layout() {
     let naga::TypeInner::Struct { members, span } = &ty.inner else {
         panic!("PostParams is not a struct");
     };
-    assert_eq!(*span, 104 * 4, "WGSL size disagrees with POST_PARAM_FLOATS");
+    assert_eq!(*span, 124 * 4, "WGSL size disagrees with POST_PARAM_FLOATS");
     let offset = |name: &str| {
         members
             .iter()
@@ -478,6 +478,8 @@ fn the_post_params_struct_matches_the_rust_layout() {
     assert_eq!(offset("wb_r"), 92 * 4);
     assert_eq!(offset("wb_g"), 96 * 4);
     assert_eq!(offset("wb_b"), 100 * 4);
+    assert_eq!(offset("heat"), 104 * 4);
+    assert_eq!(offset("view_proj"), 108 * 4);
 }
 
 /// The `enable` directives survive composition and end up first.

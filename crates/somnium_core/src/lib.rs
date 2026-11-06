@@ -1472,6 +1472,19 @@ pub struct PostProcessComponent {
     /// exposes for the land and lets the sky run bright, as a photographer does; a view that is mostly sky still
     /// meters on it.
     pub exposure_sky_weight: f32,
+    /// The share of the meter's swing the eye follows when the view is brighter than `exposure_anchor_ev`, 0..1
+    /// (default 1). A reflected-light meter turns sunlit sand and snow grey; at 0.5 sand (meter about EV 16.6) and
+    /// snow (17.7) expose near 14.3-14.9 about an anchor of 12, so sand reads pale and snow near white.
+    pub exposure_adaptation_bright: f32,
+    /// Heat shimmer over hot ground, 0 off (default) ..= 1 a desert noon: far ground seen along grazing rays wobbles
+    /// at a few hertz, up to about 3 px. Set it where and when the ground is hot.
+    pub heat_shimmer: f32,
+    /// The inferior mirage, 0 off (default) ..= 1 full: below a vanishing line `mirage_dip_deg` under the horizon, far
+    /// hot ground shows the sky and the land above the horizon mirrored, shimmering, as a lake would.
+    pub mirage: f32,
+    /// How far under the horizon the mirage's vanishing line lies, degrees (default 0.3: hot ground ~300 m ahead of an
+    /// eye 1.7 m up). Steeper heat gradients bring it closer.
+    pub mirage_dip_deg: f32,
 }
 
 impl Default for PostProcessComponent {
@@ -1651,6 +1664,10 @@ impl Default for PostProcessComponent {
             sensor_noise: 0.0,
             white_balance: 0.0,
             exposure_sky_weight: 1.0,
+            exposure_adaptation_bright: 1.0,
+            heat_shimmer: 0.0,
+            mirage: 0.0,
+            mirage_dip_deg: 0.3,
         }
     }
 }

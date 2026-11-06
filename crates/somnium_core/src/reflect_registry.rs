@@ -962,6 +962,14 @@ fn post_process_schema() -> ComponentSchema {
                 doc: "With the photographic camera: the white the camera is set for, in kelvin. 0 leaves the light as rendered (D65). Lower is cooler, higher warmer." },
             exposure_sky_weight { min: 0.0, max: 1.0, step: 0.05, precision: 2, group: "Exposure", display_name: "Sky in Meter",
                 doc: "How much open sky counts in the exposure meter: 1 as any other pixel; 0.25 exposes for the land and lets the sky run bright, as a photographer does." },
+            exposure_adaptation_bright { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Exposure", display_name: "Eye Adaptation (bright)",
+                doc: "The share of the meter's swing the eye follows when the view is brighter than the anchor: 1 all of it; about 0.5 keeps sunlit sand pale and snow near white instead of metering them grey." },
+            heat_shimmer { min: 0.0, max: 2.0, step: 0.05, precision: 2, group: "Atmosphere", display_name: "Heat Shimmer",
+                doc: "Far ground seen along grazing rays wobbles in the heat: 0 off, 1 a desert noon. Set it where the ground is hot." },
+            mirage { min: 0.0, max: 1.0, step: 0.05, precision: 2, group: "Atmosphere", display_name: "Mirage",
+                doc: "The inferior mirage: under a line just below the horizon, far hot ground shows the sky mirrored, as a lake would. 0 off." },
+            mirage_dip_deg { min: 0.0, max: 5.0, step: 0.05, precision: 2, unit: "deg", group: "Atmosphere", display_name: "Mirage Dip",
+                doc: "How far under the horizon the mirage's vanishing line lies (0.3: hot ground about 300 m ahead of a standing eye)." },
         }
     };
     if let Some(field) = schema.fields.iter_mut().find(|f| f.name == "dream_mode") {

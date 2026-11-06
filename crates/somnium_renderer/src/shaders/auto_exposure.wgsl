@@ -41,7 +41,9 @@ struct ExposureParams {
     /// How much an open-sky pixel counts in the meter, 0..1 (1 as any other): below 1 the eye exposes for the land
     /// and lets the sky run bright, as a photographer does (sunscar-photoreal, 6 Nov 2026).
     sky_weight:      f32,
-    _pad0: f32,
+    /// The share the eye follows when the meter reads brighter than the anchor (sand, snow, sunlit stone): a camera
+    /// metering reflected light would turn them grey, the eye keeps them pale.
+    adaptation_bright: f32,
     _pad1: f32,
     _pad2: f32,
 }
@@ -167,8 +169,9 @@ fn resolve_exposure(@builtin(local_invocation_index) lid: u32) {
     var target_ev = log2(max(avg_luminance, 1e-5) * 100.0 / 12.5);
     // Partial adaptation: the eye follows only part of the meter's swing from the anchor, so a dark wood stays
     // darker than open land on screen, as in a photograph. At 1 (the default) this is the meter's own reading.
-    if params.adaptation < 1.0 {
-        target_ev = params.anchor_ev + params.adaptation * (target_ev - params.anchor_ev);
+    if params.adaptation < 1.0 || params.adaptation_bright < 1.0 {
+        let share = select(params.adaptation, params.adaptation_bright, target_ev > params.anchor_ev);
+        target_ev = params.anchor_ev + share * (target_ev - params.anchor_ev);
     }
     target_ev = clamp(target_ev - params.exposure_compensation,
                       params.min_ev100, params.max_ev100);
