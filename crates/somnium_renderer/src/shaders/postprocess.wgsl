@@ -163,12 +163,12 @@ fn pcg_hash(v: u32) -> u32 {
     return (word >> 22u) ^ word;
 }
 
-/// A standard normal number for a pixel, a frame and a stream (Box-Muller on two PCG draws).
-fn gauss(pixel: vec2<u32>, frame: u32, stream: u32) -> f32 {
+/// Two independent standard normal numbers for a pixel, a frame and a stream (Box-Muller on two PCG draws).
+fn gauss2(pixel: vec2<u32>, frame: u32, stream: u32) -> vec2<f32> {
     let base = pcg_hash(pixel.x + pcg_hash(pixel.y + pcg_hash(frame * 8u + stream)));
-    let u1 = max(f32(base) * 2.3283064e-10, 1e-7);
-    let u2 = f32(pcg_hash(base)) * 2.3283064e-10;
-    return sqrt(-2.0 * log(u1)) * cos(6.2831853 * u2);
+    let r = sqrt(-2.0 * log(max(f32(base) * 2.3283064e-10, 1e-7)));
+    let a = 6.2831853 * f32(pcg_hash(base)) * 2.3283064e-10;
+    return r * vec2<f32>(cos(a), sin(a));
 }
 
 /// Sensor noise on the exposed light (middle grey 0.18), as a camera makes it: photon noise, the square root of the
@@ -182,9 +182,10 @@ fn sensor_noise(x: vec3<f32>, pixel: vec2<u32>, strength: f32, ev: f32) -> vec3<
     let sigma = sqrt(luma * electrons + 9.0) / electrons;
     // A new draw every 60th of a second: noise moves with time, as a sensor's does, and never sits as a pattern.
     let frame = u32(fract(pp.time / 4096.0) * 4096.0 * 60.0);
-    let n = gauss(pixel, frame, 0u);
-    let colour = vec3<f32>(gauss(pixel, frame, 1u), gauss(pixel, frame, 2u), gauss(pixel, frame, 3u));
-    let noise = vec3<f32>(n) + 0.33 * (colour - vec3<f32>(n));
+    let g0 = gauss2(pixel, frame, 0u);
+    let g1 = gauss2(pixel, frame, 1u);
+    let n = g0.x;
+    let noise = vec3<f32>(n) + 0.33 * (vec3<f32>(g0.y, g1.x, g1.y) - vec3<f32>(n));
     // In each channel's own share of the light, so a coloured surface keeps its colour; grey in the near-black.
     let share = select(vec3<f32>(1.0), x / max(luma, 1e-6), luma > 1e-4);
     return max(x + strength * sigma * noise * share, vec3<f32>(0.0));

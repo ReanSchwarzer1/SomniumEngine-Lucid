@@ -92,9 +92,9 @@ const PHOTO_SLOPE_HI: f32 = 0.1400;
 const PHOTO_TOE: f32 = 2.146;
 const PHOTO_SHOULDER: f32 = 3.0;
 
-fn photo_clamp(u: vec3<f32>, p: f32) -> vec3<f32> {
+fn photo_clamp(u: vec3<f32>, p: vec3<f32>) -> vec3<f32> {
     let v = max(u, vec3<f32>(0.0));
-    return v / pow(vec3<f32>(1.0) + pow(v, vec3<f32>(p)), vec3<f32>(1.0 / p));
+    return v / pow(vec3<f32>(1.0) + pow(v, p), vec3<f32>(1.0) / p);
 }
 
 /// The photographic curve. `contrast` scales its slope about middle grey (1 as fitted): steeper deepens the darks
@@ -103,8 +103,11 @@ fn photographic(color_in: vec3<f32>, contrast: f32) -> vec3<f32> {
     let c = AGX_INSET * max(color_in, vec3<f32>(0.0));
     let stops = log2(max(c, vec3<f32>(1e-10)) / 0.18);
     let k = max(contrast, 0.05);
-    let lo = PHOTO_PIVOT - PHOTO_PIVOT * photo_clamp(-stops * (PHOTO_SLOPE_LO * k / PHOTO_PIVOT), PHOTO_TOE);
-    let hi = PHOTO_PIVOT + (1.0 - PHOTO_PIVOT) * photo_clamp(stops * (PHOTO_SLOPE_HI * k / (1.0 - PHOTO_PIVOT)), PHOTO_SHOULDER);
-    let encoded = AGX_OUTSET * select(hi, lo, stops < vec3<f32>(0.0));
+    // Each channel takes its own half: the toe below middle grey, the shoulder above (one clamp, not both).
+    let toe = stops < vec3<f32>(0.0);
+    let reach = select(vec3<f32>(1.0 - PHOTO_PIVOT), vec3<f32>(PHOTO_PIVOT), toe);
+    let slope = select(vec3<f32>(PHOTO_SLOPE_HI), vec3<f32>(PHOTO_SLOPE_LO), toe) * k / reach;
+    let bend = photo_clamp(abs(stops) * slope, select(vec3<f32>(PHOTO_SHOULDER), vec3<f32>(PHOTO_TOE), toe));
+    let encoded = AGX_OUTSET * (vec3<f32>(PHOTO_PIVOT) + select(reach, -reach, toe) * bend);
     return clamp(pow(max(encoded, vec3<f32>(0.0)), vec3<f32>(2.2)), vec3<f32>(0.0), vec3<f32>(1.0));
 }
