@@ -39,26 +39,48 @@ fn visible_sprite_coverage_respects_alpha_depth_empty_frames_and_viewports() {
         sprite.size(),
     );
     let sprite_view = sprite.create_view(&Default::default());
+    // Lit particles read the sun (particle.wgsl `ParticleSun`, binding 6); unlit ones here, so zeros serve.
+    let sun = device.create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 320,
+        usage: wgpu::BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
     let global_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: None,
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 4,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Texture {
-                sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                view_dimension: wgpu::TextureViewDimension::D2,
-                multisampled: false,
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: std::num::NonZeroU32::new(1),
             },
-            count: std::num::NonZeroU32::new(1),
-        }],
+            wgpu::BindGroupLayoutEntry {
+                binding: 6,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
     });
     let global = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &global_layout,
-        entries: &[wgpu::BindGroupEntry {
-            binding: 4,
-            resource: wgpu::BindingResource::TextureViewArray(&[&sprite_view]),
-        }],
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: wgpu::BindingResource::TextureViewArray(&[&sprite_view]),
+            },
+            wgpu::BindGroupEntry { binding: 6, resource: sun.as_entire_binding() },
+        ],
     });
     let hdr = gpu::texture(
         &device,
@@ -87,6 +109,7 @@ fn visible_sprite_coverage_respects_alpha_depth_empty_frames_and_viewports() {
         flags: 0,
         flutter: 0.0,
     };
+    // Scene depth is reversed-Z (renderer.rs `set_view`): the sprite at 0.5 is in front of 0.25 and behind 0.75.
     let mut frame = |slot, depth_value, particles: &[GpuParticle]| {
         let mut encoder = device.create_command_encoder(&Default::default());
         {
@@ -123,7 +146,7 @@ fn visible_sprite_coverage_respects_alpha_depth_empty_frames_and_viewports() {
             pass.reactive_view(slot).unwrap().texture(),
         )
     };
-    let visible = frame(0, 0.75, &[particle]);
+    let visible = frame(0, 0.25, &[particle]);
     let pixel = |image: &[u8], x, y| image[((y * size + x) * 4) as usize];
     assert_eq!(
         pixel(&visible, 10, 8),
@@ -138,7 +161,7 @@ fn visible_sprite_coverage_respects_alpha_depth_empty_frames_and_viewports() {
     assert_eq!(pixel(&visible, 1, 1), 0, "outside sprite is not reactive");
     let faint = frame(
         0,
-        0.75,
+        0.25,
         &[GpuParticle {
             color: [1.0, 1.0, 1.0, 0.05],
             ..particle
@@ -151,7 +174,7 @@ fn visible_sprite_coverage_respects_alpha_depth_empty_frames_and_viewports() {
     );
     let mirrored = frame(
         0,
-        0.75,
+        0.25,
         &[GpuParticle {
             flags: 4,
             ..particle
@@ -168,7 +191,7 @@ fn visible_sprite_coverage_respects_alpha_depth_empty_frames_and_viewports() {
     }
     let bent = frame(
         0,
-        0.75,
+        0.25,
         &[GpuParticle {
             flutter: 0.4,
             ..particle
@@ -185,19 +208,19 @@ fn visible_sprite_coverage_respects_alpha_depth_empty_frames_and_viewports() {
             "base stays pinned"
         );
     }
-    let occluded = frame(1, 0.25, &[particle]);
+    let occluded = frame(1, 0.75, &[particle]);
     assert!(
         occluded.chunks_exact(4).all(|p| p[0] == 0),
         "depth-hidden sprites must not erase scene history"
     );
-    let stopped = frame(0, 0.75, &[]);
+    let stopped = frame(0, 0.25, &[]);
     assert!(
         stopped.chunks_exact(4).all(|p| p[0] == 0),
         "empty frame clears previous sprite attachment"
     );
     let additive = frame(
         0,
-        0.75,
+        0.25,
         &[GpuParticle {
             flags: 1,
             ..particle

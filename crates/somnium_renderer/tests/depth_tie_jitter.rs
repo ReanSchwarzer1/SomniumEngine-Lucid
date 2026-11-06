@@ -145,7 +145,8 @@ fn coplanar_faces_keep_one_winner_under_jitter_once_their_ties_are_apart() {
             .map(|frame| {
                 // FSR's jitter (renderer.rs `set_view`): an NDC offset on the projection's z axis.
                 let j = glam::vec2(halton(frame as u32 + 1, 2) - 0.5, halton(frame as u32 + 1, 3) - 0.5);
-                let mut jittered = proj;
+                // Reversed-Z, as the scene draws (renderer.rs `set_view`); the slope above is from the forward one.
+                let mut jittered = somnium_renderer::view::reversed_z(proj);
                 jittered.z_axis.x += j.x * 2.0 / SIZE as f32;
                 jittered.z_axis.y -= j.y * 2.0 / SIZE as f32;
                 let view_proj = jittered * view;
@@ -168,7 +169,7 @@ fn coplanar_faces_keep_one_winner_under_jitter_once_their_ties_are_apart() {
                         })],
                         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                             view: &vis.depth_view,
-                            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Store }),
+                            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0.0), store: wgpu::StoreOp::Store }),
                             stencil_ops: None,
                         }),
                         ..Default::default()
