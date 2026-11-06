@@ -9229,6 +9229,7 @@ impl<G: GameApp> Engine<G> {
             somnium_ecs::curve::Curve,
             Option<glam::Vec4>,
             Option<u64>,
+            String,
         )> = self
             .world
             .entities_with::<TerrainComponent>()
@@ -9264,6 +9265,11 @@ impl<G: GameApp> Engine<G> {
                         .map(|s| s.own_area)
                         .filter(|a| *a != glam::Vec4::ZERO),
                     seed_key,
+                    // The tile's ground layer set, which says which ground-cover kinds may grow on it.
+                    self.world
+                        .get::<crate::cell_streaming::TerrainStreamingComponent>(e)
+                        .map(|s| s.layer_set.clone())
+                        .unwrap_or_default(),
                 ))
             })
             .collect();
@@ -9287,6 +9293,7 @@ impl<G: GameApp> Engine<G> {
             lod_falloff,
             own_area,
             seed_key,
+            layer_set,
         ) in terrains
         {
             // Which palette entries this terrain actually uses, so nothing is
@@ -9420,7 +9427,9 @@ impl<G: GameApp> Engine<G> {
                 Some(key) => {
                     // A tile's drifts follow the world, so they carry across its seams.
                     let origin = glam::Vec2::new(model.w_axis.x, model.w_axis.z);
-                    self.ground_cover.update_seeded(terrain_id, key, t, &self.project_foliage, focus_local, own_area, origin);
+                    self.ground_cover.update_seeded(
+                        terrain_id, key, t, &self.project_foliage, focus_local, own_area, origin, &layer_set,
+                    );
                 }
                 None => self.ground_cover.update(terrain_id, t, &self.project_foliage, focus_local, own_area),
             }

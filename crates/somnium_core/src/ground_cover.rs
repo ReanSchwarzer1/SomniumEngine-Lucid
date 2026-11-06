@@ -134,7 +134,7 @@ impl GroundCover {
         camera: Vec3,
         area: Option<glam::Vec4>,
     ) {
-        self.update_seeded(terrain_id, u64::from(terrain_id), terrain, palette, camera, area, glam::Vec2::ZERO);
+        self.update_seeded(terrain_id, u64::from(terrain_id), terrain, palette, camera, area, glam::Vec2::ZERO, "");
     }
 
     /// As [`Self::update`], with the instances hashed from `seed_key` rather than the terrain's id: a streamed tile's
@@ -149,11 +149,19 @@ impl GroundCover {
         camera: Vec3,
         area: Option<glam::Vec4>,
         origin: glam::Vec2,
+        layer_set: &str,
     ) {
         let scale = density_scale();
+        // Only the kinds this terrain's layer set grows (`GroundCoverRules::layer_sets`; unset grows everywhere).
         let kinds: Vec<(u16, &ProjectEntry, f32, f32)> = palette
             .iter()
-            .filter_map(|(kind, entry)| entry.ground_cover.as_ref().map(|g| (*kind, entry, g.density * scale, g.radius)))
+            .filter_map(|(kind, entry)| {
+                entry
+                    .ground_cover
+                    .as_ref()
+                    .filter(|g| g.grows_on(layer_set))
+                    .map(|g| (*kind, entry, g.density * scale, g.radius))
+            })
             .collect();
         if kinds.is_empty() {
             self.terrains.remove(&terrain_id);
@@ -683,7 +691,7 @@ mod tests {
         for _ in 0..8 {
             let camera = Vec3::new(64.0, 2.0, 64.0);
             match seed_key {
-                Some(key) => cover.update_seeded(id, key, ground, &palette, camera, None, glam::Vec2::ZERO),
+                Some(key) => cover.update_seeded(id, key, ground, &palette, camera, None, glam::Vec2::ZERO, ""),
                 None => cover.update(id, ground, &palette, camera, None),
             }
         }
