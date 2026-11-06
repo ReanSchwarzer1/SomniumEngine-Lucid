@@ -3580,8 +3580,16 @@ impl SomniumRenderer {
             slots.extend(
                 batch.placements.iter().map(|&placement| crate::instance_batch::GpuSlot::new(part, placement, bounds)),
             );
-            // Opaque copies the top level traces: the traced sun shades them, so the cascades may skip them.
-            if !cutout {
+            // Flat parts (litter, floor cards) and opaque copies the top level traces: with the traced sun the
+            // cascades skip them (`flat_caster`, `rays_shade_opaque`).
+            let flat = bounds.is_some_and(|(min, max)| {
+                part.local.transform_vector3(glam::Vec3::new(0.0, max[1] - min[1], 0.0)).length() < FLAT_CASTER_M
+            });
+            if flat {
+                for slot in &mut slots[first..] {
+                    slot.shadow[3] = 1.0;
+                }
+            } else if !cutout {
                 for copy in traced.iter().filter(|c| c.vertex_offset == part.vertex_offset) {
                     if let Some(slot) = slots.get_mut(copy.slot as usize).filter(|_| copy.slot as usize >= first) {
                         slot.shadow[3] = 1.0;
@@ -3635,8 +3643,14 @@ impl SomniumRenderer {
             slots.extend(
                 batch.placements.iter().map(|&placement| crate::instance_batch::GpuSlot::new(part, placement, bounds)),
             );
-            // A run draws every copy at once: the cascades may skip it only if the top level traces all of them.
-            if !cutout && traced.iter().filter(|c| c.slot as usize >= start).count() == batch.placements.len() {
+            // A run draws every copy at once: the cascades may skip it if it is flat, or if the top level traces all
+            // of its copies.
+            let flat = bounds.is_some_and(|(min, max)| {
+                part.local.transform_vector3(glam::Vec3::new(0.0, max[1] - min[1], 0.0)).length() < FLAT_CASTER_M
+            });
+            if flat
+                || (!cutout && traced.iter().filter(|c| c.slot as usize >= start).count() == batch.placements.len())
+            {
                 for slot in &mut slots[start..] {
                     slot.shadow[3] = 1.0;
                 }
@@ -7832,6 +7846,14 @@ impl SomniumRenderer {
         })
     }
 
+    /// A caster too flat to throw a shadow worth drawing (`FLAT_CASTER_M`): litter and floor cards lying on the
+    /// ground only shadow themselves through a cascade's bias, as hard-edged dark rectangles (Sunscar, 6 Nov 2026).
+    fn flat_caster(&self, cmd: &DrawCommand) -> bool {
+        self.geometry.mesh_aabb(cmd.vertex_offset).is_some_and(|(min, max)| {
+            cmd.transform.transform_vector3(glam::Vec3::new(0.0, max[1] - min[1], 0.0)).length() < FLAT_CASTER_M
+        })
+    }
+
     fn rebuild_shadow_casters(&mut self) {
         let threshold = match self.directional_shadow_technique() {
             crate::shadow::virtual_map::ShadowTechnique::Cascaded => self.shadow_radius_threshold,
@@ -7868,7 +7890,7 @@ impl SomniumRenderer {
         };
         let rays = self.restir_pass.active() && self.raytrace_pass.tlas().is_some();
         for (i, cmd) in self.draw_queue.iter().enumerate() {
-            if rays && self.rays_shade_opaque(cmd) {
+            if rays && (self.rays_shade_opaque(cmd) || self.flat_caster(cmd)) {
                 continue;
             }
             consider_shadow_caster(
@@ -8492,6 +8514,8 @@ fn mix_shadow_caster_revision(hash: &mut u64, command: &DrawCommand) {
 
 /// World-space bounding radius below which a draw stays out of the TLAS (metres).
 const TLAS_MIN_RADIUS: f32 = 1.0;
+/// With the traced sun, the cascades skip casters lower than this (`flat_caster`); grass blades stand above it.
+const FLAT_CASTER_M: f32 = 0.12;
 
 /// Horizontal metres from the eye within which instance batches' copies are traced (`instance_batch.rs`), and how
 /// many at most: near foliage shadows traced lights and shows in reflections; beyond, a copy is raster-only.
