@@ -1608,11 +1608,13 @@ impl<G: GameApp> Engine<G> {
         let writer = self.palette_writer(&name);
         let habitat = self.layer_label(pick.terrain, entry.brush.layer);
         let file = self.ground_file(pick.terrain);
-        let streamed = self
-            .world
-            .iter_with::<TerrainComponent>()
-            .find(|(_, t)| t.terrain_id == pick.terrain)
-            .is_some_and(|(e, _)| self.world.get::<crate::cell_streaming::Streamed>(e).is_some());
+        let ground_entity = self.world.iter_with::<TerrainComponent>().find(|(_, t)| t.terrain_id == pick.terrain).map(|(e, _)| e);
+        let streamed = ground_entity.is_some_and(|e| self.world.get::<crate::cell_streaming::Streamed>(e).is_some());
+        // The tile's layer set ("" the project's own), which a kind's rules may name (`GroundCoverRules::layer_sets`).
+        let tile_set = ground_entity
+            .and_then(|e| self.world.get::<crate::cell_streaming::TerrainStreamingComponent>(e))
+            .map(|s| s.layer_set.trim().to_owned())
+            .unwrap_or_default();
         let renderer = self.renderer.as_ref()?;
         let data = renderer.terrain(pick.terrain)?;
         let (x, z) = (pick.copy.position.x, pick.copy.position.z);
@@ -1658,19 +1660,25 @@ impl<G: GameApp> Engine<G> {
         let together: usize = nearby.iter().map(|(_, n)| n).sum();
         let listed: Vec<String> = nearby.iter().take(5).map(|(k, n)| format!("{n} {}", self.foliage_kind_name(*k))).collect();
         let more = nearby.len().saturating_sub(5);
+        // The kinds that grow on this slot of this tile's set: the habitat's mix.
         let same_layer: Vec<&str> = self
             .project_foliage
             .values()
-            .filter(|e| e.ground_cover.is_some() && e.brush.layer == entry.brush.layer)
+            .filter(|e| e.brush.layer == entry.brush.layer && e.ground_cover.as_ref().is_some_and(|g| g.grows_on(&tile_set)))
             .map(|e| e.name.as_str())
             .collect();
+        let sets = rules.layer_sets.as_ref().map_or_else(String::new, |sets| {
+            let named: Vec<String> =
+                sets.iter().map(|s| if s.trim().is_empty() { "the project's".to_owned() } else { s.trim().to_owned() }).collect();
+            format!(", only on sets: {}", named.join(", "))
+        });
         let at = data.model.transform_point3(pick.copy.position);
         let from_centre = (pick.copy.position.x - focus.x).hypot(pick.copy.position.z - focus.z);
         let mut lines = vec![
             format!("{name}   ground cover, kind {kind}: grown round the view by its rules, never stored"),
             format!("model     {}", project_relative(root.as_deref(), &entry.source)),
             format!(
-                "habitat   ground {habitat}, weight {weight:.2} here (grows from {:.2}, on slopes to {:.0} deg); {} cover kinds grow on the slot",
+                "habitat   ground {habitat}, weight {weight:.2} here (grows from {:.2}, on slopes to {:.0} deg); {} cover kinds grow on this slot of this set",
                 entry.brush.min_layer_weight.max(1e-3),
                 entry.brush.max_slope_deg,
                 same_layer.len()
@@ -1693,7 +1701,7 @@ impl<G: GameApp> Engine<G> {
                 if more > 0 { format!(" and {more} more kinds") } else { String::new() }
             ),
             format!(
-                "rules     {}, kind {kind}: radius {:.0} m{}{}",
+                "rules     {}, kind {kind}: radius {:.0} m{}{}{sets}",
                 project_relative(root.as_deref(), &self.config.content_root.join("foliage.palette.json")),
                 rules.radius,
                 rules.clump.map_or_else(String::new, |m| format!(", drifts {m:.0} m")),
