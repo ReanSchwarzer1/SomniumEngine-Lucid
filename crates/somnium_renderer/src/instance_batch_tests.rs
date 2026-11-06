@@ -130,6 +130,7 @@ fn shadow_cull_keeps_the_casters_inside_each_redrawn_cascade() {
             [true, false, true, false],
             compact,
             0.0,
+            false,
         );
         queue.submit([encoder.finish()]);
         let draws = batches.shadow_draws().expect("the cull ran");
@@ -168,6 +169,7 @@ fn a_copy_too_small_at_its_distance_casts_no_shadow() {
         [true, false, false, false],
         true,
         0.5,
+        false,
     );
     queue.submit([encoder.finish()]);
     let counts: Vec<u32> = read(&device, &queue, batches.shadow_draws().unwrap().counts.unwrap());

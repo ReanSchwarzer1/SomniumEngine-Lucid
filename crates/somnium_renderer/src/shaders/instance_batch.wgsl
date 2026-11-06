@@ -134,7 +134,10 @@ fn shadow_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let s = slots[j];
     let copies = run_copies(s);
-    var casts = s.index_count != 0u && s.shadow.y != 0.0 && copies != 0u;
+    // camera.w = 1: the traced sun shades opaque traced copies and flat ones are not worth a shadow (casts = 2), so
+    // the cascades skip them and hold the cut-out cards and untraced copies alone (Sunscar, 6 Nov 2026).
+    var casts = s.index_count != 0u && s.shadow.y != 0.0 && copies != 0u
+        && !(shadow_params.camera.w > 0.5 && s.shadow.y > 1.5);
     if casts && s.shadow.x > 0.0 {
         // Horizontal, like the draw distance: climbing a hill does not switch the shadows below back on.
         let d = s.model[3].xz - shadow_params.camera.xz;
