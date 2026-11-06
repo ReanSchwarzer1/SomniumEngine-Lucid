@@ -40,7 +40,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (!is_on_screen(pos, c.render_size)) {
         return;
     }
-    // Nearest depth in the 3x3 neighbourhood (smallest: standard depth).
+    // Nearest depth in the 3x3 neighbourhood (largest: reversed depth).
     var offsets = array<vec2<i32>, 9>(
         vec2<i32>(0, 0), vec2<i32>(1, 0), vec2<i32>(0, 1), vec2<i32>(0, -1), vec2<i32>(-1, 0),
         vec2<i32>(-1, 1), vec2<i32>(1, 1), vec2<i32>(-1, -1), vec2<i32>(1, -1),
@@ -51,7 +51,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         let p = pos + offsets[i];
         if (is_on_screen(p, c.render_size)) {
             let d = load_input_depth(p);
-            if (d < nearest_depth) {
+            if (d > nearest_depth) {
                 nearest_coord = p;
                 nearest_depth = d;
             }
