@@ -9082,6 +9082,20 @@ impl<G: GameApp> Engine<G> {
                 ],
                 view_proj: glam::Mat4::IDENTITY.to_cols_array(),
             };
+            // Snow lying on surfaces (snow.wgsl via the View's snow0..3); all zero is none. The renderer fills the
+            // direction toward the sun itself.
+            r.snow = if pp.snow {
+                let wind = pp.snow_wind_deg.to_radians();
+                [
+                    1.0, pp.snowline_m, pp.snow_full_m.max(pp.snowline_m + 1.0),
+                    pp.snow_max_slope_deg.clamp(0.0, 90.0).to_radians().cos(),
+                    pp.snow_shade_bias.clamp(0.0, 1.0), 0.0, pp.snow_age.clamp(0.0, 1.0), 0.0,
+                    0.0, 0.0, 0.0, 0.0,
+                    wind.sin(), wind.cos(), pp.snow_scour.clamp(0.0, 1.0), 0.0,
+                ]
+            } else {
+                [0.0; 16]
+            };
             r.authored_picture_shift = somnium_renderer::pass::postprocess::PictureShift {
                 kind: if pp.picture_shift <= 3 { pp.picture_shift } else { 0 },
                 progress: pp.picture_shift_progress.clamp(0.0, 1.0),
