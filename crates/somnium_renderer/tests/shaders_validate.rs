@@ -70,8 +70,9 @@ fn every_composed_root_validates() {
     for root in [
         "shading.wgsl",
         "restir_gi.wgsl",
-        // 6 Nov 2026: the traced sun composes the global pool and the cut-out test for leaf cards.
         "restir_di.wgsl",
+        // 6 Nov 2026: GI despeckled on its own grid before the upsample.
+        "gi_despeckle.wgsl",
         "lighting_extra.wgsl",
         // 17 Oct 2026: the real-time path tracer and its denoiser.
         "path_tracer.wgsl",

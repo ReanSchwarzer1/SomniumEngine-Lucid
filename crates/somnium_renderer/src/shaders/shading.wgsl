@@ -1453,77 +1453,37 @@ fn sh_probe_volume_weight(pos: vec3<f32>) -> f32 {
 /// reproduced as a gold firefly — always on the first-person hands, which keep
 /// little temporal history, and on everything while running.
 ///
-/// Two bounds per tap, both relative so they need no exposure. A tap may not
-/// exceed `GI_SPECK_RATIO` times its brightest same-surface neighbour in the
-/// footprint: an isolated hot texel is exactly a speck, while real bounce is
-/// smooth and its neighbours vouch for it. A cap against the footprint mean
-/// alone could not do this — the speck lifts the mean it is measured against,
-/// so a texel 100x its neighbours came out 18x and stayed visible. The mean
-/// cap stays as the backstop for small clusters.
+/// The speck and firefly bounds that used to run here per tap now run once per GI texel before this reads
+/// them (`gi_despeckle.wgsl`): per screen pixel they were 11 of a dense wood's 19.6 ms of shading.
 fn gi_upsample(pixel: vec2<f32>, dist: f32) -> vec4<f32> {
     let gdims = vec2<i32>(textureDimensions(restir_gi));
     let ratio = vec2<f32>(textureDimensions(vis_buffer)) / vec2<f32>(gdims);
     let gp = pixel / ratio - 0.5;
     let g0 = vec2<i32>(floor(gp));
     let f = gp - floor(gp);
-    var taps: array<vec4<f32>, 16>;
-    // Tap luminance, or -1 for a tap on another surface (or none).
-    var luma: array<f32, 16>;
-    var mean = vec3<f32>(0.0);
+    var sum = vec3<f32>(0.0);
     var wsum = 0.0;
     for (var k = 0; k < 16; k = k + 1) {
         let d = vec2<i32>(k & 3, k >> 2) - vec2<i32>(1);
         let t = textureLoad(restir_gi, clamp(g0 + d, vec2<i32>(0), gdims - 1), 0);
-        luma[k] = -1.0;
         if t.a <= 0.0 {
-            taps[k] = vec4<f32>(0.0);
             continue;
         }
         let offset = vec2<f32>(d) - f;
         let ws = exp(-0.5 * dot(offset, offset) / (GI_FILTER_SIGMA * GI_FILTER_SIGMA));
         let wd = exp(-abs(t.a - dist) / (dist * 0.025 + 0.05));
         let w = (ws + 0.002) * wd;
-        taps[k] = vec4<f32>(t.rgb, w);
-        if wd > 0.1 {
-            luma[k] = dot(t.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-        }
-        mean += t.rgb * w;
+        sum += t.rgb * w;
         wsum += w;
     }
     if wsum < 1.0e-4 {
         return vec4<f32>(0.0);
-    }
-    mean /= wsum;
-    let mean_ceiling = GI_FIREFLY_RATIO * dot(mean, vec3<f32>(0.2126, 0.7152, 0.0722)) + 1.0e-6;
-    var sum = vec3<f32>(0.0);
-    for (var k = 0; k < 16; k = k + 1) {
-        if taps[k].a <= 0.0 {
-            continue;
-        }
-        var neighbour_max = -1.0;
-        for (var n = 0; n < 9; n = n + 1) {
-            let x = (k & 3) + n % 3 - 1;
-            let y = (k >> 2) + n / 3 - 1;
-            if n != 4 && x >= 0 && x < 4 && y >= 0 && y < 4 {
-                neighbour_max = max(neighbour_max, luma[y * 4 + x]);
-            }
-        }
-        var ceiling = mean_ceiling;
-        if neighbour_max >= 0.0 {
-            ceiling = min(ceiling, GI_SPECK_RATIO * neighbour_max + 1.0e-6);
-        }
-        let l = dot(taps[k].rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-        sum += taps[k].rgb * min(1.0, ceiling / max(l, 1.0e-6)) * taps[k].a;
     }
     return vec4<f32>(sum / wsum, 1.0);
 }
 
 /// Gaussian radius of the GI upsample, in GI texels.
 const GI_FILTER_SIGMA: f32 = 1.0;
-/// A GI texel may be at most this many times brighter than its neighbourhood.
-const GI_FIREFLY_RATIO: f32 = 2.5;
-/// ...and than its brightest same-surface neighbour.
-const GI_SPECK_RATIO: f32 = 1.25;
 
 /// The terrain bake's sky visibility at this pixel (1 off terrain). `surface.occlusion` carries it for the sky light;
 /// a traced GI estimate already sees the canopy and the near ground, so it takes the bake back out rather than count

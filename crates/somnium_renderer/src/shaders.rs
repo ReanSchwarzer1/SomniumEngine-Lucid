@@ -133,6 +133,7 @@ impl Shaders {
             "fsr_sanitize.wgsl",
             "fsr_untonemap.wgsl",
             "fxaa.wgsl",
+            "gi_despeckle.wgsl",
             "gizmo.wgsl",
             "global_pool.wgsl",
             "dream_lens.wgsl",

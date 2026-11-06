@@ -166,6 +166,11 @@ pub struct RestirGiPass {
     grain_enabled: bool,
     out_view: Option<wgpu::TextureView>,
     out_tex: Option<wgpu::Texture>,
+    /// The radiance despeckled on the GI grid (`gi_despeckle.wgsl`): what the shading pass reads.
+    clean_view: Option<wgpu::TextureView>,
+    clean_tex: Option<wgpu::Texture>,
+    despeckle: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
+    despeckle_bind: Option<wgpu::BindGroup>,
     /// Set once the pass has written the target, so a disabled pass knows it
     /// still has stale contents to clear. Same trap 24K hit: switching the
     /// feature off left every surface pinned to the last traced result.
@@ -222,6 +227,10 @@ impl RestirGiPass {
                 && crate::pass::grain::enabled_by_default("SOMNIUM_DREAMS_GRAIN"),
             out_view: None,
             out_tex: None,
+            clean_view: None,
+            clean_tex: None,
+            despeckle: None,
+            despeckle_bind: None,
             dirty: false,
             frame: 0,
             history_valid: false,
@@ -411,6 +420,7 @@ impl RestirGiPass {
             })
         };
         pass.initial = Some(make("initial_and_temporal", "ReSTIR GI initial+temporal"));
+        pass.despeckle = Some(Self::despeckle_pipeline(device, shaders));
         pass.spatial = Some(make("spatial_and_shade", "ReSTIR GI spatial+shade"));
         pass.layout = Some(layout);
         pass.params = Some(device.create_buffer(&wgpu::BufferDescriptor {
@@ -471,7 +481,57 @@ impl RestirGiPass {
     /// Indirect radiance, for the shading pass to use in place of the constant
     /// ambient term.
     pub fn radiance_view(&self) -> Option<&wgpu::TextureView> {
-        self.out_view.as_ref()
+        if self.despeckle.is_some() { self.clean_view.as_ref() } else { self.out_view.as_ref() }
+    }
+
+    /// The despeckle pass (`gi_despeckle.wgsl`): the radiance in, its despeckled copy out, on the GI grid.
+    fn despeckle_pipeline(
+        device: &wgpu::Device,
+        shaders: &crate::shaders::Shaders,
+    ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("GI despeckle BGL"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: GI_FORMAT,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("GI despeckle PL"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("gi_despeckle.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(shaders.source_or_panic("gi_despeckle.wgsl").into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("GI despeckle"),
+            layout: Some(&pl),
+            module: &module,
+            entry_point: Some("despeckle"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        (pipeline, layout)
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
@@ -501,6 +561,21 @@ impl RestirGiPass {
         });
         self.out_view = Some(tex.create_view(&wgpu::TextureViewDescriptor::default()));
         self.out_tex = Some(tex);
+        let clean = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ReSTIR GI radiance (despeckled)"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: GI_FORMAT,
+            usage: wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        self.clean_view = Some(clean.create_view(&wgpu::TextureViewDescriptor::default()));
+        self.clean_tex = Some(clean);
+        self.despeckle_bind = None;
         self.dirty = false;
 
         if !self.supported {
@@ -627,7 +702,7 @@ impl RestirGiPass {
         if self.active() || !self.dirty {
             return;
         }
-        if let Some(view) = self.out_view.as_ref() {
+        for view in self.out_view.iter().chain(self.clean_view.iter()) {
             // A load-op clear, not `clear_texture`: that needs the optional
             // CLEAR_TEXTURE feature this device never requests.
             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -758,6 +833,31 @@ impl RestirGiPass {
             cpass.dispatch_workgroups(groups.0, groups.1, 1);
         }
         profiler.end(encoder);
+        if let (Some((pipeline, layout)), Some(out), Some(clean)) =
+            (self.despeckle.as_ref(), self.out_view.as_ref(), self.clean_view.as_ref())
+        {
+            let bind = self.despeckle_bind.get_or_insert_with(|| {
+                device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("GI despeckle BG"),
+                    layout,
+                    entries: &[
+                        wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(out) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(clean) },
+                    ],
+                })
+            });
+            profiler.begin(encoder, "GI despeckle");
+            {
+                let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("ReSTIR GI despeckle"),
+                    timestamp_writes: None,
+                });
+                cpass.set_pipeline(pipeline);
+                cpass.set_bind_group(0, &*bind, &[]);
+                cpass.dispatch_workgroups(groups.0, groups.1, 1);
+            }
+            profiler.end(encoder);
+        }
 
         self.dirty = true;
         self.frame = self.frame.wrapping_add(1);
