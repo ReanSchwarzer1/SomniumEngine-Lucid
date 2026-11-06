@@ -30,6 +30,8 @@ struct MeshBlas {
     index_offset: u32,
     /// Built at least once, so the TLAS may name it (`BLAS_TRIANGLES_PER_FRAME`).
     ready: bool,
+    /// Fast trace or fast build, kept so a re-registration (`mark_cutout`) asks for the same.
+    build_flags: wgpu::AccelerationStructureFlags,
 }
 
 /// The most BLAS triangles one frame builds. A burst of new meshes (a region's tree kinds streaming in at once)
@@ -61,6 +63,12 @@ pub struct RaytracePass {
     overflowed: bool,
     /// Hash of the instance list the current TLAS was built from.
     built: Option<u64>,
+    /// Meshes drawn with a cut-out material (leaf and grass cards). Only their BLAS is built non-opaque, so a ray
+    /// that tests alpha (`rt_alpha.wgsl`) stops for their triangles alone; terrain, trunks and rocks stay on the
+    /// hardware's opaque path (Sunscar, 6 Nov 2026).
+    cutout: crate::fast_hash::FastSet<u32>,
+    /// Cut-out meshes whose opaque BLAS the next `build` re-registers.
+    recut: Vec<u32>,
 }
 
 /// FNV-1a over the words that decide a TLAS, including shadow participation.
@@ -100,6 +108,8 @@ impl RaytracePass {
                 max_instances: 0,
                 overflowed: false,
                 built: None,
+                cutout: Default::default(),
+                recut: Vec::new(),
             };
         }
 
@@ -139,6 +149,8 @@ impl RaytracePass {
             max_instances,
             overflowed: false,
             built: None,
+                cutout: Default::default(),
+                recut: Vec::new(),
         }
     }
 
@@ -205,7 +217,11 @@ impl RaytracePass {
             vertex_count,
             index_format: Some(wgpu::IndexFormat::Uint32),
             index_count: Some(index_count),
-            flags: wgpu::AccelerationStructureGeometryFlags::OPAQUE,
+            flags: if self.cutout.contains(&vertex_offset) {
+                wgpu::AccelerationStructureGeometryFlags::empty()
+            } else {
+                wgpu::AccelerationStructureGeometryFlags::OPAQUE
+            },
         };
 
         let blas = device.create_blas(
@@ -228,6 +244,7 @@ impl RaytracePass {
                 vertex_offset,
                 index_offset,
                 ready: false,
+                build_flags: flags,
             },
         );
         self.pending_blas.push(vertex_offset);
@@ -251,7 +268,16 @@ impl RaytracePass {
     }
 
     /// Remove acceleration data before a scene-owned vertex reservation is reused.
+    /// The mesh at `vertex_offset` is drawn with a cut-out material: its BLAS is (re)built non-opaque, so rays that
+    /// test alpha see through its holes and every other ray treats it as a candidate to confirm.
+    pub fn mark_cutout(&mut self, vertex_offset: u32) {
+        if self.supported && self.cutout.insert(vertex_offset) {
+            self.recut.push(vertex_offset);
+        }
+    }
+
     pub fn unregister_mesh(&mut self, vertex_offset: u32) {
+        self.cutout.remove(&vertex_offset);
         if self.blas.remove(&vertex_offset).is_some() {
             // The TLAS may still name this BLAS; force the next build to
             // re-encode even if the new scene's instance words happen to match.
@@ -286,6 +312,18 @@ impl RaytracePass {
     ) {
         if !self.supported {
             return;
+        }
+        for offset in std::mem::take(&mut self.recut) {
+            let Some(old) = self.blas.get(&offset) else { continue };
+            if !old.size.flags.contains(wgpu::AccelerationStructureGeometryFlags::OPAQUE) {
+                continue;
+            }
+            let (vertex_count, index_offset, index_count, flags) =
+                (old.size.vertex_count, old.index_offset, old.index_count, old.build_flags);
+            self.blas.remove(&offset);
+            self.pending_blas.retain(|o| *o != offset);
+            self.built = None;
+            self.register(device, offset, vertex_count, index_offset, index_count, flags);
         }
         let Some(tlas) = self.tlas.as_mut() else {
             return;

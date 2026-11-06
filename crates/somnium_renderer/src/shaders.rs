@@ -159,6 +159,7 @@ impl Shaders {
             "restir_di.wgsl",
             "restir_gi.wgsl",
             "rt_debug.wgsl",
+            "rt_alpha.wgsl",
             "rt_hit.wgsl",
             "sampling.wgsl",
             "scene_capture.wgsl",
@@ -447,6 +448,7 @@ mod tests {
         let mut gi = vec![
             "restir_gi.wgsl",
             "rt_hit.wgsl",
+            "rt_alpha.wgsl",
             "global_pool.wgsl",
             "brdf.wgsl",
             "sampling.wgsl",
@@ -464,6 +466,7 @@ mod tests {
         let mut extra = vec![
             "lighting_extra.wgsl",
             "rt_hit.wgsl",
+            "rt_alpha.wgsl",
             "global_pool.wgsl",
             "brdf.wgsl",
             "sampling.wgsl",
@@ -479,6 +482,7 @@ mod tests {
         let mut water = vec![
             "water_reflection.wgsl",
             "rt_hit.wgsl",
+            "rt_alpha.wgsl",
             "global_pool.wgsl",
             "brdf.wgsl",
             "terrain_splat_core.wgsl",

@@ -35,7 +35,9 @@ fn practical_visibility(p: vec3<f32>, geometric_normal: vec3<f32>, emitter: vec3
             // tolerance, not a distance-dependent leak across room partitions.
             rayQueryInitialize(&rq, local_shadow_accel,
                 RayDesc(0x4u, 0x1u, 0.008, distance - 0.06, origin, delta / distance));
-            rayQueryProceed(&rq);
+            while rayQueryProceed(&rq) {
+                rayQueryConfirmIntersection(&rq);   // cut-out meshes are non-opaque
+            }
             return select(0.0, 1.0, rayQueryGetCommittedIntersection(&rq).kind == RAY_QUERY_INTERSECTION_NONE);
         }
     }
@@ -154,7 +156,9 @@ fn skin_visibility(p: vec3<f32>, emitter: vec3<f32>, reach: f32) -> f32 {
             var rq: ray_query;
             rayQueryInitialize(&rq, local_shadow_accel,
                 RayDesc(0x4u, 0x1u, reach, distance - 0.06, p, delta / distance));
-            rayQueryProceed(&rq);
+            while rayQueryProceed(&rq) {
+                rayQueryConfirmIntersection(&rq);   // cut-out meshes are non-opaque
+            }
             return select(0.0, 1.0, rayQueryGetCommittedIntersection(&rq).kind == RAY_QUERY_INTERSECTION_NONE);
         }
         return 1.0;
@@ -1525,6 +1529,23 @@ const GI_FIREFLY_RATIO: f32 = 2.5;
 /// ...and than its brightest same-surface neighbour.
 const GI_SPECK_RATIO: f32 = 1.25;
 
+/// The terrain bake's sky visibility at this pixel (1 off terrain). `surface.occlusion` carries it for the sky light;
+/// a traced GI estimate already sees the canopy and the near ground, so it takes the bake back out rather than count
+/// the same crowns twice (Sunscar, 6 Nov 2026).
+var<private> baked_sky_vis: f32 = 1.0;
+/// How much of the sky the traced GI saw here against the unshadowed sky, past what the bake already says (1 when
+/// nothing was traced, or in the open). The sky's reflection takes it as the diffuse sky does: under a canopy the
+/// leaves and the litter stop mirroring a sky they cannot see (Sunscar, 6 Nov 2026).
+var<private> gi_sky_seen: f32 = 1.0;
+
+fn note_gi_sky_seen(traced_diffuse: vec4<f32>, sky_irradiance: vec3<f32>) {
+    if traced_diffuse.a > 0.5 {
+        let luma = vec3<f32>(0.2126, 0.7152, 0.0722);
+        gi_sky_seen = saturate(dot(traced_diffuse.rgb, luma) / max(baked_sky_vis, 0.05)
+            / max(dot(sky_irradiance, luma), 1.0e-4));
+    }
+}
+
 fn evaluate_ibl_diffuse(surface: Surface, traced_diffuse: vec4<f32>) -> vec3<f32> {
     let n = surface.normal;
 
@@ -1541,8 +1562,9 @@ fn evaluate_ibl_diffuse(surface: Surface, traced_diffuse: vec4<f32>) -> vec3<f32
     var diffuse = irradiance * light.ibl_intensity * surface.albedo * kd;
     // Traced, the estimate holds the sky through the gaps as well as the bounce (restir_gi.wgsl's escaped rays),
     // so it takes the unshadowed sky's place: the floor of a wood gets the sky its canopy lets through.
+    note_gi_sky_seen(traced_diffuse, irradiance * light.ibl_intensity);
     if traced_diffuse.a > 0.5 {
-        diffuse = traced_diffuse.rgb * surface.albedo * kd;
+        diffuse = traced_diffuse.rgb * surface.albedo * kd / max(baked_sky_vis, 0.05);
     }
 
     return diffuse * surface.occlusion;
@@ -1594,7 +1616,7 @@ fn evaluate_ibl_specular(surface: Surface) -> vec3<f32> {
     let specular = prefiltered * env_brdf_approx(surface.f0, surface.roughness, n_dot_v);
     let spec_ao  = specular_occlusion(n_dot_v, surface.occlusion, surface.roughness);
 
-    return specular * spec_ao;
+    return specular * spec_ao * gi_sky_seen;
 }
 
 /// Multiple-scattering IBL, Fdez-Agüera (JCGT 8(1), 2019).
@@ -1635,8 +1657,9 @@ fn evaluate_ibl_ms(surface: Surface, traced_diffuse: vec4<f32>) -> vec3<f32> {
     let gather_n = normalize(mix(n, surface.bent_normal, 0.75));
     var irradiance = textureSampleLevel(env_cube, env_sampler, gather_n, ENV_MAX_MIP).rgb * light.ibl_intensity;
     // Traced, the estimate holds the sky through the gaps as well as the bounce: it takes the unshadowed sky's place.
+    note_gi_sky_seen(traced_diffuse, irradiance);
     if traced_diffuse.a > 0.5 {
-        irradiance = traced_diffuse.rgb;
+        irradiance = traced_diffuse.rgb / max(baked_sky_vis, 0.05);
     }
 
     let fss_ess = k_s * ab.x + ab.y;
@@ -1647,7 +1670,7 @@ fn evaluate_ibl_ms(surface: Surface, traced_diffuse: vec4<f32>) -> vec3<f32> {
         * (1.0 - surface.metallic);
 
     let spec_ao = specular_occlusion(n_dot_v, surface.occlusion, surface.roughness);
-    return fss_ess * radiance * light.ibl_intensity * spec_ao
+    return fss_ess * radiance * light.ibl_intensity * spec_ao * gi_sky_seen
         + (fms_ems + k_d) * irradiance * surface.occlusion;
 }
 
@@ -1657,8 +1680,9 @@ fn evaluate_ibl(surface: Surface, traced_diffuse: vec4<f32>) -> vec3<f32> {
     }
     // Occlusion applies to indirect light only. The sun already has shadow
     // maps, and multiplying it by AO as well double-darkens lit surfaces.
-    return evaluate_ibl_diffuse(surface, traced_diffuse)
-        + evaluate_ibl_specular(surface) * light.ibl_intensity;
+    // Diffuse first: it notes how much sky the traced GI saw, which the specular then reads.
+    let diffuse = evaluate_ibl_diffuse(surface, traced_diffuse);
+    return diffuse + evaluate_ibl_specular(surface) * light.ibl_intensity;
 }
 
 // ─── Vertex shader ───────────────────────────────────────────────────────────
@@ -2963,6 +2987,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         surface.albedo = surface.albedo * mix(vec3(1.0), vec3(0.88, 0.97, 0.78), sheltered);
 
         surface.occlusion = surface.occlusion * sky_vis;
+        baked_sky_vis = sky_vis;
         // The landscape-scale bent normal, **composed with** the contact-scale
         // one GTAO already wrote rather than replacing it. The two see
         // different occluders — GTAO sees the boulder a metre away and cannot
