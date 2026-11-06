@@ -107,13 +107,6 @@ struct View {
     // `inv_view_proj` cancels to 2^-6 steps in ndc kilometres from the origin (Sunscar, 5 Nov 2026: the
     // 21.6 px columns at the feet 15 km out). Add camera_pos after the divide for a world position.
     inv_view_proj_rel: mat4x4<f32>, // offset 256
-    // Snow lying on surfaces (snow.wgsl, `somnium.SnowCover`; sunscar-photoreal 6 Nov 2026), offsets 320-383:
-    // snow0 (on, snowline m, full-cover m, cos of the slope limit), snow1 (shade bias, depth m, age, sparkle),
-    // snow2 (direction toward the sun, -), snow3 (wind x, wind z, scour, -). All zero: no snow.
-    snow0:         vec4<f32>,
-    snow1:         vec4<f32>,
-    snow2:         vec4<f32>,
-    snow3:         vec4<f32>,
 }
 
 // GpuDirectionalLight (336 bytes) — matches shadow/mod.rs::GpuDirectionalLight.

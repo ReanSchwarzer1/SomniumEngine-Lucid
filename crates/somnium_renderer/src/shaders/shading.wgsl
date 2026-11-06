@@ -3043,7 +3043,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Snow lying on the finished surface (snow.wgsl; sunscar-photoreal, 6 Nov 2026): before specular antialiasing
     // and f0, after terrain, decals and wetness. Off unless a scene has a SnowCover.
-    if view.snow0.x > 0.5 {
+    if snow_params.p0.x > 0.5 {
         surface = apply_snow(surface, hit_point, geo_normal);
     }
     // ── Geometric specular antialiasing (TSUSHIMA-E) ─────────────────────────

@@ -365,7 +365,7 @@ pub struct SomniumRenderer {
     pub sun_angular_radius: f32,
     /// Tone-mapping curve index; matches `Tonemapper::as_index`.
     pub tonemapper: u32,
-    /// Snow lying on surfaces (`somnium.SnowCover`, snow.wgsl): the View uniform's `snow0..snow3`; all zero is none.
+    /// Snow lying on surfaces (snow.wgsl's uniform, shading group 1 binding 34); all zero is none.
     /// Its third vector (toward the sun) is filled from the light each frame.
     pub snow: [f32; 16],
     /// Radial vignette strength (0 = off, 1 = default, higher = stronger).
@@ -2713,10 +2713,6 @@ impl SomniumRenderer {
         // ponytail: the primary camera's, as camera_pos above already is for every view slot; a second
         // viewport's near-eye rays use it too. Per-slot cameras when a multi-view editor needs them.
         view_data.extend_from_slice(bytemuck::bytes_of(&self.view_proj_rel.inverse().to_cols_array()));
-        // Snow (offsets 320-383): its settings, with the direction toward the sun in the third vector.
-        let mut snow = self.snow;
-        snow[8..11].copy_from_slice(&self.light_direction.normalize_or_zero().to_array());
-        view_data.extend_from_slice(bytemuck::bytes_of(&snow));
         view_data
     }
 
@@ -2745,6 +2741,13 @@ impl SomniumRenderer {
     fn write_view_buffer(&self, queue: &wgpu::Queue, view_proj: glam::Mat4) {
         let view_data = self.view_buffer_bytes(view_proj);
         queue.write_buffer(&self.global_pool.view_proj_buffer, 0, &view_data);
+        // Snow lying on surfaces (snow.wgsl, shading group 1 binding 34): the direction toward the sun goes in its third
+        // vector each frame.
+        let mut snow = self.snow;
+        snow[8..11].copy_from_slice(&self.light_direction.normalize_or_zero().to_array());
+        // Metres per pixel per metre of distance: the snow's finer patterns fade where a pixel cannot hold them.
+        snow[11] = 2.0 / (self.proj_matrix.y_axis.y.abs().max(1e-6) * self.render_height.max(1) as f32);
+        self.shading_pass.set_snow(queue, &snow);
     }
 
     /// Put one view's matrices where the *encoder* will pick them up.

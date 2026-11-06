@@ -9082,8 +9082,8 @@ impl<G: GameApp> Engine<G> {
                 ],
                 view_proj: glam::Mat4::IDENTITY.to_cols_array(),
             };
-            // Snow lying on surfaces (snow.wgsl via the View's snow0..3); all zero is none. The renderer fills the
-            // direction toward the sun itself.
+            // Snow lying on surfaces (snow.wgsl's uniform, shading group 1 binding 34); all zero is none. The renderer
+            // fills the direction toward the sun itself.
             r.snow = if pp.snow {
                 let wind = pp.snow_wind_deg.to_radians();
                 [
