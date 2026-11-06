@@ -11,8 +11,13 @@
 //! - **The log** also goes to `logs/editor.log` (`logs/game.log` for a game alone) under the project, plain text, the
 //!   two runs before kept as `.1.log` and `.2.log`, at most [`LOG_CAP`] bytes a run. `SOMNIUM_LOG_FILE=0` keeps it off.
 //!
+//! - **A native crash** (an access violation in a driver, Jolt's C++ or Luau, which never reaches Rust's panic hook and
+//!   left nothing) writes `logs/crash-<secs>.dmp`, a minidump with every thread's stack for a debugger and the program's
+//!   PDB, and `logs/crash-<secs>.txt`: the exception in words, the module and offset it happened in, the build, the GPU.
+//!   Then the same box, and Windows' own handling. In process, so a crash that wrecked the heap may leave less.
+//!
 //! No box where nobody watches it: a background window, a capture run, CI, `SOMNIUM_NO_DIALOGS=1`, or a run whose
-//! output a tool has taken (a pipe or a file). `SOMNIUM_CRASH_REPORT=0` leaves panics to a game's own hook.
+//! output a tool has taken (a pipe or a file). `SOMNIUM_CRASH_REPORT=0` leaves panics and native crashes to the game.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -27,6 +32,8 @@ const LOG_CAP: u64 = 256 * 1024 * 1024;
 const LOGS_KEPT: u32 = 2;
 
 static INSTALLED: OnceLock<()> = OnceLock::new();
+/// The program's name and its report folders, for a native crash's filter (which can take no arguments).
+static NATIVE: OnceLock<(String, Vec<PathBuf>)> = OnceLock::new();
 static REPORTS: AtomicU32 = AtomicU32::new(0);
 /// This run's log file, for a report and a box to point at.
 static LOG_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -85,6 +92,8 @@ pub(crate) fn install(program: &str, project: Option<&Path>) {
     }
     let program = program.to_owned();
     let folders = report_folders(&program, project);
+    let _ = NATIVE.set((program.clone(), folders.clone()));
+    native::install();
     let main = std::thread::current().id();
     let usual = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -240,6 +249,272 @@ fn utc(secs: u64) -> String {
     format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02} UTC")
 }
 
+/// A native exception's code in words.
+fn exception_name(code: u32) -> &'static str {
+    match code {
+        0xC000_0005 => "an access violation (memory the program does not own)",
+        0xC000_0006 => "a page that could not be read in (a file or a drive went away)",
+        0xC000_001D => "an illegal instruction",
+        0xC000_0094 => "an integer divided by zero",
+        0xC000_0095 => "an integer overflow",
+        0xC000_00FD => "a stack overflow",
+        0xC000_0374 => "heap corruption",
+        0xC000_0409 => "a stack buffer overrun (a fast fail)",
+        0x8000_0003 => "a breakpoint",
+        _ => "a native exception",
+    }
+}
+
+/// What a native crash's report says.
+struct NativeFacts<'a> {
+    program: &'a str,
+    secs: u64,
+    code: u32,
+    /// Where it happened: the module's file, and the offset into it.
+    at: String,
+    /// For an access violation: read, write or execute, and the address it touched.
+    touched: Option<(usize, usize)>,
+    thread: u32,
+    build: String,
+    gpu: &'a str,
+    log: String,
+    dump: Option<&'a Path>,
+}
+
+impl NativeFacts<'_> {
+    fn report(&self) -> String {
+        let touched = self.touched.map_or_else(String::new, |(kind, address)| {
+            let how = match kind {
+                0 => "reading",
+                1 => "writing",
+                8 => "running code at",
+                _ => "touching",
+            };
+            format!(" ({how} {address:#x})")
+        });
+        let dump = self.dump.map_or_else(
+            || "none: it could not be written".to_owned(),
+            |p| format!("{} (open it in a debugger with the program's PDB beside it)", p.display()),
+        );
+        format!(
+            "{} stopped with a native crash.\n\
+             When: {} ({} seconds since 1970)\n\
+             What: {}{touched}, code {:#010x}\n\
+             Where: {}\n\
+             Thread: {}\n\
+             Program: {}\n\
+             Engine: somnium_core {}\n\
+             GPU: {}\n\
+             System: {} {}\n\
+             Log: {}\n\
+             Dump: {dump}\n",
+            self.program,
+            utc(self.secs),
+            self.secs,
+            exception_name(self.code),
+            self.code,
+            self.at,
+            self.thread,
+            self.build,
+            env!("CARGO_PKG_VERSION"),
+            self.gpu,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            self.log,
+        )
+    }
+}
+
+/// The unhandled-exception filter (Windows): a minidump and a report for the first native crash, then whatever filter
+/// was there before, then Windows' own handling.
+#[cfg(windows)]
+mod native {
+    use super::{NATIVE, NativeFacts, build, watched, write_report};
+    use std::ffi::c_void;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[repr(C)]
+    struct ExceptionRecord {
+        code: u32,
+        flags: u32,
+        record: *mut ExceptionRecord,
+        address: *mut c_void,
+        parameters: u32,
+        information: [usize; 15],
+    }
+
+    #[repr(C)]
+    pub(super) struct ExceptionPointers {
+        record: *mut ExceptionRecord,
+        context: *mut c_void,
+    }
+
+    /// `MINIDUMP_EXCEPTION_INFORMATION`, which dbghelp.h declares under `#pragma pack(4)`.
+    #[repr(C, packed(4))]
+    struct DumpException {
+        thread_id: u32,
+        pointers: *mut ExceptionPointers,
+        client_pointers: i32,
+    }
+
+    type Filter = unsafe extern "system" fn(*mut ExceptionPointers) -> i32;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetUnhandledExceptionFilter(filter: Option<Filter>) -> Option<Filter>;
+        fn GetCurrentProcess() -> *mut c_void;
+        fn GetCurrentProcessId() -> u32;
+        fn GetCurrentThreadId() -> u32;
+        fn GetModuleHandleExW(flags: u32, address: *const c_void, module: *mut *mut c_void) -> i32;
+        fn GetModuleFileNameW(module: *mut c_void, name: *mut u16, size: u32) -> u32;
+        fn RaiseException(code: u32, flags: u32, count: u32, arguments: *const usize);
+    }
+
+    #[link(name = "dbghelp")]
+    unsafe extern "system" {
+        fn MiniDumpWriteDump(
+            process: *mut c_void,
+            pid: u32,
+            file: *mut c_void,
+            kind: u32,
+            exception: *const DumpException,
+            user: *const c_void,
+            callback: *const c_void,
+        ) -> i32;
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn MessageBoxW(window: *mut c_void, text: *const u16, caption: *const u16, kind: u32) -> i32;
+    }
+
+    /// `MiniDumpNormal` with thread info and unloaded modules: every thread's stack, a few MB, small enough to send.
+    const DUMP_KIND: u32 = 0x0000_1000 | 0x0000_0020;
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+    /// `GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT`.
+    const MODULE_FROM_ADDRESS: u32 = 0x4 | 0x2;
+
+    static PREVIOUS: OnceLock<Option<Filter>> = OnceLock::new();
+    static ENTERED: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn install() {
+        // SAFETY: registers a process-wide filter with the signature Windows calls it with; the previous one is kept
+        // and called after ours.
+        let previous = unsafe { SetUnhandledExceptionFilter(Some(filter)) };
+        let _ = PREVIOUS.set(previous);
+    }
+
+    /// Raise an access violation, as a driver's or C++'s would arrive (the minidump's proof run).
+    pub(crate) fn raise_access_violation() {
+        let arguments = [1usize, 0];
+        // SAFETY: raises a structured exception with two arguments in a live array; nothing catches it but the filter.
+        unsafe { RaiseException(0xC000_0005, 0, 2, arguments.as_ptr()) };
+    }
+
+    /// The module an address lies in, as its file and the offset into it.
+    fn module_of(address: *mut c_void) -> String {
+        let mut module: *mut c_void = std::ptr::null_mut();
+        // SAFETY: Win32 queries with valid out-pointers and a sized buffer; the module's refcount is left unchanged.
+        let found = unsafe { GetModuleHandleExW(MODULE_FROM_ADDRESS, address, &mut module) } != 0;
+        if !found || module.is_null() {
+            return format!("{address:p} (in no module the program loaded)");
+        }
+        let mut name = [0u16; 520];
+        let length = unsafe { GetModuleFileNameW(module, name.as_mut_ptr(), name.len() as u32) } as usize;
+        let file = String::from_utf16_lossy(&name[..length.min(name.len())]);
+        format!("{file} + {:#x}", (address as usize).wrapping_sub(module as usize))
+    }
+
+    fn write_dump(dir: &Path, secs: u64, pointers: *mut ExceptionPointers) -> Option<PathBuf> {
+        use std::os::windows::io::AsRawHandle;
+        std::fs::create_dir_all(dir).ok()?;
+        let path = dir.join(format!("crash-{secs}.dmp"));
+        let file = std::fs::File::create(&path).ok()?;
+        // SAFETY: plain thread id query.
+        let thread_id = unsafe { GetCurrentThreadId() };
+        let exception = DumpException { thread_id, pointers, client_pointers: 0 };
+        // SAFETY: a live file handle, this process, and the exception pointers Windows handed the filter.
+        let written = unsafe {
+            MiniDumpWriteDump(
+                GetCurrentProcess(),
+                GetCurrentProcessId(),
+                file.as_raw_handle().cast(),
+                DUMP_KIND,
+                &exception,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        } != 0;
+        written.then_some(path)
+    }
+
+    unsafe extern "system" fn filter(pointers: *mut ExceptionPointers) -> i32 {
+        // The first crash only: a fault inside this filter must not come back into it.
+        if !ENTERED.swap(true, Ordering::SeqCst) {
+            report(pointers);
+        }
+        match PREVIOUS.get().copied().flatten() {
+            // SAFETY: the filter that was installed before ours, called as Windows would have.
+            Some(previous) => unsafe { previous(pointers) },
+            None => EXCEPTION_CONTINUE_SEARCH,
+        }
+    }
+
+    fn report(pointers: *mut ExceptionPointers) {
+        let Some((program, folders)) = NATIVE.get() else { return };
+        // SAFETY: Windows hands the filter valid exception pointers for the duration of the call.
+        let record = unsafe { pointers.as_ref().and_then(|p| p.record.as_ref()) };
+        let (code, address, touched) = match record {
+            Some(r) => {
+                let touched = (r.code == 0xC000_0005 && r.parameters >= 2).then(|| (r.information[0], r.information[1]));
+                (r.code, r.address, touched)
+            }
+            None => (0, std::ptr::null_mut(), None),
+        };
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let dump = folders.iter().find_map(|dir| write_dump(dir, secs, pointers));
+        // SAFETY: plain thread id query.
+        let thread = unsafe { GetCurrentThreadId() };
+        let facts = NativeFacts {
+            program,
+            secs,
+            code,
+            at: module_of(address),
+            touched,
+            thread,
+            build: build(),
+            gpu: somnium_renderer::context::gpu_in_use().unwrap_or("none yet (it stopped before the GPU started)"),
+            log: super::LOG_PATH.get().map_or_else(|| "none".to_owned(), |p| p.display().to_string()),
+            dump: dump.as_deref(),
+        };
+        let text = facts.report();
+        let written = folders.iter().find_map(|dir| write_report(dir, secs, &text));
+        eprintln!("{program} stopped with a native crash; report {}", written.as_ref().map_or_else(|| "not written".to_owned(), |p| p.display().to_string()));
+        if watched() {
+            let message = super::crash_text(program, written.as_deref());
+            let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+            let (text, caption) = (wide(&message), wide(program));
+            // SAFETY: NUL-terminated UTF-16 strings that outlive the call; no owner window; error icon, topmost.
+            unsafe { MessageBoxW(std::ptr::null_mut(), text.as_ptr(), caption.as_ptr(), 0x10 | 0x1_0000 | 0x4_0000) };
+        }
+    }
+}
+
+#[cfg(not(windows))]
+mod native {
+    pub(super) fn install() {}
+    pub(crate) fn raise_access_violation() {
+        std::process::abort();
+    }
+}
+
+/// Raise a native access violation, as a driver's would arrive: the minidump's proof run (`SOMNIUM_EDITOR_SCRIPT`).
+pub(crate) fn raise_native_crash() {
+    native::raise_access_violation();
+}
+
 fn crash_text(program: &str, report: Option<&Path>) -> String {
     match report {
         Some(path) => format!(
@@ -333,6 +608,31 @@ mod tests {
         }
         let worker = Facts { on_main: false, thread: "somnium-job-3", ..facts };
         assert!(worker.report("").contains("a worker: the program went on"));
+    }
+
+    #[test]
+    fn a_native_crash_report_names_the_exception_the_module_and_the_dump() {
+        let dump = Path::new("F:/game/logs/crash-42.dmp");
+        let facts = NativeFacts {
+            program: "Rimeborn: Sunscar",
+            secs: 1_700_000_000,
+            code: 0xC000_0005,
+            at: "C:\\Windows\\System32\\nvoglv64.dll + 0x1a2b".to_owned(),
+            touched: Some((1, 0x10)),
+            thread: 7,
+            build: "F:/game/sunscar.exe".to_owned(),
+            gpu: "NVIDIA GeForce RTX 5080 Laptop GPU (Vulkan, NVIDIA 617.42)",
+            log: "F:/game/logs/editor.log".to_owned(),
+            dump: Some(dump),
+        };
+        let text = facts.report();
+        for part in ["native crash", "an access violation", "writing 0x10", "0xc0000005", "nvoglv64.dll + 0x1a2b", "crash-42.dmp", "RTX 5080"] {
+            assert!(text.contains(part), "{part} missing from:\n{text}");
+        }
+        assert_eq!(exception_name(0xC000_00FD), "a stack overflow");
+        assert_eq!(exception_name(0x1234), "a native exception");
+        let unwritten = NativeFacts { dump: None, touched: None, ..facts }.report();
+        assert!(unwritten.contains("Dump: none") && !unwritten.contains("writing"));
     }
 
     #[test]
