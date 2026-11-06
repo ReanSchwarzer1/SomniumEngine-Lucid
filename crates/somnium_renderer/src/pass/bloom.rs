@@ -220,6 +220,13 @@ impl BloomPass {
         &self.views[0]
     }
 
+    /// How many levels the chain sums (each holds the whole light, blurred wider): the photographic camera's glare
+    /// share is divided by this so the chain mixes in with its energy kept.
+    #[must_use]
+    pub fn levels(&self) -> usize {
+        self.views.len().max(1)
+    }
+
     pub fn intensity(&self) -> f32 {
         if self.enabled { self.intensity } else { 0.0 }
     }

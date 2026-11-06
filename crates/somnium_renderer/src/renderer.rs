@@ -1286,7 +1286,6 @@ impl SomniumRenderer {
             auto_exposure_pass.exposure_buffer(),
             bloom_pass.result_view(),
         );
-        auto_exposure_pass.resize(&ctx.device, &postprocess_pass.hdr_view);
 
         // Phase 24I: screen-space occlusion, consumed by the shading pass.
         let gtao_pass = crate::pass::gtao::GtaoPass::new(
@@ -1372,6 +1371,7 @@ impl SomniumRenderer {
             ctx.config.height,
             &global_pool.layout,
         );
+        auto_exposure_pass.resize(&ctx.device, &postprocess_pass.hdr_view, &vis_pass.view);
         let hiz_pass = crate::pass::hiz::HiZPass::new(
             &ctx.device,
             &shaders,
@@ -3447,7 +3447,7 @@ impl SomniumRenderer {
             self.postprocess_pass
                 .resize(&ctx.device, width, height, self.bloom_pass.result_view());
             self.auto_exposure_pass
-                .resize(&ctx.device, &self.postprocess_pass.hdr_view);
+                .resize(&ctx.device, &self.postprocess_pass.hdr_view, &self.vis_pass.view);
             self.render_width = width;
             self.render_height = height;
             self.gtao_pass.resize(&ctx.device, width, height);
@@ -7428,7 +7428,7 @@ impl SomniumRenderer {
             } else {
                 self.chromatic_aberration
             },
-            if debugging { 3 } else { self.tonemapper },
+            if debugging { crate::pass::postprocess::TONEMAP_PASSTHROUGH } else { self.tonemapper },
             self.auto_exposure && !debugging,
             if debugging {
                 0.0
@@ -7440,7 +7440,12 @@ impl SomniumRenderer {
             if debugging {
                 crate::pass::postprocess::Grading::default()
             } else {
-                self.grading
+                // The lens's fall-off needs the field of view and the aspect: tan(half fov) = 1 / proj[1][1].
+                let mut grading = self.grading;
+                let fy = self.proj_matrix.y_axis.y.abs().max(1e-6);
+                grading.lens = [1.0 / fy, fy / self.proj_matrix.x_axis.x.abs().max(1e-6)];
+                grading.view_proj = self.view_proj_rel.to_cols_array();
+                grading
             },
             if debugging {
                 Default::default()

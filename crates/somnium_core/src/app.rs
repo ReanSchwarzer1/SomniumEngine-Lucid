@@ -8859,6 +8859,10 @@ impl<G: GameApp> Engine<G> {
                 max_ev100: pp.exposure_max_ev.max(pp.exposure_min_ev),
                 to_bright: pp.adapt_to_bright.max(0.0),
                 to_dark: pp.adapt_to_dark.max(0.0),
+                adaptation: pp.exposure_adaptation.clamp(0.0, 1.0),
+                anchor_ev: pp.exposure_anchor_ev,
+                sky_weight: pp.exposure_sky_weight.clamp(0.0, 1.0),
+                adaptation_bright: pp.exposure_adaptation_bright.clamp(0.0, 1.0),
             };
             // Adaptation is per second, so it needs the real frame time or the
             // eye adjusts at a rate that depends on frame rate.
@@ -8918,8 +8922,13 @@ impl<G: GameApp> Engine<G> {
             // On under the path tracer too: the raster keeps the sky's fill there, and its contact shadows with it.
             r.gtao_pass.enabled = pp.gtao_enabled && budget.gtao && !retro;
             r.bloom_pass.enabled = pp.bloom_enabled;
-            r.bloom_pass.intensity = pp.bloom_intensity;
-            r.bloom_pass.threshold_ev = pp.bloom_threshold.max(0.0);
+            // Under the photographic camera the chain is the lens's glare: a share of the light, over the chain's
+            // level count (each level holds the whole light, blurred wider), mixed in with energy kept and no
+            // threshold, as a lens scatters all light alike.
+            let glare = pp.lens_glare.clamp(0.0, 0.2);
+            r.bloom_pass.intensity =
+                if pp.photographic { glare / r.bloom_pass.levels() as f32 } else { pp.bloom_intensity };
+            r.bloom_pass.threshold_ev = if pp.photographic { 0.0 } else { pp.bloom_threshold.max(0.0) };
             r.bloom_pass.lens_flare = pp.lens_flare.max(r.lens_flare_requested).max(0.0);
             r.dof_pass.enabled = pp.dof_enabled && budget.camera_effects && !retro;
             r.dof_pass.focus_distance = pp.dof_focus_distance;
@@ -9058,6 +9067,20 @@ impl<G: GameApp> Engine<G> {
                 stylise: [pp.painterly.clamp(0.0, 1.0), pp.ink_lines.clamp(0.0, 1.0), 0.0, 0.0],
                 lut_strength: if r.grade_lut_ready { pp.grade_lut_strength.clamp(0.0, 1.0) } else { 0.0 },
                 low_light: pp.low_light_vision.clamp(0.0, 1.0),
+                photographic: pp.photographic,
+                // The glare's share leaves the image only where the chain brings it back (bloom on).
+                lens_glare: if pp.bloom_enabled { pp.lens_glare.clamp(0.0, 0.2) } else { 0.0 },
+                sensor_noise: pp.sensor_noise.clamp(0.0, 4.0),
+                white_balance: somnium_renderer::pass::postprocess::white_balance_matrix(
+                    if pp.photographic { pp.white_balance } else { 0.0 },
+                ),
+                lens: [0.5, 16.0 / 9.0],
+                heat: [
+                    pp.heat_shimmer.max(0.0),
+                    pp.mirage.max(0.0),
+                    pp.mirage_dip_deg.clamp(0.0, 5.0).to_radians().sin(),
+                ],
+                view_proj: glam::Mat4::IDENTITY.to_cols_array(),
             };
             r.authored_picture_shift = somnium_renderer::pass::postprocess::PictureShift {
                 kind: if pp.picture_shift <= 3 { pp.picture_shift } else { 0 },
@@ -13223,6 +13246,7 @@ impl<G: GameApp> Engine<G> {
                     pp.tonemapper = match idx {
                         1 => crate::Tonemapper::Aces,
                         2 => crate::Tonemapper::Reinhard,
+                        3 => crate::Tonemapper::Photographic,
                         _ => crate::Tonemapper::AgX,
                     };
                     info!("Tonemapper: {}", pp.tonemapper.label());
