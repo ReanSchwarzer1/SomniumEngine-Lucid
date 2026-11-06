@@ -6,11 +6,11 @@
 //! ground rules); this file wires them to the live world, the renderer and the panels.
 
 use super::*;
-use crate::editor_ground::{self, Ground, Hit, MeshSurface, TriangleBvh};
+use crate::editor_ground::{self, Ground, Hit, MeshShape, MeshSurface, TriangleBvh};
 use crate::scene_edits::{self, EditOp, Origin, SceneEdits, Scope};
 use serde_json::Value;
 use somnium_ecs::{Entity, PersistentId};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,6 +29,18 @@ const PAINTED_REFINE: usize = 32;
 /// A painted kind smaller than this (box diagonal, metres, at scale 1) never hides an object behind it: grass and
 /// litter cover the ground everywhere, and a click meant for a rock should find the rock.
 const PAINTED_SMALL: f32 = 1.5;
+/// A copy is still found this far past where a click meets the ground (its foot sits in the slope); past that it is
+/// behind the hill.
+const GROUND_MARGIN: f32 = 0.5;
+/// The ground-cover card counts every copy this close to the clicked one, by kind.
+const COVER_NEARBY: f32 = 2.0;
+/// The card checks the surface of a selection up to this many triangles; Check Meshes does any size.
+const CARD_SHAPE_LIMIT: u64 = 500_000;
+/// Words that make a model file rock-like: a rock or cliff must be closed on every side it shows.
+const ROCK_WORDS: [&str; 20] = [
+    "rock", "cliff", "boulder", "stone", "scree", "tor", "crag", "outcrop", "slab", "talus", "ledge", "granite",
+    "limestone", "basalt", "chalk", "flint", "pebble", "rubble", "bluff", "monolith",
+];
 /// Words that make a model file tree-like, for the census's list of trees from outside the painted palette.
 const TREE_WORDS: [&str; 22] = [
     "tree", "oak", "pine", "cypress", "fig", "olive", "chestnut", "beech", "maple", "ash", "alder", "willow",
@@ -38,9 +50,58 @@ const TREE_WORDS: [&str; 22] = [
 /// Whether a model path names a tree: a whole word of it (folders included, plurals too) is a tree word, so
 /// `trees/grown/holm_oak_b.gltf` and `wall_fig.gltf` are and `silver_street_01.gltf` is not.
 fn tree_like(path: &str) -> bool {
+    named_by(path, &TREE_WORDS)
+}
+
+/// Whether a model path names a rock or a cliff, the same way: `rocks/granite_tor_03.gltf` is, `stonemason_hut.gltf`
+/// is not (a whole word, plurals too), and neither is a plant (`foliage/.../rock_rose.gltf`, `stone_pine.gltf`).
+fn rock_like(path: &str) -> bool {
+    let plant = tree_like(path) || path.to_ascii_lowercase().replace('\\', "/").contains("/foliage/");
+    !plant && named_by(path, &ROCK_WORDS)
+}
+
+fn named_by(path: &str, words: &[&str]) -> bool {
     path.to_ascii_lowercase().split(|c: char| !c.is_ascii_alphabetic()).any(|word| {
-        TREE_WORDS.contains(&word) || word.strip_suffix('s').is_some_and(|single| TREE_WORDS.contains(&single))
+        words.contains(&word) || word.strip_suffix('s').is_some_and(|single| words.contains(&single))
     })
+}
+
+/// A count with thousands marked: 12,400.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// What the card and the report say of a surface.
+fn shape_text(shape: &MeshShape) -> String {
+    let triangles = thousands(u64::from(shape.triangles));
+    let mut text = if shape.open_above_base > 0 {
+        format!(
+            "OPEN on a side or top: {} edges with one face, {} above its base (hollow from behind them); {triangles} triangles",
+            thousands(u64::from(shape.open_edges)),
+            thousands(u64::from(shape.open_above_base))
+        )
+    } else if shape.open_edges > 0 {
+        format!(
+            "open at its base only ({} edges): fine where it sits in the ground; {triangles} triangles",
+            thousands(u64::from(shape.open_edges))
+        )
+    } else {
+        format!("closed on every side; {triangles} triangles")
+    };
+    for (n, what) in [(shape.non_manifold_edges, "edges with 3+ faces"), (shape.degenerate, "slivers"), (shape.broken, "broken triangles")] {
+        if n > 0 {
+            text.push_str(&format!(", {} {what}", thousands(u64::from(n))));
+        }
+    }
+    text
 }
 
 /// A painted copy a click found: the ground it lives with, its place in that ground's list, its kind.
@@ -49,6 +110,18 @@ pub(crate) struct PaintedPick {
     pub terrain: u32,
     pub index: usize,
     pub kind: u16,
+    pub distance: f32,
+}
+
+/// A ground-cover copy a click found (grass, a flower, a pebble). Cover is grown round the view and dropped behind
+/// it, never stored, so the pick keeps the copy itself.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CoverPick {
+    pub terrain: u32,
+    /// Its 16 m cell (`ground_cover::CELL`).
+    pub cell: (i32, i32),
+    /// The copy, terrain-local.
+    pub copy: somnium_renderer::terrain::foliage_paint::PaintedFoliage,
     pub distance: f32,
 }
 
@@ -101,6 +174,38 @@ pub(crate) struct EditingState {
     painted_card: Option<(PaintedPick, String)>,
     /// Each painted kind's box in its own units (the union of its parts); `None` while it has no mesh.
     kind_boxes: HashMap<u16, Option<(glam::Vec3, glam::Vec3)>>,
+    /// The ground-cover copy the last click found, when no object or painted copy was nearer.
+    cover: Option<CoverPick>,
+    /// Its card, built once per pick.
+    cover_card: Option<(CoverPick, String)>,
+    /// The project's tools that name the foliage palette file, with their text, read once: the cards say which of
+    /// them writes a kind's rules.
+    palette_tools: Option<Vec<(String, String)>>,
+    /// Each ground material set's names for its slots, by the set's folder (`SOURCE.json`), read once.
+    set_names: HashMap<PathBuf, Arc<BTreeMap<u8, String>>>,
+    /// Each mesh's surface, by mesh range (`None`: too big or unreadable).
+    shapes: HashMap<(u32, u32, u32), Option<MeshShape>>,
+}
+
+/// What a ground material set calls its slots: `layers[]` with `slot` and `layer` in the set's `SOURCE.json` (Sunscar's
+/// look and biome tools write it). Empty where the file or a name is missing.
+fn set_slot_names(dir: &Path) -> BTreeMap<u8, String> {
+    let Ok(text) = std::fs::read_to_string(dir.join("SOURCE.json")) else {
+        return BTreeMap::new();
+    };
+    let Ok(document) = serde_json::from_str::<Value>(&text) else {
+        return BTreeMap::new();
+    };
+    document["layers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|layer| {
+            let slot = u8::try_from(layer["slot"].as_u64()?).ok()?;
+            let name = layer["layer"].as_str()?.trim();
+            (!name.is_empty()).then(|| (slot, name.to_owned()))
+        })
+        .collect()
 }
 
 #[derive(Clone, PartialEq)]
@@ -439,7 +544,12 @@ impl<G: GameApp> Engine<G> {
     /// After the scene spawned: say what its layer did.
     pub(super) fn edits_after_scene_spawn(&mut self) {
         if let Some(summary) = self.editing.summary.take() {
-            self.toast(&summary);
+            // A player is never told about the editor's edit layer; the log keeps the line.
+            if self.config.player_mode {
+                info!("{summary}");
+            } else {
+                self.toast(&summary);
+            }
         }
     }
 
@@ -818,13 +928,33 @@ impl<G: GameApp> Engine<G> {
     pub(super) fn click_pick(&mut self) -> Option<Entity> {
         let (origin, direction) = self.cursor_ray()?;
         let hit = self.pick_hit(origin, direction);
-        // A painted copy (a tree, a shrub) nearer than any object is what was clicked: not an entity, so the
-        // selection clears and the card names the copy.
-        self.editing.painted = self.pick_painted(origin, direction, hit.map(|(d, _)| d));
-        if self.editing.painted.is_some() {
+        // A painted copy (a tree, a shrub) or a ground-cover one (grass, a flower) nearer than any object is what was
+        // clicked: not an entity, so the selection clears and the card names the copy.
+        let (painted, cover) = self.pick_copies(origin, direction, hit.map(|(d, _)| d));
+        (self.editing.painted, self.editing.cover) = (painted, cover);
+        if painted.is_some() || cover.is_some() {
             return None;
         }
         hit.map(|(_, entity)| entity)
+    }
+
+    /// The painted or ground-cover copy a world ray meets first, before the object hit at `object` and the ground
+    /// (a copy behind a hill is not under the cursor). At most one of the two.
+    fn pick_copies(&mut self, origin: glam::Vec3, direction: glam::Vec3, object: Option<f32>) -> (Option<PaintedPick>, Option<CoverPick>) {
+        let ground = self.renderer.as_ref().and_then(|renderer| {
+            let terrains: Vec<u32> = self.world.iter_with::<TerrainComponent>().map(|(_, t)| t.terrain_id).collect();
+            terrain_hit(renderer, &terrains, origin, direction, PAINTED_REACH)
+        });
+        let limit = object
+            .into_iter()
+            .chain(ground.map(|hit| hit.distance + GROUND_MARGIN))
+            .fold(PAINTED_REACH, f32::min);
+        let painted = self.pick_painted(origin, direction, limit, object.is_some());
+        let cover = self.pick_cover(origin, direction, painted.map_or(limit, |p| p.distance), object.is_some());
+        match cover {
+            Some(cover) => (None, Some(cover)),
+            None => (painted, None),
+        }
     }
 
     /// F4: the object at the centre of the view. In Play, stop first and select it in the restored editor world (by
@@ -839,16 +969,25 @@ impl<G: GameApp> Engine<G> {
         let primary = self.selection.primary.take();
         let found = (direction != glam::Vec3::ZERO).then(|| self.pick_hit(origin, direction)).flatten();
         self.selection.primary = primary;
-        let painted = (direction != glam::Vec3::ZERO).then(|| self.pick_painted(origin, direction, found.map(|(d, _)| d))).flatten();
-        if let Some(pick) = painted {
+        let (painted, cover) = if direction == glam::Vec3::ZERO {
+            (None, None)
+        } else {
+            self.pick_copies(origin, direction, found.map(|(d, _)| d))
+        };
+        if painted.is_some() || cover.is_some() {
             if self.play_session_active {
                 self.handle_editor_event(EditorEvent::StopSimulation);
             }
             self.selection.clear();
             self.after_selection_change();
-            self.editing.painted = Some(pick);
-            let name = self.foliage_kind_name(pick.kind).to_owned();
-            self.toast(&format!("{name}: a painted copy (it lives with its ground, so it is not an object). The card says where it is from"));
+            (self.editing.painted, self.editing.cover) = (painted, cover);
+            let kind = painted.map_or_else(|| cover.map_or(0, |c| c.copy.kind), |p| p.kind);
+            let name = self.foliage_kind_name(kind).to_owned();
+            self.toast(&if painted.is_some() {
+                format!("{name}: a painted copy (it lives with its ground, so it is not an object). The card says where it is from")
+            } else {
+                format!("{name}: ground cover, grown round the view by its rules (not stored). The card says which rules")
+            });
             return;
         }
         let hit = found.map(|(_, entity)| entity);
@@ -967,11 +1106,24 @@ impl<G: GameApp> Engine<G> {
         bounds
     }
 
-    /// The nearest painted copy a world ray meets, nearer than the object hit at `object` (if any): each terrain's
-    /// foliage grid is visited along the ray, every copy's box tested, then the nearest few by their triangles. Small
-    /// kinds (grass, litter) never hide an object behind them.
-    fn pick_painted(&mut self, origin: glam::Vec3, direction: glam::Vec3, object: Option<f32>) -> Option<PaintedPick> {
-        let limit = object.unwrap_or(PAINTED_REACH).min(PAINTED_REACH);
+    /// A foliage kind's parts as meshes, each with its transform within the kind.
+    fn foliage_parts(&self, kind: u16) -> Vec<(MeshComponent, glam::Mat4)> {
+        self.foliage_meshes
+            .get(usize::from(kind))
+            .and_then(Option::as_ref)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .map(|p| (MeshComponent { vertex_offset: p.vertex_offset, index_offset: p.index_offset, index_count: p.index_count }, p.local))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The nearest painted copy a world ray meets before `limit` metres: each terrain's foliage grid is visited along
+    /// the ray, every copy's box tested, then the nearest few by their triangles. Small kinds (grass, litter) never
+    /// hide an object behind them (`behind_object`).
+    fn pick_painted(&mut self, origin: glam::Vec3, direction: glam::Vec3, limit: f32, behind_object: bool) -> Option<PaintedPick> {
         // Copy out what the walk needs, so the box cache can borrow `self` afterwards.
         let mut copies: Vec<(u32, usize, somnium_renderer::terrain::foliage_paint::PaintedFoliage, glam::Mat4)> = Vec::new();
         {
@@ -1001,7 +1153,7 @@ impl<G: GameApp> Engine<G> {
         let mut entered: Vec<(f32, u32, usize, u16, glam::Mat4)> = Vec::new();
         for (terrain, index, copy, ground) in copies {
             let Some((lo, hi)) = self.kind_box(copy.kind) else { continue };
-            if object.is_some() && (hi - lo).length() < PAINTED_SMALL {
+            if behind_object && (hi - lo).length() < PAINTED_SMALL {
                 continue;
             }
             let model = ground
@@ -1025,35 +1177,564 @@ impl<G: GameApp> Engine<G> {
             if best.is_some_and(|b| box_distance > b.distance) {
                 break;
             }
-            let parts: Vec<(MeshComponent, glam::Mat4)> = self
-                .foliage_meshes
-                .get(usize::from(kind))
-                .and_then(Option::as_ref)
-                .map(|parts| {
-                    parts
-                        .iter()
-                        .map(|p| (MeshComponent { vertex_offset: p.vertex_offset, index_offset: p.index_offset, index_count: p.index_count }, p.local))
-                        .collect()
-                })
-                .unwrap_or_default();
-            for (mesh, local) in parts {
-                let Some(bvh) = self.bvh_for(mesh) else { continue };
-                let world = model * local;
-                let surface = MeshSurface {
-                    bvh: &bvh,
-                    model: world,
-                    inverse: world.inverse(),
-                    min: glam::Vec3::splat(f32::NEG_INFINITY),
-                    max: glam::Vec3::splat(f32::INFINITY),
-                };
-                if let Some(hit) = surface.raycast(origin, direction, limit)
-                    && best.is_none_or(|b| hit.distance < b.distance)
-                {
-                    best = Some(PaintedPick { terrain, index, kind, distance: hit.distance });
-                }
+            if let Some(distance) = self.copy_hit(kind, model, origin, direction, limit)
+                && best.is_none_or(|b| distance < b.distance)
+            {
+                best = Some(PaintedPick { terrain, index, kind, distance });
             }
         }
         best
+    }
+
+    /// Where a world ray first meets a foliage copy's triangles (`model` places the copy), before `limit`.
+    fn copy_hit(&mut self, kind: u16, model: glam::Mat4, origin: glam::Vec3, direction: glam::Vec3, limit: f32) -> Option<f32> {
+        let mut best: Option<f32> = None;
+        for (mesh, local) in self.foliage_parts(kind) {
+            let Some(bvh) = self.bvh_for(mesh) else { continue };
+            let world = model * local;
+            let surface = MeshSurface {
+                bvh: &bvh,
+                model: world,
+                inverse: world.inverse(),
+                min: glam::Vec3::splat(f32::NEG_INFINITY),
+                max: glam::Vec3::splat(f32::INFINITY),
+            };
+            if let Some(hit) = surface.raycast(origin, direction, limit)
+                && best.is_none_or(|b| hit.distance < b)
+            {
+                best = Some(hit.distance);
+            }
+        }
+        best
+    }
+
+    /// The nearest ground-cover copy (grass, flowers, pebbles: grown round the view) a world ray meets before `limit`
+    /// metres, as it is drawn: thinned with distance, widened, sunk at its kind's edge. Each cell's column is tested
+    /// first, then its copies' boxes, then the nearest few by their triangles. Between thin blades the box of a small
+    /// kind is near enough. Small kinds never hide an object behind them (`behind_object`), as with painted copies.
+    fn pick_cover(&mut self, origin: glam::Vec3, direction: glam::Vec3, limit: f32, behind_object: bool) -> Option<CoverPick> {
+        let terrains: Vec<(u32, glam::Mat4)> = {
+            let renderer = self.renderer.as_ref()?;
+            self.world
+                .iter_with::<TerrainComponent>()
+                .filter_map(|(_, t)| renderer.terrain(t.terrain_id).map(|data| (t.terrain_id, data.model)))
+                .collect()
+        };
+        // Each grown kind's box first: the box cache needs `self` mutably, the walk below only reads.
+        let kinds: HashSet<u16> = terrains.iter().flat_map(|&(t, _)| self.ground_cover.cells(t).map(|((kind, _, _), _)| kind)).collect();
+        let boxes: HashMap<u16, (glam::Vec3, glam::Vec3)> = kinds.into_iter().filter_map(|k| self.kind_box(k).map(|b| (k, b))).collect();
+        let batched = crate::foliage_batches::enabled();
+        // (box distance, the copy, where it is drawn, whether it is small)
+        let mut entered: Vec<(f32, CoverPick, glam::Mat4, bool)> = Vec::new();
+        for (terrain, ground) in terrains {
+            let Some(focus) = self.ground_cover.focus(terrain) else { continue };
+            let inverse = ground.inverse();
+            let (local_origin, local_direction) = (inverse.transform_point3(origin), inverse.transform_vector3(direction));
+            for ((kind, cx, cz), cell) in self.ground_cover.cells(terrain) {
+                let Some(&(lo, hi)) = boxes.get(&kind) else { continue };
+                let Some((radius, inner)) =
+                    self.project_foliage.get(&kind).and_then(|e| e.ground_cover.as_ref()).map(|g| (g.radius, g.inner))
+                else {
+                    continue;
+                };
+                let small = (hi - lo).length() < PAINTED_SMALL;
+                if cell.is_empty() || (behind_object && small) {
+                    continue;
+                }
+                // The cell's column: its square, from its lowest copy's foot to its highest copy's top, as wide as the
+                // widest copy can draw.
+                let (mut low, mut high, mut largest) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f32);
+                for c in cell {
+                    low = low.min(c.instance.position.y);
+                    high = high.max(c.instance.position.y);
+                    largest = largest.max(c.instance.scale);
+                }
+                let reach = lo.abs().max(hi.abs()).max_element() * largest * crate::ground_cover::MOST_WIDEN;
+                let size = crate::ground_cover::CELL;
+                let column = (
+                    glam::Vec3::new(cx as f32 * size - reach, low - reach, cz as f32 * size - reach),
+                    glam::Vec3::new((cx + 1) as f32 * size + reach, high + reach, (cz + 1) as f32 * size + reach),
+                );
+                if ray_aabb_distance(local_origin, local_direction, column.0, column.1).is_none() {
+                    continue;
+                }
+                for c in cell {
+                    let scale = if batched {
+                        crate::ground_cover::drawn_scale(c, focus, radius, inner)
+                    } else {
+                        let d = c.instance.position - focus;
+                        let distance = d.x.hypot(d.z);
+                        (distance <= radius && distance >= inner && c.instance.scale > 0.0).then(|| glam::Vec3::splat(c.instance.scale))
+                    };
+                    let Some(scale) = scale else { continue };
+                    let model = ground * glam::Mat4::from_scale_rotation_translation(scale, c.rotation, c.instance.position);
+                    let inverse = model.inverse();
+                    let (o, d) = (inverse.transform_point3(origin), inverse.transform_vector3(direction));
+                    if let Some(t) = ray_aabb_distance(o, d, lo, hi) {
+                        let distance = origin.distance(model.transform_point3(o + d * t));
+                        if distance < limit {
+                            let pick = CoverPick { terrain, cell: (cx, cz), copy: c.instance, distance };
+                            entered.push((distance, pick, model, small));
+                        }
+                    }
+                }
+            }
+        }
+        entered.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let nearest_small = entered.iter().find(|e| e.3).map(|e| e.1);
+        let mut best: Option<CoverPick> = None;
+        for (box_distance, pick, model, _) in entered.into_iter().take(PAINTED_REFINE) {
+            if best.is_some_and(|b| box_distance > b.distance) {
+                break;
+            }
+            if let Some(distance) = self.copy_hit(pick.copy.kind, model, origin, direction, limit)
+                && best.is_none_or(|b| distance < b.distance)
+            {
+                best = Some(CoverPick { distance, ..pick });
+            }
+        }
+        best.or(nearest_small)
+    }
+
+    /// A mesh's surface (`editor_ground::mesh_shape`), read back once and kept.
+    fn mesh_shape_of(&mut self, mesh: MeshComponent) -> Option<MeshShape> {
+        let key = (mesh.vertex_offset, mesh.index_offset, mesh.index_count);
+        if let Some(found) = self.editing.shapes.get(&key) {
+            return *found;
+        }
+        let shape = (mesh.index_count / 3 <= BVH_TRIANGLE_LIMIT)
+            .then(|| {
+                let (renderer, ctx) = (self.renderer.as_ref()?, self.render_ctx.as_ref()?);
+                let (vertices, indices) = renderer.read_mesh(ctx, mesh.vertex_offset, mesh.index_offset, mesh.index_count)?;
+                let positions: Vec<glam::Vec3> = vertices.iter().map(|v| glam::Vec3::from_array(v.position)).collect();
+                Some(editor_ground::mesh_shape(&positions, &indices))
+            })
+            .flatten();
+        self.editing.shapes.insert(key, shape);
+        shape
+    }
+
+    /// The card's line on a selection's surface, every mesh under it together.
+    fn shape_line(&mut self, entity: Entity) -> Option<String> {
+        let children = children_map(&self.world);
+        let mut meshes: Vec<MeshComponent> =
+            subtree(&children, entity).into_iter().filter_map(|e| self.world.get::<MeshComponent>(e).copied()).collect();
+        meshes.sort_by_key(|m| (m.vertex_offset, m.index_offset, m.index_count));
+        meshes.dedup_by_key(|m| (m.vertex_offset, m.index_offset, m.index_count));
+        if meshes.is_empty() {
+            return None;
+        }
+        let triangles: u64 = meshes.iter().map(|m| u64::from(m.index_count / 3)).sum();
+        if triangles > CARD_SHAPE_LIMIT {
+            return Some(format!("shape     not checked on a click ({} triangles); Check Meshes (Level) does", thousands(triangles)));
+        }
+        let mut shape = MeshShape::default();
+        for mesh in meshes {
+            shape.add(&self.mesh_shape_of(mesh)?);
+        }
+        Some(format!("shape     {}", shape_text(&shape)))
+    }
+
+    /// Check the surface of every model the loaded objects draw: closed, open only at its base (fine where it sits in
+    /// the ground), or open on a side or top (hollow from behind). Rocks and cliffs come first, since every one must
+    /// be closed where it shows (the developer, 6 Nov: "they are hollow and one side is only there"). Written beside
+    /// the scene as `<scene>.meshcheck.md`.
+    pub(super) fn check_meshes(&mut self) {
+        let started = std::time::Instant::now();
+        let root = self.config.project_root.clone();
+        let children = children_map(&self.world);
+        // Each model file: its meshes, and the objects that draw it.
+        let imported: Vec<(Entity, String, Option<MeshComponent>)> = self
+            .world
+            .iter_with::<crate::ImportedMesh>()
+            .map(|(e, m)| (e, m.source.clone(), self.world.get::<MeshComponent>(e).copied()))
+            .collect();
+        let mut models: BTreeMap<String, (BTreeSet<(u32, u32, u32)>, HashSet<Entity>)> = BTreeMap::new();
+        for (entity, source, mesh) in &imported {
+            let entry = models.entry(source.clone()).or_default();
+            if let Some(m) = mesh {
+                entry.0.insert((m.vertex_offset, m.index_offset, m.index_count));
+            }
+            entry.1.insert(self.object_in(&children, *entity));
+        }
+        // (model, its surface, objects drawing it, examples, whether every mesh was read)
+        let mut rows: Vec<(String, MeshShape, usize, Vec<String>, bool)> = Vec::new();
+        for (source, (meshes, objects)) in models {
+            let mut shape = MeshShape::default();
+            let mut whole = true;
+            for (vertex_offset, index_offset, index_count) in meshes {
+                match self.mesh_shape_of(MeshComponent { vertex_offset, index_offset, index_count }) {
+                    Some(s) => shape.add(&s),
+                    None => whole = false,
+                }
+            }
+            let mut objects_sorted: Vec<Entity> = objects.iter().copied().collect();
+            objects_sorted.sort_by_key(|e| e.index());
+            let examples: Vec<String> = objects_sorted.iter().take(3).map(|e| name_of(&self.world, *e)).collect();
+            rows.push((source, shape, objects.len(), examples, whole));
+        }
+        // The files themselves, with the foliage palette's (its models, LODs and impostors): what will not load.
+        let content = self.config.content_root.clone();
+        let resolve = |source: &str| -> PathBuf {
+            let path = Path::new(source);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else if let Some(root) = root.as_ref().filter(|r| r.join(path).exists()) {
+                root.join(path)
+            } else {
+                content.join(path)
+            }
+        };
+        let mut files: BTreeMap<String, PathBuf> = rows.iter().map(|r| (r.0.clone(), resolve(&r.0))).collect();
+        for entry in self.project_foliage.values() {
+            for path in std::iter::once(&entry.source)
+                .chain(entry.lod.as_ref().map(|l| &l.source))
+                .chain(entry.impostor.as_ref().map(|l| &l.source))
+            {
+                let path = if path.is_absolute() { path.clone() } else { content.join(path) };
+                files.insert(project_relative(root.as_deref(), &path), path);
+            }
+        }
+        let file_problems: Vec<(String, Vec<String>)> = files
+            .iter()
+            .map(|(name, path)| (name.clone(), somnium_asset::gltf_file_problems(path)))
+            .filter(|(_, problems)| !problems.is_empty())
+            .collect();
+        // Objects whose model failed to load: they keep their source and draw nothing.
+        let mut drawing_nothing: BTreeMap<String, usize> = BTreeMap::new();
+        for (entity, source, mesh) in &imported {
+            if mesh.is_none() && self.world.get::<crate::ImportedMesh>(*entity).is_some() {
+                *drawing_nothing.entry(source.clone()).or_default() += 1;
+            }
+        }
+        let open_side = |r: &&(String, MeshShape, usize, Vec<String>, bool)| r.1.open_above_base > 0;
+        let rocks: Vec<&(String, MeshShape, usize, Vec<String>, bool)> = rows.iter().filter(|r| rock_like(&r.0)).collect();
+        let mut hollow_rocks: Vec<&(String, MeshShape, usize, Vec<String>, bool)> = rocks.iter().copied().filter(open_side).collect();
+        hollow_rocks.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.open_above_base.cmp(&a.1.open_above_base)));
+        let mut others: Vec<&(String, MeshShape, usize, Vec<String>, bool)> =
+            rows.iter().filter(|r| !rock_like(&r.0) && r.1.open_above_base > 0).collect();
+        others.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        // Slivers alone are harmless; fins and broken triangles (an index past the vertices) are not.
+        let broken: Vec<&(String, MeshShape, usize, Vec<String>, bool)> =
+            rows.iter().filter(|r| r.1.broken > 0 || r.1.non_manifold_edges > 0).collect();
+        let unread: Vec<&(String, MeshShape, usize, Vec<String>, bool)> = rows.iter().filter(|r| !r.4).collect();
+        let table = |items: &[&(String, MeshShape, usize, Vec<String>, bool)]| -> Vec<String> {
+            let mut out = vec!["| objects | model | surface | e.g. |".to_owned(), "|---:|---|---|---|".to_owned()];
+            out.extend(items.iter().map(|(source, shape, objects, examples, _)| {
+                format!("| {objects} | {source} | {} | {} |", shape_text(shape), examples.join("; "))
+            }));
+            out
+        };
+        let mut report = vec![
+            format!(
+                "# Mesh check of {}",
+                self.editing.scene.as_deref().map_or_else(|| "the open scene".to_owned(), |s| project_relative(root.as_deref(), s))
+            ),
+            String::new(),
+            format!(
+                "{} model files drawn by the loaded objects. \"Open on a side or top\" means an edge with one face above \
+                 the model's lowest fifth: seen from behind it, the model is hollow. Open at the base only is fine where \
+                 the model sits in the ground. Select one of its objects and use Select All Using This Model to find the rest.",
+                rows.len()
+            ),
+            String::new(),
+            format!("## Model files that will not load or do not match ({} of {} checked)", file_problems.len(), files.len()),
+            String::new(),
+        ];
+        if file_problems.is_empty() {
+            report.push("None: every model file the loaded objects and the foliage palette name reads whole.".to_owned());
+        } else {
+            report.push("| file | what is wrong |".to_owned());
+            report.push("|---|---|".to_owned());
+            for (name, problems) in &file_problems {
+                report.push(format!("| {name} | {} |", problems.join("; ")));
+            }
+        }
+        report.push(String::new());
+        report.push(format!("## Objects that draw nothing: their model did not load, or is still streaming in ({})", drawing_nothing.values().sum::<usize>()));
+        report.push(String::new());
+        for (source, count) in &drawing_nothing {
+            report.push(format!("- {source}: {count} object{}", if *count == 1 { "" } else { "s" }));
+        }
+        report.push(String::new());
+        report.push(format!("## Rocks and cliffs open on a side or top ({} of {} rock-like models)", hollow_rocks.len(), rocks.len()));
+        report.push(String::new());
+        if hollow_rocks.is_empty() {
+            report.push("None: every rock and cliff model loaded is closed where it shows.".to_owned());
+        } else {
+            report.extend(table(&hollow_rocks));
+        }
+        for (title, items) in [
+            ("Other models open on a side or top (walls and roofs may be meant to be; foliage cards are)", &others),
+            ("Fins (an edge with 3+ faces) or broken triangles (a corner past the vertices or not a number)", &broken),
+            ("Not checked (too big to read back, or unreadable)", &unread),
+        ] {
+            report.push(String::new());
+            report.push(format!("## {title} ({})", items.len()));
+            report.push(String::new());
+            if !items.is_empty() {
+                report.extend(table(items));
+            }
+        }
+        let text = report.join("\n") + "\n";
+        let target = self
+            .editing
+            .scene
+            .as_ref()
+            .map(|s| PathBuf::from(format!("{}.meshcheck.md", s.display())))
+            .or_else(|| root.as_ref().map(|r| r.join("meshcheck.md")));
+        let summary = format!(
+            "Check Meshes: {} model files will not load or do not match, {} objects draw nothing; {} of {} rock and cliff models are open on a side (hollow from behind); {} other models open on a side, {} with fins or broken triangles ({} files, {:.1} s)",
+            file_problems.len(),
+            drawing_nothing.values().sum::<usize>(),
+            hollow_rocks.len(),
+            rocks.len(),
+            others.len(),
+            broken.len(),
+            rows.len(),
+            started.elapsed().as_secs_f32()
+        );
+        match target.map(|path| std::fs::write(&path, &text).map(|()| path)) {
+            Some(Ok(path)) => {
+                info!("{summary}; written to {}", path.display());
+                self.toast(&format!("{summary}. Written to {}", project_relative(root.as_deref(), &path)));
+            }
+            Some(Err(error)) => self.toast(&format!("{summary}. Not written: {error}")),
+            None => self.toast(&summary),
+        }
+    }
+
+    /// The height of the loaded ground at world x, z, from the first terrain that covers the point.
+    fn ground_height(&self, x: f32, z: f32) -> Option<f32> {
+        let renderer = self.renderer.as_ref()?;
+        self.world.iter_with::<TerrainComponent>().find_map(|(_, t)| {
+            let data = renderer.terrain(t.terrain_id)?;
+            let local = data.model.inverse().transform_point3(glam::Vec3::new(x, 0.0, z));
+            let [wx, wz] = data.desc.world_size();
+            ((0.0..=wx).contains(&local.x) && (0.0..=wz).contains(&local.z)).then(|| {
+                let h = data.world_height_at(local.x, local.z);
+                data.model.transform_point3(glam::Vec3::new(local.x, h, local.z)).y
+            })
+        })
+    }
+
+    /// The file a ground's data comes from: its streamed cell's, or the open scene's.
+    fn ground_file(&self, terrain: u32) -> Option<PathBuf> {
+        self.world
+            .iter_with::<TerrainComponent>()
+            .find(|(_, t)| t.terrain_id == terrain)
+            .and_then(|(e, _)| self.world.get::<crate::cell_streaming::Streamed>(e).copied())
+            .and_then(|s| self.cell_streamer.cells.get(s.cell as usize))
+            .map(|cell| cell.file.clone())
+            .or_else(|| self.editing.scene.clone())
+    }
+
+    /// Which of the project's tools writes a foliage kind's palette entry: a tool that names the palette file and the
+    /// kind's name (without its number), quoted. Read once per session.
+    fn palette_writer(&mut self, kind_name: &str) -> Option<String> {
+        if self.editing.palette_tools.is_none() {
+            let tools = self.config.project_root.as_ref().and_then(|root| std::fs::read_dir(root.join("tools")).ok());
+            let mut found: Vec<(String, String)> = tools
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "py"))
+                .filter_map(|entry| {
+                    let text = std::fs::read_to_string(entry.path()).ok()?;
+                    text.contains("foliage.palette.json").then(|| (format!("tools/{}", entry.file_name().to_string_lossy()), text))
+                })
+                .collect();
+            found.sort();
+            self.editing.palette_tools = Some(found);
+        }
+        let base = kind_name.trim_end_matches(|c: char| c.is_ascii_digit()).trim_end();
+        let quoted = [format!("\"{base}\""), format!("'{base}'")];
+        let writers: Vec<&String> = self
+            .editing
+            .palette_tools
+            .iter()
+            .flatten()
+            .filter(|(_, text)| quoted.iter().any(|q| text.contains(q.as_str())))
+            .map(|(name, _)| name)
+            .collect();
+        match writers.as_slice() {
+            [] => None,
+            [one] => Some((*one).clone()),
+            [first, rest @ ..] => Some(format!("{first} (and {} more name it)", rest.len())),
+        }
+    }
+
+    /// A ground slot's number and what the ground's own material set calls it (its `SOURCE.json`), with the set where
+    /// it is not the project's. A set that names nothing falls back on the engine's built-in name for the slot, which a
+    /// project's set need not follow.
+    fn layer_label(&mut self, terrain: u32, layer: u8) -> String {
+        let set = self
+            .world
+            .iter_with::<TerrainComponent>()
+            .find(|(_, t)| t.terrain_id == terrain)
+            .and_then(|(e, _)| self.world.get::<crate::cell_streaming::TerrainStreamingComponent>(e))
+            .map(|s| s.layer_set.trim().to_owned())
+            .unwrap_or_default();
+        let terrain_root = self.config.content_root.join("terrain");
+        let dir = crate::cell_streaming::layer_set_dir(&terrain_root, &set).unwrap_or(terrain_root);
+        let names = match self.editing.set_names.get(&dir) {
+            Some(names) => Arc::clone(names),
+            None => {
+                let names = Arc::new(set_slot_names(&dir));
+                self.editing.set_names.insert(dir, Arc::clone(&names));
+                names
+            }
+        };
+        let in_set = if set.is_empty() { String::new() } else { format!(" in set {set}") };
+        match names.get(&layer) {
+            Some(name) => format!("slot {layer} \"{name}\"{in_set}"),
+            None => {
+                let engine = somnium_renderer::terrain::textures::LAYER_NAMES.get(usize::from(layer)).copied().unwrap_or("?");
+                format!("slot {layer}{in_set} (the set names none; the engine's \"{engine}\")")
+            }
+        }
+    }
+
+    /// The card for a ground-cover copy: what kind, which model, the ground it grows on (its habitat), how dense it
+    /// grows there and what grows beside it, the rules that grew it and the tool that wrote them.
+    fn cover_card(&mut self, pick: CoverPick) -> Option<String> {
+        if let Some((cached, card)) = &self.editing.cover_card
+            && *cached == pick
+        {
+            return Some(card.clone());
+        }
+        let root = self.config.project_root.clone();
+        let kind = pick.copy.kind;
+        let entry = self.project_foliage.get(&kind)?.clone();
+        let rules = entry.ground_cover.clone()?;
+        let name = self.foliage_kind_name(kind).to_owned();
+        let writer = self.palette_writer(&name);
+        let habitat = self.layer_label(pick.terrain, entry.brush.layer);
+        let file = self.ground_file(pick.terrain);
+        let ground_entity = self.world.iter_with::<TerrainComponent>().find(|(_, t)| t.terrain_id == pick.terrain).map(|(e, _)| e);
+        let streamed = ground_entity.is_some_and(|e| self.world.get::<crate::cell_streaming::Streamed>(e).is_some());
+        // The tile's layer set ("" the project's own), which a kind's rules may name (`GroundCoverRules::layer_sets`).
+        let tile_set = ground_entity
+            .and_then(|e| self.world.get::<crate::cell_streaming::TerrainStreamingComponent>(e))
+            .map(|s| s.layer_set.trim().to_owned())
+            .unwrap_or_default();
+        let renderer = self.renderer.as_ref()?;
+        let data = renderer.terrain(pick.terrain)?;
+        let (x, z) = (pick.copy.position.x, pick.copy.position.z);
+        // A streamed tile's drifts follow the world (`GroundCover::update_seeded`).
+        let origin = if streamed { glam::Vec2::new(data.model.w_axis.x, data.model.w_axis.z) } else { glam::Vec2::ZERO };
+        let weight = data.layer_weight_at(x, z, entry.brush.layer);
+        let here = crate::ground_cover::density_at(data, kind, &entry, x, z, origin);
+        let full = rules.density * crate::ground_cover::density_scale();
+        let focus = self.ground_cover.focus(pick.terrain).unwrap_or(pick.copy.position);
+        let batched = crate::foliage_batches::enabled();
+        let drawn = |c: &crate::ground_cover::Cover, radius: f32| {
+            if batched {
+                crate::ground_cover::drawn_scale(c, focus, radius, rules.inner).is_some()
+            } else {
+                let d = c.instance.position - focus;
+                (rules.inner..=radius).contains(&d.x.hypot(d.z))
+            }
+        };
+        // Its own cell, and every kind within a couple of metres of the copy.
+        let (mut in_cell, mut drawn_in_cell) = (0usize, 0usize);
+        let mut nearby: BTreeMap<u16, usize> = BTreeMap::new();
+        let size = crate::ground_cover::CELL;
+        for ((k, cx, cz), cell) in self.ground_cover.cells(pick.terrain) {
+            if (k, cx, cz) == (kind, pick.cell.0, pick.cell.1) {
+                in_cell = cell.len();
+                drawn_in_cell = cell.iter().filter(|c| drawn(c, rules.radius)).count();
+            }
+            let (x0, z0) = (cx as f32 * size, cz as f32 * size);
+            let gap = (x0 - x).max(x - (x0 + size)).max(0.0).hypot((z0 - z).max(z - (z0 + size)).max(0.0));
+            if gap > COVER_NEARBY {
+                continue;
+            }
+            let near = cell
+                .iter()
+                .filter(|c| (c.instance.position.x - x).hypot(c.instance.position.z - z) <= COVER_NEARBY)
+                .count();
+            if near > 0 {
+                *nearby.entry(k).or_default() += near;
+            }
+        }
+        let mut nearby: Vec<(u16, usize)> = nearby.into_iter().collect();
+        nearby.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let together: usize = nearby.iter().map(|(_, n)| n).sum();
+        let listed: Vec<String> = nearby.iter().take(5).map(|(k, n)| format!("{n} {}", self.foliage_kind_name(*k))).collect();
+        let more = nearby.len().saturating_sub(5);
+        // The kinds that grow on this slot of this tile's set: the habitat's mix.
+        let same_layer: Vec<&str> = self
+            .project_foliage
+            .values()
+            .filter(|e| e.brush.layer == entry.brush.layer && e.ground_cover.as_ref().is_some_and(|g| g.grows_on(&tile_set)))
+            .map(|e| e.name.as_str())
+            .collect();
+        let sets = rules.layer_sets.as_ref().map_or_else(String::new, |sets| {
+            let named: Vec<String> =
+                sets.iter().map(|s| if s.trim().is_empty() { "the project's".to_owned() } else { s.trim().to_owned() }).collect();
+            format!(", only on sets: {}", named.join(", "))
+        });
+        let at = data.model.transform_point3(pick.copy.position);
+        let from_centre = (pick.copy.position.x - focus.x).hypot(pick.copy.position.z - focus.z);
+        let mut lines = vec![
+            format!("{name}   ground cover, kind {kind}: grown round the view by its rules, never stored"),
+            format!("model     {}", project_relative(root.as_deref(), &entry.source)),
+            format!(
+                "habitat   ground {habitat}, weight {weight:.2} here (grows from {:.2}, on slopes to {:.0} deg); {} cover kinds grow on this slot of this set",
+                entry.brush.min_layer_weight.max(1e-3),
+                entry.brush.max_slope_deg,
+                same_layer.len()
+            ),
+            format!(
+                "density   {here:.2} a m2 here by the rules: {full:.2} at a full layer x weight {weight:.2}{}",
+                if rules.clump.is_some() && weight * full > 0.0 {
+                    format!(" x drift {:.2}", here / (weight * full))
+                } else {
+                    String::new()
+                }
+            ),
+            format!(
+                "grown     {in_cell} in its {size:.0} m cell ({:.2} a m2), {drawn_in_cell} drawn from {from_centre:.0} m",
+                in_cell as f32 / (size * size)
+            ),
+            format!(
+                "nearby    within {COVER_NEARBY:.0} m: {}{} ({together} copies)",
+                listed.join(", "),
+                if more > 0 { format!(" and {more} more kinds") } else { String::new() }
+            ),
+            format!(
+                "rules     {}, kind {kind}: radius {:.0} m{}{}{sets}",
+                project_relative(root.as_deref(), &self.config.content_root.join("foliage.palette.json")),
+                rules.radius,
+                rules.clump.map_or_else(String::new, |m| format!(", drifts {m:.0} m")),
+                if rules.align_to_ground { ", leans with the slope" } else { ", upright" }
+            ),
+        ];
+        if let Some(writer) = writer {
+            lines.push(format!("written   by {writer}"));
+        }
+        match &file {
+            Some(file) => lines.push(format!(
+                "ground    {}{}",
+                project_relative(root.as_deref(), file),
+                if streamed { " (a streamed tile)" } else { "" }
+            )),
+            None => lines.push("ground    (a scene with no file yet)".to_owned()),
+        }
+        lines.push(format!(
+            "at        x {:.1}  y {:.1}  z {:.1}   scale {:.2}   turned {:.0} deg",
+            at.x,
+            at.y,
+            at.z,
+            pick.copy.scale,
+            pick.copy.yaw.to_degrees().rem_euclid(360.0)
+        ));
+        lines.push("Census (Level) lists every ground-cover kind grown round the view now".to_owned());
+        let card = lines.join("\n");
+        info!("cover card:\n{card}");
+        self.editing.cover_card = Some((pick, card.clone()));
+        Some(card)
     }
 
     /// The card for a painted copy: what kind, which model file, where it lives and which file keeps it.
@@ -1064,6 +1745,10 @@ impl<G: GameApp> Engine<G> {
             return Some(card.clone());
         }
         let root = self.config.project_root.clone();
+        let name = self.foliage_kind_name(pick.kind).to_owned();
+        if crate::foliage_palette::is_project_kind(pick.kind) {
+            self.palette_writer(&name);
+        }
         let renderer = self.renderer.as_ref()?;
         let data = renderer.terrain(pick.terrain)?;
         let copy = *data.painted_foliage.get(pick.index)?;
@@ -1076,7 +1761,6 @@ impl<G: GameApp> Engine<G> {
             .and_then(|s| self.cell_streamer.cells.get(s.cell as usize))
             .map(|cell| cell.file.clone())
             .or_else(|| self.editing.scene.clone());
-        let name = self.foliage_kind_name(pick.kind).to_owned();
         let model = self.project_foliage.get(&pick.kind).map_or_else(
             || format!("built-in kind {} (the engine's own palette)", pick.kind),
             |entry| project_relative(root.as_deref(), &entry.source),
@@ -1086,6 +1770,11 @@ impl<G: GameApp> Engine<G> {
             format!("model     {model}"),
             format!("copy      {} of {total} on this ground; {same} of this kind here", pick.index + 1),
         ];
+        if crate::foliage_palette::is_project_kind(pick.kind)
+            && let Some(writer) = self.palette_writer(&name)
+        {
+            lines.push(format!("kind by   {writer} (its entry in the foliage palette)"));
+        }
         match &file {
             Some(file) => {
                 lines.push(format!("ground    {}", project_relative(root.as_deref(), file)));
@@ -1143,8 +1832,9 @@ impl<G: GameApp> Engine<G> {
         let mut models: BTreeMap<String, (usize, HashSet<Entity>)> = BTreeMap::new();
         let imported: Vec<(Entity, String)> =
             self.world.iter_with::<crate::ImportedMesh>().map(|(e, m)| (e, m.source.clone())).collect();
+        let children = children_map(&self.world);
         for (entity, source) in &imported {
-            let object = self.object_of(*entity);
+            let object = self.object_in(&children, *entity);
             let entry = models.entry(source.clone()).or_default();
             entry.0 += 1;
             entry.1.insert(object);
@@ -1152,6 +1842,32 @@ impl<G: GameApp> Engine<G> {
         let palette: HashSet<String> =
             self.project_foliage.values().map(|e| project_relative(root.as_deref(), &e.source)).collect();
         let copies: usize = painted.values().sum();
+        // Ground cover is grown round the view and dropped behind it: what is grown now, and how much of it draws.
+        let batched = crate::foliage_batches::enabled();
+        let mut cover: BTreeMap<u16, (usize, usize, BTreeSet<u32>)> = BTreeMap::new();
+        let terrain_ids: Vec<u32> = self.world.iter_with::<TerrainComponent>().map(|(_, t)| t.terrain_id).collect();
+        for &terrain in &terrain_ids {
+            let Some(focus) = self.ground_cover.focus(terrain) else { continue };
+            for ((kind, _, _), cell) in self.ground_cover.cells(terrain) {
+                let (radius, inner) =
+                    self.project_foliage.get(&kind).and_then(|e| e.ground_cover.as_ref()).map_or((0.0, 0.0), |g| (g.radius, g.inner));
+                let entry = cover.entry(kind).or_default();
+                entry.2.insert(terrain);
+                entry.0 += cell.len();
+                entry.1 += cell
+                    .iter()
+                    .filter(|c| {
+                        if batched {
+                            crate::ground_cover::drawn_scale(c, focus, radius, inner).is_some()
+                        } else {
+                            (inner..=radius).contains(&(c.instance.position.x - focus.x).hypot(c.instance.position.z - focus.z))
+                        }
+                    })
+                    .count();
+            }
+        }
+        let cover_grown: usize = cover.values().map(|v| v.0).sum();
+        let cover_drawn: usize = cover.values().map(|v| v.1).sum();
         let mut report = vec![
             format!(
                 "# Census of {}",
@@ -1160,7 +1876,7 @@ impl<G: GameApp> Engine<G> {
             String::new(),
             format!(
                 "What is loaded now: {grounds} grounds and {} objects round the camera. Cells streamed out are not counted.",
-                imported.iter().map(|(e, _)| self.object_of(*e)).collect::<HashSet<_>>().len()
+                imported.iter().map(|(e, _)| self.object_in(&children, *e)).collect::<HashSet<_>>().len()
             ),
             String::new(),
             format!("## Painted copies by kind ({copies} in {} kinds; they live with their ground, not as objects)", painted.len()),
@@ -1176,6 +1892,30 @@ impl<G: GameApp> Engine<G> {
                 .get(kind)
                 .map_or_else(|| "built-in".to_owned(), |e| project_relative(root.as_deref(), &e.source));
             report.push(format!("| {count} | {kind} | {} | {model} |", self.foliage_kind_name(*kind)));
+        }
+        report.push(String::new());
+        report.push(format!(
+            "## Ground cover round the view now ({cover_grown} grown, {cover_drawn} drawn, in {} kinds; grown by rules, never stored)",
+            cover.len()
+        ));
+        report.push(String::new());
+        report.push("Click a copy for its card: habitat, density there, rules and the tool that wrote them.".to_owned());
+        report.push(String::new());
+        report.push("| grown | drawn | kind | name | ground | model |".to_owned());
+        report.push("|---:|---:|---:|---|---|---|".to_owned());
+        let mut cover_rows: Vec<(u16, (usize, usize, BTreeSet<u32>))> = cover.into_iter().collect();
+        cover_rows.sort_by(|a, b| b.1.0.cmp(&a.1.0).then(a.0.cmp(&b.0)));
+        for (kind, (grown, drawn, terrains)) in &cover_rows {
+            let (model, layer) = self.project_foliage.get(kind).map_or_else(
+                || ("built-in".to_owned(), 0),
+                |e| (project_relative(root.as_deref(), &e.source), e.brush.layer),
+            );
+            // Every set it grows on: one kind on two biomes' slots shows here.
+            let mut grounds: Vec<String> = terrains.iter().map(|&t| self.layer_label(t, layer)).collect();
+            grounds.sort();
+            grounds.dedup();
+            let name = self.foliage_kind_name(*kind).to_owned();
+            report.push(format!("| {grown} | {drawn} | {kind} | {name} | {} | {model} |", grounds.join("; ")));
         }
         report.push(String::new());
         report.push(format!("## Models the objects draw ({} files)", models.len()));
@@ -1210,8 +1950,10 @@ impl<G: GameApp> Engine<G> {
             .map(|s| PathBuf::from(format!("{}.census.md", s.display())))
             .or_else(|| root.as_ref().map(|r| r.join("census.md")));
         let summary = format!(
-            "Census: {copies} painted copies in {} kinds, {} model files; {} tree-like models from outside the palette",
+            "Census: {copies} painted copies in {} kinds, {cover_grown} ground-cover copies round the view in {} kinds, {} model \
+             files; {} tree-like models from outside the palette",
             painted.len(),
+            cover_rows.len(),
             models.len(),
             outside.len()
         );
@@ -1228,9 +1970,9 @@ impl<G: GameApp> Engine<G> {
     /// Select every object that draws the selected object's model files.
     pub(super) fn select_same_asset(&mut self) {
         let Some(selected) = self.selection.primary.filter(|e| self.world.is_alive(*e)) else {
-            let painted = self.editing.painted.is_some();
-            self.toast(if painted {
-                "Painted copies are not objects; the Census lists every copy of each kind"
+            let copy = self.editing.painted.is_some() || self.editing.cover.is_some();
+            self.toast(if copy {
+                "Painted and ground-cover copies are not objects; the Census lists every copy of each kind"
             } else {
                 "Select something first"
             });
@@ -1271,13 +2013,17 @@ impl<G: GameApp> Engine<G> {
 
     /// The object `part` belongs to: its highest ancestor that is still one object, not a container of hundreds.
     fn object_of(&self, part: Entity) -> Entity {
-        let children = children_map(&self.world);
+        self.object_in(&children_map(&self.world), part)
+    }
+
+    /// [`Self::object_of`] over a children map built once (a pass over thousands of parts).
+    fn object_in(&self, children: &HashMap<Entity, Vec<Entity>>, part: Entity) -> Entity {
         let mut object = part;
         loop {
             let Some(parent) = self.world.get::<Parent>(object).map(|p| p.entity) else {
                 break;
             };
-            if parent == Entity::DANGLING || !self.world.is_alive(parent) || subtree(&children, parent).len() > CONTAINER_PARTS
+            if parent == Entity::DANGLING || !self.world.is_alive(parent) || subtree(children, parent).len() > CONTAINER_PARTS
             {
                 break;
             }
@@ -1757,8 +2503,11 @@ impl<G: GameApp> Engine<G> {
     pub(super) fn selection_card(&mut self) -> Option<String> {
         if self.selection.primary.is_some() {
             self.editing.painted = None;
+            self.editing.cover = None;
         } else if let Some(pick) = self.editing.painted {
             return self.painted_card(pick);
+        } else if let Some(pick) = self.editing.cover {
+            return self.cover_card(pick);
         }
         let entity = self.selection.primary.filter(|e| self.world.is_alive(*e))?;
         let id = self.world.persistent_id(entity);
@@ -1783,7 +2532,9 @@ impl<G: GameApp> Engine<G> {
 
     /// `SOMNIUM_EDITOR_SCRIPT`: scripted editor input for proof captures in a background window, inert unless set.
     /// Steps are `<frame>:<action>`, separated by `;`: `pick=<x>,<y>` (a click at that fraction of the window),
-    /// `select=<name part>` (the first entity whose name contains it), `cmd=<command id>`, `save`.
+    /// `select=<name part>` (the first entity whose name contains it), `cmd=<command id>`, `save`, `close`, `splash`,
+    /// `gpu_error`, `panic` (a crash on the main thread), and `eye=<x>,<z>,<yaw>,<pitch>` (the editor camera 1.7 m over
+    /// the loaded ground at scene x, z).
     pub(super) fn run_editor_script(&mut self) {
         static SCRIPT: std::sync::LazyLock<Vec<(u64, String)>> = std::sync::LazyLock::new(|| {
             std::env::var("SOMNIUM_EDITOR_SCRIPT")
@@ -1816,6 +2567,25 @@ impl<G: GameApp> Engine<G> {
                     self.selection.set_single(hit);
                     self.after_selection_change();
                     self.reveal_selection_in_outliner(true);
+                }
+                None if action == "panic" => {
+                    // A crash on the main thread, for the crash report's proof run.
+                    panic!("editor script: a panic on the main thread, asked for by the proof run");
+                }
+                Some(("eye", at)) => {
+                    // The editor camera 1.7 m over the ground at scene x, z, turned to yaw and pitch (degrees).
+                    let numbers: Vec<f32> = at.split(',').filter_map(|v| v.trim().parse::<f32>().ok()).collect();
+                    let [x, z, yaw, pitch] = numbers[..] else {
+                        warn!(action = %action, "editor script: eye wants x,z,yaw,pitch");
+                        continue;
+                    };
+                    match self.ground_height(x, z) {
+                        Some(y) => {
+                            info!(x, z, ground = y, yaw, pitch, "editor script: eye over the ground");
+                            self.camera_pose_request = Some((glam::Vec3::new(x, y + 1.7, z), yaw, pitch.clamp(-89.0, 89.0)));
+                        }
+                        None => warn!(x, z, "editor script: no ground loaded under the eye"),
+                    }
                 }
                 Some(("select", part)) => {
                     let found = self.world.iter_with::<Name>().find(|(_, name)| name.as_str().contains(part)).map(|(e, _)| e);
@@ -1935,6 +2705,11 @@ impl<G: GameApp> Engine<G> {
                 })
                 .unwrap_or_default();
             lines.push(format!("object    {parts} part{}{size}", if parts == 1 { "" } else { "s" }));
+        }
+
+        // Whether its surface is closed: a rock or cliff open on a side is hollow from behind.
+        if let Some(line) = self.shape_line(entity) {
+            lines.push(line);
         }
 
         // Where it came from.
@@ -2190,6 +2965,47 @@ mod tests {
         assert!(tree_like("assets/props/cypress.glb"));
         assert!(!tree_like("assets/architecture/places/monargent/silver_street_+1_0_01.gltf"));
         assert!(!tree_like("assets/props/airplane_wreck.glb"));
+    }
+
+    #[test]
+    fn rocks_are_named_by_whole_words_and_a_surface_reads_plainly() {
+        assert!(rock_like("assets/rocks/granite_tor_03.gltf"));
+        assert!(rock_like("assets/pois/kit/Cliff_Face_B.glb"));
+        assert!(rock_like("assets/props/pebbles.gltf"));
+        assert!(!rock_like("assets/foliage/ground/pebbles.gltf"), "ground cover, not a placed rock");
+        assert!(!rock_like("assets/architecture/stonemason_hut.gltf"), "a whole word, not a part of one");
+        assert!(!rock_like("assets/foliage/trees/grown/rock_rose.gltf"), "a shrub");
+        assert!(!rock_like("assets/props/stone_pine.gltf"), "a tree");
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(1_234_567), "1,234,567");
+        let closed = MeshShape { triangles: 12_400, ..MeshShape::default() };
+        assert_eq!(shape_text(&closed), "closed on every side; 12,400 triangles");
+        let seated = MeshShape { triangles: 10, open_edges: 4, ..MeshShape::default() };
+        assert!(shape_text(&seated).starts_with("open at its base only (4 edges)"));
+        let hollow = MeshShape { triangles: 10, open_edges: 1_230, open_above_base: 1_100, degenerate: 2, ..MeshShape::default() };
+        let text = shape_text(&hollow);
+        assert!(text.starts_with("OPEN on a side or top: 1,230 edges") && text.contains("1,100 above") && text.ends_with("2 slivers"), "{text}");
+    }
+
+    #[test]
+    fn a_ground_slot_is_named_by_its_own_material_set() {
+        let dir = std::env::temp_dir().join(format!("somnium-set-names-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(set_slot_names(&dir).is_empty(), "no SOURCE.json: no names");
+        std::fs::write(
+            dir.join("SOURCE.json"),
+            r#"{"made_by": "tools/look_terrain_set.py", "layers": [
+                {"slot": 4, "file": "leafy_grass", "layer": "sunstraw"},
+                {"slot": 31, "file": "snow_01", "layer": "moss"},
+                {"slot": 300, "layer": "past the slots"},
+                {"slot": 5, "layer": "  "}]}"#,
+        )
+        .unwrap();
+        let names = set_slot_names(&dir);
+        assert_eq!(names.get(&4).map(String::as_str), Some("sunstraw"));
+        assert_eq!(names.get(&31).map(String::as_str), Some("moss"), "the set's name, not the engine's \"Hard Snow\"");
+        assert_eq!(names.len(), 2, "a slot past 255 and a blank name are skipped: {names:?}");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -27,6 +27,15 @@ pub fn set_gpu_errors_fatal(fatal: bool) {
     GPU_ERRORS_FATAL.store(fatal, Ordering::Relaxed);
 }
 
+/// The GPU the program draws with, named for a crash report once its device exists.
+static GPU_IN_USE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The GPU in use (name, backend, driver and its version), once a device exists: what a crash report names.
+#[must_use]
+pub fn gpu_in_use() -> Option<&'static str> {
+    GPU_IN_USE.get().map(String::as_str)
+}
+
 /// The GPU as a crash report needs it: name, backend, driver and its version.
 fn gpu_label(info: &wgpu::AdapterInfo) -> String {
     format!("{} ({:?}, {} {})", info.name, info.backend, info.driver, info.driver_info)
@@ -41,6 +50,7 @@ fn gpu_error_line(gpu: &str, text: &str, times: u32) -> Option<String> {
 /// Report uncaptured GPU errors and a lost device with the GPU named.
 fn watch_gpu_errors(device: &wgpu::Device, info: &wgpu::AdapterInfo) {
     let gpu = gpu_label(info);
+    let _ = GPU_IN_USE.set(gpu.clone());
     let seen = std::sync::Mutex::new(std::collections::HashMap::<String, u32>::new());
     let named = gpu.clone();
     device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
@@ -59,7 +69,12 @@ fn watch_gpu_errors(device: &wgpu::Device, info: &wgpu::AdapterInfo) {
         }
     }));
     device.set_device_lost_callback(move |reason, message| {
-        tracing::error!(?reason, "GPU device lost on {gpu}: {message}");
+        // `Destroyed` is the program letting its device go at exit, not a lost GPU.
+        if reason == wgpu::DeviceLostReason::Destroyed {
+            tracing::debug!("GPU device released on {gpu}");
+        } else {
+            tracing::error!(?reason, "GPU device lost on {gpu}: {message}");
+        }
     });
 }
 

@@ -3693,7 +3693,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             }
             let air_t = exp(-depth);
             let horizon = normalize(vec3<f32>(dir.x, max(dir.y, 0.02), dir.z));
-            let sky = textureSampleLevel(env_cube, env_sampler, horizon, 0.0).rgb;
+            // With clouds, mip 1: the first mip the clouds' capture is laid over (mip 0 is the bare sky the
+            // background draws under them), so the far land fades to the horizon the deck leaves, not the clear
+            // sky's blue behind it (Sunscar, 6 Nov 2026).
+            let sky_mip = select(0.0, 1.0, cloud_shadow_params.w > 0.0);
+            let sky = textureSampleLevel(env_cube, env_sampler, horizon, sky_mip).rgb;
             result = result * air_t + sky * (vec3<f32>(1.0) - air_t);
             fog_transmittance *= dot(air_t, vec3<f32>(0.2126, 0.7152, 0.0722));
         }

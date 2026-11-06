@@ -802,6 +802,8 @@ pub enum LevelTool {
     Census,
     /// Select every object that draws the selection's model files.
     SelectSameAsset,
+    /// Check the surface of every model the loaded objects draw (closed or open, and where) and write a report.
+    CheckMeshes,
     /// Select the object at the centre of the view; in Play, stop first, so what you saw is what you fix.
     SelectLookedAt,
 }
