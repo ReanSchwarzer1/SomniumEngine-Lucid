@@ -138,6 +138,7 @@ impl Shaders {
             "global_pool.wgsl",
             "dream_lens.wgsl",
             "tone_curves.wgsl",
+            "snow.wgsl",
             "game_highlight.wgsl",
             "game_highlight_mask.wgsl",
             "editor_glow.wgsl",

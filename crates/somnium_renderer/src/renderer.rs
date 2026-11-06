@@ -365,6 +365,9 @@ pub struct SomniumRenderer {
     pub sun_angular_radius: f32,
     /// Tone-mapping curve index; matches `Tonemapper::as_index`.
     pub tonemapper: u32,
+    /// Snow lying on surfaces (`somnium.SnowCover`, snow.wgsl): the View uniform's `snow0..snow3`; all zero is none.
+    /// Its third vector (toward the sun) is filled from the light each frame.
+    pub snow: [f32; 16],
     /// Radial vignette strength (0 = off, 1 = default, higher = stronger).
     ///
     /// Defaults to **off**: an always-on vignette darkens the viewport edges,
@@ -1647,6 +1650,7 @@ impl SomniumRenderer {
             render_width: ctx.config.width,
             render_height: ctx.config.height,
             tonemapper: 0,
+            snow: [0.0; 16],
             vignette_strength: 0.0,
             chromatic_aberration: 0.0,
             fxaa_pass: crate::pass::fxaa::FxaaPass::new(
@@ -2709,6 +2713,10 @@ impl SomniumRenderer {
         // ponytail: the primary camera's, as camera_pos above already is for every view slot; a second
         // viewport's near-eye rays use it too. Per-slot cameras when a multi-view editor needs them.
         view_data.extend_from_slice(bytemuck::bytes_of(&self.view_proj_rel.inverse().to_cols_array()));
+        // Snow (offsets 320-383): its settings, with the direction toward the sun in the third vector.
+        let mut snow = self.snow;
+        snow[8..11].copy_from_slice(&self.light_direction.normalize_or_zero().to_array());
+        view_data.extend_from_slice(bytemuck::bytes_of(&snow));
         view_data
     }
 

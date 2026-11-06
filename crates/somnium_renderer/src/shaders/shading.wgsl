@@ -1,4 +1,5 @@
 //!include "spot_cookie.wgsl"
+//!include "snow.wgsl"
 // MORROWIND-C: composition is declared here rather than assembled by a
 // `format!` of `include_str!` calls at this pass's construction site. The
 // resolver (`somnium_shader`) emits each module once, in this order, and
@@ -3040,6 +3041,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         apply_wetness(&surface, material.porosity);
     }
 
+    // Snow lying on the finished surface (snow.wgsl; sunscar-photoreal, 6 Nov 2026): before specular antialiasing
+    // and f0, after terrain, decals and wetness. Off unless a scene has a SnowCover.
+    if view.snow0.x > 0.5 {
+        surface = apply_snow(surface, hit_point, geo_normal);
+    }
     // ── Geometric specular antialiasing (TSUSHIMA-E) ─────────────────────────
     //
     // Tokuyoshi & Kaplanyan, I3D 2019. The filter kernel comes from the

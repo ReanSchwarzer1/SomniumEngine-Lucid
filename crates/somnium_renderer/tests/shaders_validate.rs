@@ -326,8 +326,9 @@ fn material_mirrors_and_the_view_carry_the_wind_where_rust_puts_it() {
         assert_eq!((mat, bend, flutter), (112, Some(96), Some(100)), "{root} Material");
         if let Some((view, _, _, wind, wind_time)) = span("View") {
             if wind.is_some() {
-                // 320 with inv_view_proj_rel after the wind (5 Nov 2026); shorter mirrors stop at 256.
-                assert!(matches!(view, 256 | 320), "{root} View is {view} bytes");
+                // 320 with inv_view_proj_rel after the wind (5 Nov 2026), 384 with the snow vectors after that
+                // (6 Nov 2026, inside the 512-byte slot); shorter mirrors stop at 256.
+                assert!(matches!(view, 256 | 320 | 384), "{root} View is {view} bytes");
                 assert_eq!((wind, wind_time), (Some(224), Some(240)), "{root} View");
             }
         }
