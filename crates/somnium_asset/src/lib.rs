@@ -552,6 +552,9 @@ pub fn load_gltf_for(path: impl AsRef<Path>, parts: Option<&HashSet<usize>>) -> 
                 .into_u32()
                 .collect();
 
+            // Unchecked, a broken file reaches the GPU, and the flat normals below panic on it.
+            check_primitive(mesh.name().unwrap_or("?"), prim_idx, &positions, &indices)?;
+
             if normals.is_none() {
                 generate_flat_normals(&mut vertices, &indices);
             }
@@ -858,6 +861,119 @@ pub struct GltfPart {
     pub material: String,
     /// The image files (or embedded image names) the material reads.
     pub images: Vec<String>,
+}
+
+/// A primitive the engine can upload: every index names one of its vertices, and every corner a triangle uses is a
+/// number. A broken file (its .gltf and .bin from two different writes, say) fails this; uploaded, it sends the GPU
+/// outside the mesh, and a ray-tracing build can lose the device on it (Sunscar, 6 Nov 2026).
+///
+/// # Errors
+/// Which index or vertex, in which mesh and primitive.
+pub fn check_primitive(mesh: &str, primitive: usize, positions: &[[f32; 3]], indices: &[u32]) -> Result<(), String> {
+    if let Some(&past) = indices.iter().find(|&&i| i as usize >= positions.len()) {
+        return Err(format!(
+            "Mesh '{mesh}' primitive {primitive}: index {past} is past its {} vertices (its .gltf and .bin may come from \
+             two different writes)",
+            positions.len()
+        ));
+    }
+    if let Some(&corner) = indices.iter().find(|&&i| !positions[i as usize].iter().all(|c| c.is_finite())) {
+        return Err(format!("Mesh '{mesh}' primitive {primitive}: vertex {corner} is not a number"));
+    }
+    Ok(())
+}
+
+/// What stops a glTF loading in the engine, its images aside: [`gltf_file_problems`], then every primitive read as the
+/// importer reads it (a position attribute, an index buffer, [`check_primitive`]). Empty when it loads. Seconds for
+/// thousands of files, where [`load_gltf`] decodes every image.
+#[must_use]
+pub fn gltf_problems(path: &Path) -> Vec<String> {
+    let problems = gltf_file_problems(path);
+    if !problems.is_empty() {
+        return problems;
+    }
+    let geometry = || -> Result<(), String> {
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("./"));
+        let gltf::Gltf { document, blob } = gltf::Gltf::open(path).map_err(|e| format!("glTF import failed: {e}"))?;
+        let buffers =
+            gltf::import_buffers(&document, Some(base_dir), blob).map_err(|e| format!("glTF import failed: {e}"))?;
+        for mesh in document.meshes() {
+            let name = mesh.name().unwrap_or("?");
+            for (index, primitive) in mesh.primitives().enumerate() {
+                let reader = primitive.reader(|buf| Some(&buffers[buf.index()]));
+                let positions: Vec<[f32; 3]> = reader
+                    .read_positions()
+                    .ok_or_else(|| format!("Mesh '{name}' primitive {index}: no POSITION attribute"))?
+                    .collect();
+                let indices: Vec<u32> = reader
+                    .read_indices()
+                    .ok_or_else(|| format!("Mesh '{name}' primitive {index}: no index buffer"))?
+                    .into_u32()
+                    .collect();
+                check_primitive(name, index, &positions, &indices)?;
+            }
+        }
+        Ok(())
+    };
+    geometry().err().into_iter().collect()
+}
+
+/// What is wrong with a glTF file before its geometry is read: missing; a buffer file shorter than the glTF declares
+/// (the importer refuses it) or of another size (a pair from two different writes); a missing texture; a `.glb` cut
+/// short. Empty when nothing is. Cheap: the JSON and file sizes only.
+#[must_use]
+pub fn gltf_file_problems(path: &Path) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return vec!["the file is missing".to_owned()];
+    };
+    let base = path.parent().unwrap_or(Path::new("."));
+    let document: serde_json::Value = if bytes.starts_with(b"glTF") {
+        let declared = bytes.get(8..12).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+        if declared != bytes.len() {
+            return vec![format!("the .glb declares {declared} bytes and has {}", bytes.len())];
+        }
+        let length = bytes.get(12..16).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+        match bytes.get(20..20 + length).map(serde_json::from_slice::<serde_json::Value>) {
+            Some(Ok(json)) => json,
+            _ => return vec!["the .glb's JSON chunk does not read".to_owned()],
+        }
+    } else {
+        match serde_json::from_slice(&bytes) {
+            Ok(json) => json,
+            Err(error) => return vec![format!("the glTF JSON does not read: {error}")],
+        }
+    };
+    let external = |uri: &str| (!uri.starts_with("data:")).then(|| base.join(uri.replace("%20", " ")));
+    let name = |file: &Path| file.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let mut problems = Vec::new();
+    for (i, buffer) in document["buffers"].as_array().into_iter().flatten().enumerate() {
+        let Some(file) = buffer["uri"].as_str().and_then(external) else { continue };
+        let declared = buffer["byteLength"].as_u64().unwrap_or(0);
+        match std::fs::metadata(&file).map(|m| m.len()) {
+            Err(_) => problems.push(format!("buffer {i}: {} is missing", name(&file))),
+            Ok(size) if size < declared => {
+                problems.push(format!("buffer {i}: declares {declared} bytes, the .bin has {size}: the importer refuses it"));
+            }
+            Ok(size) if size != declared => problems.push(format!(
+                "buffer {i}: declares {declared} bytes, the .bin has {size}: written apart, its geometry may be another's"
+            )),
+            Ok(_) => {}
+        }
+    }
+    let missing: Vec<String> = document["images"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|image| image["uri"].as_str().and_then(external))
+        .filter(|file| !file.is_file())
+        .map(|file| name(&file))
+        .collect();
+    if !missing.is_empty() {
+        let shown = missing.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+        let more = if missing.len() > 3 { format!(" and {} more", missing.len() - 3) } else { String::new() };
+        problems.push(format!("missing texture{}: {shown}{more}", if missing.len() == 1 { "" } else { "s" }));
+    }
+    problems
 }
 
 /// What each uploaded part of a glTF is, in `ImportedMesh.node` order. Reads the JSON only (a `.glb`'s first chunk),
@@ -1516,5 +1632,80 @@ mod describe_parts_tests {
         assert_eq!(parts[1].material, "velvet");
         assert!(parts[1].images.is_empty());
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod broken_file_tests {
+    use std::path::Path;
+
+    /// A one-triangle glTF beside its .bin: positions, then u16 indices.
+    fn triangle(dir: &Path, name: &str, corners: [[f32; 3]; 3], indices: [u16; 3]) -> std::path::PathBuf {
+        let mut bin: Vec<u8> = corners.iter().flatten().flat_map(|c| c.to_le_bytes()).collect();
+        bin.extend(indices.iter().flat_map(|i| i.to_le_bytes()));
+        bin.extend([0, 0]);
+        std::fs::write(dir.join(format!("{name}.bin")), &bin).unwrap();
+        let document = serde_json::json!({
+            "asset": {"version": "2.0"},
+            "buffers": [{"uri": format!("{name}.bin"), "byteLength": bin.len()}],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+                {"buffer": 0, "byteOffset": 36, "byteLength": 6}],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0]},
+                {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"}],
+            "meshes": [{"name": "slab", "primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
+            "nodes": [{"mesh": 0}], "scenes": [{"nodes": [0]}], "scene": 0
+        });
+        let path = dir.join(format!("{name}.gltf"));
+        std::fs::write(&path, document.to_string()).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_file_that_names_a_vertex_it_has_not_or_a_corner_that_is_no_number_is_refused() {
+        let dir = std::env::temp_dir().join(format!("somnium-broken-gltf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let flat = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        assert!(super::load_gltf(triangle(&dir, "whole", flat, [0, 1, 2])).is_ok());
+        assert!(super::gltf_problems(&dir.join("whole.gltf")).is_empty());
+        let past = super::load_gltf(triangle(&dir, "past", flat, [0, 1, 5])).err().unwrap();
+        assert!(past.contains("index 5 is past its 3 vertices"), "{past}");
+        assert_eq!(super::gltf_problems(&dir.join("past.gltf")), vec![past], "the quick check says what the load does");
+        let nan = [[0.0, 0.0, 0.0], [f32::NAN, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let nan = super::load_gltf(triangle(&dir, "nan", nan, [0, 1, 2])).err().unwrap();
+        assert!(nan.contains("vertex 1 is not a number"), "{nan}");
+        assert_eq!(super::gltf_problems(&dir.join("nan.gltf")), vec![nan]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_model_file_that_will_not_load_says_why() {
+        let dir = std::env::temp_dir().join(format!("somnium-gltf-files-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gltf = |name: &str, length: u32, images: &str| {
+            let text = format!(
+                r#"{{"asset":{{"version":"2.0"}},"buffers":[{{"uri":"{name}.bin","byteLength":{length}}}],"images":[{images}]}}"#
+            );
+            std::fs::write(dir.join(format!("{name}.gltf")), text).unwrap();
+            dir.join(format!("{name}.gltf"))
+        };
+        std::fs::write(dir.join("whole.bin"), [0u8; 64]).unwrap();
+        std::fs::write(dir.join("short.bin"), [0u8; 40]).unwrap();
+        std::fs::write(dir.join("long.bin"), [0u8; 80]).unwrap();
+        std::fs::write(dir.join("bark.png"), [0u8; 4]).unwrap();
+        assert!(super::gltf_file_problems(&gltf("whole", 64, r#"{"uri":"bark.png"}"#)).is_empty());
+        assert!(super::gltf_file_problems(&gltf("short", 64, ""))[0].contains("the importer refuses it"));
+        assert!(super::gltf_file_problems(&gltf("long", 64, ""))[0].contains("written apart"));
+        assert!(super::gltf_file_problems(&gltf("lost", 64, ""))[0].contains("lost.bin is missing"));
+        let unseen = super::gltf_file_problems(&gltf("whole", 64, r#"{"uri":"leaf.png"},{"uri":"data:image/png;base64,AA"}"#));
+        assert_eq!(unseen, vec!["missing texture: leaf.png".to_owned()]);
+        assert_eq!(super::gltf_file_problems(&dir.join("nothing.gltf")), vec!["the file is missing".to_owned()]);
+        let mut glb = b"glTF".to_vec();
+        glb.extend(2u32.to_le_bytes());
+        glb.extend(999u32.to_le_bytes());
+        std::fs::write(dir.join("cut.glb"), &glb).unwrap();
+        assert!(super::gltf_file_problems(&dir.join("cut.glb"))[0].contains("declares 999 bytes and has 12"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

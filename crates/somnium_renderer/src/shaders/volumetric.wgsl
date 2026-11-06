@@ -97,6 +97,12 @@ struct VolumetricParams {
     /// World height where the fog stops, softly over `fog_top_softness` metres; at or under `fog_base_height`, none.
     fog_top_height: f32,
     fog_top_softness: f32,
+    /// 1 when the clouds' sky-light capture (`cloud_sky_tex`) holds a marched deck: the sky light the air and the fog
+    /// scatter then comes through it. 0 leaves the clear sky's (the multiscatter LUT) as it was.
+    cloud_sky: f32,
+    _cloud_pad0: f32,
+    _cloud_pad1: f32,
+    _cloud_pad2: f32,
 }
 
 @group(0) @binding(0) var<uniform> vol: VolumetricParams;
@@ -144,6 +150,45 @@ struct VolClusterParams {
 @group(0) @binding(11) var<storage, read> vol_light_indices: array<u32>;
 @group(0) @binding(12) var<storage, read> vol_cluster_offsets: array<VolClusterOffset>;
 @group(0) @binding(13) var<storage, read> vol_cluster: VolClusterParams;
+
+// The clouds (Sunscar, 6 Nov 2026). The fog was lit by the full sun and the clear sky's blue whatever the deck did,
+// while the ground under it had the clouds' shadow and their grey sky light: under an overcast every hill past a
+// kilometre wore a bright blue veil the land under it could not have, and read cobalt.
+/// The clouds' capture of the sky (clouds.wgsl `cloud_env`): in-scattered light and transmittance per direction.
+@group(0) @binding(14) var cloud_sky_tex: texture_cube<f32>;
+/// The world-XZ field of how much sun reaches the ground through the deck (clouds.wgsl `cloud_shadow`), last frame's.
+@group(0) @binding(15) var cloud_shadow_tex: texture_2d<f32>;
+/// `[centre_x, centre_z, extent_metres, strength]`; strength 0: no clouds, the field is not read.
+@group(0) @binding(16) var<uniform> cloud_shadow_params: vec4<f32>;
+
+/// How much sun reaches this air through the deck. Past the field's edge its edge holds: the volume reaches ~1 km,
+/// well inside the field, so this only guards a short field (shading's `cloud_shadow_at` fades to the field's mean).
+fn cloud_sun_at(p: vec3<f32>) -> f32 {
+    if cloud_shadow_params.w <= 0.0 {
+        return 1.0;
+    }
+    let local = clamp((p.xz - cloud_shadow_params.xy) / max(cloud_shadow_params.z, 1.0), vec2<f32>(-1.0), vec2<f32>(1.0));
+    return clamp(textureSampleLevel(cloud_shadow_tex, lut_sampler, local * 0.5 + 0.5, 0.0).r, 0.0, 1.0);
+}
+
+/// The sky light through the deck, as (mean transmittance, mean in-scatter) over the upper hemisphere: the zenith and
+/// rings at 50 and 15 degrees, a solid-angle-even enough spread for a light that only sets a tint and a level.
+fn cloud_sky_mean() -> vec4<f32> {
+    var t = 0.0;
+    var s = vec3<f32>(0.0);
+    let c0 = textureSampleLevel(cloud_sky_tex, lut_sampler, vec3<f32>(0.0, 1.0, 0.0), 0.0);
+    t += c0.a;
+    s += c0.rgb;
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        let a = f32(i) * 0.7853982;
+        let el = select(0.2617994, 0.8726646, i % 2u == 0u);
+        let d = vec3<f32>(cos(a) * cos(el), sin(el), sin(a) * cos(el));
+        let c = textureSampleLevel(cloud_sky_tex, lut_sampler, d, 0.0);
+        t += c.a;
+        s += c.rgb;
+    }
+    return vec4<f32>(s / 9.0, clamp(t / 9.0, 0.0, 1.0));
+}
 
 /// Lights read per froxel step; the cluster list is already culled to the cell.
 const VOL_MAX_LOCAL: u32 = 12u;
@@ -299,6 +344,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var inscatter = vec3<f32>(0.0);
     var throughput = vec3<f32>(1.0);
 
+    // The sky light the air and the fog scatter, through the deck: the clear sky's (multiscatter LUT) where the deck
+    // lets it through, and the clouds' own light. The clouds fill the upper half of the sphere an isotropic scatterer
+    // sees, so half their mean; per unit of sun, as the LUT's is.
+    var sky_through = 1.0;
+    var sky_clouds = vec3<f32>(0.0);
+    if vol.cloud_sky > 0.5 {
+        let mean = cloud_sky_mean();
+        sky_through = mean.a;
+        sky_clouds = 0.5 * mean.rgb / max(vol.sun_illuminance, vec3<f32>(1e-3));
+    }
+
     for (var slice = 0u; slice < slices; slice = slice + 1u) {
         for (var step = 0u; step < VOL_STEPS_PER_SLICE; step = step + 1u) {
             // Position within the slice, offset by a per-frame jitter (24U).
@@ -377,6 +433,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 // a closed room glowed with the whole sky (the Forest lodge).
                 sky_vis = mix(1.0, shadow_vis, saturate(vol.fog_sky_occlusion));
             }
+            sun_vis *= cloud_sun_at(world_pos);
+            multiscatter = multiscatter * sky_through + sky_clouds;
 
             var step_scatter = (scatter_rayleigh * rayleigh + scatter_mie * mie)
                 * sun_transmittance * sun_vis

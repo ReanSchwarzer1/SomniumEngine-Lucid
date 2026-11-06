@@ -274,11 +274,10 @@ struct VirtualShadowParams {
 
 /// Sun visibility through the cloud layer at a world position.
 ///
-/// Returns 1 — no shadow at all — when the cloud pass is off, when the point
-/// falls outside the field, or when the strength is zero. Outside rather than
-/// clamped: the field is centred on the camera and clamping would smear the
-/// edge texel across the whole horizon, which reads as a permanent shadow
-/// wall at the edge of the world.
+/// Returns 1 — no shadow at all — when the cloud pass is off or the strength is zero. Past the field (centred on the
+/// camera, `extent` each way) the land takes the field's mean, faded in over half an extent from the edge: not the
+/// edge texel clamped (that smears one column across the horizon as a shadow wall), and not 1 either. Under an
+/// overcast, 1 lit everything past 4 km in full sun, a hard bright ring round a dark middle (Sunscar, 7 Nov 2026).
 fn cloud_shadow_at(world_pos: vec3<f32>) -> f32 {
     let strength = cloud_shadow_params.w;
     if strength <= 0.0 {
@@ -286,11 +285,20 @@ fn cloud_shadow_at(world_pos: vec3<f32>) -> f32 {
     }
     let extent = max(cloud_shadow_params.z, 1.0);
     let local = (world_pos.xz - cloud_shadow_params.xy) / extent;
-    if any(abs(local) > vec2<f32>(1.0)) {
-        return 1.0;
+    let near = clamp(textureSampleLevel(cloud_shadow_tex, default_sampler,
+        clamp(local, vec2<f32>(-1.0), vec2<f32>(1.0)) * 0.5 + 0.5, 0.0).r, 0.0, 1.0);
+    let past = max(abs(local.x), abs(local.y)) - 1.0;
+    if past <= 0.0 {
+        return near;
     }
-    let uv = local * 0.5 + 0.5;
-    return clamp(textureSampleLevel(cloud_shadow_tex, default_sampler, uv, 0.0).r, 0.0, 1.0);
+    // The field's mean over a 4 x 4 grid: the same for every pixel of a frame, so the far land is shaded as evenly as
+    // the deck covers it on average, and moves with it.
+    var mean = 0.0;
+    for (var i = 0; i < 16; i = i + 1) {
+        let g = (vec2<f32>(f32(i & 3), f32(i >> 2)) + 0.5) / 4.0;
+        mean += textureSampleLevel(cloud_shadow_tex, default_sampler, g, 0.0).r;
+    }
+    return mix(near, clamp(mean / 16.0, 0.0, 1.0), saturate(past * 2.0));
 }
 
 /// CONTROL-N: what rain does to a surface, following Lagarde's *Water drop 3b*.
@@ -3699,7 +3707,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             }
             let air_t = exp(-depth);
             let horizon = normalize(vec3<f32>(dir.x, max(dir.y, 0.02), dir.z));
-            let sky = textureSampleLevel(env_cube, env_sampler, horizon, 0.0).rgb;
+            // With clouds, mip 1: the first mip the clouds' capture is laid over (mip 0 is the bare sky the
+            // background draws under them), so the far land fades to the horizon the deck leaves, not the clear
+            // sky's blue behind it (Sunscar, 6 Nov 2026).
+            let sky_mip = select(0.0, 1.0, cloud_shadow_params.w > 0.0);
+            let sky = textureSampleLevel(env_cube, env_sampler, horizon, sky_mip).rgb;
             result = result * air_t + sky * (vec3<f32>(1.0) - air_t);
             fog_transmittance *= dot(air_t, vec3<f32>(0.2126, 0.7152, 0.0722));
         }

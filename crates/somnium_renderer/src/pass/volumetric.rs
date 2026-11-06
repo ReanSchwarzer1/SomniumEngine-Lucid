@@ -65,6 +65,9 @@ struct VolumetricParams {
     fog_skylight: f32,
     fog_top_height: f32,
     fog_top_softness: f32,
+    /// 1: the clouds' sky-light capture holds a deck, and the fog's sky light comes through it.
+    cloud_sky: f32,
+    _cloud_pad: [f32; 3],
 }
 
 #[cfg(test)]
@@ -283,6 +286,28 @@ impl VolumetricPass {
                 storage(11),
                 storage(12),
                 storage(13),
+                // The clouds: their sky-light capture (a cube), their shadow field and its params (Sunscar, 6 Nov).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::Cube,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                lut(15),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -388,6 +413,9 @@ impl VolumetricPass {
         light_buffer: &wgpu::Buffer,
         shadow_atlas: &wgpu::TextureView,
         cluster: &crate::cluster::ClusterGrid,
+        cloud_sky: &wgpu::TextureView,
+        cloud_shadow: &wgpu::TextureView,
+        cloud_shadow_params: &wgpu::Buffer,
     ) {
         if self.bind_group.is_some() {
             return;
@@ -452,6 +480,18 @@ impl VolumetricPass {
                     binding: 13,
                     resource: cluster.params_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: wgpu::BindingResource::TextureView(cloud_sky),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: wgpu::BindingResource::TextureView(cloud_shadow),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: cloud_shadow_params.as_entire_binding(),
+                },
             ],
         }));
     }
@@ -461,7 +501,8 @@ impl VolumetricPass {
         if self.enabled { self.max_distance } else { 0.0 }
     }
 
-    /// `view_proj` is the forward matrix, kept for next frame's reprojection.
+    /// `view_proj` is the forward matrix, kept for next frame's reprojection. `cloud_sky`: the clouds' sky-light
+    /// capture holds a marched deck (`CloudPass::sky_light_clouds`).
     /// `inv_view_proj` and `view_proj` are camera-relative (projection x the view's rotation alone): the absolute
     /// inverse snaps every froxel ray to 2^-7 in ndc 13 km from the origin (Sunscar, 5 Nov 2026).
     pub fn record(
@@ -474,6 +515,7 @@ impl VolumetricPass {
         camera_pos: glam::Vec3,
         sun_direction: glam::Vec3,
         sun_illuminance: glam::Vec3,
+        cloud_sky: bool,
     ) {
         let Some(bind_group) = self.bind_group.as_ref() else {
             return;
@@ -541,6 +583,8 @@ impl VolumetricPass {
                 fog_skylight: self.fog.skylight.max(0.0),
                 fog_top_height: self.fog.top_height,
                 fog_top_softness: self.fog.top_softness.max(0.1),
+                cloud_sky: f32::from(u8::from(cloud_sky)),
+                _cloud_pad: [0.0; 3],
             }),
         );
 

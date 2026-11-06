@@ -1744,13 +1744,31 @@ impl FloatingWindow {
 
 impl<G: GameApp + 'static> Engine<G> {
     /// Start the engine loop. This will take control of the current thread.
-    pub fn run(mut config: EngineConfig, mut game: G) -> Result<(), EngineError> {
+    ///
+    /// A panic leaves a crash report under the project's `logs` and, on this thread, says so in a box; an error that
+    /// stops the start gets a box too, and the log is kept in `logs/editor.log` or `logs/game.log` (`crash_report.rs`).
+    pub fn run(config: EngineConfig, game: G) -> Result<(), EngineError> {
+        crate::crash_report::install(&config.window_title, config.project_root.as_deref());
+        let program = config.window_title.clone();
+        let result = Self::run_engine(config, game);
+        if let Err(error) = &result {
+            crate::crash_report::could_not_start(&program, error);
+        }
+        result
+    }
+
+    fn run_engine(mut config: EngineConfig, mut game: G) -> Result<(), EngineError> {
         // Phase 11.5M: install both the fmt layer and the log-capture layer.
         let (capture_layer, log_rx) = crate::log_capture::make_log_capture();
         {
             use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+            // The log in a file as well, plain text, beside the project: a console that closes with the program keeps
+            // nothing.
+            let log_file = crate::crash_report::open_log(config.project_root.as_deref(), config.player_mode)
+                .map(|file| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(file)));
             tracing_subscriber::registry()
                 .with(tracing_subscriber::fmt::layer())
+                .with(log_file)
                 .with(
                     tracing_subscriber::EnvFilter::try_from_default_env()
                         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -11539,6 +11557,7 @@ impl<G: GameApp> Engine<G> {
                     L::CopyIdentity => self.copy_identity(),
                     L::SelectLookedAt => self.select_looked_at(),
                     L::Census => self.census(),
+                    L::CheckMeshes => self.check_meshes(),
                     L::SelectSameAsset => self.select_same_asset(),
                 }
             }

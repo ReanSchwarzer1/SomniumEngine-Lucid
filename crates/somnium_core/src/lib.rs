@@ -57,6 +57,7 @@ pub mod blockout;
 pub mod character;
 pub mod clipboard;
 pub mod config;
+mod crash_report;
 pub mod context;
 pub mod cpu_watchdog;
 /// Phase CONTROL-O: deferred decals.
