@@ -151,6 +151,10 @@ pub struct LoadedMaterial {
     /// `somnium_hair`): the shading pass adds the highlight that runs across
     /// strands, which a card's own flat normal cannot give.
     pub hair: bool,
+    /// Cut out against a moving noise threshold where its texture is minified (extras `somnium_hashed_alpha`):
+    /// bare twigs a texel wide break into flecks at a fixed 0.5 cut-off, and a hashed test turns them into the
+    /// soft, see-through haze a bare crown is from afar (TAA averages it).
+    pub hashed_alpha: bool,
     /// This material is painted on **flat cut-out cards whose `uv.x` runs
     /// across the blade**, which is what `shading.wgsl`'s curved-card normal
     /// needs to be true.
@@ -312,6 +316,7 @@ pub fn load_gltf_for(path: impl AsRef<Path>, parts: Option<&HashSet<usize>>) -> 
             subsurface: material_extra(&mat, "somnium_subsurface"),
             eye: material_extra(&mat, "somnium_eye") > 0.5,
             hair: material_extra(&mat, "somnium_hair") > 0.5,
+            hashed_alpha: material_extra(&mat, "somnium_hashed_alpha") > 0.5,
             // Authored only: see the field's own note on why no import can
             // honestly infer it.
             foliage_card: false,
@@ -394,6 +399,7 @@ pub fn load_gltf_for(path: impl AsRef<Path>, parts: Option<&HashSet<usize>>) -> 
             subsurface: 0.0,
             eye: false,
             hair: false,
+            hashed_alpha: false,
             foliage_card: false,
             emissive: [0.0; 3],
             emissive_intensity: 1.0,
@@ -839,6 +845,86 @@ fn images_for_parts(document: &gltf::Document, parts: &HashSet<usize>) -> HashSe
         images.extend(textures.into_iter().flatten().map(|t| t.source().index()));
     }
     images
+}
+
+/// One uploaded part of a glTF, as the editor names it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GltfPart {
+    /// The node's name.
+    pub node: String,
+    /// The mesh's name.
+    pub mesh: String,
+    /// The material's name.
+    pub material: String,
+    /// The image files (or embedded image names) the material reads.
+    pub images: Vec<String>,
+}
+
+/// What each uploaded part of a glTF is, in `ImportedMesh.node` order. Reads the JSON only (a `.glb`'s first chunk),
+/// never geometry or pixels, so asking about a 400 MB bank costs one JSON parse.
+///
+/// # Errors
+/// The file cannot be read or is not glTF.
+pub fn describe_gltf_parts(path: &Path) -> Result<Vec<GltfPart>, String> {
+    use std::io::Read;
+    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    let mut file = std::fs::File::open(path).map_err(|e| fail(&e))?;
+    let mut bytes = Vec::new();
+    let mut header = [0u8; 20];
+    if file.read_exact(&mut header).is_ok() && &header[..4] == b"glTF" {
+        let length = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+        bytes.resize(length, 0);
+        file.read_exact(&mut bytes).map_err(|e| fail(&e))?;
+    } else {
+        bytes = std::fs::read(path).map_err(|e| fail(&e))?;
+    }
+    let gltf::Gltf { document, .. } = gltf::Gltf::from_slice(&bytes).map_err(|e| fail(&e))?;
+    fn image(texture: Option<gltf::Texture>) -> Option<String> {
+        let source = texture?.source();
+        Some(match source.source() {
+            gltf::image::Source::Uri { uri, .. } => uri.to_owned(),
+            gltf::image::Source::View { .. } => {
+                source.name().map_or_else(|| format!("embedded image {}", source.index()), str::to_owned)
+            }
+        })
+    }
+    fn walk(node: &gltf::Node, parts: &mut Vec<GltfPart>) {
+        if let Some(mesh) = node.mesh() {
+            for primitive in mesh.primitives() {
+                let material = primitive.material();
+                let pbr = material.pbr_metallic_roughness();
+                let images = [
+                    image(pbr.base_color_texture().map(|t| t.texture())),
+                    image(material.normal_texture().map(|t| t.texture())),
+                    image(pbr.metallic_roughness_texture().map(|t| t.texture())),
+                    image(material.occlusion_texture().map(|t| t.texture())),
+                    image(material.emissive_texture().map(|t| t.texture())),
+                ];
+                let mut seen = Vec::new();
+                for name in images.into_iter().flatten() {
+                    if !seen.contains(&name) {
+                        seen.push(name);
+                    }
+                }
+                parts.push(GltfPart {
+                    node: node.name().unwrap_or_default().to_owned(),
+                    mesh: mesh.name().unwrap_or_default().to_owned(),
+                    material: material.name().unwrap_or("(default material)").to_owned(),
+                    images: seen,
+                });
+            }
+        }
+        for child in node.children() {
+            walk(&child, parts);
+        }
+    }
+    let mut parts = Vec::new();
+    if let Some(scene) = document.default_scene().or_else(|| document.scenes().next()) {
+        for root in scene.nodes() {
+            walk(&root, &mut parts);
+        }
+    }
+    Ok(parts)
 }
 
 /// Every image the document holds, decoded on all cores (only `wanted`, if
@@ -1342,7 +1428,7 @@ mod normal_scale_tests {
             "asset":{"version":"2.0"},
             "materials":[{"extras":{"somnium_wind_bend":0.00035,"somnium_wind_flutter":0.02}},
                          {"extras":{"somnium_subsurface":0.7}},
-                         {"extras":{"somnium_eye":1}}, {"extras":{"somnium_hair":1}}]
+                         {"extras":{"somnium_eye":1}}, {"extras":{"somnium_hair":1,"somnium_hashed_alpha":1}}]
         });
         std::fs::write(&path, document.to_string()).unwrap();
         let loaded = super::load_gltf(&path).unwrap();
@@ -1351,6 +1437,7 @@ mod normal_scale_tests {
         assert_eq!(loaded.materials[1].subsurface, 0.7, "skin");
         assert_eq!(loaded.materials.iter().map(|m| (m.eye, m.hair)).collect::<Vec<_>>(),
             [(false, false), (false, false), (true, false), (false, true)]);
+        assert_eq!(loaded.materials.iter().map(|m| m.hashed_alpha).collect::<Vec<_>>(), [false, false, false, true]);
         assert_eq!(loaded.materials[0].height_depth, 0.0, "no extras, no room");
         std::fs::remove_file(&path).unwrap();
         // A window onto a room carries the room's depth as a negative height depth.
@@ -1385,6 +1472,49 @@ mod height_sidecar_tests {
         assert!((depth - 0.035).abs() < 1e-6, "the note sets the depth");
         assert!(sidecar_height_path(&root, "textures/stone_diff_2k.jpg").is_none(), "no map, no parallax");
         assert!(sidecar_height_path(&root, "textures/brick.png").is_none(), "only _diff colour maps qualify");
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod describe_parts_tests {
+    use super::*;
+
+    /// Two parts in walk order, each named with its material and the images it reads; the geometry is never read.
+    #[test]
+    fn parts_are_named_in_import_order_with_their_material_and_images() {
+        let root = std::env::temp_dir().join(format!("somnium-describe-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("bench.gltf");
+        let json = r#"{
+          "asset": {"version": "2.0"},
+          "scene": 0,
+          "scenes": [{"nodes": [0]}],
+          "nodes": [{"name": "Bench", "mesh": 0, "children": [1]}, {"name": "Cushion", "mesh": 1}],
+          "meshes": [
+            {"name": "bench_mesh", "primitives": [{"attributes": {"POSITION": 0}, "material": 0}]},
+            {"name": "cushion_mesh", "primitives": [{"attributes": {"POSITION": 0}, "material": 1}]}
+          ],
+          "materials": [
+            {"name": "oak", "pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}, "normalTexture": {"index": 1}},
+            {"name": "velvet"}
+          ],
+          "textures": [{"source": 0}, {"source": 1}],
+          "images": [{"uri": "textures/oak_diff.png"}, {"uri": "textures/oak_nor.png"}],
+          "buffers": [{"byteLength": 36, "uri": "missing.bin"}],
+          "bufferViews": [{"buffer": 0, "byteLength": 36}],
+          "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+                         "min": [0, 0, 0], "max": [1, 1, 1]}]
+        }"#;
+        std::fs::write(&path, json).unwrap();
+        let parts = describe_gltf_parts(&path).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].node, "Bench");
+        assert_eq!(parts[0].material, "oak");
+        assert_eq!(parts[0].images, vec!["textures/oak_diff.png", "textures/oak_nor.png"]);
+        assert_eq!(parts[1].node, "Cushion");
+        assert_eq!(parts[1].material, "velvet");
+        assert!(parts[1].images.is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -22,8 +22,8 @@ use somnium_ui::{EditorEvent, GestureId, TerrainInspectorState, UiManager};
 use crate::config::EngineConfig;
 use crate::context::{EngineContext, SimulationClock, SimulationState};
 use crate::editor_commands::{
-    AssignMaterialCmd, CreateEntityCmd, CreateLandscapeCmd, DeleteEntityCmd, EntitySnapshot,
-    FieldUndoSnapshot, SetFieldCmd, SetTransformCmd, TerrainEditCmd, TerrainRestoreOp,
+    AssignMaterialCmd, CommandGroup, CreateEntityCmd, CreateLandscapeCmd, EditorCommand, EntitySnapshot,
+    FieldUndoSnapshot, SetEditorFlagsCmd, SetFieldCmd, SetTransformCmd, TerrainEditCmd, TerrainRestoreOp,
     TerrainRestoreQueue, UndoStack,
 };
 use crate::editor_gizmo::{
@@ -114,20 +114,27 @@ fn shortcut_action_for(
     modifiers: somnium_ui::message::Modifiers,
     game_owns_keyboard: bool,
 ) -> Option<somnium_ui::commands::CommandAction> {
-    somnium_ui::commands::Chord::from_winit(
+    use somnium_ui::{commands::CommandAction as A, editor_event::LevelTool as L};
+    let chord = somnium_ui::commands::Chord::from_winit(
         code,
         modifiers.command(),
         modifiers.shift,
         modifiers.alt,
         false,
-    )
+    )?;
+    let action = somnium_ui::commands::registry().binding(chord)?.action;
     // While the game owns the keyboard — flying the viewport, or in a play
     // session — an unmodified shortcut stands down and the key falls through.
     // Modified chords are unaffected: `Ctrl+S` is unambiguous and should still
-    // save mid-flight and mid-play.
-    .filter(|chord| !game_owns_keyboard || chord.has_modifier())
-    .and_then(|chord| somnium_ui::commands::registry().binding(chord))
-    .map(|command| command.action)
+    // save mid-flight and mid-play. The level tools are edit-mode tools,
+    // modified or not (Shift+F mid-play is a sprinting player's key), except
+    // Select What You Look At (F4), which is made for Play.
+    if game_owns_keyboard && !matches!(action, A::LevelTool(L::SelectLookedAt)) {
+        if !chord.has_modifier() || matches!(action, A::LevelTool(_)) {
+            return None;
+        }
+    }
+    Some(action)
 }
 
 fn shortcut_preserves_game_key(action: somnium_ui::commands::CommandAction) -> bool {
@@ -182,6 +189,31 @@ mod shortcut_input_tests {
         assert_eq!(
             shortcut_action_for(KeyCode::KeyS, ctrl, true),
             Some(CommandAction::SaveScene),
+        );
+    }
+
+    /// The level tools never take a key from the game: Shift is a sprint, and Shift+F mid-play is the player's.
+    #[test]
+    fn level_tools_stand_down_while_the_game_owns_the_keyboard() {
+        use somnium_ui::editor_event::LevelTool;
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            shortcut_action_for(KeyCode::KeyF, shift, false),
+            Some(CommandAction::LevelTool(LevelTool::FindInOutliner))
+        );
+        assert_eq!(shortcut_action_for(KeyCode::KeyF, shift, true), None);
+        assert_eq!(
+            shortcut_action_for(KeyCode::End, Modifiers::default(), false),
+            Some(CommandAction::LevelTool(LevelTool::DropToGround))
+        );
+        assert_eq!(shortcut_action_for(KeyCode::End, Modifiers::default(), true), None);
+        assert_eq!(
+            shortcut_action_for(KeyCode::F4, Modifiers::default(), true),
+            Some(CommandAction::LevelTool(LevelTool::SelectLookedAt)),
+            "F4 is made for Play: what you see, stopped and selected"
         );
     }
 
@@ -1130,6 +1162,8 @@ pub struct Engine<G: GameApp> {
     /// resolved against the order the user can actually see.
     outliner_order: Vec<somnium_ecs::entity::Entity>,
     outliner_hierarchy: crate::outliner_hierarchy::OutlinerHierarchy,
+    /// The open scene's edit layer, the selection card and the level tools (`app_editing.rs`).
+    editing: editing_host::EditingState,
     /// TOWN-PERF: when the outliner rows were last gathered, and the entity
     /// count and primary selection they were gathered for. See `OUTLINER_REFRESH`.
     outliner_refreshed: Option<std::time::Instant>,
@@ -1304,6 +1338,8 @@ pub struct Engine<G: GameApp> {
     precipitation_entity: Option<somnium_ecs::Entity>,
     /// Title-bar close requested a shutdown.
     ui_wants_exit: bool,
+    /// The author answered "Save changes?" on the way out, so closing no longer asks.
+    quit_confirmed: bool,
     /// Map load completed this frame; game code seeds fly-cam / boat after ECS reset.
     pending_map_load: Option<crate::MapLoadResult>,
     // ── Phase 16-C: scripting ────────────────────────────────────────────
@@ -1849,6 +1885,7 @@ impl<G: GameApp + 'static> Engine<G> {
             selection: crate::selection::Selection::default(),
             outliner_order: Vec::new(),
             outliner_hierarchy: crate::outliner_hierarchy::OutlinerHierarchy::default(),
+            editing: editing_host::EditingState::default(),
             outliner_refreshed: None,
             outliner_seen: (0, None),
             settings: settings_store,
@@ -1925,6 +1962,7 @@ impl<G: GameApp + 'static> Engine<G> {
             weather_state: crate::weather::WeatherState::default(),
             precipitation_entity: None,
             ui_wants_exit: false,
+            quit_confirmed: false,
             pending_map_load: None,
             scripts: crate::script_host::ScriptHost::default(),
             script_input: crate::script_input::ScriptInputTracker::new(),
@@ -2573,6 +2611,7 @@ impl<G: GameApp> Engine<G> {
 
         match kind {
             SceneKind::MapRecipe | SceneKind::LegacyDump => {
+                self.reset_editing(None);
                 let Some((renderer, render_ctx)) =
                     self.renderer.as_mut().zip(self.render_ctx.as_ref())
                 else {
@@ -2619,6 +2658,9 @@ impl<G: GameApp> Engine<G> {
             self.world.despawn(entity);
         }
 
+        // The edit layer beside the scene: the author's own changes, applied before anything spawns.
+        let edited = self.edits_before_scene_spawn(path, document);
+        let document = edited.as_ref().unwrap_or(document);
         let report = match crate::scene_schema::scene_from_json(
             &mut self.world,
             &self.type_registry,
@@ -2647,6 +2689,7 @@ impl<G: GameApp> Engine<G> {
             report.warnings.len()
         );
         self.after_scene_load(path);
+        self.edits_after_scene_spawn();
     }
 
     /// Where an `ImportedMesh.source` lives on disk, contained by the project.
@@ -3317,6 +3360,7 @@ impl<G: GameApp> Engine<G> {
             self.terrain_stroke = None;
         }
         self.refresh_gizmo_anchor();
+        self.touch_selection();
     }
 
     /// Put the transform gizmo where the primary selection actually is.
@@ -3971,10 +4015,22 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             self.physics = Some(PhysicsWorld::new(PhysicsConfig::default()));
         }
 
+        // SOMNIUM_NO_AUDIO=1 runs silent on purpose: capture runs, and the proof that a machine with no sound device
+        // still runs.
+        let no_audio = std::env::var("SOMNIUM_NO_AUDIO").is_ok_and(|v| !matches!(v.trim(), "" | "0" | "false" | "off"));
+        if self.audio.is_none() && no_audio {
+            info!("SOMNIUM_NO_AUDIO: running without sound");
+            self.audio = Some(AudioEngine::silent());
+        }
         if self.audio.is_none() {
             match AudioEngine::new() {
                 Ok(engine) => self.audio = Some(engine),
-                Err(e) => tracing::error!("Failed to initialize audio: {}", e),
+                Err(e) => {
+                    // No device (off, missing, or held by another program): run silent rather than
+                    // panic at the first frame, which unwraps the engine in a dozen places.
+                    tracing::error!("Failed to initialize audio: {e}; running without sound");
+                    self.audio = Some(AudioEngine::silent());
+                }
             }
         }
 
@@ -4004,7 +4060,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
 
         let size = LogicalSize::new(self.config.window_size.0, self.config.window_size.1);
         let mut attrs = WindowAttributes::default()
-            .with_title("Somnium Engine")
+            .with_title("Lucid")
             .with_inner_size(size)
             .with_resizable(self.config.resizable)
             // MORROWIND-I. Created invisible and shown at the end of this
@@ -4052,6 +4108,9 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 self.window = Some(Arc::clone(&window));
 
                 info!("Initializing rendering subsystems...");
+                // A GPU error stops the game, with the GPU named for its crash report; the editor logs it and stays
+                // up, so a bad shader edit can be saved around and fixed.
+                somnium_renderer::context::set_gpu_errors_fatal(self.config.player_mode);
                 let render_ctx = pollster::block_on(RenderContext::new(Arc::clone(&window)));
                 let started = std::time::Instant::now();
                 let renderer = SomniumRenderer::new(&render_ctx);
@@ -4646,25 +4705,34 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                     if band.is_dragged() {
                         self.apply_marquee(band);
                     } else {
-                        let hit = self.entities_under_cursor().into_iter().next();
+                        let hit = self.click_pick();
                         self.selection.set_single(hit);
                         self.after_selection_change();
+                        self.reveal_selection_in_outliner(true);
                     }
                     gizmo_consumed = true;
                 }
                 if let Some(drag) = self.gizmo_drag.take() {
-                    if let Some(entity) = self.world.find_entity_by_index(drag.entity_index) {
-                        let final_t = self
-                            .world
-                            .get::<Transform>(entity)
-                            .copied()
-                            .unwrap_or(drag.start_transform);
-                        let cmd = Box::new(SetTransformCmd::new(
-                            drag.entity_index,
-                            drag.start_transform,
-                            final_t,
-                        ));
-                        self.undo_stack.push_silent(cmd);
+                    // Every moved entity, the followers too: undo used to put back only the primary.
+                    let starts = std::iter::once((drag.entity_index, drag.start_transform))
+                        .chain(drag.followers.iter().map(|f| (f.entity_index, f.start_transform)));
+                    let mut moves: Vec<Box<dyn EditorCommand>> = Vec::new();
+                    for (index, start) in starts {
+                        let Some(entity) = self.world.find_entity_by_index(index) else {
+                            continue;
+                        };
+                        let end = self.world.get::<Transform>(entity).copied().unwrap_or(start);
+                        if end.translation != start.translation
+                            || end.rotation != start.rotation
+                            || end.scale != start.scale
+                        {
+                            moves.push(Box::new(SetTransformCmd::new(index, start, end)));
+                        }
+                    }
+                    if !moves.is_empty() {
+                        self.undo_stack
+                            .push_silent(Box::new(CommandGroup::named("Transform".to_owned(), moves)));
+                        self.scene_dirty = true;
                     }
                     gizmo_consumed = true;
                 }
@@ -4939,7 +5007,14 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 || new_t.translation - start.translation,
                 |drag| drag.parent_world.transform_point3(new_t.translation) - drag.gizmo_pos,
             );
-            let spin = new_t.rotation * start.rotation.inverse();
+            // The followers take the turn in world space (each writes it into its own parent's frame).
+            let spin = self.gizmo_drag.as_ref().map_or_else(
+                || new_t.rotation * start.rotation.inverse(),
+                |drag| {
+                    let parent = drag.parent_world.to_scale_rotation_translation().1;
+                    parent * new_t.rotation * start.rotation.inverse() * parent.inverse()
+                },
+            );
             let growth = glam::Vec3::new(
                 safe_ratio(new_t.scale.x, start.scale.x),
                 safe_ratio(new_t.scale.y, start.scale.y),
@@ -5162,6 +5237,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                     row.locked = flags.locked;
                 }
                 entity_tags(&self.world, entity, &mut row.tags);
+                self.decorate_outliner_row(entity, row);
                 if self
                     .world
                     .get::<crate::prefab::PrefabMember>(entity)
@@ -5455,6 +5531,9 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 (None, None)
             };
             self.zone_end();
+            self.run_editor_script();
+            self.touch_selection();
+            let selection_card = self.selection_card();
             self.zone_begin("Panel: hand to UI");
             if let Some(ui) = &mut self.ui_manager {
                 if refresh {
@@ -5517,6 +5596,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                         .and_then(|idx| tree.iter().find(|row| row.id == idx))
                         .map(|row| row.name.as_str()),
                 );
+                ui.set_selection_card(selection_card.as_deref());
                 if let Some(t) = sel_t {
                     let (rx, ry, rz) = t.rotation.to_euler(glam::EulerRot::XYZ);
                     ui.update_inspector(
@@ -5738,7 +5818,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             );
             self.game.on_render(&mut ctx);
 
-            if ctx.should_exit {
+            if ctx.should_exit && self.may_quit() {
                 self.initiate_shutdown(event_loop);
                 return;
             }
@@ -6037,7 +6117,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 self.game.on_map_loaded(&mut ctx, &result);
             }
         }
-        if self.ui_wants_exit {
+        if std::mem::take(&mut self.ui_wants_exit) && self.may_quit() {
             self.initiate_shutdown(event_loop);
             return;
         }
@@ -6882,14 +6962,16 @@ impl<G: GameApp> Engine<G> {
         self.game.on_event(&mut ctx, &engine_event);
         let speed_request = ctx.camera_speed_request;
 
-        if ctx.should_exit {
+        if ctx.should_exit && self.may_quit() {
             self.initiate_shutdown(event_loop);
             return;
         }
 
         if matches!(engine_event, EngineEvent::WindowCloseRequested) {
             self.floating_layout.flush(true);
-            self.initiate_shutdown(event_loop);
+            if self.may_quit() {
+                self.initiate_shutdown(event_loop);
+            }
         }
 
         // Phase 20B: apply a camera-speed change requested by game code
@@ -6901,6 +6983,31 @@ impl<G: GameApp> Engine<G> {
                 ui.update_camera_speed(norm, speed);
             }
         }
+    }
+
+    /// Whether the editor may close now. With unsaved changes it asks "Save changes?" first and says no; the answer
+    /// comes back as `EditorEvent::Quit`. A game run as a game, an automated capture run (`SOMNIUM_CAPTURE_QUIT`) and
+    /// an answered question close at once.
+    fn may_quit(&mut self) -> bool {
+        if self.config.player_mode
+            || self.quit_confirmed
+            || !self.scene_dirty
+            || std::env::var_os("SOMNIUM_CAPTURE_QUIT").is_some()
+        {
+            return true;
+        }
+        if self.ui_manager.is_none() {
+            return true;
+        }
+        if self.play_session_active {
+            // Back to the editor first, so the question is on screen.
+            self.handle_editor_event(EditorEvent::StopSimulation);
+        }
+        if let Some(ui) = self.ui_manager.as_mut() {
+            ui.set_scene_dirty(true);
+            ui.prompt_unsaved_quit();
+        }
+        false
     }
 
     fn initiate_shutdown(&mut self, event_loop: &ActiveEventLoop) {
@@ -7831,6 +7938,7 @@ impl<G: GameApp> Engine<G> {
         let Some(stroke) = self.terrain_stroke.take() else {
             return false;
         };
+        self.note_terrain_edit();
         let Some(region) = stroke.region else {
             return true;
         };
@@ -11370,6 +11478,22 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::FocusSelection => self.focus_camera_on_selection(),
+            EditorEvent::LevelTool(tool) => {
+                use somnium_ui::editor_event::LevelTool as L;
+                match tool {
+                    L::DropToGround => self.drop_selection_to_ground(false),
+                    L::AlignToSurface => self.drop_selection_to_ground(true),
+                    L::FindFloating => self.find_floating_objects(),
+                    L::ToggleHide => self.toggle_hide_selection(),
+                    L::Isolate => self.isolate_selection(),
+                    L::EndIsolation => self.end_isolation(),
+                    L::FindInOutliner => self.reveal_selection_in_outliner(false),
+                    L::SelectParent => self.select_parent(),
+                    L::SaveSceneAs => self.save_scene_as(),
+                    L::CopyIdentity => self.copy_identity(),
+                    L::SelectLookedAt => self.select_looked_at(),
+                }
+            }
 
             EditorEvent::RenameSelected => {}
 
@@ -11796,10 +11920,16 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::DeleteSelected => {
-                if let Some(entity) = self.selection.primary {
-                    let cmd = Box::new(DeleteEntityCmd::new(entity.index()));
+                // Every selected entity with every part under it. Deleting the primary alone left the rest of a
+                // multi-selection, and walking `Children` (sixteen slots) left parts seventeen on standing.
+                let roots = self.selection.as_slice().to_vec();
+                if !roots.is_empty() {
+                    let cmd = Box::new(crate::editor_commands::DeleteSubtreesCmd::new(&mut self.world, &roots));
                     self.undo_stack
                         .push(cmd, &mut self.world, &mut self.selection.primary);
+                    self.selection.retain_alive(&self.world);
+                    self.selection.reconcile();
+                    self.scene_dirty = true;
                     if let Some(r) = &mut self.renderer {
                         r.clear_gizmo();
                     }
@@ -11807,13 +11937,15 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::Undo => {
-                self.undo_stack
-                    .undo(&mut self.world, &mut self.selection.primary);
+                if self.undo_stack.undo(&mut self.world, &mut self.selection.primary) {
+                    self.scene_dirty = true;
+                }
             }
 
             EditorEvent::Redo => {
-                self.undo_stack
-                    .redo(&mut self.world, &mut self.selection.primary);
+                if self.undo_stack.redo(&mut self.world, &mut self.selection.primary) {
+                    self.scene_dirty = true;
+                }
             }
 
             EditorEvent::ToggleShadingMode => {
@@ -11849,10 +11981,18 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::OpenScenePicker => {
+                // Both games keep their levels as `scenes/*.scene.json`, which a `.somnium`-only filter hid.
+                let start = self
+                    .config
+                    .project_root
+                    .as_ref()
+                    .map(|root| root.join("scenes"))
+                    .filter(|scenes| scenes.is_dir())
+                    .unwrap_or_else(|| self.config.content_root.clone());
                 let Some(path) = rfd::FileDialog::new()
                     .set_title("Open Scene")
-                    .add_filter("Somnium scene", &["somnium"])
-                    .set_directory(&self.config.content_root)
+                    .add_filter("Scene", &["json", "somnium"])
+                    .set_directory(&start)
                     .pick_file()
                 else {
                     return;
@@ -12219,71 +12359,10 @@ impl<G: GameApp> Engine<G> {
                 }
             }
 
-            EditorEvent::SaveScene => {
-                self.flush_material_assets();
-                let path = "scene.somnium";
-                // Phase 16-A: the schema-driven format (`version: 3`).
-                // It writes whatever the registry describes, which is how
-                // script attachments and their authored properties reach
-                // the file at all — the hand-written version-1 walk has no
-                // way to express them.
-                match crate::scene_schema::save_scene_schema(
-                    &mut self.world,
-                    &self.type_registry,
-                    path,
-                ) {
-                    Ok(()) => {
-                        info!("Scene saved to {}", path);
-                        self.scene_dirty = false;
-                        // A clean manual save is the moment there is nothing
-                        // left to recover, so the autosaves go with it. Leaving
-                        // them would offer the person older work next launch.
-                        self.autosave.saved();
-                        crate::autosave::clear(&self.config.content_root);
-                        self.remember_recent_scene(std::path::Path::new(path));
-                        if let Some(ui) = self.ui_manager.as_mut() {
-                            ui.set_scene_name(Some(path.to_string()));
-                        }
-                        if let Some(ui) = &mut self.ui_manager {
-                            ui.push_toast("Scene saved");
-                            // Saving is what "modified" was measured against.
-                            ui.reset_inspector_baseline();
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to save scene: {}", e);
-                        if let Some(ui) = &mut self.ui_manager {
-                            ui.push_toast("Save failed");
-                        }
-                    }
-                }
-                // Phase 14F-3: heightmap + splatmap sidecars, one per terrain.
-                if let Some(r) = &self.renderer {
-                    // Streamed tiles have their own sidecars beside their cells; Save never writes them.
-                    let terrain_ids: Vec<u32> = self
-                        .world
-                        .entities()
-                        .filter(|&e| self.world.get::<crate::cell_streaming::Streamed>(e).is_none())
-                        .filter_map(|e| {
-                            self.world
-                                .get::<TerrainComponent>(e)
-                                .map(|tc| tc.terrain_id)
-                        })
-                        .collect();
-                    for id in terrain_ids {
-                        if let Some(t) = r.terrain(id) {
-                            let sidecar = format!("{path}.terrain{id}.bin");
-                            match t.save_binary(&sidecar) {
-                                Ok(()) => info!("Terrain {} data saved to {}", id, sidecar),
-                                Err(e) => warn!("Failed to save terrain {}: {}", id, e),
-                            }
-                        }
-                    }
-                }
-            }
-
+            EditorEvent::SaveScene => self.save_scene_edits(),
             EditorEvent::NewScene => {
                 info!("Creating new scene");
+                self.reset_editing(None);
                 self.animation_authoring
                     .clear(&mut self.world, self.physics.as_mut());
                 self.navigation_editor.clear(&mut self.world);
@@ -12344,84 +12423,50 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::DuplicateSelected => {
-                if let Some(entity) = self.selection.primary {
-                    let transform = self
-                        .world
-                        .get::<Transform>(entity)
-                        .copied()
-                        .unwrap_or_else(|| Transform::from_translation(glam::Vec3::ZERO));
-                    let name = self
-                        .world
-                        .get::<Name>(entity)
-                        .map(|n| Name::new(&format!("{}_copy", n.as_str())))
-                        .unwrap_or_else(|| Name::new("Entity_copy"));
-                    let light = self.world.get::<LightComponent>(entity).copied();
-                    let audio = self
-                        .world
-                        .get::<crate::AudioEmitterComponent>(entity)
-                        .cloned();
-                    let mesh = self.world.get::<MeshComponent>(entity).copied();
-                    let mat = self.world.get::<MaterialComponent>(entity).copied();
-                    let mesh_kind = self.world.get::<MeshKind>(entity).copied();
-                    let mut water = self.world.get::<WaterComponent>(entity).copied();
-                    if let Some(component) = water.as_mut() {
-                        if let (Some(renderer), Some(render_ctx)) =
-                            (&mut self.renderer, &self.render_ctx)
-                        {
-                            component.water_id = renderer.allocate_water_body_id();
-                            if let Err(error) =
-                                renderer.ensure_water_body(render_ctx, component.descriptor())
-                            {
-                                warn!("Failed to duplicate water data: {error}");
-                            }
+                if self.selection.is_empty() {
+                    return;
+                }
+                // The whole object, every part (an imported model's root alone is an empty shell), beside its
+                // original: the clipboard's subtree copy, under the original's parent, as one undo step.
+                let mut clipboard =
+                    crate::clipboard::EntityClipboard::duplicate(&self.world, self.selection.as_slice());
+                let (renderer, render_ctx) = (&mut self.renderer, &self.render_ctx);
+                clipboard.for_each_snapshot_mut(|snapshot, root| {
+                    if root {
+                        // Offset the duplicate slightly so it's visible.
+                        if let Some(transform) = snapshot.transform.as_mut() {
+                            transform.translation += glam::Vec3::X;
+                        }
+                        let name = snapshot.name.as_ref().map_or_else(|| "Entity".to_owned(), |n| n.as_str().to_owned());
+                        snapshot.name = Some(Name::new(&format!("{name}_copy")));
+                    }
+                    // Terrains are not duplicated — two entities sharing one terrain_id would draw the same
+                    // terrain twice. Nor is the scene's environment, or what was painted onto the original.
+                    snapshot.environment = false;
+                    snapshot.terrain = None;
+                    snapshot.world_partition = None;
+                    snapshot.ui_canvas = None;
+                    snapshot.voxel_terrain = None;
+                    snapshot.foliage = None;
+                    if let Some(component) = snapshot.water.as_mut()
+                        && let (Some(renderer), Some(render_ctx)) = (renderer.as_mut(), render_ctx.as_ref())
+                    {
+                        component.water_id = renderer.allocate_water_body_id();
+                        if let Err(error) = renderer.ensure_water_body(render_ctx, component.descriptor()) {
+                            warn!("Failed to duplicate water data: {error}");
                         }
                     }
-                    let parent = self.world.get::<Parent>(entity).copied();
-                    let is_particle_emitter =
-                        self.world.get::<crate::ParticleEmitter>(entity).is_some();
-                    // Offset the duplicate slightly so it's visible
-                    let mut dup_transform = transform;
-                    dup_transform.translation += glam::Vec3::new(1.0, 0.0, 0.0);
-                    let snapshot = EntitySnapshot {
-                        reflected: EntitySnapshot::capture(&self.world, entity).reflected,
-                        spline: self.world.get::<crate::SplineComponent>(entity).cloned(),
-                        blockout: self
-                            .world
-                            .get::<crate::blockout::BlockoutComponent>(entity)
-                            .copied(),
-                        prefab: None,
-                        persistent_id: Some(somnium_ecs::PersistentId::mint()),
-                        surface_tags: self
-                            .world
-                            .get::<crate::scatter_scene::SurfaceTagsComponent>(entity)
-                            .cloned(),
-                        transform: Some(dup_transform),
-                        name: Some(name),
-                        light,
-                        audio,
-                        mesh,
-                        mat,
-                        wt: Some(WorldTransform::identity()),
-                        environment: false,
-                        decal: None,
-                        mesh_kind,
-                        is_particle_emitter,
-                        // Terrains are not duplicated — two entities sharing
-                        // one terrain_id would draw the same terrain twice.
-                        terrain: None,
-                        world_partition: None,
-                        ui_canvas: None,
-                        voxel_terrain: None,
-                        foliage: None,
-                        water,
-                        parent,
-                        children: None,
-                    };
-                    let cmd = Box::new(CreateEntityCmd::new(snapshot));
-                    self.undo_stack
-                        .push(cmd, &mut self.world, &mut self.selection.primary);
-                    info!("Duplicated entity {}", entity.index());
-                }
+                });
+                let count = clipboard.root_count();
+                use crate::editor_commands::EditorCommand as _;
+                let mut command = crate::clipboard::PasteEntitiesCmd::new(clipboard, None);
+                command.execute(&mut self.world, &mut self.selection.primary);
+                let roots = command.roots().to_vec();
+                self.undo_stack.push_silent(Box::new(command));
+                self.selection.set_many(roots);
+                self.after_selection_change();
+                self.scene_dirty = true;
+                info!("Duplicated {count} object(s) with their parts");
             }
 
             EditorEvent::LoadScene(path) => self.load_scene_file(&path),
@@ -12901,6 +12946,7 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::PlaySimulation => {
+                self.end_isolation();
                 // Phase 16-D: the authored world is captured on the way in,
                 // once per session. Resuming from Pause must not recapture
                 // it — that would silently make everything a script has
@@ -13061,6 +13107,18 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::CloseWindow => {
+                self.ui_wants_exit = true;
+            }
+
+            EditorEvent::Quit { after_save } => {
+                if after_save {
+                    self.save_scene_edits();
+                    if self.scene_dirty {
+                        self.toast("Not saved, so the editor stays open");
+                        return;
+                    }
+                }
+                self.quit_confirmed = true;
                 self.ui_wants_exit = true;
             }
 
@@ -13612,8 +13670,11 @@ fn apply_gizmo_drag(
                     snap.rotate_deg,
                 )
                 .to_radians();
+                // The turn is about a world axis; the authored rotation is in the parent's frame.
+                let turn = glam::Quat::from_axis_angle(axis_dir, delta);
+                let parent = drag.parent_world.to_scale_rotation_translation().1;
                 result.rotation =
-                    glam::Quat::from_axis_angle(axis_dir, delta) * drag.start_transform.rotation;
+                    crate::editor_gizmo::spin_in_parent(parent, turn) * drag.start_transform.rotation;
             }
         }
     }
@@ -14676,6 +14737,8 @@ mod story_host;
 mod cell_streaming_host;
 #[path = "app_prop_sets.rs"]
 mod prop_sets_host;
+#[path = "app_editing.rs"]
+mod editing_host;
 
 include!("app_project_foliage.rs");
 

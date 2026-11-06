@@ -36,6 +36,17 @@ use crate::editor::parts::*;
 
 pub(crate) fn fill_help_body(ui: &mut UserInterface, parent: NodeHandle, font_id: u8, page: u8) {
     ui.clear_children(parent);
+    if page == 4 {
+        // About: Lucid's lock-up, drawn from the logo's own files.
+        let lockup = crate::widgets::splash::LockupBuilder::new(
+            WidgetBuilder::new()
+                .with_horizontal_alignment(HorizontalAlignment::Left)
+                .with_margin(Thickness { left: 0.0, top: 8.0, right: 8.0, bottom: 4.0 }),
+        )
+        .with_height(56.0)
+        .build();
+        ui.add_node(lockup, parent);
+    }
     for block in crate::metaphor::help_blocks(page) {
         match block {
             crate::metaphor::HelpBlock::Heading(text) => {

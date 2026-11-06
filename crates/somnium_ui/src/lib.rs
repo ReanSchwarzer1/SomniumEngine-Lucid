@@ -985,11 +985,39 @@ static DISPLAY_SIZES: std::sync::Mutex<(Option<[u32; 2]>, Vec<[u32; 2]>)> = std:
 /// resizes for a game's display options, and never captures the pointer (somnium_core `sync_play_cursor`). Pictures
 /// still come from its own frames, since the capture copies the swap chain. The developer: "i would prefer it if you
 /// stopped taking the mouse away for checks".
+///
+/// Set to anything that is not a size (`1`, `true`), it still means a background window, at 1600x900, and says so:
+/// a value that silently failed to parse used to open an ordinary window that took the focus (5 Nov 2026).
 pub fn background_window() -> Option<[u32; 2]> {
     static SIZE: std::sync::LazyLock<Option<[u32; 2]>> = std::sync::LazyLock::new(|| {
-        parse_window_size(&std::env::var("SOMNIUM_BACKGROUND_WINDOW").ok()?)
+        background_window_size(std::env::var("SOMNIUM_BACKGROUND_WINDOW").ok().as_deref())
     });
     *SIZE
+}
+
+fn background_window_size(value: Option<&str>) -> Option<[u32; 2]> {
+    let value = value?.trim();
+    if value.is_empty() || matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no") {
+        return None;
+    }
+    Some(parse_window_size(value).unwrap_or_else(|| {
+        tracing::warn!(value, "SOMNIUM_BACKGROUND_WINDOW is not WIDTHxHEIGHT: a background window at 1600x900");
+        [1600, 900]
+    }))
+}
+
+#[cfg(test)]
+mod background_window_flag_tests {
+    #[test]
+    fn any_set_value_means_a_background_window() {
+        use super::background_window_size as size;
+        assert_eq!(size(Some("2560x1440")), Some([2560, 1440]));
+        assert_eq!(size(Some("1")), Some([1600, 900]), "a flag, not a size, must not open an ordinary window");
+        assert_eq!(size(Some("true")), Some([1600, 900]));
+        assert_eq!(size(Some("0")), None);
+        assert_eq!(size(Some("")), None);
+        assert_eq!(size(None), None);
+    }
 }
 
 fn parse_window_size(text: &str) -> Option<[u32; 2]> {
@@ -3571,14 +3599,14 @@ impl UiManager {
         self.refresh_title();
     }
 
-    /// `Somnium Engine — scene.somnium •` — CONTROL-J's accurate title bar.
+    /// `Lucid — scene.somnium •` — CONTROL-J's accurate title bar.
     ///
     /// The bullet is the convention every editor uses for unsaved work, and
     /// the title bar is the one place that state is visible without looking
     /// down at the status bar. Composed here rather than at the two call
     /// sites so the facts it combines cannot get out of step.
     fn refresh_title(&mut self) {
-        let mut title = "Somnium Engine".to_string();
+        let mut title = "Lucid".to_string();
         if let Some(name) = &self.scene_name {
             title.push_str(" \u{2014} ");
             title.push_str(name);
@@ -3618,6 +3646,47 @@ impl UiManager {
             }
             None => self.native_ui.set_visibility(self.vp_overlay, false),
         }
+    }
+
+    /// The viewport's selection card: what the selection is and where it came from, several lines. `None` leaves the
+    /// one-line name [`Self::set_status_selection`] put there.
+    pub fn set_selection_card(&mut self, card: Option<&str>) {
+        if let Some(card) = card {
+            self.native_ui
+                .send(TextMessage::set_text(self.vp_overlay_text, card.to_owned()));
+            self.native_ui.set_visibility(self.vp_overlay, true);
+        }
+    }
+
+    /// Open every row above `id` and scroll the Outliner so it shows. False when the Outliner's search hides it.
+    pub fn reveal_outliner_row(&mut self, id: u32, ancestors: &[u32]) -> bool {
+        self.outliner_expanded.extend(ancestors.iter().copied());
+        let Some((rows, _)) = self.last_outliner_state.as_ref() else {
+            return false;
+        };
+        let filter = crate::outliner_filter::OutlinerFilter::parse(&format!(
+            "{} {}",
+            self.outliner_filter, self.persona.outliner_scope
+        ));
+        let mut visible = crate::outliner_filter::OutlinerVisibility::new(filter.is_empty());
+        let position = rows
+            .iter()
+            .filter(|row| filter.matches(row) && visible.shows(row, &self.outliner_expanded))
+            .position(|row| row.id == id);
+        // Rebuilt next frame with the rows just opened.
+        self.last_outliner_state = None;
+        let Some(position) = position else {
+            return false;
+        };
+        let row = theme::active().density.row_tree;
+        let view = self.native_ui.screen_bounds(self.outliner_scroll).h;
+        let offset = (position as f32 * row - view * 0.4).max(0.0);
+        self.native_ui.send(UiMessage::new(
+            self.outliner_scroll,
+            MessageDirection::ToWidget,
+            crate::widgets::scroll_viewer::ScrollViewerMessage::ScrollTo(offset),
+        ));
+        true
     }
 
     /// Right-hand statistics cluster. Object count is what the editor can
@@ -3961,6 +4030,14 @@ impl UiManager {
 
     pub fn prompt_unsaved_new(&mut self) {
         self.prompt_unsaved_action(EditorEvent::NewScene);
+    }
+
+    /// Ask "Save changes?" before the editor closes; the answer comes back as [`EditorEvent::Quit`]. Asking again
+    /// while it is open changes nothing.
+    pub fn prompt_unsaved_quit(&mut self) {
+        if !self.unsaved_open {
+            self.prompt_unsaved_action(EditorEvent::Quit { after_save: false });
+        }
     }
 
     fn prompt_unsaved_action(&mut self, action: EditorEvent) {
@@ -5784,6 +5861,7 @@ impl UiManager {
             A::DesignerTool(action) => self
                 .editor_events
                 .push_back(EditorEvent::DesignerTool(action)),
+            A::LevelTool(tool) => self.editor_events.push_back(EditorEvent::LevelTool(tool)),
             A::ExportBlockout => self.editor_events.push_back(EditorEvent::ExportBlockout),
             A::GraphTool(action) => self.run_graph_tool_action(action),
             A::ImportModel => self.editor_events.push_back(EditorEvent::ImportModel),
@@ -7699,6 +7777,7 @@ impl UiManager {
                 locked: false,
                 script_error: false,
                 tags: Vec::new(),
+                asset: String::new(),
             })
             .collect();
         self.update_outliner_tree(&rows, selected);
@@ -7724,8 +7803,9 @@ impl UiManager {
             self.outliner_filter, self.persona.outliner_scope
         ));
         let mut items = Vec::new();
+        let mut visible = crate::outliner_filter::OutlinerVisibility::new(filter.is_empty());
         for row in entities {
-            if !filter.matches(row) {
+            if !filter.matches(row) || !visible.shows(row, &self.outliner_expanded) {
                 continue;
             }
             let expanded = self.outliner_expanded.contains(&row.id) || !row.has_children;
@@ -9418,10 +9498,8 @@ impl UiManager {
                 }
                 if msg.destination == self.unsaved_save {
                     self.close_unsaved();
-                    self.editor_events.push_back(EditorEvent::SaveScene);
-                    if let Some(action) = self.pending_scene_action.take() {
-                        self.editor_events.push_back(action);
-                    }
+                    let action = self.pending_scene_action.take();
+                    self.editor_events.extend(events_after_save(action));
                     continue;
                 }
                 if msg.destination == self.unsaved_discard {
@@ -11050,6 +11128,33 @@ mod dpi_tests {
         let mut ui = UserInterface::new(1280.0, 720.0);
         ui.draw_ctx.font_atlas.set_render_scale(2.0);
         assert_eq!(ui.draw_ctx.font_atlas.render_scale, 2.0);
+    }
+}
+
+/// What "Save" in "Save changes?" sends: the save, then the action that asked. Quitting saves inside the quit, so a
+/// save that fails or is cancelled keeps the editor open.
+fn events_after_save(action: Option<EditorEvent>) -> Vec<EditorEvent> {
+    match action {
+        Some(EditorEvent::Quit { .. }) => vec![EditorEvent::Quit { after_save: true }],
+        action => std::iter::once(EditorEvent::SaveScene).chain(action).collect(),
+    }
+}
+
+#[cfg(test)]
+mod unsaved_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn save_then_quit_is_one_quit_that_saves_first() {
+        let events = events_after_save(Some(EditorEvent::Quit { after_save: false }));
+        assert!(matches!(events.as_slice(), [EditorEvent::Quit { after_save: true }]));
+    }
+
+    #[test]
+    fn save_then_new_still_saves_then_runs_the_action() {
+        let events = events_after_save(Some(EditorEvent::NewScene));
+        assert!(matches!(events.as_slice(), [EditorEvent::SaveScene, EditorEvent::NewScene]));
+        assert!(matches!(events_after_save(None).as_slice(), [EditorEvent::SaveScene]));
     }
 }
 

@@ -1,7 +1,7 @@
 //! Write the engine mark out as a Windows `.ico`.
 //!
 //! ```text
-//! cargo run -p somnium_ui --example brand_icon -- crates/somnium_ui/assets/brand/somnium.ico
+//! cargo run -p somnium_ui --example brand_icon -- crates/somnium_ui/assets/brand/lucid.ico
 //! ```
 //!
 //! The file is committed rather than built, because the alternative is a build
@@ -14,7 +14,7 @@ fn main() {
         eprintln!("usage: brand_icon <out.ico>");
         std::process::exit(2);
     });
-    let Some(bytes) = somnium_ui::brand_ico::engine_mark(somnium_ui::theme::ACCENT) else {
+    let Some(bytes) = somnium_ui::brand_ico::engine_mark(somnium_ui::brand::LUCID_CYAN) else {
         eprintln!("the vendored brand drawing did not rasterise");
         std::process::exit(1);
     };

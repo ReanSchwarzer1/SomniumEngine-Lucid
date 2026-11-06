@@ -60,3 +60,25 @@ disagree and nothing will say so.
 No font binary, icon, colour value, or mark was taken from Lumina, Unreal, or
 another reference editor. Trademark clearance for the Somnium name and the
 Eclipse mark remains an owner task before public release.
+
+## Lucid (this fork's mark, 6 Nov 2026)
+
+| Asset | Origin | License | Notes |
+|---|---|---|---|
+| `lucid-mark-mono.svg` | Original: clear-ray, a vesica lens of five bands on a 64-unit grid whose middle band leaves as the ray | Project license | `IconId::EngineMark`: title bar, window and taskbar icon, `.ico` (one colour, `currentColor`) |
+| `lucid-mark-micro-16.svg` | Original, the same mark hand-hinted on a 16-unit grid | Project license | `brand::mark` at 20 px and under |
+| `lucid-mark.svg` | As `lucid-mark-mono.svg`, full colour (ink `#15171C`, cyan `#0B9CC2` ray) | Project license | The splash and the About lock-up read which shapes are the accent from its colours |
+| `lucid-wordmark.svg` | Original: the lettermark's LUCID, geometric capitals drawn from stems and circles (no font outlines), the C a crescent moon | Project license | The splash and the About lock-up; cyan C |
+| `lucid.ico` | `lucid-mark-mono.svg` (16 px from the micro drawing) in cyan `#0B9CC2`, at 16, 24, 32, 48, 64 and 128 px | Project license | Linked into hello_engine by its `build.rs` |
+
+All five were drawn in VectorCraft by `F:/Somnium Games/rimeborn-fp/design/lucid_logo/final/build/final_build.py`
+(the mark from the clear-ray concept's `clearray.py`, the word from the lettermark concept's `design.py`), which
+also re-opens every SVG and checks it renders as its PNG. Regenerate the `.ico` after any change to the mark:
+
+```text
+cargo run -p somnium_ui --example brand_icon -- crates/somnium_ui/assets/brand/lucid.ico
+```
+
+The Somnium files above stay for TSF's fork, which keeps the Eclipse mark. Trademark clearance for the Lucid name
+and mark is an owner task before public release; the concepts were compared by eye only (Lucid Motors, Lucid Software
+and Lucidchart, the main engines' marks).

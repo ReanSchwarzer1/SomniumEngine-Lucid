@@ -340,7 +340,10 @@ impl<G: GameApp> Engine<G> {
             sidecars.insert(saved_id, read.map_err(|error| format!("terrain {saved_id}: {error}"))?);
         }
         self.zone_begin("Cell spawn");
-        let report = crate::scene_schema::scene_from_json(&mut self.world, &self.type_registry, document);
+        // The edit layer's entries for this cell (and moves not yet saved) go in before it spawns.
+        let edited = self.edits_before_cell_spawn(index, document);
+        let report =
+            crate::scene_schema::scene_from_json(&mut self.world, &self.type_registry, edited.as_ref().unwrap_or(document));
         self.zone_end();
         let report = report.map_err(|error| error.to_string())?;
         self.zone_begin("Cell sources");
@@ -546,6 +549,7 @@ impl<G: GameApp> Engine<G> {
             }
         }
         if let Some(entities) = self.cell_streamer.loaded.remove(&index) {
+            self.edits_before_cell_unload(&entities);
             for entity in entities.into_iter().rev() {
                 if self.world.is_alive(entity) {
                     self.world.despawn(entity);

@@ -98,13 +98,12 @@ pub const SVG_SOURCES: &[(IconId, &str)] = &[
         include_str!("../assets/icons/somnium/ray-trace.svg"),
     ),
     // ── Brand ───────────────────────────────────────────────────────────────
-    // Route A "Eclipse": two counter-rotating crescent blades whose negative
-    // space reads as the S. The 16 px micro cut is a separate drawing with
-    // simplified counters; the mark draws at 24 px in the application scope, so
-    // the full construction is the right source here.
+    // Lucid's clear-ray mark, one colour: a lens of five bands whose middle band
+    // leaves as the ray (design/lucid_logo/final, `mark-mono.svg`). It draws at
+    // 24 px and up here; `brand` takes the hinted 16 px drawing below 21 px.
     (
         IconId::EngineMark,
-        include_str!("../assets/brand/somnium-s-eclipse.svg"),
+        include_str!("../assets/brand/lucid-mark-mono.svg"),
     ),
     // ── Tabler (MIT) ────────────────────────────────────────────────────────
     (
@@ -547,10 +546,12 @@ mod tests {
     }
 
     #[test]
-    fn the_engine_mark_is_the_original_eclipse_route() {
+    fn the_engine_mark_is_lucids_clear_ray() {
         // Guards against the brand slot quietly picking up a utility glyph.
         let mark = source_for(IconId::EngineMark).expect("brand mark must be vendored");
         assert!(mark.contains("<svg"));
         assert!(!mark.contains("tabler"));
+        assert_eq!(mark.matches("<path").count(), 5, "four bands and the ray");
+        assert!(mark.contains("currentColor"), "one colour: the engine tints it");
     }
 }
