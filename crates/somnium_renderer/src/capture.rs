@@ -418,7 +418,11 @@ impl FrameCapture {
         if self.pending.is_some() || (self.active() && self.frame < self.target_frame) {
             return Err("another frame capture is pending".into());
         }
-        self.write_to = None;
+        // `SOMNIUM_CAPTURE_STILL_HDR=1` (the photoreal harness, 6 Nov 2026): a scene still also keeps the frame's linear
+        // HDR and its pixel classes beside the picture, as `<name>.somcap`, so tone curves and grades can be tried on
+        // the light itself afterwards without another run. Off, nothing changes.
+        self.write_to = (!include_editor && std::env::var("SOMNIUM_CAPTURE_STILL_HDR").as_deref() == Ok("1"))
+            .then(|| path.with_extension("somcap").to_string_lossy().into_owned());
         self.write_png = None;
         self.compare_to = None;
         self.write_display_png = (!include_editor).then(|| path.to_string_lossy().into_owned());
