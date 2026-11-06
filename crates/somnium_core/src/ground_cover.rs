@@ -43,6 +43,9 @@ const SLOTS_SET_PER_FRAME: i64 = 48_000;
 /// 6 Nov, "even grass is too aggressive ... in immediate view they should appear real"; at 12 m a meadow 30 m off kept
 /// 40% of its blades. Copies cost the visibility pass (1.5 ms of a 25 ms frame), not shading.
 pub const BAND_NEAR: f32 = 24.0;
+/// Metres over which a kind with an [`GroundCoverRules::inner`] radius rises out of the ground past it, overlapping
+/// the band before it as that one sinks at its own edge ([`edge_height`]): a cross-fade, not a line.
+pub const INNER_FADE: f32 = 12.0;
 /// The widest a thinned copy is drawn, against its own width.
 pub(crate) const MOST_WIDEN: f32 = 2.5;
 
@@ -210,14 +213,14 @@ impl GroundCover {
     ) {
         let scale = density_scale();
         // Only the kinds this terrain's layer set grows (`GroundCoverRules::layer_sets`; unset grows everywhere).
-        let kinds: Vec<(u16, &ProjectEntry, f32, f32)> = palette
+        let kinds: Vec<(u16, &ProjectEntry, f32, f32, f32)> = palette
             .iter()
             .filter_map(|(kind, entry)| {
                 entry
                     .ground_cover
                     .as_ref()
                     .filter(|g| g.grows_on(layer_set))
-                    .map(|g| (*kind, entry, g.density * scale, g.radius))
+                    .map(|g| (*kind, entry, g.density * scale, g.radius, g.inner))
             })
             .collect();
         if kinds.is_empty() {
@@ -236,9 +239,15 @@ impl GroundCover {
         }
         cover.focus = camera;
         // One pass drops every kind's cells past its radius (a pass per kind was kinds x cells a frame, per terrain).
-        let radius_of: HashMap<u16, f32> = kinds.iter().map(|&(kind, _, _, radius)| (kind, radius)).collect();
+        let band_of: HashMap<u16, (f32, f32)> =
+            kinds.iter().map(|&(kind, _, _, radius, inner)| (kind, (inner, radius))).collect();
         let before = cover.cells.len();
-        cover.cells.retain(|&(k, cx, cz), _| radius_of.get(&k).is_some_and(|r| cell_distance(cx, cz, camera) <= r + CELL));
+        cover.cells.retain(|&(k, cx, cz), _| {
+            band_of.get(&k).is_some_and(|&(inner, r)| {
+                let d = cell_distance(cx, cz, camera);
+                d <= r + CELL && !inside_inner(d, inner)
+            })
+        });
         let mut changed = cover.cells.len() != before;
         // Only cells on this terrain's own ground: a tile the player is not on grows nothing round him. Every loaded
         // tile once kept thousands of empty cells round the eye (Sunscar, 30 Oct 2026: 40-100 ms a frame).
@@ -260,7 +269,7 @@ impl GroundCover {
                 }
             }
             let mut plan: Vec<(f32, usize, i32, i32)> = Vec::new();
-            for (index, &(kind, entry, _, radius)) in kinds.iter().enumerate() {
+            for (index, &(kind, entry, _, radius, inner)) in kinds.iter().enumerate() {
                 let bit = 1u32 << u32::from(entry.brush.layer.min(31));
                 let reach = (radius / CELL).ceil() as i32 + 1;
                 let (cells, layers) = (&cover.cells, &cover.layers);
@@ -269,7 +278,9 @@ impl GroundCover {
                         .flat_map(|cz| ((ox - reach).max(lo_x)..=(ox + reach).min(hi_x)).map(move |cx| (cx, cz)))
                         .filter(|cell| layers.get(cell).is_none_or(|m| m & bit != 0))
                         .map(|(cx, cz)| (cell_distance(cx, cz, camera), index, cx, cz))
-                        .filter(|&(d, _, cx, cz)| d <= radius && !cells.contains_key(&(kind, cx, cz))),
+                        .filter(|&(d, _, cx, cz)| {
+                            d <= radius && !inside_inner(d, inner) && !cells.contains_key(&(kind, cx, cz))
+                        }),
                 );
             }
             plan.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -298,7 +309,7 @@ impl GroundCover {
                 break;
             }
             done += 1;
-            let (kind, entry, density, _) = kinds[i];
+            let (kind, entry, density, _, _) = kinds[i];
             if cover.cells.contains_key(&(kind, cx, cz)) {
                 continue;
             }
@@ -547,6 +558,22 @@ fn keep_at(distance: f32) -> f32 {
     if distance <= BAND_NEAR { 1.0 } else { BAND_NEAR / distance }
 }
 
+/// Whether a whole cell, `d` metres to its nearest point, lies inside a kind's `inner` radius (a cell's far corner is
+/// at most about 1.5 cells beyond its nearest point).
+fn inside_inner(d: f32, inner: f32) -> bool {
+    inner > 0.0 && d + 1.5 * CELL < inner
+}
+
+/// A copy's height share `distance` metres out past a kind's `inner` radius: nothing inside it, rising smoothly over
+/// [`INNER_FADE`], whole beyond. A kind without one is whole from the eye.
+fn inner_height(distance: f32, inner: f32) -> f32 {
+    if inner <= 0.0 {
+        return 1.0;
+    }
+    let t = ((distance - inner) / INNER_FADE).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 /// A copy's height share `distance` metres out of a kind's `radius`: whole until the last fifth, then sinking smoothly to
 /// nothing at the radius, so the cover ends in the ground rather than in a line (the lead, 31 Oct: "a hard band").
 fn edge_height(distance: f32, radius: f32) -> f32 {
@@ -559,15 +586,16 @@ fn widen(keep: f32) -> f32 {
     keep.sqrt().recip().min(MOST_WIDEN)
 }
 
-/// How a copy draws round `focus` (terrain-local) inside its kind's `radius`: its scale on each axis (a thinned copy
-/// widened, one near the radius sunk into the ground), or `None` while it is thinned out. The one rule for
-/// [`CoverBatches`] and the editor's click, so a click finds what is drawn.
+/// How a copy draws round `focus` (terrain-local) between its kind's `inner` radius and its `radius`: its scale on each
+/// axis (a thinned copy widened, one near either edge sunk into the ground), or `None` while it is thinned out. The one
+/// rule for [`CoverBatches`] and the editor's click, so a click finds what is drawn.
 #[must_use]
-pub(crate) fn drawn_scale(cover: &Cover, focus: Vec3, radius: f32) -> Option<Vec3> {
+pub(crate) fn drawn_scale(cover: &Cover, focus: Vec3, radius: f32, inner: f32) -> Option<Vec3> {
     let at = cover.instance.position;
     let distance = (at.x - focus.x).hypot(at.z - focus.z);
-    let keep = keep_at(distance);
-    let sink = edge_height(distance, radius);
+    // A far band thins from where it starts, not from the eye's near band.
+    let keep = keep_at(distance - inner.max(0.0));
+    let sink = edge_height(distance, radius) * inner_height(distance, inner);
     if cover.rank >= keep || cover.instance.scale <= 0.0 || sink <= 0.05 {
         return None;
     }
@@ -632,10 +660,12 @@ impl CoverBatches {
         let mut copies = 0;
         for (d, (kind, cx, cz), cell) in cells {
             let Some(Some(list)) = parts.get(usize::from(kind)) else { continue };
-            let Some(radius) = palette.get(&kind).and_then(|e| e.ground_cover.as_ref()).map(|g| g.radius) else {
+            let Some((radius, inner)) =
+                palette.get(&kind).and_then(|e| e.ground_cover.as_ref()).map(|g| (g.radius, g.inner))
+            else {
                 continue;
             };
-            if d > radius {
+            if d > radius || inside_inner(d, inner) {
                 continue;
             }
             // A cell past its kind's shadow distance casts nothing: a casting batch set or removed redraws every
@@ -668,7 +698,7 @@ impl CoverBatches {
                     let placements: Vec<Mat4> = cell
                         .iter()
                         .filter_map(|c| {
-                            drawn_scale(c, focus, radius).map(|scale| {
+                            drawn_scale(c, focus, radius, inner).map(|scale| {
                                 model * Mat4::from_scale_rotation_translation(scale, c.rotation, c.instance.position)
                             })
                         })
@@ -978,6 +1008,49 @@ mod tests {
     }
 
     #[test]
+    fn a_far_band_starts_at_its_inner_radius_and_rises_out_of_the_ground() {
+        let ground = Plain { revision: 1 };
+        let entry: ProjectEntry = serde_json::from_value(serde_json::json!({
+            "kind": 132, "name": "grass far", "source": "g.gltf", "primitives": [0],
+            "brush": {"max_tilt_deg": 10.0},
+            "ground_cover": {"density": 0.5, "radius": 90.0, "inner": 30.0, "align_to_ground": true}}))
+        .unwrap();
+        let palette = std::collections::BTreeMap::from([(132, entry)]);
+        let eye = Vec3::new(64.0, 2.0, 64.0);
+        let mut cover = GroundCover::default();
+        for _ in 0..8 {
+            cover.update(1, &ground, &palette, eye, None);
+        }
+        let part = BatchPart {
+            vertex_offset: 1,
+            index_offset: 0,
+            index_count: 30,
+            material_id: 0,
+            local: Mat4::IDENTITY,
+            near: 0.0,
+            far: 0.0,
+            casts_shadow: false,
+            shadow_far: 0.0,
+        };
+        let mut parts = vec![None; 133];
+        parts[132] = Some(vec![part]);
+        let mut batches = CoverBatches::default();
+        batches.begin_frame();
+        let copies = batches.terrain(1, &cover, &palette, &parts, Mat4::IDENTITY, eye);
+        batches.end_frame();
+        assert!(copies > 0, "the far band draws beyond its inner radius");
+        let nearest = batches
+            .set
+            .iter()
+            .flat_map(|(_, b)| b.placements.iter())
+            .map(|m| (m.w_axis.x - eye.x).hypot(m.w_axis.z - eye.z))
+            .fold(f32::MAX, f32::min);
+        assert!(nearest >= 30.0, "nothing inside the inner radius: nearest copy {nearest} m");
+        assert!(inner_height(30.0, 30.0) == 0.0 && inner_height(30.0 + INNER_FADE, 30.0) == 1.0);
+        assert!(inner_height(5.0, 0.0) == 1.0, "a kind without an inner radius is whole from the eye");
+    }
+
+    #[test]
     fn cover_cells_become_batches_thinned_by_band_and_removed_when_they_leave() {
         let ground = Plain { revision: 1 };
         let palette = grass();
@@ -1061,11 +1134,15 @@ mod tests {
             rotation: Quat::IDENTITY,
             rank,
         };
-        assert_eq!(drawn_scale(&copy(1.0, 0.99), Vec3::ZERO, 400.0), Some(Vec3::splat(2.0)), "every copy near the centre");
+        assert_eq!(drawn_scale(&copy(1.0, 0.99), Vec3::ZERO, 400.0, 0.0), Some(Vec3::splat(2.0)), "every copy near the centre");
         let far = 4.0 * BAND_NEAR;
-        assert_eq!(drawn_scale(&copy(far, 0.3), Vec3::ZERO, 400.0), None, "a quarter kept that far");
-        assert_eq!(drawn_scale(&copy(far, 0.2), Vec3::ZERO, 400.0), Some(Vec3::new(4.0, 2.0, 4.0)), "widened twice");
-        assert_eq!(drawn_scale(&copy(far, 0.0), Vec3::ZERO, far), None, "sunk at the radius");
+        assert_eq!(drawn_scale(&copy(far, 0.3), Vec3::ZERO, 400.0, 0.0), None, "a quarter kept that far");
+        assert_eq!(drawn_scale(&copy(far, 0.2), Vec3::ZERO, 400.0, 0.0), Some(Vec3::new(4.0, 2.0, 4.0)), "widened twice");
+        assert_eq!(drawn_scale(&copy(far, 0.0), Vec3::ZERO, far, 0.0), None, "sunk at the radius");
+        // A far band: nothing inside its inner radius, whole once past its fade, thinned from where it starts.
+        assert_eq!(drawn_scale(&copy(10.0, 0.0), Vec3::ZERO, 400.0, 30.0), None, "inside the inner radius");
+        let past = 30.0 + INNER_FADE;
+        assert_eq!(drawn_scale(&copy(past, 0.0), Vec3::ZERO, 400.0, 30.0).map(|s| s.y), Some(2.0), "risen out past it");
     }
 
     #[test]

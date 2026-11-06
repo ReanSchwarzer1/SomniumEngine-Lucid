@@ -1232,7 +1232,9 @@ impl<G: GameApp> Engine<G> {
             let (local_origin, local_direction) = (inverse.transform_point3(origin), inverse.transform_vector3(direction));
             for ((kind, cx, cz), cell) in self.ground_cover.cells(terrain) {
                 let Some(&(lo, hi)) = boxes.get(&kind) else { continue };
-                let Some(radius) = self.project_foliage.get(&kind).and_then(|e| e.ground_cover.as_ref()).map(|g| g.radius) else {
+                let Some((radius, inner)) =
+                    self.project_foliage.get(&kind).and_then(|e| e.ground_cover.as_ref()).map(|g| (g.radius, g.inner))
+                else {
                     continue;
                 };
                 let small = (hi - lo).length() < PAINTED_SMALL;
@@ -1258,10 +1260,11 @@ impl<G: GameApp> Engine<G> {
                 }
                 for c in cell {
                     let scale = if batched {
-                        crate::ground_cover::drawn_scale(c, focus, radius)
+                        crate::ground_cover::drawn_scale(c, focus, radius, inner)
                     } else {
                         let d = c.instance.position - focus;
-                        (d.x.hypot(d.z) <= radius && c.instance.scale > 0.0).then(|| glam::Vec3::splat(c.instance.scale))
+                        let distance = d.x.hypot(d.z);
+                        (distance <= radius && distance >= inner && c.instance.scale > 0.0).then(|| glam::Vec3::splat(c.instance.scale))
                     };
                     let Some(scale) = scale else { continue };
                     let model = ground * glam::Mat4::from_scale_rotation_translation(scale, c.rotation, c.instance.position);
@@ -1627,10 +1630,10 @@ impl<G: GameApp> Engine<G> {
         let batched = crate::foliage_batches::enabled();
         let drawn = |c: &crate::ground_cover::Cover, radius: f32| {
             if batched {
-                crate::ground_cover::drawn_scale(c, focus, radius).is_some()
+                crate::ground_cover::drawn_scale(c, focus, radius, rules.inner).is_some()
             } else {
                 let d = c.instance.position - focus;
-                d.x.hypot(d.z) <= radius
+                (rules.inner..=radius).contains(&d.x.hypot(d.z))
             }
         };
         // Its own cell, and every kind within a couple of metres of the copy.
@@ -1846,7 +1849,8 @@ impl<G: GameApp> Engine<G> {
         for &terrain in &terrain_ids {
             let Some(focus) = self.ground_cover.focus(terrain) else { continue };
             for ((kind, _, _), cell) in self.ground_cover.cells(terrain) {
-                let radius = self.project_foliage.get(&kind).and_then(|e| e.ground_cover.as_ref()).map_or(0.0, |g| g.radius);
+                let (radius, inner) =
+                    self.project_foliage.get(&kind).and_then(|e| e.ground_cover.as_ref()).map_or((0.0, 0.0), |g| (g.radius, g.inner));
                 let entry = cover.entry(kind).or_default();
                 entry.2.insert(terrain);
                 entry.0 += cell.len();
@@ -1854,9 +1858,9 @@ impl<G: GameApp> Engine<G> {
                     .iter()
                     .filter(|c| {
                         if batched {
-                            crate::ground_cover::drawn_scale(c, focus, radius).is_some()
+                            crate::ground_cover::drawn_scale(c, focus, radius, inner).is_some()
                         } else {
-                            (c.instance.position.x - focus.x).hypot(c.instance.position.z - focus.z) <= radius
+                            (inner..=radius).contains(&(c.instance.position.x - focus.x).hypot(c.instance.position.z - focus.z))
                         }
                     })
                     .count();
