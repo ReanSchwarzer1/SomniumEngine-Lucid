@@ -611,11 +611,28 @@ impl CoverBatches {
             .collect();
         cells.sort_by(|a, b| a.0.total_cmp(&b.0));
         let mut copies = 0;
+        // What every cell's signature shares, hashed once a frame (the model) or once a kind (its rule and parts),
+        // not once a cell: with a grass's mid and far bands out to 300 m a terrain holds tens of thousands of cells,
+        // and each one looked its kind up in the palette and hashed 16 floats and its parts every frame.
+        let mut frame_sig = 0xcbf2_9ce4_8422_2325u64 ^ t.epoch.rotate_left(17);
+        for v in model.to_cols_array() {
+            fold(&mut frame_sig, v.to_bits());
+        }
+        let mut per_kind: HashMap<u16, Option<(f32, f32, u64)>> = HashMap::new();
         for (d, (kind, cx, cz), cell) in cells {
             let Some(Some(list)) = parts.get(usize::from(kind)) else { continue };
-            let Some((radius, inner)) =
-                palette.get(&kind).and_then(|e| e.ground_cover.as_ref()).map(|g| (g.radius, g.inner))
-            else {
+            let Some((radius, inner, kind_sig)) = *per_kind.entry(kind).or_insert_with(|| {
+                palette.get(&kind).and_then(|e| e.ground_cover.as_ref()).map(|g| {
+                    let mut h = frame_sig;
+                    for p in list {
+                        for word in [p.vertex_offset, p.index_offset, p.index_count, p.material_id, u32::from(p.casts_shadow)] {
+                            fold(&mut h, word);
+                        }
+                        fold(&mut h, p.shadow_far.to_bits());
+                    }
+                    (g.radius, g.inner, h)
+                })
+            }) else {
                 continue;
             };
             if d > radius || inside_inner(d, inner) {
@@ -624,18 +641,9 @@ impl CoverBatches {
             // A cell past its kind's shadow distance casts nothing: a casting batch set or removed redraws every
             // cascade, and the far cells come and go all the time.
             let casts = list.iter().any(|p| p.casts_shadow && (p.shadow_far <= 0.0 || d <= p.shadow_far));
-            let mut sig = 0xcbf2_9ce4_8422_2325u64 ^ t.epoch.rotate_left(17);
+            let mut sig = kind_sig;
             fold(&mut sig, band(d));
             fold(&mut sig, u32::from(casts));
-            for v in model.to_cols_array() {
-                fold(&mut sig, v.to_bits());
-            }
-            for p in list {
-                for word in [p.vertex_offset, p.index_offset, p.index_count, p.material_id, u32::from(p.casts_shadow)] {
-                    fold(&mut sig, word);
-                }
-                fold(&mut sig, p.shadow_far.to_bits());
-            }
             let id = cover_batch_id(terrain_id, kind, cx, cz);
             let live = self.live.get(&id).copied();
             let n = match live {
