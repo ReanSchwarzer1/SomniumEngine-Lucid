@@ -6,7 +6,7 @@
 //! ground rules); this file wires them to the live world, the renderer and the panels.
 
 use super::*;
-use crate::editor_ground::{self, Ground, Hit, MeshSurface, TriangleBvh};
+use crate::editor_ground::{self, Ground, Hit, MeshShape, MeshSurface, TriangleBvh};
 use crate::scene_edits::{self, EditOp, Origin, SceneEdits, Scope};
 use serde_json::Value;
 use somnium_ecs::{Entity, PersistentId};
@@ -34,6 +34,13 @@ const PAINTED_SMALL: f32 = 1.5;
 const GROUND_MARGIN: f32 = 0.5;
 /// The ground-cover card counts every copy this close to the clicked one, by kind.
 const COVER_NEARBY: f32 = 2.0;
+/// The card checks the surface of a selection up to this many triangles; Check Meshes does any size.
+const CARD_SHAPE_LIMIT: u64 = 500_000;
+/// Words that make a model file rock-like: a rock or cliff must be closed on every side it shows.
+const ROCK_WORDS: [&str; 20] = [
+    "rock", "cliff", "boulder", "stone", "scree", "tor", "crag", "outcrop", "slab", "talus", "ledge", "granite",
+    "limestone", "basalt", "chalk", "flint", "pebble", "rubble", "bluff", "monolith",
+];
 /// Words that make a model file tree-like, for the census's list of trees from outside the painted palette.
 const TREE_WORDS: [&str; 22] = [
     "tree", "oak", "pine", "cypress", "fig", "olive", "chestnut", "beech", "maple", "ash", "alder", "willow",
@@ -43,9 +50,58 @@ const TREE_WORDS: [&str; 22] = [
 /// Whether a model path names a tree: a whole word of it (folders included, plurals too) is a tree word, so
 /// `trees/grown/holm_oak_b.gltf` and `wall_fig.gltf` are and `silver_street_01.gltf` is not.
 fn tree_like(path: &str) -> bool {
+    named_by(path, &TREE_WORDS)
+}
+
+/// Whether a model path names a rock or a cliff, the same way: `rocks/granite_tor_03.gltf` is, `stonemason_hut.gltf`
+/// is not (a whole word, plurals too), and neither is a plant (`foliage/.../rock_rose.gltf`, `stone_pine.gltf`).
+fn rock_like(path: &str) -> bool {
+    let plant = tree_like(path) || path.to_ascii_lowercase().replace('\\', "/").contains("/foliage/");
+    !plant && named_by(path, &ROCK_WORDS)
+}
+
+fn named_by(path: &str, words: &[&str]) -> bool {
     path.to_ascii_lowercase().split(|c: char| !c.is_ascii_alphabetic()).any(|word| {
-        TREE_WORDS.contains(&word) || word.strip_suffix('s').is_some_and(|single| TREE_WORDS.contains(&single))
+        words.contains(&word) || word.strip_suffix('s').is_some_and(|single| words.contains(&single))
     })
+}
+
+/// A count with thousands marked: 12,400.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// What the card and the report say of a surface.
+fn shape_text(shape: &MeshShape) -> String {
+    let triangles = thousands(u64::from(shape.triangles));
+    let mut text = if shape.open_above_base > 0 {
+        format!(
+            "OPEN on a side or top: {} edges with one face, {} above its base (hollow from behind them); {triangles} triangles",
+            thousands(u64::from(shape.open_edges)),
+            thousands(u64::from(shape.open_above_base))
+        )
+    } else if shape.open_edges > 0 {
+        format!(
+            "open at its base only ({} edges): fine where it sits in the ground; {triangles} triangles",
+            thousands(u64::from(shape.open_edges))
+        )
+    } else {
+        format!("closed on every side; {triangles} triangles")
+    };
+    for (n, what) in [(shape.non_manifold_edges, "edges with 3+ faces"), (shape.degenerate, "slivers"), (shape.broken, "broken triangles")] {
+        if n > 0 {
+            text.push_str(&format!(", {} {what}", thousands(u64::from(n))));
+        }
+    }
+    text
 }
 
 /// A painted copy a click found: the ground it lives with, its place in that ground's list, its kind.
@@ -127,6 +183,8 @@ pub(crate) struct EditingState {
     palette_tools: Option<Vec<(String, String)>>,
     /// Each ground material set's names for its slots, by the set's folder (`SOURCE.json`), read once.
     set_names: HashMap<PathBuf, Arc<BTreeMap<u8, String>>>,
+    /// Each mesh's surface, by mesh range (`None`: too big or unreadable).
+    shapes: HashMap<(u32, u32, u32), Option<MeshShape>>,
 }
 
 /// What a ground material set calls its slots: `layers[]` with `slot` and `layer` in the set's `SOURCE.json` (Sunscar's
@@ -1235,6 +1293,214 @@ impl<G: GameApp> Engine<G> {
         best.or(nearest_small)
     }
 
+    /// A mesh's surface (`editor_ground::mesh_shape`), read back once and kept.
+    fn mesh_shape_of(&mut self, mesh: MeshComponent) -> Option<MeshShape> {
+        let key = (mesh.vertex_offset, mesh.index_offset, mesh.index_count);
+        if let Some(found) = self.editing.shapes.get(&key) {
+            return *found;
+        }
+        let shape = (mesh.index_count / 3 <= BVH_TRIANGLE_LIMIT)
+            .then(|| {
+                let (renderer, ctx) = (self.renderer.as_ref()?, self.render_ctx.as_ref()?);
+                let (vertices, indices) = renderer.read_mesh(ctx, mesh.vertex_offset, mesh.index_offset, mesh.index_count)?;
+                let positions: Vec<glam::Vec3> = vertices.iter().map(|v| glam::Vec3::from_array(v.position)).collect();
+                Some(editor_ground::mesh_shape(&positions, &indices))
+            })
+            .flatten();
+        self.editing.shapes.insert(key, shape);
+        shape
+    }
+
+    /// The card's line on a selection's surface, every mesh under it together.
+    fn shape_line(&mut self, entity: Entity) -> Option<String> {
+        let children = children_map(&self.world);
+        let mut meshes: Vec<MeshComponent> =
+            subtree(&children, entity).into_iter().filter_map(|e| self.world.get::<MeshComponent>(e).copied()).collect();
+        meshes.sort_by_key(|m| (m.vertex_offset, m.index_offset, m.index_count));
+        meshes.dedup_by_key(|m| (m.vertex_offset, m.index_offset, m.index_count));
+        if meshes.is_empty() {
+            return None;
+        }
+        let triangles: u64 = meshes.iter().map(|m| u64::from(m.index_count / 3)).sum();
+        if triangles > CARD_SHAPE_LIMIT {
+            return Some(format!("shape     not checked on a click ({} triangles); Check Meshes (Level) does", thousands(triangles)));
+        }
+        let mut shape = MeshShape::default();
+        for mesh in meshes {
+            shape.add(&self.mesh_shape_of(mesh)?);
+        }
+        Some(format!("shape     {}", shape_text(&shape)))
+    }
+
+    /// Check the surface of every model the loaded objects draw: closed, open only at its base (fine where it sits in
+    /// the ground), or open on a side or top (hollow from behind). Rocks and cliffs come first, since every one must
+    /// be closed where it shows (the developer, 6 Nov: "they are hollow and one side is only there"). Written beside
+    /// the scene as `<scene>.meshcheck.md`.
+    pub(super) fn check_meshes(&mut self) {
+        let started = std::time::Instant::now();
+        let root = self.config.project_root.clone();
+        let children = children_map(&self.world);
+        // Each model file: its meshes, and the objects that draw it.
+        let imported: Vec<(Entity, String, Option<MeshComponent>)> = self
+            .world
+            .iter_with::<crate::ImportedMesh>()
+            .map(|(e, m)| (e, m.source.clone(), self.world.get::<MeshComponent>(e).copied()))
+            .collect();
+        let mut models: BTreeMap<String, (BTreeSet<(u32, u32, u32)>, HashSet<Entity>)> = BTreeMap::new();
+        for (entity, source, mesh) in &imported {
+            let entry = models.entry(source.clone()).or_default();
+            if let Some(m) = mesh {
+                entry.0.insert((m.vertex_offset, m.index_offset, m.index_count));
+            }
+            entry.1.insert(self.object_in(&children, *entity));
+        }
+        // (model, its surface, objects drawing it, examples, whether every mesh was read)
+        let mut rows: Vec<(String, MeshShape, usize, Vec<String>, bool)> = Vec::new();
+        for (source, (meshes, objects)) in models {
+            let mut shape = MeshShape::default();
+            let mut whole = true;
+            for (vertex_offset, index_offset, index_count) in meshes {
+                match self.mesh_shape_of(MeshComponent { vertex_offset, index_offset, index_count }) {
+                    Some(s) => shape.add(&s),
+                    None => whole = false,
+                }
+            }
+            let mut objects_sorted: Vec<Entity> = objects.iter().copied().collect();
+            objects_sorted.sort_by_key(|e| e.index());
+            let examples: Vec<String> = objects_sorted.iter().take(3).map(|e| name_of(&self.world, *e)).collect();
+            rows.push((source, shape, objects.len(), examples, whole));
+        }
+        // The files themselves, with the foliage palette's (its models, LODs and impostors): what will not load.
+        let content = self.config.content_root.clone();
+        let resolve = |source: &str| -> PathBuf {
+            let path = Path::new(source);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else if let Some(root) = root.as_ref().filter(|r| r.join(path).exists()) {
+                root.join(path)
+            } else {
+                content.join(path)
+            }
+        };
+        let mut files: BTreeMap<String, PathBuf> = rows.iter().map(|r| (r.0.clone(), resolve(&r.0))).collect();
+        for entry in self.project_foliage.values() {
+            for path in std::iter::once(&entry.source)
+                .chain(entry.lod.as_ref().map(|l| &l.source))
+                .chain(entry.impostor.as_ref().map(|l| &l.source))
+            {
+                let path = if path.is_absolute() { path.clone() } else { content.join(path) };
+                files.insert(project_relative(root.as_deref(), &path), path);
+            }
+        }
+        let file_problems: Vec<(String, Vec<String>)> = files
+            .iter()
+            .map(|(name, path)| (name.clone(), somnium_asset::gltf_file_problems(path)))
+            .filter(|(_, problems)| !problems.is_empty())
+            .collect();
+        // Objects whose model failed to load: they keep their source and draw nothing.
+        let mut drawing_nothing: BTreeMap<String, usize> = BTreeMap::new();
+        for (entity, source, mesh) in &imported {
+            if mesh.is_none() && self.world.get::<crate::ImportedMesh>(*entity).is_some() {
+                *drawing_nothing.entry(source.clone()).or_default() += 1;
+            }
+        }
+        let open_side = |r: &&(String, MeshShape, usize, Vec<String>, bool)| r.1.open_above_base > 0;
+        let rocks: Vec<&(String, MeshShape, usize, Vec<String>, bool)> = rows.iter().filter(|r| rock_like(&r.0)).collect();
+        let mut hollow_rocks: Vec<&(String, MeshShape, usize, Vec<String>, bool)> = rocks.iter().copied().filter(open_side).collect();
+        hollow_rocks.sort_by(|a, b| b.2.cmp(&a.2).then(b.1.open_above_base.cmp(&a.1.open_above_base)));
+        let mut others: Vec<&(String, MeshShape, usize, Vec<String>, bool)> =
+            rows.iter().filter(|r| !rock_like(&r.0) && r.1.open_above_base > 0).collect();
+        others.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        // Slivers alone are harmless; fins and broken triangles (an index past the vertices) are not.
+        let broken: Vec<&(String, MeshShape, usize, Vec<String>, bool)> =
+            rows.iter().filter(|r| r.1.broken > 0 || r.1.non_manifold_edges > 0).collect();
+        let unread: Vec<&(String, MeshShape, usize, Vec<String>, bool)> = rows.iter().filter(|r| !r.4).collect();
+        let table = |items: &[&(String, MeshShape, usize, Vec<String>, bool)]| -> Vec<String> {
+            let mut out = vec!["| objects | model | surface | e.g. |".to_owned(), "|---:|---|---|---|".to_owned()];
+            out.extend(items.iter().map(|(source, shape, objects, examples, _)| {
+                format!("| {objects} | {source} | {} | {} |", shape_text(shape), examples.join("; "))
+            }));
+            out
+        };
+        let mut report = vec![
+            format!(
+                "# Mesh check of {}",
+                self.editing.scene.as_deref().map_or_else(|| "the open scene".to_owned(), |s| project_relative(root.as_deref(), s))
+            ),
+            String::new(),
+            format!(
+                "{} model files drawn by the loaded objects. \"Open on a side or top\" means an edge with one face above \
+                 the model's lowest fifth: seen from behind it, the model is hollow. Open at the base only is fine where \
+                 the model sits in the ground. Select one of its objects and use Select All Using This Model to find the rest.",
+                rows.len()
+            ),
+            String::new(),
+            format!("## Model files that will not load or do not match ({} of {} checked)", file_problems.len(), files.len()),
+            String::new(),
+        ];
+        if file_problems.is_empty() {
+            report.push("None: every model file the loaded objects and the foliage palette name reads whole.".to_owned());
+        } else {
+            report.push("| file | what is wrong |".to_owned());
+            report.push("|---|---|".to_owned());
+            for (name, problems) in &file_problems {
+                report.push(format!("| {name} | {} |", problems.join("; ")));
+            }
+        }
+        report.push(String::new());
+        report.push(format!("## Objects that draw nothing: their model did not load, or is still streaming in ({})", drawing_nothing.values().sum::<usize>()));
+        report.push(String::new());
+        for (source, count) in &drawing_nothing {
+            report.push(format!("- {source}: {count} object{}", if *count == 1 { "" } else { "s" }));
+        }
+        report.push(String::new());
+        report.push(format!("## Rocks and cliffs open on a side or top ({} of {} rock-like models)", hollow_rocks.len(), rocks.len()));
+        report.push(String::new());
+        if hollow_rocks.is_empty() {
+            report.push("None: every rock and cliff model loaded is closed where it shows.".to_owned());
+        } else {
+            report.extend(table(&hollow_rocks));
+        }
+        for (title, items) in [
+            ("Other models open on a side or top (walls and roofs may be meant to be; foliage cards are)", &others),
+            ("Fins (an edge with 3+ faces) or broken triangles (a corner past the vertices or not a number)", &broken),
+            ("Not checked (too big to read back, or unreadable)", &unread),
+        ] {
+            report.push(String::new());
+            report.push(format!("## {title} ({})", items.len()));
+            report.push(String::new());
+            if !items.is_empty() {
+                report.extend(table(items));
+            }
+        }
+        let text = report.join("\n") + "\n";
+        let target = self
+            .editing
+            .scene
+            .as_ref()
+            .map(|s| PathBuf::from(format!("{}.meshcheck.md", s.display())))
+            .or_else(|| root.as_ref().map(|r| r.join("meshcheck.md")));
+        let summary = format!(
+            "Check Meshes: {} model files will not load or do not match, {} objects draw nothing; {} of {} rock and cliff models are open on a side (hollow from behind); {} other models open on a side, {} with fins or broken triangles ({} files, {:.1} s)",
+            file_problems.len(),
+            drawing_nothing.values().sum::<usize>(),
+            hollow_rocks.len(),
+            rocks.len(),
+            others.len(),
+            broken.len(),
+            rows.len(),
+            started.elapsed().as_secs_f32()
+        );
+        match target.map(|path| std::fs::write(&path, &text).map(|()| path)) {
+            Some(Ok(path)) => {
+                info!("{summary}; written to {}", path.display());
+                self.toast(&format!("{summary}. Written to {}", project_relative(root.as_deref(), &path)));
+            }
+            Some(Err(error)) => self.toast(&format!("{summary}. Not written: {error}")),
+            None => self.toast(&summary),
+        }
+    }
+
     /// The height of the loaded ground at world x, z, from the first terrain that covers the point.
     fn ground_height(&self, x: f32, z: f32) -> Option<f32> {
         let renderer = self.renderer.as_ref()?;
@@ -1555,8 +1821,9 @@ impl<G: GameApp> Engine<G> {
         let mut models: BTreeMap<String, (usize, HashSet<Entity>)> = BTreeMap::new();
         let imported: Vec<(Entity, String)> =
             self.world.iter_with::<crate::ImportedMesh>().map(|(e, m)| (e, m.source.clone())).collect();
+        let children = children_map(&self.world);
         for (entity, source) in &imported {
-            let object = self.object_of(*entity);
+            let object = self.object_in(&children, *entity);
             let entry = models.entry(source.clone()).or_default();
             entry.0 += 1;
             entry.1.insert(object);
@@ -1597,7 +1864,7 @@ impl<G: GameApp> Engine<G> {
             String::new(),
             format!(
                 "What is loaded now: {grounds} grounds and {} objects round the camera. Cells streamed out are not counted.",
-                imported.iter().map(|(e, _)| self.object_of(*e)).collect::<HashSet<_>>().len()
+                imported.iter().map(|(e, _)| self.object_in(&children, *e)).collect::<HashSet<_>>().len()
             ),
             String::new(),
             format!("## Painted copies by kind ({copies} in {} kinds; they live with their ground, not as objects)", painted.len()),
@@ -1734,13 +2001,17 @@ impl<G: GameApp> Engine<G> {
 
     /// The object `part` belongs to: its highest ancestor that is still one object, not a container of hundreds.
     fn object_of(&self, part: Entity) -> Entity {
-        let children = children_map(&self.world);
+        self.object_in(&children_map(&self.world), part)
+    }
+
+    /// [`Self::object_of`] over a children map built once (a pass over thousands of parts).
+    fn object_in(&self, children: &HashMap<Entity, Vec<Entity>>, part: Entity) -> Entity {
         let mut object = part;
         loop {
             let Some(parent) = self.world.get::<Parent>(object).map(|p| p.entity) else {
                 break;
             };
-            if parent == Entity::DANGLING || !self.world.is_alive(parent) || subtree(&children, parent).len() > CONTAINER_PARTS
+            if parent == Entity::DANGLING || !self.world.is_alive(parent) || subtree(children, parent).len() > CONTAINER_PARTS
             {
                 break;
             }
@@ -2424,6 +2695,11 @@ impl<G: GameApp> Engine<G> {
             lines.push(format!("object    {parts} part{}{size}", if parts == 1 { "" } else { "s" }));
         }
 
+        // Whether its surface is closed: a rock or cliff open on a side is hollow from behind.
+        if let Some(line) = self.shape_line(entity) {
+            lines.push(line);
+        }
+
         // Where it came from.
         let streamed = self.world.get::<crate::cell_streaming::Streamed>(entity).copied();
         let file = match streamed.and_then(|s| self.cell_streamer.cells.get(s.cell as usize)) {
@@ -2677,6 +2953,26 @@ mod tests {
         assert!(tree_like("assets/props/cypress.glb"));
         assert!(!tree_like("assets/architecture/places/monargent/silver_street_+1_0_01.gltf"));
         assert!(!tree_like("assets/props/airplane_wreck.glb"));
+    }
+
+    #[test]
+    fn rocks_are_named_by_whole_words_and_a_surface_reads_plainly() {
+        assert!(rock_like("assets/rocks/granite_tor_03.gltf"));
+        assert!(rock_like("assets/pois/kit/Cliff_Face_B.glb"));
+        assert!(rock_like("assets/props/pebbles.gltf"));
+        assert!(!rock_like("assets/foliage/ground/pebbles.gltf"), "ground cover, not a placed rock");
+        assert!(!rock_like("assets/architecture/stonemason_hut.gltf"), "a whole word, not a part of one");
+        assert!(!rock_like("assets/foliage/trees/grown/rock_rose.gltf"), "a shrub");
+        assert!(!rock_like("assets/props/stone_pine.gltf"), "a tree");
+        assert_eq!(thousands(0), "0");
+        assert_eq!(thousands(1_234_567), "1,234,567");
+        let closed = MeshShape { triangles: 12_400, ..MeshShape::default() };
+        assert_eq!(shape_text(&closed), "closed on every side; 12,400 triangles");
+        let seated = MeshShape { triangles: 10, open_edges: 4, ..MeshShape::default() };
+        assert!(shape_text(&seated).starts_with("open at its base only (4 edges)"));
+        let hollow = MeshShape { triangles: 10, open_edges: 1_230, open_above_base: 1_100, degenerate: 2, ..MeshShape::default() };
+        let text = shape_text(&hollow);
+        assert!(text.starts_with("OPEN on a side or top: 1,230 edges") && text.contains("1,100 above") && text.ends_with("2 slivers"), "{text}");
     }
 
     #[test]

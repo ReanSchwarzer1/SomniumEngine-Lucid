@@ -11511,6 +11511,7 @@ impl<G: GameApp> Engine<G> {
                     L::CopyIdentity => self.copy_identity(),
                     L::SelectLookedAt => self.select_looked_at(),
                     L::Census => self.census(),
+                    L::CheckMeshes => self.check_meshes(),
                     L::SelectSameAsset => self.select_same_asset(),
                 }
             }

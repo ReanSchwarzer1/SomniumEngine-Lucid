@@ -1265,6 +1265,16 @@ fn declarations() -> Vec<Command> {
             always
         ),
         command!(
+            "editor.level.check_meshes",
+            "Check Meshes",
+            "Level",
+            None,
+            "Check the surface of every model the loaded objects draw: closed, open only at its base (fine where it sits in the ground), or open on a side or top (hollow from behind). Rocks and cliffs come first; the list is written beside the scene.",
+            A::LevelTool(L::CheckMeshes),
+            EDIT,
+            always
+        ),
+        command!(
             "editor.level.select_same_asset",
             "Select All Using This Model",
             "Level",
@@ -2495,7 +2505,7 @@ pub fn icon_for(id: &str) -> crate::icons::IconId {
         "editor.level.select_parent" => I::Select,
         "editor.level.copy_identity" => I::Copy,
         "editor.level.select_looked_at" => I::Focus,
-        "editor.level.census" => I::Search,
+        "editor.level.census" | "editor.level.check_meshes" => I::Search,
         "editor.level.select_same_asset" => I::Select,
         "editor.asset.import_model" => I::Import,
         "editor.asset.new_material" => I::MaterialBall,

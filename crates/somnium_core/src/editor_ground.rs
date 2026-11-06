@@ -366,6 +366,109 @@ pub fn floats(support: &Support, min: Vec3, max: Vec3) -> bool {
     span <= PROP_SPAN && !support.touching && support.gap.is_some_and(|gap| gap > FLOAT_GAP)
 }
 
+// ─── Mesh shape (asset validation) ─────────────────────────────────────────
+
+/// Corners closer than this (mesh units, metres in glTF) are one vertex: a glTF splits a vertex at every UV or
+/// normal seam, which is no hole.
+const WELD: f32 = 1.0e-4;
+/// An open rim no higher than this share of a mesh's height is its base, which sits in the ground (a rock seated
+/// 30-70% deep shows none of it); one above it is a side or a top, seen from somewhere.
+const BASE_SHARE: f32 = 0.2;
+
+/// What a mesh's triangles make, once corners at one place are one vertex.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MeshShape {
+    /// Triangles counted, every one (the broken and degenerate ones too).
+    pub triangles: u32,
+    /// Edges with one face: the rim of a hole. A closed (watertight) mesh has none; one seen from behind its open side
+    /// is hollow.
+    pub open_edges: u32,
+    /// Open edges above the mesh's base (its lowest [`BASE_SHARE`] of height, mesh units, up the mesh's Y): an open
+    /// side or top, which a seated rock still shows.
+    pub open_above_base: u32,
+    /// Edges with three or more faces: fins and doubled walls.
+    pub non_manifold_edges: u32,
+    /// Triangles with no area (two corners at one place, or all three on a line).
+    pub degenerate: u32,
+    /// Triangles with a corner that is not a number, or an index past the vertices.
+    pub broken: u32,
+}
+
+impl MeshShape {
+    /// Closed on every side: no edge with one face, none with three.
+    #[must_use]
+    pub fn closed(&self) -> bool {
+        self.open_edges == 0 && self.non_manifold_edges == 0
+    }
+
+    /// Fold another part's shape into this one (a model of several meshes).
+    pub fn add(&mut self, other: &MeshShape) {
+        self.triangles += other.triangles;
+        self.open_edges += other.open_edges;
+        self.open_above_base += other.open_above_base;
+        self.non_manifold_edges += other.non_manifold_edges;
+        self.degenerate += other.degenerate;
+        self.broken += other.broken;
+    }
+}
+
+/// The shape of indexed triangles: corners welded within [`WELD`], every edge counted by its faces.
+#[must_use]
+pub fn mesh_shape(positions: &[Vec3], indices: &[u32]) -> MeshShape {
+    let mut shape = MeshShape::default();
+    let mut ids: std::collections::HashMap<(i64, i64, i64), u32> = std::collections::HashMap::new();
+    let mut welded: Vec<u32> = Vec::with_capacity(positions.len());
+    let mut heights: Vec<f32> = Vec::new();
+    for p in positions {
+        let key = ((p.x / WELD).round() as i64, (p.y / WELD).round() as i64, (p.z / WELD).round() as i64);
+        let next = ids.len() as u32;
+        welded.push(if p.is_finite() {
+            *ids.entry(key).or_insert_with(|| {
+                heights.push(p.y);
+                next
+            })
+        } else {
+            u32::MAX
+        });
+    }
+    let (low, high) = heights.iter().fold((f32::INFINITY, f32::NEG_INFINITY), |(lo, hi), &y| (lo.min(y), hi.max(y)));
+    let base = low + BASE_SHARE * (high - low).max(0.0);
+    let mut edges: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+    for t in indices.chunks_exact(3) {
+        shape.triangles += 1;
+        let Some(corners) = t.iter().map(|&i| positions.get(i as usize).copied()).collect::<Option<Vec<Vec3>>>() else {
+            shape.broken += 1;
+            continue;
+        };
+        let v = [welded[t[0] as usize], welded[t[1] as usize], welded[t[2] as usize]];
+        if v.contains(&u32::MAX) {
+            shape.broken += 1;
+            continue;
+        }
+        let area = (corners[1] - corners[0]).cross(corners[2] - corners[0]).length();
+        if v[0] == v[1] || v[1] == v[2] || v[0] == v[2] || area <= 1.0e-12 {
+            shape.degenerate += 1;
+            continue;
+        }
+        for (a, b) in [(v[0], v[1]), (v[1], v[2]), (v[2], v[0])] {
+            *edges.entry((a.min(b), a.max(b))).or_default() += 1;
+        }
+    }
+    for (&(a, b), &faces) in &edges {
+        match faces {
+            1 => {
+                shape.open_edges += 1;
+                if heights[a as usize].max(heights[b as usize]) > base {
+                    shape.open_above_base += 1;
+                }
+            }
+            2 => {}
+            _ => shape.non_manifold_edges += 1,
+        }
+    }
+    shape
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -531,5 +634,42 @@ mod tests {
         let support = Support { gap: Some(3.0), normal: Vec3::Y, touching: false };
         assert!(!floats(&support, Vec3::new(0.0, 3.0, 0.0), Vec3::new(30.0, 3.2, 30.0)));
         assert!(floats(&support, Vec3::new(0.0, 3.0, 0.0), Vec3::new(1.0, 3.2, 1.0)));
+    }
+
+    #[test]
+    fn a_closed_box_is_closed_and_an_open_one_shows_its_rim() {
+        // A unit cube split at every face (as a glTF splits at UV seams): 24 corners, 12 triangles.
+        let faces: [[Vec3; 4]; 6] = [
+            [Vec3::new(0.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.0, 1.0, 0.0), Vec3::new(0.0, 1.0, 0.0)],
+            [Vec3::new(0.0, 0.0, 1.0), Vec3::new(0.0, 1.0, 1.0), Vec3::new(1.0, 1.0, 1.0), Vec3::new(1.0, 0.0, 1.0)],
+            [Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), Vec3::new(0.0, 1.0, 1.0), Vec3::new(0.0, 0.0, 1.0)],
+            [Vec3::new(1.0, 0.0, 0.0), Vec3::new(1.0, 0.0, 1.0), Vec3::new(1.0, 1.0, 1.0), Vec3::new(1.0, 1.0, 0.0)],
+            [Vec3::new(0.0, 0.0, 0.0), Vec3::new(0.0, 0.0, 1.0), Vec3::new(1.0, 0.0, 1.0), Vec3::new(1.0, 0.0, 0.0)],
+            [Vec3::new(0.0, 1.0, 0.0), Vec3::new(1.0, 1.0, 0.0), Vec3::new(1.0, 1.0, 1.0), Vec3::new(0.0, 1.0, 1.0)],
+        ];
+        let positions: Vec<Vec3> = faces.iter().flatten().copied().collect();
+        let quads: Vec<u32> = (0..6u32).flat_map(|f| [f * 4, f * 4 + 1, f * 4 + 2, f * 4, f * 4 + 2, f * 4 + 3]).collect();
+        let closed = mesh_shape(&positions, &quads);
+        assert_eq!(closed, MeshShape { triangles: 12, ..MeshShape::default() });
+        assert!(closed.closed(), "seams are welded, so the split cube is closed");
+        // Without its top face: the four rim edges are open, all above its base. Without its bottom: open at the base only.
+        let open = mesh_shape(&positions, &quads[..30]);
+        assert_eq!((open.triangles, open.open_edges, open.open_above_base, open.closed()), (10, 4, 4, false));
+        let seated: Vec<u32> = quads[..24].iter().chain(&quads[30..]).copied().collect();
+        let seated = mesh_shape(&positions, &seated);
+        assert_eq!((seated.open_edges, seated.open_above_base), (4, 0), "a box open underneath shows nothing seated");
+        // A fin off one edge (a third face on it, its own two edges open); a sliver; a corner that is not a number; an
+        // index past the corners.
+        let mut finned = positions.clone();
+        finned.push(Vec3::new(0.5, 0.0, -1.0));
+        let mut fin = quads.clone();
+        fin.extend([0, 1, 24]);
+        let fin = mesh_shape(&finned, &fin);
+        assert_eq!((fin.non_manifold_edges, fin.open_edges), (1, 2));
+        assert_eq!(fin.open_above_base, 0, "the fin lies on the floor");
+        let mut bad = positions.clone();
+        bad.push(Vec3::new(f32::NAN, 0.0, 0.0));
+        let broken = mesh_shape(&bad, &[0, 1, 24, 0, 1, 99, 0, 0, 1]);
+        assert_eq!((broken.broken, broken.degenerate), (2, 1));
     }
 }
