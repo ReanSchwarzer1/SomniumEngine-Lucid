@@ -111,6 +111,20 @@ pub(crate) struct GroundCoverRules {
     /// half the candidates, in patches, and grows them taller inside. Unset: evenly, as before.
     #[serde(default)]
     pub clump: Option<f32>,
+    /// The terrain layer sets this kind grows on (a tile's `TerrainStreaming.layer_set`; "" is the project's own
+    /// layers). Unset: every set, as before. A biome's tiles list their own kinds, and the meadow's grass stays off
+    /// their sand and ice: ground cover is keyed by splat slot across all sets, so without this a desert tile grew
+    /// the meadow's slot-k grass (Sunscar, 6 Nov 2026; design/BIOMES_GROUND_COVER.md).
+    #[serde(default)]
+    pub layer_sets: Option<Vec<String>>,
+}
+
+impl GroundCoverRules {
+    /// Whether this kind grows on a terrain wearing `layer_set` (names compared trimmed).
+    #[must_use]
+    pub(crate) fn grows_on(&self, layer_set: &str) -> bool {
+        self.layer_sets.as_ref().is_none_or(|sets| sets.iter().any(|s| s.trim() == layer_set.trim()))
+    }
 }
 
 #[derive(Deserialize)]
@@ -252,6 +266,21 @@ pub(crate) fn load(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_ground_kind_grows_only_on_the_layer_sets_it_names() {
+        let document = serde_json::json!({"version":1,"entries":[
+            {"kind":130,"name":"meadow grass","source":"g.gltf","primitives":[0],
+             "ground_cover":{"density":1.0,"radius":40.0,"layer_sets":["", "spine"]}},
+            {"kind":131,"name":"desert grass","source":"d.gltf","primitives":[0],
+             "ground_cover":{"density":1.0,"radius":40.0,"layer_sets":["desert"]}},
+            {"kind":132,"name":"untagged","source":"u.gltf","primitives":[0],
+             "ground_cover":{"density":1.0,"radius":40.0}}]});
+        let parsed = parse(&serde_json::to_vec(&document).unwrap()).unwrap();
+        let grows = |kind: u16, set: &str| parsed[&kind].ground_cover.as_ref().unwrap().grows_on(set);
+        assert!(grows(130, "") && grows(130, " spine ") && !grows(130, "desert"), "the meadow's grass stays off sand");
+        assert!(grows(131, "desert") && !grows(131, "") && !grows(131, "spine"));
+        assert!(grows(132, "") && grows(132, "desert"), "untagged kinds grow everywhere, as before");
+    }
     #[test]
     fn optional_lod_preserves_parts_and_rejects_invalid_distances() {
         let mut document = serde_json::json!({"version":1,"entries":[{
