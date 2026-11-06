@@ -960,6 +960,8 @@ fn post_process_schema() -> ComponentSchema {
                 doc: "With the photographic camera: photon and read noise as a real sensor's at this exposure (1). A bright day is clean; a dim wood or a night grows grain." },
             white_balance { min: 0.0, max: 15000.0, step: 50.0, precision: 0, unit: "K", group: "Camera", display_name: "White Balance",
                 doc: "With the photographic camera: the white the camera is set for, in kelvin. 0 leaves the light as rendered (D65). Lower is cooler, higher warmer." },
+            exposure_sky_weight { min: 0.0, max: 1.0, step: 0.05, precision: 2, group: "Exposure", display_name: "Sky in Meter",
+                doc: "How much open sky counts in the exposure meter: 1 as any other pixel; 0.25 exposes for the land and lets the sky run bright, as a photographer does." },
         }
     };
     if let Some(field) = schema.fields.iter_mut().find(|f| f.name == "dream_mode") {

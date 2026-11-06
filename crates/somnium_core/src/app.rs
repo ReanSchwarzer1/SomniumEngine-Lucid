@@ -8861,6 +8861,7 @@ impl<G: GameApp> Engine<G> {
                 to_dark: pp.adapt_to_dark.max(0.0),
                 adaptation: pp.exposure_adaptation.clamp(0.0, 1.0),
                 anchor_ev: pp.exposure_anchor_ev,
+                sky_weight: pp.exposure_sky_weight.clamp(0.0, 1.0),
             };
             // Adaptation is per second, so it needs the real frame time or the
             // eye adjusts at a rate that depends on frame rate.

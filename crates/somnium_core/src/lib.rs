@@ -1468,6 +1468,10 @@ pub struct PostProcessComponent {
     /// Camera white balance in kelvin with `photographic` (default 0: the light as rendered, which is balanced for
     /// D65 daylight). The white the camera is set for: below 6500 the picture goes cooler, above it warmer.
     pub white_balance: f32,
+    /// How much an open-sky pixel counts in the exposure meter, 0..1 (default 1: as any other). At 0.25 the eye
+    /// exposes for the land and lets the sky run bright, as a photographer does; a view that is mostly sky still
+    /// meters on it.
+    pub exposure_sky_weight: f32,
 }
 
 impl Default for PostProcessComponent {
@@ -1646,6 +1650,7 @@ impl Default for PostProcessComponent {
             lens_glare: 0.03,
             sensor_noise: 0.0,
             white_balance: 0.0,
+            exposure_sky_weight: 1.0,
         }
     }
 }

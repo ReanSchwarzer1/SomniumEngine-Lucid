@@ -1281,7 +1281,6 @@ impl SomniumRenderer {
             auto_exposure_pass.exposure_buffer(),
             bloom_pass.result_view(),
         );
-        auto_exposure_pass.resize(&ctx.device, &postprocess_pass.hdr_view);
 
         // Phase 24I: screen-space occlusion, consumed by the shading pass.
         let gtao_pass = crate::pass::gtao::GtaoPass::new(
@@ -1367,6 +1366,7 @@ impl SomniumRenderer {
             ctx.config.height,
             &global_pool.layout,
         );
+        auto_exposure_pass.resize(&ctx.device, &postprocess_pass.hdr_view, &vis_pass.view);
         let hiz_pass = crate::pass::hiz::HiZPass::new(
             &ctx.device,
             &shaders,
@@ -3431,7 +3431,7 @@ impl SomniumRenderer {
             self.postprocess_pass
                 .resize(&ctx.device, width, height, self.bloom_pass.result_view());
             self.auto_exposure_pass
-                .resize(&ctx.device, &self.postprocess_pass.hdr_view);
+                .resize(&ctx.device, &self.postprocess_pass.hdr_view, &self.vis_pass.view);
             self.render_width = width;
             self.render_height = height;
             self.gtao_pass.resize(&ctx.device, width, height);

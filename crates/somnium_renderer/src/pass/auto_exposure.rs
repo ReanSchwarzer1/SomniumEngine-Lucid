@@ -32,11 +32,21 @@ pub struct EyeAdaptation {
     pub adaptation: f32,
     /// The EV100 partial adaptation pivots on.
     pub anchor_ev: f32,
+    /// How much an open-sky pixel counts in the meter (`PostProcessComponent::exposure_sky_weight`; 1 as any other).
+    pub sky_weight: f32,
 }
 
 impl Default for EyeAdaptation {
     fn default() -> Self {
-        Self { min_ev100: -8.0, max_ev100: 18.0, to_bright: 3.0, to_dark: 1.0, adaptation: 1.0, anchor_ev: 12.0 }
+        Self {
+            min_ev100: -8.0,
+            max_ev100: 18.0,
+            to_bright: 3.0,
+            to_dark: 1.0,
+            adaptation: 1.0,
+            anchor_ev: 12.0,
+            sky_weight: 1.0,
+        }
     }
 }
 
@@ -56,6 +66,8 @@ struct ExposureParams {
     highlight_end_nits: f32,
     adaptation: f32,
     anchor_ev: f32,
+    sky_weight: f32,
+    _pad: [f32; 3],
 }
 
 /// Histogram build + resolve, plus the two-float exposure result buffer.
@@ -99,6 +111,17 @@ impl AutoExposurePass {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // The visibility buffer: the open sky is where nothing was drawn.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
                     count: None,
                 },
@@ -161,8 +184,8 @@ impl AutoExposurePass {
         &self.exposure
     }
 
-    /// Rebuild the bind group against a (possibly resized) HDR view.
-    pub fn resize(&mut self, device: &wgpu::Device, hdr_view: &wgpu::TextureView) {
+    /// Rebuild the bind group against a (possibly resized) HDR view and the visibility buffer of the same size.
+    pub fn resize(&mut self, device: &wgpu::Device, hdr_view: &wgpu::TextureView, vis_view: &wgpu::TextureView) {
         self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("AutoExposure BG"),
             layout: &self.layout,
@@ -182,6 +205,10 @@ impl AutoExposurePass {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: self.params.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(vis_view),
                 },
             ],
         }));
@@ -223,6 +250,8 @@ impl AutoExposurePass {
                 highlight_end_nits: 40_000.0,
                 adaptation: eye.adaptation.clamp(0.0, 1.0),
                 anchor_ev: eye.anchor_ev,
+                sky_weight: eye.sky_weight.clamp(0.0, 1.0),
+                _pad: [0.0; 3],
             }),
         );
 
