@@ -2276,6 +2276,10 @@ impl SomniumRenderer {
                             crate::material::pool::MATERIAL_FLAG_HASHED_ALPHA
                         } else {
                             0
+                        } | if mat.far_ground {
+                            crate::material::pool::MATERIAL_FLAG_FAR_GROUND
+                        } else {
+                            0
                         },
                         // Linear, not colour: listed with the data maps above.
                         height_map: resolve_tex(mat.height_map),

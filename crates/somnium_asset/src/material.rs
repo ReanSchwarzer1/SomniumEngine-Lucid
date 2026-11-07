@@ -743,6 +743,7 @@ mod tests {
                 eye: false,
                 hair: false,
                 hashed_alpha: false,
+                far_ground: false,
                 foliage_card: false,
                 emissive: [0.0; 3],
                 emissive_intensity: 1.0,

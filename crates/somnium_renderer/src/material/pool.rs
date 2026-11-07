@@ -113,6 +113,8 @@ pub const MATERIAL_FLAG_HAIR: u32 = 1 << 4;
 /// `GpuMaterial::flags` bit 5 — hashed alpha where minified (glTF extras `somnium_hashed_alpha`): bare twigs. The
 /// visibility pass tests `(flags & 32u)`.
 pub const MATERIAL_FLAG_HASHED_ALPHA: u32 = 1 << 5;
+/// Far ground (`somnium_asset::Material::far_ground`): shading adds world-space relief and colour (`apply_far_ground`).
+pub const MATERIAL_FLAG_FAR_GROUND: u32 = 1 << 6;
 
 impl GpuMaterial {
     /// Rebuild the frozen 80-byte runtime payload from an authored material.
