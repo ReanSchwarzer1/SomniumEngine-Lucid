@@ -970,6 +970,19 @@ fn post_process_schema() -> ComponentSchema {
                 doc: "The inferior mirage: under a line just below the horizon, far hot ground shows the sky mirrored, as a lake would. 0 off." },
             mirage_dip_deg { min: 0.0, max: 5.0, step: 0.05, precision: 2, unit: "deg", group: "Atmosphere", display_name: "Mirage Dip",
                 doc: "How far under the horizon the mirage's vanishing line lies (0.3: hot ground about 300 m ahead of a standing eye)." },
+            snow { group: "Snow", display_name: "Snow Cover",
+                doc: "Snow lying on every up-facing surface above the snowline: terrain, rock, ruins, roofs, branches and the far ranges." },
+            snowline_m { step: 5.0, unit: "m", group: "Snow", display_name: "Snowline", doc: "Height where snow starts (ragged by about 40 m)." },
+            snow_full_m { step: 5.0, unit: "m", group: "Snow", display_name: "Full Cover", doc: "Height where snow covers everything that can hold it." },
+            snow_max_slope_deg { min: 0.0, max: 90.0, step: 1.0, unit: "deg", group: "Snow", display_name: "Steepest Slope", doc: "Steeper faces shed their snow." },
+            snow_shade_bias { min: 0.0, max: 1.0, step: 0.05, group: "Snow", display_name: "Shade Bias", doc: "How much lower snow lies on faces turned from the sun (up to 150 m)." },
+            snow_age { min: 0.0, max: 1.0, step: 0.05, group: "Snow", display_name: "Age", doc: "0 fresh and white; 1 old, grey and dirty." },
+            snow_wind_deg { step: 1.0, unit: "deg", group: "Snow", display_name: "Wind Bearing", doc: "The bearing the wind blows toward (0 toward +Z, 90 toward +X)." },
+            snow_scour { min: 0.0, max: 1.0, step: 0.05, group: "Snow", display_name: "Wind Scour", doc: "How hard the wind strips faces turned into it." },
+            snow_bare_slope_deg { min: 0.0, max: 90.0, step: 1.0, unit: "deg", group: "Snow", display_name: "Bare Past",
+                doc: "Steeper faces keep no snow; between Steepest Slope and this it keeps to gullies and ledges." },
+            snow_map { group: "Snow", display_name: "Snowline Map",
+                doc: "A SNOWLN01 snowline map, project-relative: where it covers, its snowline replaces Snowline. Empty for none." },
         }
     };
     if let Some(field) = schema.fields.iter_mut().find(|f| f.name == "dream_mode") {

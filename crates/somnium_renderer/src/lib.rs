@@ -37,6 +37,7 @@ pub mod renderer;
 pub mod shaders;
 pub mod shadow;
 pub mod skinning;
+pub mod snow_map;
 pub mod terrain;
 pub mod texture_pool;
 pub mod timing;

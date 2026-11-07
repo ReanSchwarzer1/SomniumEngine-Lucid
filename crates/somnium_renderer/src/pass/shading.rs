@@ -252,6 +252,11 @@ pub struct ShadingPass {
     paint_capacity_words: u64,
     /// Where the finished surface goes while the path tracer runs (bindings 31-33).
     path_surface: [wgpu::TextureView; 3],
+    /// Snow lying on surfaces (snow.wgsl's `SnowParams`, binding 34): 96 bytes, all zero when there is none.
+    snow_buffer: wgpu::Buffer,
+    /// The local snowline map (snow.wgsl, binding 35): f32 metres row by row, one cell when there is none. A storage
+    /// buffer, not a texture: the fragment stage already holds the device's 16 sampled textures.
+    snow_map: wgpu::Buffer,
     /// Kept so growing the paint buffer can rebuild the bind group.
     visibility_view: wgpu::TextureView,
     _virtual_shadow_dummy: wgpu::Texture,
@@ -611,6 +616,24 @@ impl ShadingPass {
                 count: None,
             });
         }
+        // binding 34: snow lying on surfaces (snow.wgsl's SnowParams, sunscar-photoreal).
+        layout_entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 34,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        });
+        // binding 35: the local snowline map (snow.wgsl), a read-only storage buffer.
+        layout_entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 35,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        });
         if local_shadow_tlas.is_some() {
             layout_entries.push(wgpu::BindGroupLayoutEntry {
                 binding: 29,
@@ -711,6 +734,14 @@ impl ShadingPass {
 
         let paint_capacity_words = 1024;
         let paint_buffer = Self::make_paint_buffer(device, paint_capacity_words);
+        // Snow lying on surfaces (binding 34): created zeroed, so the layer starts off.
+        let snow_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Snow Params"),
+            size: 96,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let snow_map = Self::make_snow_map(device, 1);
         let bind_group = Self::make_bind_group(
             device,
             &bind_group_layout,
@@ -743,6 +774,8 @@ impl ShadingPass {
             &paint_buffer,
             local_shadow_tlas,
             path_surface,
+            &snow_buffer,
+            &snow_map,
         );
 
         // MORROWIND-C: composition is declared in `shading.wgsl` and
@@ -874,6 +907,8 @@ impl ShadingPass {
             paint_buffer,
             paint_capacity_words,
             path_surface: path_surface.map(Clone::clone),
+            snow_buffer,
+            snow_map,
             visibility_view: visibility_view.clone(),
             _virtual_shadow_dummy: virtual_shadow_dummy,
             clipmap_layout,
@@ -1364,6 +1399,8 @@ impl ShadingPass {
         paint: &wgpu::Buffer,
         local_shadow_tlas: Option<&wgpu::Tlas>,
         path_surface: [&wgpu::TextureView; 3],
+        snow: &wgpu::Buffer,
+        snow_map: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         let mut entries = vec![
                 wgpu::BindGroupEntry {
@@ -1495,6 +1532,8 @@ impl ShadingPass {
         for (binding, view) in (31..).zip(path_surface) {
             entries.push(wgpu::BindGroupEntry { binding, resource: wgpu::BindingResource::TextureView(view) });
         }
+        entries.push(wgpu::BindGroupEntry { binding: 34, resource: snow.as_entire_binding() });
+        entries.push(wgpu::BindGroupEntry { binding: 35, resource: snow_map.as_entire_binding() });
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Shading Pass Bind Group"), layout, entries: &entries,
         })
@@ -1714,6 +1753,8 @@ impl ShadingPass {
             &self.paint_buffer,
             self.local_shadow_tlas.as_ref(),
             [&self.path_surface[0], &self.path_surface[1], &self.path_surface[2]],
+            &self.snow_buffer,
+            &self.snow_map,
         );
     }
 
@@ -1748,6 +1789,31 @@ impl ShadingPass {
         if !data.is_empty() {
             queue.write_buffer(&self.paint_buffer, u64::from(word) * 4, bytemuck::cast_slice(data));
         }
+    }
+
+    /// Snow lying on surfaces (snow.wgsl's `SnowParams`): (on, snowline m, full-cover m, cos of the slope limit),
+    /// (shade bias, cos of the bare slope, age, -), (toward the sun, metres per pixel per metre), (wind x, wind z,
+    /// scour, -), the snowline map's (x0, z0, 1 / cell, on) and (width, height, -, -). All zero turns it off.
+    pub fn set_snow(&self, queue: &wgpu::Queue, snow: &[f32; 24]) {
+        queue.write_buffer(&self.snow_buffer, 0, bytemuck::cast_slice(snow));
+    }
+
+    fn make_snow_map(device: &wgpu::Device, cells: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Snowline Map"),
+            size: cells.max(4) * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Put a snowline map (metres, row by row along +Z) where snow.wgsl reads it, and rebind.
+    pub fn set_snow_map(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, width: u32, height: u32, metres: &[f32]) {
+        debug_assert_eq!(metres.len(), width as usize * height as usize);
+        let buffer = Self::make_snow_map(device, metres.len() as u64);
+        queue.write_buffer(&buffer, 0, bytemuck::cast_slice(metres));
+        self.snow_map = buffer;
+        self.rebind(device);
     }
 
     /// Bind the renderer-owned sparse shadow cache into opaque/terrain shading.

@@ -8864,6 +8864,31 @@ impl<G: GameApp> Engine<G> {
                     }
                 }
             }
+            // The snowline map: read when its path changes, kept until it does again; none when empty or unreadable.
+            let snow_map = pp.snow_map.trim();
+            if r.snow_map_source != snow_map {
+                if let Some(ctx) = self.render_ctx.as_ref() {
+                    r.snow_map_source = snow_map.to_owned();
+                    let read = if snow_map.is_empty() {
+                        Ok(None)
+                    } else {
+                        match self.config.project_root.as_ref() {
+                            Some(root) => resolved_source(root, snow_map),
+                            None => Ok(std::path::PathBuf::from(snow_map)),
+                        }
+                        .and_then(|path| std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display())))
+                        .and_then(|bytes| somnium_renderer::snow_map::parse(&bytes))
+                        .map(Some)
+                    };
+                    match read {
+                        Ok(map) => r.set_snow_map(ctx, map.as_ref()),
+                        Err(e) => {
+                            warn!("snowline map {snow_map}: {e}");
+                            r.set_snow_map(ctx, None);
+                        }
+                    }
+                }
+            }
             // The player's graphics tier: gates and scales what the scene
             // authored, never enables what it left off (see `quality`).
             let budget = r.graphics_budget();
@@ -9100,6 +9125,22 @@ impl<G: GameApp> Engine<G> {
                     pp.mirage_dip_deg.clamp(0.0, 5.0).to_radians().sin(),
                 ],
                 view_proj: glam::Mat4::IDENTITY.to_cols_array(),
+            };
+            // Snow lying on surfaces (snow.wgsl's uniform, shading group 1 binding 34); all zero is none. The renderer
+            // fills the direction toward the sun itself.
+            r.snow = if pp.snow {
+                let wind = pp.snow_wind_deg.to_radians();
+                [
+                    1.0, pp.snowline_m, pp.snow_full_m.max(pp.snowline_m + 1.0),
+                    pp.snow_max_slope_deg.clamp(0.0, 90.0).to_radians().cos(),
+                    pp.snow_shade_bias.clamp(0.0, 1.0),
+                    pp.snow_bare_slope_deg.max(pp.snow_max_slope_deg.clamp(0.0, 87.0) + 3.0).min(90.0).to_radians().cos(),
+                    pp.snow_age.clamp(0.0, 1.0), 0.0,
+                    0.0, 0.0, 0.0, 0.0,
+                    wind.sin(), wind.cos(), pp.snow_scour.clamp(0.0, 1.0), 0.0,
+                ]
+            } else {
+                [0.0; 16]
             };
             r.authored_picture_shift = somnium_renderer::pass::postprocess::PictureShift {
                 kind: if pp.picture_shift <= 3 { pp.picture_shift } else { 0 },

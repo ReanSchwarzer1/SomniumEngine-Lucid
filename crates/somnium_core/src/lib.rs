@@ -1486,6 +1486,30 @@ pub struct PostProcessComponent {
     /// How far under the horizon the mirage's vanishing line lies, degrees (default 0.3: hot ground ~300 m ahead of an
     /// eye 1.7 m up). Steeper heat gradients bring it closer.
     pub mirage_dip_deg: f32,
+    /// Snow lying on surfaces (snow.wgsl), off by default: on every up-facing surface above `snowline_m` (terrain,
+    /// rock, ruins, roofs, branches, the far ranges), only where the slope holds it, lower on faces turned from the
+    /// sun, scoured where the wind strikes, breaking crisply against rock. Set per region by the looks.
+    pub snow: bool,
+    /// Height where snow starts, metres (ragged by about ±40 m). Default 600.
+    pub snowline_m: f32,
+    /// Height where it covers everything that can hold it, metres. Default 800.
+    pub snow_full_m: f32,
+    /// Steepest slope that holds snow, degrees. Default 40.
+    pub snow_max_slope_deg: f32,
+    /// How much lower snow lies on faces turned from the sun, 0..1: up to 150 m at 1. Default 0.5.
+    pub snow_shade_bias: f32,
+    /// 0 fresh, 1 old, grey and dirty. Default 0.3.
+    pub snow_age: f32,
+    /// The bearing the wind blows toward, degrees (0 toward +Z, 90 toward +X), for scouring. Default 0.
+    pub snow_wind_deg: f32,
+    /// How hard the wind scours faces turned into it, 0..1. Default 0.3.
+    pub snow_scour: f32,
+    /// Steepest face that keeps any snow, degrees: between `snow_max_slope_deg` and this it keeps to gullies and
+    /// ledges, fewer the steeper. Default 65.
+    pub snow_bare_slope_deg: f32,
+    /// A local snowline map, project-relative (`SNOWLN01`, see `somnium_renderer::snow_map`): where it covers, its
+    /// snowline replaces `snowline_m` and already carries the sun's shade. Empty for none.
+    pub snow_map: String,
 }
 
 impl Default for PostProcessComponent {
@@ -1669,6 +1693,16 @@ impl Default for PostProcessComponent {
             heat_shimmer: 0.0,
             mirage: 0.0,
             mirage_dip_deg: 0.3,
+            snow: false,
+            snowline_m: 600.0,
+            snow_full_m: 800.0,
+            snow_max_slope_deg: 40.0,
+            snow_shade_bias: 0.5,
+            snow_age: 0.3,
+            snow_wind_deg: 0.0,
+            snow_scour: 0.3,
+            snow_bare_slope_deg: 65.0,
+            snow_map: String::new(),
         }
     }
 }
