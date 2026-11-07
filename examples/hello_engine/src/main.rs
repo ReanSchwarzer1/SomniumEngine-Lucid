@@ -759,6 +759,10 @@ pub struct HelloGame {
     /// Spawn the scripted first-person character (and its camera, which wins the view) on Play. On by default; a game
     /// with its own player and camera (Rimeborn's isometric rig) turns it off.
     pub play_character: bool,
+    /// Where a game with its own camera stands this frame (its player's eye), set before `on_render`: levels of
+    /// detail, foliage distances and the cutaway fallback are chosen from it. The shell's editor camera stays where
+    /// the scene left it while such a game plays, kilometres away in an open world. `None` keeps the shell's camera.
+    pub game_eye: Option<Vec3>,
     /// Roofs and upper floors opened for the camera while the viewer is inside (somnium_core::cutaway).
     cutaways: somnium_core::cutaway::Cutaways,
     /// Levels of detail not drawn this frame (somnium_core::lod_group).
@@ -892,6 +896,7 @@ impl HelloGame {
         runtime_ui.add_pause_banner("Hello Engine - UI Canvas");
         Self {
             play_character: true,
+            game_eye: None,
             cutaways: Default::default(),
             imported_draws: Default::default(),
             lods: Default::default(),
@@ -2772,12 +2777,15 @@ impl GameApp for HelloGame {
                 }
             }
 
+            // The eye this frame's choices are made from: the game's own camera if it gave one (Sunscar measured
+            // every level from the editor camera at the origin, 13-17 km off, and drew far levels up close).
+            let draw_eye = self.game_eye.unwrap_or(renderer.camera_pos);
             // Cutaways: the viewer a game names (its player, its camera's focus), else the camera.
             self.cutaways.update(
                 ctx.world,
-                somnium_core::cutaway::viewer(ctx.world).unwrap_or(renderer.camera_pos),
+                somnium_core::cutaway::viewer(ctx.world).unwrap_or(draw_eye),
             );
-            self.lods.update(ctx.world, renderer.camera_pos);
+            self.lods.update(ctx.world, draw_eye);
             self.imported_draws.begin_frame();
 
             // Phase 11.5A-2: Use WorldTransform for rendering instead of Transform::to_matrix().
@@ -2834,7 +2842,7 @@ impl GameApp for HelloGame {
                         continue;
                     }
                     let Some(casts_shadow) =
-                        self.imported_draws.draw_row(ctx.world, archetype, row, entity, renderer.camera_pos)
+                        self.imported_draws.draw_row(ctx.world, archetype, row, entity, draw_eye)
                     else {
                         continue;
                     };
