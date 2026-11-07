@@ -939,6 +939,11 @@ impl GpuProfiler {
         }
     }
 
+    /// Frames rendered so far: the number `PROFILE frame=` prints.
+    pub fn frame_index(&self) -> u64 {
+        self.frame_index
+    }
+
     /// Print the table to the log every `log_every` collected frames.
     ///
     /// Gated on a *collected* frame rather than a rendered one, so the numbers

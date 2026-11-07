@@ -2747,6 +2747,14 @@ impl SomniumRenderer {
         snow[8..11].copy_from_slice(&self.light_direction.normalize_or_zero().to_array());
         // Metres per pixel per metre of distance: the snow's finer patterns fade where a pixel cannot hold them.
         snow[11] = 2.0 / (self.proj_matrix.y_axis.y.abs().max(1e-6) * self.render_height.max(1) as f32);
+        // SOMNIUM_SNOW_AB=1 (measuring its cost): the layer is off for alternate 120-frame stretches, offset by 60, so a
+        // run with SOMNIUM_PROFILE_EVERY=120 logs blocks without it (frame=120, 360, ...) and with it (240, 480, ...)
+        // under the same clocks.
+        static SNOW_AB: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var("SOMNIUM_SNOW_AB").as_deref() == Ok("1"));
+        if *SNOW_AB && (self.profiler.frame_index() + 60) / 120 % 2 == 1 {
+            snow[0] = 0.0;
+        }
         self.shading_pass.set_snow(queue, &snow);
     }
 

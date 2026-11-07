@@ -77,8 +77,9 @@ fn snow_streaks(xz: vec2<f32>, fall: vec2<f32>, across_m: f32, along_m: f32) -> 
 
 /// Where snow lies, from the geometric normal: (amount 0..1, nearness to its lower edge 0..1, metres per pixel).
 /// Above the snowline, lower and deeper on faces turned from the sun and on lee faces, ragged at its edge (broad
-/// lobes, finer breakup, and on slopes streaks down the fall line: gullies hold snow, ribs shed it), only where the
-/// slope holds it (gullies hold it on steeper ground), stripped from faces the wind strikes.
+/// lobes, finer breakup, and on slopes streaks down the fall line: gullies hold snow, ribs shed it), and stripped from
+/// faces the wind strikes. Up to the slope limit it lies everywhere; steeper, it keeps to gullies and ledges, fewer
+/// the steeper the face, and none past 65 degrees (a winter north face is streaked and plastered, not bare).
 fn snow_cover(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let footprint = distance(world, view.camera_pos) * snow_params.p2.w;
     let line = snow_params.p0.y;
@@ -98,8 +99,10 @@ fn snow_cover(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let height = world.y + away * snow_params.p1.x * 150.0 + snow_params.p3.z * max(lee, 0.0) * 120.0
         + lobes * 110.0 + mid * 55.0 + fine * 16.0 + gullies * 110.0;
     var amount = smoothstep(line, full, height);
-    let hold = snow_params.p0.w - gullies * 0.2 - mid * 0.1;
-    amount *= smoothstep(hold - 0.06, hold + 0.10, n.y);
+    let cos_bare = min(snow_params.p0.w - 0.05, 0.4226);
+    let hold = saturate((n.y - cos_bare) / max(snow_params.p0.w - cos_bare, 0.05));
+    let streak = saturate(0.5 + gullies * 1.4 + mid * 0.5);
+    amount *= smoothstep(0.0, 0.25, hold - (1.0 - streak) * 0.85);
     amount *= 1.0 - snow_params.p3.z * saturate(-lee) * 1.5;
     let edge = 1.0 - smoothstep(line, mix(line, full, 0.5), height);
     return vec3<f32>(saturate(amount), edge, footprint);
