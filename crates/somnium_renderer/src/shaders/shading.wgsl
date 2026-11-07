@@ -1243,6 +1243,61 @@ fn sample_material_map(
 /// (geometric, world space), `local_height` metres above its object's origin
 /// (grounded assets sit on it, so this is height above their foot), with
 /// `crevice` the scan's own occlusion.
+// ── Far ground (Sunscar, 7 Nov 2026) ─────────────────────────────────────────
+//
+// A backdrop or far stand-in's colour comes in texels 16-64 m wide, so from 2-6 km a hillside drew as one smooth wash
+// and its shading as the 32-64 m mesh alone: clay, not ground. Real slopes at that range show scree fans, turf and
+// rock in patches, and gullies and ribs in their light. This adds both, in world space so they hold still: value
+// noise at 8, 24, 72 and 216 m, each scale only where it spans several pixels (it fades in with distance so it never
+// aliases), shifting the albedo by up to about a fifth and tilting the shading normal by the same relief.
+
+fn far_ground_hash(c: vec2<i32>) -> f32 {
+    var h = u32(c.x) * 374761393u + u32(c.y) * 668265263u;
+    h = (h ^ (h >> 13u)) * 1274126177u;
+    h = h ^ (h >> 16u);
+    return f32(h & 0xffffu) / 65535.0;
+}
+
+fn far_ground_noise(p: vec2<f32>) -> f32 {
+    let i = vec2<i32>(floor(p));
+    let f = p - floor(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = far_ground_hash(i);
+    let b = far_ground_hash(i + vec2<i32>(1, 0));
+    let c = far_ground_hash(i + vec2<i32>(0, 1));
+    let d = far_ground_hash(i + vec2<i32>(1, 1));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+fn apply_far_ground(surface: ptr<function, Surface>, world_pos: vec3<f32>, distance: f32) {
+    // Metres a pixel spans there (about 1 mrad at 1440p after FSR), and a scale shows once it is 4+ pixels wide.
+    let footprint = max(distance * 0.001, 0.01);
+    let scales = array<f32, 4>(8.0, 24.0, 72.0, 216.0);
+    let colour_amp = array<f32, 4>(0.07, 0.08, 0.08, 0.06);
+    var tone = 0.0;
+    var grad = vec2<f32>(0.0);
+    for (var k = 0; k < 4; k = k + 1) {
+        let s = scales[k];
+        let w = saturate((s / footprint - 4.0) / 4.0);
+        if w <= 0.0 {
+            continue;
+        }
+        let p = world_pos.xz / s + vec2<f32>(f32(k) * 17.3, f32(k) * 7.1);
+        let n0 = far_ground_noise(p);
+        let e = 0.25;
+        let nx = far_ground_noise(p + vec2<f32>(e, 0.0));
+        let nz = far_ground_noise(p + vec2<f32>(0.0, e));
+        tone += w * colour_amp[k] * (2.0 * n0 - 1.0);
+        // Relief 12% of the scale: d(height)/dx = 0.12 s dn/(e s) = 0.12 dn / e.
+        grad += w * 0.12 * vec2<f32>(nx - n0, nz - n0) / e;
+    }
+    let dry = far_ground_noise(world_pos.xz / 55.0 + vec2<f32>(3.7, 9.1));
+    (*surface).albedo = (*surface).albedo * (1.0 + tone)
+        * mix(vec3<f32>(1.0), vec3<f32>(1.06, 1.0, 0.9), saturate(dry * 2.0 - 1.0) * saturate(30.0 / footprint));
+    let n = (*surface).normal;
+    (*surface).normal = normalize(vec3<f32>(n.x - grad.x, n.y, n.z - grad.y));
+}
+
 fn apply_weathering(
     surface: ptr<function, Surface>,
     amount: f32,
@@ -2718,6 +2773,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // The same fade that takes paint back takes the authored weathering back with it.
         apply_weathering(&surface, material.weathering * (1.0 - saturate(bitcast<f32>(vertex_paint[6]))),
             hit_point, geo_normal, local_height, micro_occlusion);
+    }
+    // Far ground; see `apply_far_ground`.
+    if (material.flags & 64u) != 0u {
+        apply_far_ground(&surface, hit_point, length(hit_point - view.camera_pos));
     }
 
     // ── Foliage: curved card normals (Phase 17E, re-gated in TSUSHIMA-J) ─────
