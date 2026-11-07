@@ -979,6 +979,10 @@ fn post_process_schema() -> ComponentSchema {
             snow_age { min: 0.0, max: 1.0, step: 0.05, group: "Snow", display_name: "Age", doc: "0 fresh and white; 1 old, grey and dirty." },
             snow_wind_deg { step: 1.0, unit: "deg", group: "Snow", display_name: "Wind Bearing", doc: "The bearing the wind blows toward (0 toward +Z, 90 toward +X)." },
             snow_scour { min: 0.0, max: 1.0, step: 0.05, group: "Snow", display_name: "Wind Scour", doc: "How hard the wind strips faces turned into it." },
+            snow_bare_slope_deg { min: 0.0, max: 90.0, step: 1.0, unit: "deg", group: "Snow", display_name: "Bare Past",
+                doc: "Steeper faces keep no snow; between Steepest Slope and this it keeps to gullies and ledges." },
+            snow_map { group: "Snow", display_name: "Snowline Map",
+                doc: "A SNOWLN01 snowline map, project-relative: where it covers, its snowline replaces Snowline. Empty for none." },
         }
     };
     if let Some(field) = schema.fields.iter_mut().find(|f| f.name == "dream_mode") {

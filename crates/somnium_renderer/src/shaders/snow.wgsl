@@ -2,9 +2,11 @@
 // `apply_snow` once per opaque surface after terrain, decals and wetness, so terrain, rock, ruins, roofs, branches and
 // the far stand-in cells all take it. Its settings are its own uniform (shading group 1 binding 34):
 //   p0 = (on, snowline m, full-cover height m, cos of the slope where snow stops sliding off)
-//   p1 = (shade bias, reserved, age 0 fresh .. 1 old and dirty, reserved)
+//   p1 = (shade bias, cos of the slope past which no snow holds, age 0 fresh .. 1 old and dirty, unused)
 //   p2 = (direction toward the sun, metres per pixel per metre of distance)
 //   p3 = (wind direction x, z, scour, unused)
+//   p4 = (snowline map: x0, z0 in scene metres, 1 / cell, on), p5 = (its width, height, unused, unused)
+// The map (binding 35, R32Float metres) replaces the snowline where it covers; it already carries the sun's shade.
 // Off (p0.x 0) costs one branch.
 
 struct SnowParams {
@@ -12,8 +14,34 @@ struct SnowParams {
     p1: vec4<f32>,
     p2: vec4<f32>,
     p3: vec4<f32>,
+    p4: vec4<f32>,
+    p5: vec4<f32>,
 }
 @group(1) @binding(34) var<uniform> snow_params: SnowParams;
+@group(1) @binding(35) var snow_map: texture_2d<f32>;
+
+/// The snowline here: the map's where it covers (blended into the look's over its outer 8 cells), else the look's.
+/// Returns (snowline m, how much the map holds 0..1).
+fn snow_line_at(xz: vec2<f32>) -> vec2<f32> {
+    let look_line = snow_params.p0.y;
+    if snow_params.p4.w < 0.5 {
+        return vec2<f32>(look_line, 0.0);
+    }
+    let size = snow_params.p5.xy;
+    let t = (xz - snow_params.p4.xy) * snow_params.p4.z - 0.5;
+    let inside = min(min(t.x, t.y), min(size.x - 2.0 - t.x, size.y - 2.0 - t.y));
+    if inside < 0.0 {
+        return vec2<f32>(look_line, 0.0);
+    }
+    let i = vec2<i32>(floor(t));
+    let f = t - floor(t);
+    let a = textureLoad(snow_map, i, 0).x;
+    let b = textureLoad(snow_map, i + vec2<i32>(1, 0), 0).x;
+    let c = textureLoad(snow_map, i + vec2<i32>(0, 1), 0).x;
+    let d = textureLoad(snow_map, i + vec2<i32>(1, 1), 0).x;
+    let held = saturate(inside / 8.0);
+    return vec2<f32>(mix(look_line, mix(mix(a, b, f.x), mix(c, d, f.x), f.y), held), held);
+}
 
 /// PCG on integer cells: far from the world's origin a float hash (fract(sin(big))) loses its randomness.
 fn snow_pcg(v: u32) -> u32 {
@@ -79,11 +107,12 @@ fn snow_streaks(xz: vec2<f32>, fall: vec2<f32>, across_m: f32, along_m: f32) -> 
 /// Above the snowline, lower and deeper on faces turned from the sun and on lee faces, ragged at its edge (broad
 /// lobes, finer breakup, and on slopes streaks down the fall line: gullies hold snow, ribs shed it), and stripped from
 /// faces the wind strikes. Up to the slope limit it lies everywhere; steeper, it keeps to gullies and ledges, fewer
-/// the steeper the face, and none past 65 degrees (a winter north face is streaked and plastered, not bare).
+/// the steeper the face, and none past the bare slope (a winter north face is streaked and plastered, not bare).
 fn snow_cover(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let footprint = distance(world, view.camera_pos) * snow_params.p2.w;
-    let line = snow_params.p0.y;
-    let full = max(snow_params.p0.z, line + 1.0);
+    let local = snow_line_at(world.xz);
+    let line = local.x;
+    let full = line + max(snow_params.p0.z - snow_params.p0.y, 1.0);
     let steep = length(n.xz);
     let fall = select(vec2<f32>(1.0, 0.0), n.xz / max(steep, 1e-4), steep > 1e-3);
     let flat_sun = snow_params.p2.xz / max(length(snow_params.p2.xz), 1e-4);
@@ -96,12 +125,16 @@ fn snow_cover(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let on_slope = smoothstep(0.2, 0.55, steep);
     let gullies = ((snow_streaks(world.xz, fall, 16.0, 110.0) - 0.5) * snow_fade(footprint, 16.0)
         + (snow_streaks(world.xz, fall, 90.0, 520.0) - 0.5) * 0.8 * snow_fade(footprint, 90.0)) * on_slope;
-    let height = world.y + away * snow_params.p1.x * 150.0 + snow_params.p3.z * max(lee, 0.0) * 120.0
+    // Ledges: bands a few metres apart in height, broken along the contour (fixed bearing, so nothing swings).
+    let ledges = (snow_noise_d(vec2<f32>(world.y / 7.0, dot(world.xz, vec2<f32>(0.8, 0.6)) / 45.0)).x - 0.5)
+        * snow_fade(footprint, 7.0) * on_slope;
+    // The map already carries the sun's shade, so the facing bias holds only where it does not.
+    let height = world.y + away * snow_params.p1.x * 150.0 * (1.0 - local.y) + snow_params.p3.z * max(lee, 0.0) * 120.0
         + lobes * 110.0 + mid * 55.0 + fine * 16.0 + gullies * 110.0;
     var amount = smoothstep(line, full, height);
-    let cos_bare = min(snow_params.p0.w - 0.05, 0.4226);
+    let cos_bare = min(snow_params.p0.w - 0.05, snow_params.p1.y);
     let hold = saturate((n.y - cos_bare) / max(snow_params.p0.w - cos_bare, 0.05));
-    let streak = saturate(0.5 + gullies * 1.4 + mid * 0.5);
+    let streak = saturate(0.5 + gullies * 1.4 + ledges * 1.6 + mid * 0.5);
     amount *= smoothstep(0.0, 0.25, hold - (1.0 - streak) * 0.85);
     amount *= 1.0 - snow_params.p3.z * saturate(-lee) * 1.5;
     let edge = 1.0 - smoothstep(line, mix(line, full, 0.5), height);

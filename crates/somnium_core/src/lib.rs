@@ -1504,6 +1504,12 @@ pub struct PostProcessComponent {
     pub snow_wind_deg: f32,
     /// How hard the wind scours faces turned into it, 0..1. Default 0.3.
     pub snow_scour: f32,
+    /// Steepest face that keeps any snow, degrees: between `snow_max_slope_deg` and this it keeps to gullies and
+    /// ledges, fewer the steeper. Default 65.
+    pub snow_bare_slope_deg: f32,
+    /// A local snowline map, project-relative (`SNOWLN01`, see `somnium_renderer::snow_map`): where it covers, its
+    /// snowline replaces `snowline_m` and already carries the sun's shade. Empty for none.
+    pub snow_map: String,
 }
 
 impl Default for PostProcessComponent {
@@ -1695,6 +1701,8 @@ impl Default for PostProcessComponent {
             snow_age: 0.3,
             snow_wind_deg: 0.0,
             snow_scour: 0.3,
+            snow_bare_slope_deg: 65.0,
+            snow_map: String::new(),
         }
     }
 }

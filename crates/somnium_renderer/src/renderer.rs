@@ -368,6 +368,10 @@ pub struct SomniumRenderer {
     /// Snow lying on surfaces (snow.wgsl's uniform, shading group 1 binding 34); all zero is none.
     /// Its third vector (toward the sun) is filled from the light each frame.
     pub snow: [f32; 16],
+    /// The snowline map's placement for snow.wgsl (x0, z0, 1 / cell, on; width, height, -, -), set by `set_snow_map`
+    /// (all zero is none), and its project path as last asked for.
+    pub snow_map_params: [f32; 8],
+    pub snow_map_source: String,
     /// Radial vignette strength (0 = off, 1 = default, higher = stronger).
     ///
     /// Defaults to **off**: an always-on vignette darkens the viewport edges,
@@ -993,6 +997,20 @@ impl SomniumRenderer {
     /// Upload the grading LUT (`pass::postprocess::parse_cube`); `grading.lut_strength` decides how much is taken.
     pub fn set_grade_lut(&mut self, ctx: &RenderContext, size: u32, texels: &[[f32; 4]]) {
         self.postprocess_pass.set_lut(&ctx.device, &ctx.queue, size, texels);
+    }
+
+    /// The local snowline map snow.wgsl reads where it covers (`snow_map::parse`), or none.
+    pub fn set_snow_map(&mut self, ctx: &RenderContext, map: Option<&crate::snow_map::SnowMap>) {
+        match map {
+            Some(m) => {
+                self.shading_pass.set_snow_map(&ctx.device, &ctx.queue, m.width, m.height, &m.metres);
+                self.snow_map_params = [m.x0, m.z0, 1.0 / m.cell, 1.0, m.width as f32, m.height as f32, 0.0, 0.0];
+            }
+            None => {
+                self.shading_pass.set_snow_map(&ctx.device, &ctx.queue, 1, 1, &[0.0]);
+                self.snow_map_params = [0.0; 8];
+            }
+        }
     }
 
     pub fn warm_pipelines(&mut self, ctx: &RenderContext) {
@@ -1651,6 +1669,8 @@ impl SomniumRenderer {
             render_height: ctx.config.height,
             tonemapper: 0,
             snow: [0.0; 16],
+            snow_map_params: [0.0; 8],
+            snow_map_source: String::new(),
             vignette_strength: 0.0,
             chromatic_aberration: 0.0,
             fxaa_pass: crate::pass::fxaa::FxaaPass::new(
@@ -2743,7 +2763,9 @@ impl SomniumRenderer {
         queue.write_buffer(&self.global_pool.view_proj_buffer, 0, &view_data);
         // Snow lying on surfaces (snow.wgsl, shading group 1 binding 34): the direction toward the sun goes in its third
         // vector each frame.
-        let mut snow = self.snow;
+        let mut snow = [0.0f32; 24];
+        snow[..16].copy_from_slice(&self.snow);
+        snow[16..].copy_from_slice(&self.snow_map_params);
         snow[8..11].copy_from_slice(&self.light_direction.normalize_or_zero().to_array());
         // Metres per pixel per metre of distance: the snow's finer patterns fade where a pixel cannot hold them.
         snow[11] = 2.0 / (self.proj_matrix.y_axis.y.abs().max(1e-6) * self.render_height.max(1) as f32);
