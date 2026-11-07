@@ -138,7 +138,10 @@ fn snow_cover(world: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
     let cos_bare = min(snow_params.p0.w - 0.05, snow_params.p1.y);
     let hold = saturate((n.y - cos_bare) / max(snow_params.p0.w - cos_bare, 0.05));
     let streak = saturate(0.5 + gullies * 1.4 + ledges * 1.6 + mid * 0.5);
-    amount *= smoothstep(0.0, 0.25, hold - (1.0 - streak) * 0.85);
+    // The share a face keeps: all of it up to the slope limit, still about a third in streaks just short of the bare
+    // slope (a north face the sun never reaches stays plastered), none past it, over a couple of degrees.
+    let share = mix(0.3, 1.0, hold) * smoothstep(cos_bare - 0.015, cos_bare + 0.015, n.y);
+    amount *= smoothstep(-0.08, 0.08, streak - (1.0 - share));
     amount *= 1.0 - snow_params.p3.z * saturate(-lee) * 1.5;
     let edge = 1.0 - smoothstep(line, mix(line, full, 0.5), height);
     return vec3<f32>(saturate(amount), edge, footprint);
