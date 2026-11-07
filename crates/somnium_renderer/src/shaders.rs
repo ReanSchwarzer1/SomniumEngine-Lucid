@@ -427,6 +427,8 @@ mod tests {
             "froxel_depth.wgsl",
             // 17 Oct 2026: every spot cone's shape and cookie (small, bounded; no noise or parallax).
             "spot_cookie.wgsl",
+            // 7 Nov 2026: snow lying on surfaces (its own uniform at group 1 binding 34; off unless a look turns it on).
+            "snow.wgsl",
         ];
         expected.sort_unstable();
         assert_eq!(
