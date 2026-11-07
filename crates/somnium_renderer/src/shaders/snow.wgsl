@@ -6,7 +6,8 @@
 //   p2 = (direction toward the sun, metres per pixel per metre of distance)
 //   p3 = (wind direction x, z, scour, unused)
 //   p4 = (snowline map: x0, z0 in scene metres, 1 / cell, on), p5 = (its width, height, unused, unused)
-// The map (binding 35, R32Float metres) replaces the snowline where it covers; it already carries the sun's shade.
+// The map (binding 35: metres, row by row along +Z, in a storage buffer: shading's fragment stage already holds the
+// device's 16 sampled textures) replaces the snowline where it covers; it already carries the sun's shade.
 // Off (p0.x 0) costs one branch.
 
 struct SnowParams {
@@ -18,7 +19,7 @@ struct SnowParams {
     p5: vec4<f32>,
 }
 @group(1) @binding(34) var<uniform> snow_params: SnowParams;
-@group(1) @binding(35) var snow_map: texture_2d<f32>;
+@group(1) @binding(35) var<storage, read> snow_map: array<f32>;
 
 /// The snowline here: the map's where it covers (blended into the look's over its outer 8 cells), else the look's.
 /// Returns (snowline m, how much the map holds 0..1).
@@ -35,10 +36,12 @@ fn snow_line_at(xz: vec2<f32>) -> vec2<f32> {
     }
     let i = vec2<i32>(floor(t));
     let f = t - floor(t);
-    let a = textureLoad(snow_map, i, 0).x;
-    let b = textureLoad(snow_map, i + vec2<i32>(1, 0), 0).x;
-    let c = textureLoad(snow_map, i + vec2<i32>(0, 1), 0).x;
-    let d = textureLoad(snow_map, i + vec2<i32>(1, 1), 0).x;
+    let row = i32(size.x);
+    let at = i.y * row + i.x;
+    let a = snow_map[at];
+    let b = snow_map[at + 1];
+    let c = snow_map[at + row];
+    let d = snow_map[at + row + 1];
     let held = saturate(inside / 8.0);
     return vec2<f32>(mix(look_line, mix(mix(a, b, f.x), mix(c, d, f.x), f.y), held), held);
 }
