@@ -43,9 +43,15 @@ const SLOTS_SET_PER_FRAME: i64 = 48_000;
 /// 6 Nov, "even grass is too aggressive ... in immediate view they should appear real"; at 12 m a meadow 30 m off kept
 /// 40% of its blades. Copies cost the visibility pass (1.5 ms of a 25 ms frame), not shading.
 pub const BAND_NEAR: f32 = 24.0;
-/// Metres over which a kind with an [`GroundCoverRules::inner`] radius rises out of the ground past it, overlapping
-/// the band before it as that one sinks at its own edge ([`edge_height`]): a cross-fade, not a line.
-pub const INNER_FADE: f32 = 12.0;
+/// Metres over which a band hands over to the next, dithered copy by copy (`visibility.wgsl` FADE_WIDTH, the instance
+/// fade word, as trees' LODs hand over): a band fades out over the last of these inside its `radius`, and a far band
+/// fades in over the first of these past its [`GroundCoverRules::inner`] radius. A near band and the far band after it
+/// meet without gap or double when the far one's `inner` is the near one's `radius` less this (Sunscar, 7 Nov 2026).
+/// Before, the near band sank its copies into the ground over the last fifth of its radius and the far one rose over
+/// 12 m: cards squashed to half height read as a band of stubble at 30-45 m (foliage-render).
+pub const HANDOVER: f32 = 8.0;
+/// The far band's hand-over, kept under its old name.
+pub const INNER_FADE: f32 = HANDOVER;
 /// The widest a thinned copy is drawn, against its own width.
 pub(crate) const MOST_WIDEN: f32 = 2.5;
 
@@ -558,27 +564,23 @@ fn keep_at(distance: f32) -> f32 {
     if distance <= BAND_NEAR { 1.0 } else { BAND_NEAR / distance }
 }
 
-/// Whether a whole cell, `d` metres to its nearest point, lies inside a kind's `inner` radius (a cell's far corner is
-/// at most about 1.5 cells beyond its nearest point).
+/// Whether a whole cell, `d` metres to its nearest point, lies inside a kind's `inner` radius less half a hand-over (a
+/// cell's far corner is at most about 1.5 cells beyond its nearest point).
 fn inside_inner(d: f32, inner: f32) -> bool {
-    inner > 0.0 && d + 1.5 * CELL < inner
+    inner > 0.0 && d + 1.5 * CELL < inner - 0.5 * HANDOVER
 }
 
-/// A copy's height share `distance` metres out past a kind's `inner` radius: nothing inside it, rising smoothly over
-/// [`INNER_FADE`], whole beyond. A kind without one is whole from the eye.
-fn inner_height(distance: f32, inner: f32) -> f32 {
-    if inner <= 0.0 {
-        return 1.0;
+/// The hand-over a cell's batch carries (`InstanceBatch::fade`), the cell `d` metres to its nearest point: a far band's
+/// cells near its `inner` radius fade in across [inner, inner + HANDOVER], a band's cells near its `radius` fade out
+/// across [radius - HANDOVER, radius], others none (0). Measured from the eye by the GPU, as the dither runs there.
+fn cell_fade(d: f32, radius: f32, inner: f32) -> f32 {
+    if inner > 0.0 && d < inner + HANDOVER {
+        -(inner + 0.5 * HANDOVER)
+    } else if d + 1.5 * CELL > radius - HANDOVER {
+        radius - 0.5 * HANDOVER
+    } else {
+        0.0
     }
-    let t = ((distance - inner) / INNER_FADE).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// A copy's height share `distance` metres out of a kind's `radius`: whole until the last fifth, then sinking smoothly to
-/// nothing at the radius, so the cover ends in the ground rather than in a line (the lead, 31 Oct: "a hard band").
-fn edge_height(distance: f32, radius: f32) -> f32 {
-    let t = ((radius - distance) / (0.2 * radius)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
 }
 
 /// How much wider a copy draws where only `keep` of them do, to hold the ground they cover (at most [`MOST_WIDEN`]).
@@ -587,20 +589,23 @@ fn widen(keep: f32) -> f32 {
 }
 
 /// How a copy draws round `focus` (terrain-local) between its kind's `inner` radius and its `radius`: its scale on each
-/// axis (a thinned copy widened, one near either edge sunk into the ground), or `None` while it is thinned out. The one
-/// rule for [`CoverBatches`] and the editor's click, so a click finds what is drawn.
+/// axis (a thinned copy widened), or `None` while it is thinned out or outside its band. Whole height to the band's
+/// edges and half a hand-over past them: the GPU dithers it out (or in) across the edge by its distance from the eye
+/// ([`cell_fade`]), and the margin covers the few metres the cover's centre runs ahead of the eye. The one rule for
+/// [`CoverBatches`] and the editor's click, so a click finds what is drawn.
 #[must_use]
 pub(crate) fn drawn_scale(cover: &Cover, focus: Vec3, radius: f32, inner: f32) -> Option<Vec3> {
     let at = cover.instance.position;
     let distance = (at.x - focus.x).hypot(at.z - focus.z);
     // A far band thins from where it starts, not from the eye's near band.
     let keep = keep_at(distance - inner.max(0.0));
-    let sink = edge_height(distance, radius) * inner_height(distance, inner);
-    if cover.rank >= keep || cover.instance.scale <= 0.0 || sink <= 0.05 {
+    let margin = 0.5 * HANDOVER;
+    let outside = distance > radius + margin || (inner > 0.0 && distance < inner - margin);
+    if cover.rank >= keep || cover.instance.scale <= 0.0 || outside {
         return None;
     }
     let (s, w) = (cover.instance.scale, widen(keep));
-    Some(Vec3::new(s * w, s * sink, s * w))
+    Some(Vec3::new(s * w, s, s * w))
 }
 
 /// Ground cover as instance batches: one per terrain, kind and cell, every part's copies one instanced draw
@@ -682,15 +687,17 @@ impl CoverBatches {
             }) else {
                 continue;
             };
-            if d > radius || inside_inner(d, inner) {
+            if d > radius + 0.5 * HANDOVER || inside_inner(d, inner) {
                 continue;
             }
+            let fade = cell_fade(d, radius, inner);
             // A cell past its kind's shadow distance casts nothing: a casting batch set or removed redraws every
             // cascade, and the far cells come and go all the time.
             let casts = list.iter().any(|p| p.casts_shadow && (p.shadow_far <= 0.0 || d <= p.shadow_far));
             let mut sig = kind_sig;
             fold(&mut sig, band(d));
             fold(&mut sig, u32::from(casts));
+            fold(&mut sig, fade.to_bits());
             let id = cover_batch_id(terrain_id, kind, cx, cz);
             let live = self.live.get(&id).copied();
             let n = match live {
@@ -720,7 +727,7 @@ impl CoverBatches {
                     if !casts {
                         parts.iter_mut().for_each(|p| p.casts_shadow = false);
                     }
-                    self.set.push((id, InstanceBatch { parts, placements, fade: 0.0 }));
+                    self.set.push((id, InstanceBatch { parts, placements, fade }));
                     n
                 }
             };
@@ -1011,8 +1018,10 @@ mod tests {
         assert_eq!(band(1.0e6), 16, "capped");
         assert_eq!((keep_at(1.0), keep_at(BAND_NEAR), keep_at(4.0 * BAND_NEAR)), (1.0, 1.0, 0.25));
         assert!((widen(0.25) - 2.0).abs() < 1e-6 && widen(0.01) == MOST_WIDEN && widen(1.0) == 1.0);
-        assert_eq!((edge_height(10.0, 40.0), edge_height(40.0, 40.0), edge_height(50.0, 40.0)), (1.0, 0.0, 0.0));
-        assert!((edge_height(36.0, 40.0) - 0.5).abs() < 1e-6, "half height midway through the last fifth");
+        // A band's outer cells fade out over its last HANDOVER metres, a far band's inner ones fade in over its first.
+        assert_eq!(cell_fade(10.0, 100.0, 0.0), 0.0, "deep inside the band: no hand-over");
+        assert_eq!(cell_fade(30.0, 40.0, 0.0), 40.0 - 0.5 * HANDOVER, "near the radius: out");
+        assert_eq!(cell_fade(33.0, 90.0, 32.0), -(32.0 + 0.5 * HANDOVER), "near the inner radius: in");
     }
 
     #[test]
@@ -1053,9 +1062,11 @@ mod tests {
             .flat_map(|(_, b)| b.placements.iter())
             .map(|m| (m.w_axis.x - eye.x).hypot(m.w_axis.z - eye.z))
             .fold(f32::MAX, f32::min);
-        assert!(nearest >= 30.0, "nothing inside the inner radius: nearest copy {nearest} m");
-        assert!(inner_height(30.0, 30.0) == 0.0 && inner_height(30.0 + INNER_FADE, 30.0) == 1.0);
-        assert!(inner_height(5.0, 0.0) == 1.0, "a kind without an inner radius is whole from the eye");
+        assert!(nearest >= 30.0 - 0.5 * HANDOVER, "nothing inside the inner radius' margin: nearest copy {nearest} m");
+        assert!(
+            batches.set.iter().any(|(_, b)| b.fade == -(30.0 + 0.5 * HANDOVER)),
+            "the cells at the inner radius dither in"
+        );
     }
 
     #[test]
@@ -1146,11 +1157,11 @@ mod tests {
         let far = 4.0 * BAND_NEAR;
         assert_eq!(drawn_scale(&copy(far, 0.3), Vec3::ZERO, 400.0, 0.0), None, "a quarter kept that far");
         assert_eq!(drawn_scale(&copy(far, 0.2), Vec3::ZERO, 400.0, 0.0), Some(Vec3::new(4.0, 2.0, 4.0)), "widened twice");
-        assert_eq!(drawn_scale(&copy(far, 0.0), Vec3::ZERO, far, 0.0), None, "sunk at the radius");
-        // A far band: nothing inside its inner radius, whole once past its fade, thinned from where it starts.
+        assert_eq!(drawn_scale(&copy(far, 0.0), Vec3::ZERO, far, 0.0).map(|s| s.y), Some(2.0), "whole at the radius");
+        assert_eq!(drawn_scale(&copy(far + HANDOVER, 0.0), Vec3::ZERO, far, 0.0), None, "gone past its margin");
+        // A far band: nothing inside its inner radius' margin, whole height from there, thinned from where it starts.
         assert_eq!(drawn_scale(&copy(10.0, 0.0), Vec3::ZERO, 400.0, 30.0), None, "inside the inner radius");
-        let past = 30.0 + INNER_FADE;
-        assert_eq!(drawn_scale(&copy(past, 0.0), Vec3::ZERO, 400.0, 30.0).map(|s| s.y), Some(2.0), "risen out past it");
+        assert_eq!(drawn_scale(&copy(30.0, 0.0), Vec3::ZERO, 400.0, 30.0).map(|s| s.y), Some(2.0), "whole at it");
     }
 
     #[test]

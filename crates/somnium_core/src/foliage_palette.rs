@@ -104,11 +104,12 @@ pub(crate) struct GroundCoverRules {
     pub density: f32,
     /// Generated, and drawn, within this many metres of where the view looks (the ground under the view's centre).
     pub radius: f32,
-    /// Generated and drawn only from this many metres out, rising out of the ground over [`crate::ground_cover::
-    /// INNER_FADE`] and thinning from here instead of from the near band: the mid and far bands of a grass's LOD
-    /// chain are kinds of their own with coarser models (larger clumps, patch cards), so a meadow still reads as grass
-    /// at 120-300 m where single 4 mm blades are a fraction of a pixel (the developer, 6 Nov 2026: "the grass should
-    /// be visible even if far away or atleast load lower quality versions"). 0, the default: from the eye.
+    /// Generated and drawn only from this many metres out, dithered in over [`crate::ground_cover::HANDOVER`] (set it
+    /// to the band before's `radius` less that) and thinning from here instead of from the near band: the mid and far
+    /// bands of a grass's LOD chain are kinds of their own with coarser models (larger clumps, patch cards), so a meadow
+    /// still reads as grass at 120-300 m where single 4 mm blades are a fraction of a pixel (the developer, 6 Nov 2026:
+    /// "the grass should be visible even if far away or atleast load lower quality versions"). 0, the default: from
+    /// the eye.
     #[serde(default)]
     pub inner: f32,
     /// Tilt each instance to the ground's slope (patches of grass), instead of standing it upright (flowers).
