@@ -155,6 +155,10 @@ pub struct LoadedMaterial {
     /// bare twigs a texel wide break into flecks at a fixed 0.5 cut-off, and a hashed test turns them into the
     /// soft, see-through haze a bare crown is from afar (TAA averages it).
     pub hashed_alpha: bool,
+    /// Far ground (glTF material extras `somnium_far_ground`): a backdrop or far stand-in whose colour texels are tens
+    /// of metres wide. The shading pass adds world-space relief and colour at the scales its pixels can show, so a
+    /// slope 2-6 km out reads as ground, not a smooth wash (Sunscar, 7 Nov 2026).
+    pub far_ground: bool,
     /// This material is painted on **flat cut-out cards whose `uv.x` runs
     /// across the blade**, which is what `shading.wgsl`'s curved-card normal
     /// needs to be true.
@@ -455,6 +459,7 @@ fn load_gltf_checked(path: &Path, parts: Option<&HashSet<usize>>) -> Result<Load
             eye: material_extra(&mat, "somnium_eye") > 0.5,
             hair: material_extra(&mat, "somnium_hair") > 0.5,
             hashed_alpha: material_extra(&mat, "somnium_hashed_alpha") > 0.5,
+            far_ground: material_extra(&mat, "somnium_far_ground") > 0.5,
             // Authored only: see the field's own note on why no import can
             // honestly infer it.
             foliage_card: false,
@@ -538,6 +543,7 @@ fn load_gltf_checked(path: &Path, parts: Option<&HashSet<usize>>) -> Result<Load
             eye: false,
             hair: false,
             hashed_alpha: false,
+            far_ground: false,
             foliage_card: false,
             emissive: [0.0; 3],
             emissive_intensity: 1.0,
@@ -1094,8 +1100,9 @@ pub fn gltf_file_problems(path: &Path) -> Vec<String> {
             Ok(size) if size < declared => {
                 problems.push(format!("buffer {i}: declares {declared} bytes, the .bin has {size}: the importer refuses it"));
             }
-            Ok(size) if size != declared => problems.push(format!(
-                "buffer {i}: declares {declared} bytes, the .bin has {size}: written apart, its geometry may be another's"
+            // A buffer may be padded to four bytes, as the importer allows (`check_buffer_files`); more is two writes.
+            Ok(size) if size > declared + 3 => problems.push(format!(
+                "buffer {i}: declares {declared} bytes, the .bin has {size}: written apart, the importer refuses it"
             )),
             Ok(_) => {}
         }
@@ -1902,7 +1909,9 @@ mod broken_file_tests {
         std::fs::write(dir.join("whole.bin"), [0u8; 64]).unwrap();
         std::fs::write(dir.join("short.bin"), [0u8; 40]).unwrap();
         std::fs::write(dir.join("long.bin"), [0u8; 80]).unwrap();
+        std::fs::write(dir.join("padded.bin"), [0u8; 64]).unwrap();
         std::fs::write(dir.join("bark.png"), [0u8; 4]).unwrap();
+        assert!(super::gltf_file_problems(&gltf("padded", 62, "")).is_empty(), "padded to four bytes, as the importer allows");
         assert!(super::gltf_file_problems(&gltf("whole", 64, r#"{"uri":"bark.png"}"#)).is_empty());
         assert!(super::gltf_file_problems(&gltf("short", 64, ""))[0].contains("the importer refuses it"));
         assert!(super::gltf_file_problems(&gltf("long", 64, ""))[0].contains("written apart"));
