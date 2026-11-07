@@ -1094,8 +1094,9 @@ pub fn gltf_file_problems(path: &Path) -> Vec<String> {
             Ok(size) if size < declared => {
                 problems.push(format!("buffer {i}: declares {declared} bytes, the .bin has {size}: the importer refuses it"));
             }
-            Ok(size) if size != declared => problems.push(format!(
-                "buffer {i}: declares {declared} bytes, the .bin has {size}: written apart, its geometry may be another's"
+            // A buffer may be padded to four bytes, as the importer allows (`check_buffer_files`); more is two writes.
+            Ok(size) if size > declared + 3 => problems.push(format!(
+                "buffer {i}: declares {declared} bytes, the .bin has {size}: written apart, the importer refuses it"
             )),
             Ok(_) => {}
         }
@@ -1902,7 +1903,9 @@ mod broken_file_tests {
         std::fs::write(dir.join("whole.bin"), [0u8; 64]).unwrap();
         std::fs::write(dir.join("short.bin"), [0u8; 40]).unwrap();
         std::fs::write(dir.join("long.bin"), [0u8; 80]).unwrap();
+        std::fs::write(dir.join("padded.bin"), [0u8; 64]).unwrap();
         std::fs::write(dir.join("bark.png"), [0u8; 4]).unwrap();
+        assert!(super::gltf_file_problems(&gltf("padded", 62, "")).is_empty(), "padded to four bytes, as the importer allows");
         assert!(super::gltf_file_problems(&gltf("whole", 64, r#"{"uri":"bark.png"}"#)).is_empty());
         assert!(super::gltf_file_problems(&gltf("short", 64, ""))[0].contains("the importer refuses it"));
         assert!(super::gltf_file_problems(&gltf("long", 64, ""))[0].contains("written apart"));
