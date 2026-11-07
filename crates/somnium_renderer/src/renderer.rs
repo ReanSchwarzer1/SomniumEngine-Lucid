@@ -365,6 +365,9 @@ pub struct SomniumRenderer {
     pub sun_angular_radius: f32,
     /// Tone-mapping curve index; matches `Tonemapper::as_index`.
     pub tonemapper: u32,
+    /// Snow lying on surfaces (snow.wgsl's uniform, shading group 1 binding 34); all zero is none.
+    /// Its third vector (toward the sun) is filled from the light each frame.
+    pub snow: [f32; 16],
     /// Radial vignette strength (0 = off, 1 = default, higher = stronger).
     ///
     /// Defaults to **off**: an always-on vignette darkens the viewport edges,
@@ -1647,6 +1650,7 @@ impl SomniumRenderer {
             render_width: ctx.config.width,
             render_height: ctx.config.height,
             tonemapper: 0,
+            snow: [0.0; 16],
             vignette_strength: 0.0,
             chromatic_aberration: 0.0,
             fxaa_pass: crate::pass::fxaa::FxaaPass::new(
@@ -2737,6 +2741,21 @@ impl SomniumRenderer {
     fn write_view_buffer(&self, queue: &wgpu::Queue, view_proj: glam::Mat4) {
         let view_data = self.view_buffer_bytes(view_proj);
         queue.write_buffer(&self.global_pool.view_proj_buffer, 0, &view_data);
+        // Snow lying on surfaces (snow.wgsl, shading group 1 binding 34): the direction toward the sun goes in its third
+        // vector each frame.
+        let mut snow = self.snow;
+        snow[8..11].copy_from_slice(&self.light_direction.normalize_or_zero().to_array());
+        // Metres per pixel per metre of distance: the snow's finer patterns fade where a pixel cannot hold them.
+        snow[11] = 2.0 / (self.proj_matrix.y_axis.y.abs().max(1e-6) * self.render_height.max(1) as f32);
+        // SOMNIUM_SNOW_AB=1 (measuring its cost): the layer is off for alternate 120-frame stretches, offset by 60, so a
+        // run with SOMNIUM_PROFILE_EVERY=120 logs blocks without it (frame=120, 360, ...) and with it (240, 480, ...)
+        // under the same clocks.
+        static SNOW_AB: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var("SOMNIUM_SNOW_AB").as_deref() == Ok("1"));
+        if *SNOW_AB && (self.profiler.frame_index() + 60) / 120 % 2 == 1 {
+            snow[0] = 0.0;
+        }
+        self.shading_pass.set_snow(queue, &snow);
     }
 
     /// Put one view's matrices where the *encoder* will pick them up.
