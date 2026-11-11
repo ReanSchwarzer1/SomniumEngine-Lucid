@@ -1866,7 +1866,9 @@ impl ShadingPass {
     /// the rain.
     // ponytail: two values in one float, to stay out of shading's bind group while its layout is being reworked;
     // a uniform of its own (as snow has) when that is quiet.
-    pub fn set_standing_water(&self, level: f32, rain: f32) {
+    // The queue is not used (it was, when this wrote the uniform itself); it stays so that a game built against the
+    // first form still builds.
+    pub fn set_standing_water(&self, _queue: &wgpu::Queue, level: f32, rain: f32) {
         let packed = (level.clamp(0.0, 1.0) * 100.0).round() + rain.clamp(0.0, 0.99);
         self.standing_water.store(packed.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }

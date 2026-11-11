@@ -151,9 +151,22 @@ impl StormVolume {
     #[must_use]
     pub fn shelf(centre: glam::Vec3, radius: f32, height: f32, bearing: f32, half_arc: f32, depth: f32, nose: f32) -> Self {
         let mut v = Self::new(SHELF, centre, radius, height, 1.1, (nose * 3.0).clamp(300.0, 2500.0));
-        v.a = [bearing, half_arc.clamp(0.05, std::f32::consts::PI), depth.max(1.0), nose.max(1.0)];
+        let arc = half_arc.clamp(0.05, std::f32::consts::PI);
+        v.a = [bearing, arc, depth.max(1.0), nose.max(1.0)];
         v.bound[2] = radius + nose;
         v.bound[3] = (nose * 0.12).max(12.0);
+        if arc < std::f32::consts::FRAC_PI_2 {
+            // The cylinder round the arc alone, not the disc it is cut from: a narrow shelf seven kilometres out put
+            // fourteen kilometres of empty air at its own fine step into every ray (and the deck behind it went
+            // missing when the ray's iterations ran out). Its middle is half way between the arc's far point and its
+            // inner corners' chord; its radius reaches whichever corner is furthest.
+            let (outer, inner) = (radius + nose.max(1.0), (radius - depth.max(1.0)).max(0.0));
+            let mid = (outer + inner * arc.cos()) * 0.5;
+            let corner = |r: f32| ((r * arc.sin()).powi(2) + (r * arc.cos() - mid).powi(2)).sqrt();
+            v.bound[0] = centre.x + bearing.sin() * mid;
+            v.bound[1] = centre.z + bearing.cos() * mid;
+            v.bound[2] = (outer - mid).max(corner(outer)).max(corner(inner));
+        }
         v
     }
 
@@ -310,6 +323,15 @@ mod tests {
         let deck = StormVolume::deck(glam::Vec3::new(1000.0, 900.0, -500.0), 7000.0, 900.0, dir * 6000.0);
         assert!((at + dir * 12_900.0).distance(glam::Vec2::new(deck.bound[0], deck.bound[1])) <= deck.bound[2]);
         assert!(deck.bound_y[0] < 900.0 && (deck.bound_y[1] - 1800.0).abs() < 1.0);
+
+        // A narrow shelf's cylinder holds its arc (its nose's ends and its inner corners), and is nowhere near the
+        // size of the disc the arc is cut from.
+        let shelf = StormVolume::shelf(glam::Vec3::new(0.0, 400.0, 0.0), 7000.0, 500.0, 0.3, 0.18, 1100.0, 170.0);
+        let middle = glam::Vec2::new(shelf.bound[0], shelf.bound[1]);
+        for (r, a) in [(7170.0_f32, 0.3 - 0.18_f32), (7170.0, 0.3 + 0.18), (7170.0, 0.3), (5900.0, 0.3 - 0.18), (5900.0, 0.3 + 0.18)] {
+            assert!((glam::Vec2::new(a.sin(), a.cos()) * r).distance(middle) <= shelf.bound[2] + 1.0, "a corner of the arc is outside");
+        }
+        assert!(shelf.bound[2] < 1600.0, "{}", shelf.bound[2]);
 
         let funnel = StormVolume::funnel(glam::Vec3::new(0.0, 300.0, 0.0), 60.0, 800.0, 220.0, glam::Vec2::new(300.0, 0.0), 40.0, 2.2);
         let top = glam::Vec2::new(300.0, 0.0);
