@@ -9126,6 +9126,7 @@ impl<G: GameApp> Engine<G> {
                 ],
                 view_proj: glam::Mat4::IDENTITY.to_cols_array(),
             };
+            r.light_glints = pp.light_glints.max(0.0);
             // Snow lying on surfaces (snow.wgsl's uniform, shading group 1 binding 34); all zero is none. The renderer
             // fills the direction toward the sun itself.
             r.ground_blend_default = pp.ground_blend_m.max(0.0);
