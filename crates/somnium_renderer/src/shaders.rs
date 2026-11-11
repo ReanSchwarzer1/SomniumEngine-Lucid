@@ -327,6 +327,16 @@ impl Shaders {
         system.apply_reload(changed, validate)
     }
 
+    /// Install `source` as the module `name`'s text now, as a hot reload does after an edit, in any build: for a tool
+    /// that draws with the working tree's shaders without a rebuild (Sunscar's windowless cloud pictures, 12 Nov
+    /// 2026). Before the passes that use the module are built. A source that does not resolve is not installed and
+    /// comes back in the outcome's failures.
+    pub fn install_source(&self, name: &str, source: String) -> ReloadOutcome {
+        let id = self.id(name);
+        let mut system = self.system.lock().expect("shader system poisoned");
+        system.apply_reload(vec![(id, source)], |_, _, _| Ok(()))
+    }
+
     /// The variant budget report (plan §8 item 4).
     #[must_use]
     pub fn budget_table(&self) -> String {
