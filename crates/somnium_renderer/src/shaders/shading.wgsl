@@ -1,5 +1,6 @@
 //!include "spot_cookie.wgsl"
 //!include "snow.wgsl"
+//!include "ground_blend.wgsl"
 // MORROWIND-C: composition is declared here rather than assembled by a
 // `format!` of `include_str!` calls at this pass's construction site. The
 // resolver (`somnium_shader`) emits each module once, in this order, and
@@ -1618,7 +1619,8 @@ fn gathered_light(surface: Surface, traced: TracedLight, sky: vec3<f32>) -> vec3
     }
     let fine = surface.occlusion / (max(screen_occlusion, 0.004) * max(baked_sky_vis, 0.05));
     gi_sky_seen = mix(1.0, saturate(traced.sky / max(baked_sky_vis, 0.05)), traced.trust);
-    var gathered = sky * min(traced.sky, traced.contact) + traced.bounce;
+    // A blended mesh's band shades as the ground: its share of the sky opens toward the ground's (ground_blend.wgsl).
+    var gathered = sky * mix(min(traced.sky, traced.contact), 1.0, ground_blend_open) + traced.bounce;
     if traced.through > 0.0 {
         gathered += textureSampleLevel(env_cube, env_sampler, vec3<f32>(0.0, 1.0, 0.0), ENV_MAX_MIP).rgb
             * (light.ibl_intensity * traced.through);
@@ -3150,6 +3152,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         apply_decals(&surface, hit_point, decal_froxel);
     }
 
+    // Meshes blending into the ground under them (ground_blend.wgsl; sunscar-photoreal, 11 Nov 2026): after paint and
+    // decals, before f0, wetness and snow. Off unless the material or the scene gives a blend height; never for cut-outs,
+    // foliage, hair, far ground (flags 2, 4, 16, 32, 64) or skin. The scene's height skips whatever sways: a plant's
+    // trunk carries its wind bend (`somnium_wind_bend`), and its root flare is geometry (the lead, 11 Nov); a material's
+    // own height still applies. ponytail: instances carry no moving/static flag, so the scene's default suits a world
+    // of static meshes; anything that moves near the ground (first-person arms, a carried lamp) sets
+    // somnium_ground_blend -1.
+    if material.terrain_index < 0 && ground_blend.params.x > 0.0 && material.alpha_cutoff <= 0.0
+        && (material.flags & 118u) == 0u && material.subsurface <= 0.0 {
+        let scene_m = select(ground_blend.params.y, 0.0, material.wind_bend > 0.0);
+        let blend_m = select(scene_m, material.ground_blend, material.ground_blend != 0.0)
+            * length(instance.model[0].xyz) * ground_blend.params.z;
+        if blend_m > 0.0 {
+            surface = apply_ground_blend(surface, hit_point, geo_normal, blend_m);
+        }
+    }
     surface.f0       = mix(vec3<f32>(0.04), surface.albedo, surface.metallic);
     if material.terrain_index >= 0 {
         surface.f0 = surface.f0 + vec3<f32>(terrain_wet_f0);

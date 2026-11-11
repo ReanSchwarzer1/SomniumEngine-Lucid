@@ -74,7 +74,9 @@ pub struct GpuMaterial {
     /// albedo texture's alpha scales it per texel. Occupies what was the wind
     /// vector's unused third float.
     pub subsurface: f32,
-    /// Unused; keeps the stride at 112.
+    /// Metres within which this mesh blends into the terrain under it: WGSL `Material::ground_blend`
+    /// (`ground_blend.wgsl`, glTF extras `somnium_ground_blend`); 0 takes the scene's height (PostProcess
+    /// `ground_blend_m`), negative never blends. Keeps its old name because games build this struct literally.
     pub reserved: f32,
 }
 

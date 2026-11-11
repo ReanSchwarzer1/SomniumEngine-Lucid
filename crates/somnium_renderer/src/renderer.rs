@@ -124,11 +124,21 @@ struct FrameViewState {
     overlays: bool,
 }
 
-/// `SOMNIUM_SURFACES_AB=captures` (proof stills): photoreal's surface changes on the ground, the macro tier fading with
-/// distance and steep ground wearing its own bed's rock, are off until the run's first capture is written, then on,
-/// off, ... by each one written. A walk naming every view twice shoots each pair, before and after, in one launch (one
-/// launch per turn at Sunscar's window lock, 11 Nov 2026). `=1` (cost) turns them off in the frame=120, 360, ... blocks
-/// of a run with SOMNIUM_PROFILE_EVERY=120, as SOMNIUM_SNOW_AB.
+/// How far a blended band's occlusion and traced share of the sky open toward the ground's (`ground_blend.wgsl`
+/// `ground_blend_open`).
+const GROUND_BLEND_OPEN: f32 = 0.5;
+
+/// A comma list of numbers from the environment, or `None` when it is unset or holds none.
+fn env_floats(name: &str) -> Option<Vec<f32>> {
+    let list: Vec<f32> = std::env::var(name).ok()?.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+    (!list.is_empty()).then_some(list)
+}
+
+/// `SOMNIUM_SURFACES_AB=captures` (proof stills): photoreal's surface changes, meshes blending into the ground, the
+/// macro tier fading with distance and steep ground wearing its own bed's rock, are off until the run's first capture is
+/// written, then on, off, ... by each one written. A walk naming every view twice shoots each pair, before and after, in
+/// one launch (one launch per turn at Sunscar's window lock, 11 Nov 2026). `=1` (cost) turns them off in the frame=120,
+/// 360, ... blocks of a run with SOMNIUM_PROFILE_EVERY=120, as SOMNIUM_SNOW_AB.
 fn surfaces_ab_off(frame: u64) -> bool {
     static AB: std::sync::LazyLock<u8> =
         std::sync::LazyLock::new(|| match std::env::var("SOMNIUM_SURFACES_AB").as_deref() {
@@ -391,6 +401,9 @@ pub struct SomniumRenderer {
     /// (all zero is none), and its project path as last asked for.
     pub snow_map_params: [f32; 8],
     pub snow_map_source: String,
+    /// The scene's height, in metres, within which meshes blend into the ground where their material says nothing
+    /// (`ground_blend.wgsl`, PostProcess `ground_blend_m`); 0 is off.
+    pub ground_blend_default: f32,
     /// Last frame's [`surfaces_ab_off`], so a clipmap regenerates when its fade flips.
     surfaces_ab_was_off: bool,
     /// Radial vignette strength (0 = off, 1 = default, higher = stronger).
@@ -1699,6 +1712,7 @@ impl SomniumRenderer {
             snow: [0.0; 16],
             snow_map_params: [0.0; 8],
             snow_map_source: String::new(),
+            ground_blend_default: 0.0,
             surfaces_ab_was_off: false,
             vignette_strength: 0.0,
             chromatic_aberration: 0.0,
@@ -2318,7 +2332,7 @@ impl SomniumRenderer {
                         detile: if mat.detile { 1.0 } else { 0.0 },
                         wind: [mat.wind_bend, mat.wind_flutter],
                         subsurface: mat.subsurface,
-                        reserved: 0.0,
+                        reserved: mat.ground_blend,
                     },
                 );
                 // Phase 17D: remember double-sidedness so the visibility pass can
@@ -4074,6 +4088,10 @@ impl SomniumRenderer {
             .strata_gpu
             .as_ref()
             .map_or(-1, |(_, view)| self.add_terrain_texture(ctx, view.clone()) as i32);
+        ids.height = terrain
+            .height_gpu
+            .as_ref()
+            .map_or(-1, |(_, view)| self.add_terrain_texture(ctx, view.clone()) as i32);
         let hero = crate::terrain::textures::TERRAIN_HERO_LAYERS;
         // Virtual mode deliberately leaves every legacy layer id at -1. The
         // 4x4 arrays only keep the struct/fallback shape valid; publishing
@@ -5648,6 +5666,72 @@ impl SomniumRenderer {
             self.terrain_materials
                 .write(&ctx.queue, terrain_index, &mat);
         }
+        // Meshes blending into the ground (ground_blend.wgsl): the live terrains' rectangles, heights and indices.
+        // ponytail: a terrain's model is a translation (Sunscar's tiles); a turned or scaled one needs its inverse.
+        let mut ground = [0.0f32; 4 + 32 * 12];
+        let mut count = 0;
+        for &(id, model) in &self.terrain_queue {
+            let Some(terrain) = self.terrains.get(id as usize) else {
+                continue;
+            };
+            if terrain.texture_ids.height < 0 || count == 32 {
+                continue;
+            }
+            let [wx, wz] = terrain.desc.world_size();
+            let o = model.w_axis;
+            ground[4 + count * 12..4 + (count + 1) * 12].copy_from_slice(&[
+                o.x,
+                o.z,
+                1.0 / wx,
+                1.0 / wz,
+                o.y,
+                terrain.texture_ids.height as f32,
+                terrain.terrain_index as f32,
+                terrain.desc.total_vertices_x() as f32,
+                terrain.desc.total_vertices_z() as f32,
+                0.0,
+                0.0,
+                0.0,
+            ]);
+            count += 1;
+        }
+        // SOMNIUM_GROUND_BLEND_AB=1 (measuring its cost), as SOMNIUM_SNOW_AB: no blending in the frame=120, 360, ...
+        // blocks of a run with SOMNIUM_PROFILE_EVERY=120. `=captures` (proof stills): off until the run's first capture
+        // is written, then on, off, ... by each one written, so a walk naming every view twice shoots each pair, before
+        // and after, in one launch.
+        static GROUND_AB: std::sync::LazyLock<u8> =
+            std::sync::LazyLock::new(|| match std::env::var("SOMNIUM_GROUND_BLEND_AB").as_deref() {
+                Ok("1") => 1,
+                Ok("captures") => 2,
+                _ => 0,
+            });
+        let ab_off = match *GROUND_AB {
+            1 => (self.profiler.frame_index() + 60) / 120 % 2 == 1,
+            2 => crate::capture::captures_written() % 2 == 0,
+            _ => false,
+        };
+        ground[0] = if ab_off || surfaces_off { 0.0 } else { count as f32 };
+        ground[1] = self.ground_blend_default;
+        // SOMNIUM_GROUND_BLEND_SCALE=0.5 (tuning stills): every blend height, the materials' own and the scene's, times
+        // this, so a proof can show 0.3 m against 0.6 m without anyone's assets changing. 1 by default.
+        static GROUND_SCALE: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+            std::env::var("SOMNIUM_GROUND_BLEND_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0f32).max(0.0)
+        });
+        ground[2] = *GROUND_SCALE;
+        // Proof schedules by pair of captures (SOMNIUM_SURFACES_AB=captures shoots each view off, then on): pair k takes
+        // the k-th of SOMNIUM_GROUND_BLEND_OPENS (how far the band's occlusion and traced sky open toward the ground's)
+        // and of SOMNIUM_SHADING_DEBUG_CYCLE (a debug view), each list wrapping round.
+        static OPENS: std::sync::LazyLock<Vec<f32>> = std::sync::LazyLock::new(|| {
+            env_floats("SOMNIUM_GROUND_BLEND_OPENS").unwrap_or_else(|| vec![GROUND_BLEND_OPEN])
+        });
+        static DEBUGS: std::sync::LazyLock<Option<Vec<f32>>> =
+            std::sync::LazyLock::new(|| env_floats("SOMNIUM_SHADING_DEBUG_CYCLE"));
+        let pair = crate::capture::captures_written() / 2;
+        ground[3] = OPENS[pair % OPENS.len()];
+        if let Some(views) = DEBUGS.as_ref() {
+            self.shading_debug = views[pair % views.len()];
+        }
+        self.shading_pass.set_ground_blend(&ctx.queue, &ground);
 
         self.profiler.cpu_end();
         self.profiler.cpu_begin("Draw sort");
