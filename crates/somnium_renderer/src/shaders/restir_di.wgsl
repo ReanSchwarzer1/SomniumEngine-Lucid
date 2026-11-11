@@ -35,7 +35,8 @@ struct RestirParams {
     /// Zero when history should be ignored.
     history_valid: f32,
     camera_pos: vec3<f32>,
-    _pad: f32,
+    /// 1: a sun ray from the ground passes the ground's underside (`occluded`). 0 under debug view 38.
+    ground_rule: f32,
 }
 
 /// A reservoir over light samples.
@@ -243,7 +244,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // ── Visibility ──────────────────────────────────────────────────────────
     // One ray, for the sample that survived resampling.
     let drawn = textureLoad(vis_tex, coord, 0);
-    let on_ground = drawn.x != 0u && materials[instances[drawn.x - 1u].material_id].terrain_index >= 0;
+    let on_ground = params.ground_rule > 0.5 && drawn.x != 0u
+        && materials[instances[drawn.x - 1u].material_id].terrain_index >= 0;
     if r.w > 0.0 && occluded(origin, r.sample_dir, ray_t_min, on_ground) {
         // The running total has to go with the weight. Zeroing `w` alone left
         // `w_sum` holding the candidates' contribution, and the temporal

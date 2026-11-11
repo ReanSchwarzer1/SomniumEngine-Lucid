@@ -2601,6 +2601,17 @@ impl<G: GameApp> Engine<G> {
                     // A crash on the main thread, for the crash report's proof run.
                     panic!("editor script: a panic on the main thread, asked for by the proof run");
                 }
+                Some(("pose", at)) => {
+                    // The editor camera at scene x, y, z, turned to yaw and pitch (degrees; yaw 0 looks along +x,
+                    // 90 along +z). Asks for no ground: a view from the air, or a first stand somewhere whose ground
+                    // has yet to stream in (`eye` refuses a place with none loaded).
+                    let numbers: Vec<f32> = at.split(',').filter_map(|v| v.trim().parse::<f32>().ok()).collect();
+                    let [x, y, z, yaw, pitch] = numbers[..] else {
+                        warn!(action = %action, "editor script: pose wants x,y,z,yaw,pitch");
+                        continue;
+                    };
+                    self.camera_pose_request = Some((glam::Vec3::new(x, y, z), yaw, pitch.clamp(-89.0, 89.0)));
+                }
                 Some(("eye", at)) => {
                     // The editor camera 1.7 m over the ground at scene x, z, turned to yaw and pitch (degrees).
                     let numbers: Vec<f32> = at.split(',').filter_map(|v| v.trim().parse::<f32>().ok()).collect();

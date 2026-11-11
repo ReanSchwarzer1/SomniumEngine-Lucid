@@ -6294,6 +6294,8 @@ impl SomniumRenderer {
                     self.camera_pos,
                     self.light_direction,
                     self.sun_angular_radius,
+                    // Debug view 38 is the lit picture with the traced sun as it was before the ground rule.
+                    self.shading_debug != 38.0,
                     self.render_width,
                     self.render_height,
                 );
