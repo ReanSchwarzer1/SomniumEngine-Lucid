@@ -27,6 +27,10 @@ struct GroundBlendList {
 /// than the ground beside it). `gathered_light` opens the traced share by it.
 var<private> ground_blend_open: f32 = 0.0;
 
+/// The band's weight at this pixel (0 off the band): the traced reflection was traced off the mesh's own face, a wall's
+/// mirror where the band shades as ground, so the band takes the sky's reflection along its own normal instead.
+var<private> ground_blend_w: f32 = 0.0;
+
 /// The list entry whose rectangle holds `xz`, or -1.
 fn ground_terrain_at(xz: vec2<f32>) -> i32 {
     let count = min(u32(ground_blend.params.x), 32u);
@@ -126,6 +130,7 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     micro_occlusion = occlusion;
     let open = w * ground_blend.params.w;
     ground_blend_open = open;
+    ground_blend_w = w;
     let screen = mix(screen_occlusion, 1.0, open);
     s.occlusion = s.occlusion / max(screen_occlusion, 0.004) * screen;
     screen_occlusion = screen;
