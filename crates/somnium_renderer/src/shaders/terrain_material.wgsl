@@ -1030,6 +1030,13 @@ fn terrain_macro_blend(
 /// Where the macro tier's lerp toward each layer's far colour comes in (sunscar-look's ask, 11 Nov 2026): scanned
 /// ground keeps its own texels within TERRAIN_MACRO_NEAR of the eye and takes the far colour in full by
 /// TERRAIN_MACRO_FAR. At every distance, as it was, it flattened the scans from a few metres out.
+/// The layer a steep wall wears: the splat's strongest where the set marks it as rock (`layer_rock.json`), so a
+/// canyon's walls carry each bed's own scan at true scale (projected, as the cliff layer is); else the cliff layer.
+fn terrain_wall_layer(tm: TerrainMaterial, strongest: u32) -> u32 {
+    let mask = u32(tm.cliff_band.z) | (u32(tm.cliff_band.w) << 16u);
+    return select(tm.cliff_layer, strongest, ((mask >> strongest) & 1u) != 0u);
+}
+
 const TERRAIN_MACRO_NEAR: f32 = 40.0;
 const TERRAIN_MACRO_FAR: f32 = 400.0;
 
@@ -1587,15 +1594,24 @@ fn evaluate_terrain_material(
     albedo = albedo * terrain_macro_octaves(local_xz, tm.macro_octave_strength.xyz);
     albedo = albedo * albedo;
 
+    var strongest = selected[0];
+    var strongest_w = -1.0;
+    for (var s = 0u; s < 4u; s = s + 1u) {
+        if blend[s] > strongest_w {
+            strongest_w = blend[s];
+            strongest = selected[s];
+        }
+    }
+    let wall_layer = terrain_wall_layer(tm, strongest);
     if cliff_blend > 0.0 {
         let local_pos = vec3(terrain_xz.x, world_pos.y, terrain_xz.y);
         let cliff = terrain_projected_pbr(
             tm,
             terrain_index,
-            tm.cliff_layer,
+            wall_layer,
             local_pos,
             geo_normal,
-            terrain_layer_tiling(tm, terrain_index, tm.cliff_layer),
+            terrain_layer_tiling(tm, terrain_index, wall_layer),
             world_ddx,
             world_ddy,
         );
@@ -1615,7 +1631,7 @@ fn evaluate_terrain_material(
         }
     }
     if cliff_blend > 0.0 {
-        moisture = mix(moisture, terrain_layer_moisture(tm, terrain_index, tm.cliff_layer), cliff_blend);
+        moisture = mix(moisture, terrain_layer_moisture(tm, terrain_index, wall_layer), cliff_blend);
     }
     let wet = saturate(tm.wetness * moisture);
     albedo *= mix(1.0, tm.wetness_darken, wet);

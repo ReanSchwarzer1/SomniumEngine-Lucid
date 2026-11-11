@@ -343,13 +343,33 @@ fn evaluate_clipmap_material(
 
     if cliff_blend > 0.0 {
         let local_pos = world_pos - vec3(tm.terrain_origin.x, 0.0, tm.terrain_origin.y);
+        // The wall's own bed where the set names rock layers: the splat read here, on steep pixels only, since the
+        // cache keeps colour but not which layer it came from.
+        var wall_layer = tm.cliff_layer;
+        if tm.cliff_band.z + tm.cliff_band.w > 0.0 {
+            let local_xz = world_xz - tm.terrain_origin;
+            var weight = terrain_unpack_splats_painted(
+                terrain_fetch_splats(
+                    tm, terrain_index, local_xz * tm.inv_world_size,
+                    world_ddx * tm.inv_world_size, world_ddy * tm.inv_world_size),
+                tm, local_xz);
+            let selected = terrain_strongest_four(&weight);
+            var strongest = selected[0];
+            for (var s = 1u; s < 4u; s = s + 1u) {
+                if weight[selected[s]] > weight[strongest] {
+                    strongest = selected[s];
+                }
+            }
+            wall_layer = terrain_wall_layer(tm, strongest);
+            taps += 4u;
+        }
         let cliff = terrain_projected_pbr(
             tm,
             terrain_index,
-            tm.cliff_layer,
+            wall_layer,
             local_pos,
             geo_normal,
-            terrain_layer_tiling(tm, terrain_index, tm.cliff_layer),
+            terrain_layer_tiling(tm, terrain_index, wall_layer),
             world_ddx,
             world_ddy,
         );

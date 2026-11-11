@@ -476,6 +476,34 @@ pub fn with_far_colours(
     out
 }
 
+/// The layers a steep wall may wear (`layer_rock.json` beside the layers: a list of material names, as
+/// [`LAYER_MATERIALS`] spells them, or slot numbers), one bit per slot. A wall takes the splat's strongest layer where
+/// it is one of these, so a canyon's walls show each bed's own scan; elsewhere, and with no file, the cliff layer
+/// (Sunscar, 11 Nov 2026: the Vela Canyon's beds vanished on its walls under the one cliff layer).
+#[must_use]
+pub fn layer_rock_mask(asset_dir: &Path) -> u32 {
+    let path = asset_dir.join("layer_rock.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    let list: Vec<serde_json::Value> = match serde_json::from_str(&text) {
+        Ok(list) => list,
+        Err(err) => {
+            tracing::warn!("{}: {err}", path.display());
+            return 0;
+        }
+    };
+    list.iter().fold(0, |mask, v| {
+        let slot = v.as_u64().map(|s| s as usize).or_else(|| {
+            v.as_str().and_then(|name| LAYER_MATERIALS.iter().position(|m| *m == name))
+        });
+        match slot {
+            Some(s) if s < TERRAIN_LAYER_COUNT as usize => mask | (1 << s),
+            _ => mask,
+        }
+    })
+}
+
 /// Moisture affinity 0..1 from the XV-A manifest (porous-wetting weights).
 pub const LAYER_MOISTURE: [f32; TERRAIN_LAYER_COUNT as usize] = [
     0.55, 0.70, 0.25, 0.15, 0.60, 0.95, 0.45, 0.20, 0.35, 0.90, 0.40, 0.50, 0.55, 0.85, 0.20, 0.40,
@@ -2186,4 +2214,20 @@ mod bc7_pack_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+}
+
+#[cfg(test)]
+mod layer_rock_tests {
+    use super::*;
+
+    #[test]
+    fn a_set_names_its_rock_layers_by_material_or_slot() {
+        let dir = std::env::temp_dir().join(format!("somnium_layer_rock_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(layer_rock_mask(&dir), 0, "no file: walls keep the cliff layer");
+        std::fs::write(dir.join("layer_rock.json"), format!("[\"{}\", 21, 99, \"no such layer\"]", LAYER_MATERIALS[2])).unwrap();
+        assert_eq!(layer_rock_mask(&dir), (1 << 2) | (1 << 21));
+        std::fs::write(dir.join("layer_rock.json"), "not json").unwrap();
+        assert_eq!(layer_rock_mask(&dir), 0);
+    }
 }

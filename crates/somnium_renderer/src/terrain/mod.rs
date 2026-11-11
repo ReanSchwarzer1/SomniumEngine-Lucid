@@ -652,6 +652,8 @@ pub struct TerrainData {
     /// The folder `layer_textures` were loaded from: the one the terrain was made with, or the last
     /// [`Self::set_layer_dir`]'s (a streamed tile's slot taking another region's ground).
     pub layer_dir: std::path::PathBuf,
+    /// The layers steep ground may wear in place of the cliff layer, one bit per slot ([`textures::layer_rock_mask`]).
+    pub rock_mask: u32,
 }
 
 /// Map one physical clipmap dirty interval through its toroidal origin into at
@@ -1008,6 +1010,7 @@ impl TerrainData {
             painted_foliage: Vec::new(),
             edit_revision: 0,
             layer_dir: asset_dir.to_path_buf(),
+            rock_mask: textures::layer_rock_mask(asset_dir),
         }
     }
 
@@ -1398,7 +1401,13 @@ impl TerrainData {
                     self.skyvis_tint.max(0.0),
                 ]
             },
-            cliff_band: [self.cliff_band[0], self.cliff_band[1].max(self.cliff_band[0] + 1e-3), 0.0, 0.0],
+            cliff_band: [
+                self.cliff_band[0],
+                self.cliff_band[1].max(self.cliff_band[0] + 1e-3),
+                // The rock layers' mask as two halves, each exact in an f32 (ground_wall_layer in WGSL).
+                (self.rock_mask & 0xFFFF) as f32,
+                (self.rock_mask >> 16) as f32,
+            ],
         }
     }
 
@@ -2151,6 +2160,7 @@ impl TerrainData {
         }
         self.layer_textures = shared_layer_textures(device, queue, bc_supported, false, asset_dir);
         self.layer_dir = asset_dir.to_path_buf();
+        self.rock_mask = textures::layer_rock_mask(asset_dir);
         let tiling = textures::layer_tiling_at(asset_dir);
         for (layer, tiling) in self.layers.iter_mut().zip(tiling) {
             layer.tiling = tiling;
