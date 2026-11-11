@@ -2290,7 +2290,8 @@ impl SomniumRenderer {
                         detile: if mat.detile { 1.0 } else { 0.0 },
                         wind: [mat.wind_bend, mat.wind_flutter],
                         subsurface: mat.subsurface,
-                        terrain_blend: mat.terrain_blend,
+                        // The terrain blend distance (`GpuMaterial::reserved`).
+                        reserved: mat.terrain_blend,
                     },
                 );
                 // Phase 17D: remember double-sidedness so the visibility pass can
@@ -4135,7 +4136,7 @@ impl SomniumRenderer {
                 detile: 0.0,
                 wind: [0.0; 2],
                 subsurface: 0.0,
-                terrain_blend: 0.0,
+                reserved: 0.0,
             },
         );
         // Opaque and single-sided, which is what an unregistered material

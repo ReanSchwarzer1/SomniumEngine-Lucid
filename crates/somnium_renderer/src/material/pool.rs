@@ -75,9 +75,11 @@ pub struct GpuMaterial {
     /// vector's unused third float.
     pub subsurface: f32,
     /// Metres over the ground within which the surface cross-fades into the terrain it stands on
-    /// (`somnium_asset::LoadedMaterial::terrain_blend`; `shading.wgsl` `ground_blend`). 0 is off. In what was the
-    /// last unused float: the stride stays 112.
-    pub terrain_blend: f32,
+    /// (`somnium_asset::LoadedMaterial::terrain_blend`; `shading.wgsl` `ground_blend`, where it is called
+    /// `terrain_blend`). 0 is off. It took the last unused float, so the stride stays 112, and it keeps that float's
+    /// name: games build this struct field by field with `reserved: 0.0` (The Somnus Fracture's tools.rs), which goes
+    /// on compiling and goes on meaning "no blend".
+    pub reserved: f32,
 }
 
 /// `GpuMaterial::flags` bit 0 — the material renders from both sides.
@@ -167,7 +169,7 @@ impl GpuMaterial {
             detile: 0.0,
             wind: [0.0; 2],
             subsurface: 0.0,
-            terrain_blend: 0.0,
+            reserved: 0.0,
         }
     }
 }
