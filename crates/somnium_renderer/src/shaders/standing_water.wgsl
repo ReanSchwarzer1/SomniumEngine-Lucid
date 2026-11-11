@@ -66,12 +66,16 @@ fn sw_rings(xz: vec2<f32>, time: f32, rate: f32) -> vec2<f32> {
             tilt += off / max(d, 1e-4) * ring;
         }
     }
-    return tilt * 0.9;
+    return tilt * 0.45;
 }
 
 /// Water standing on the ground at `world`. `geo_n` is the ground's own normal (water stands only where it is nearly
 /// level); `hold` 0..1 how well this ground holds water (mud and paving do, scree does not); `level` 0..1 how much
 /// has collected; `rain` 0..1 the rings; `time` seconds.
+/// How much of the last surface `apply_standing_water` shaded is a pool, 0..1: the caller dims what it mirrors where
+/// land stands in the way (it has the rays; this file has none).
+var<private> sw_pool: f32 = 0.0;
+
 fn apply_standing_water(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, hold: f32, level: f32, rain: f32, time: f32) -> Surface {
     var s = surface_in;
     // Within about four degrees of level it stands; by ten it has run off.
@@ -85,9 +89,9 @@ fn apply_standing_water(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>,
     let reach = mix(0.22, 0.52, level) * flat;
     // What stands proud of it: the detail normal leans where a stone or a ridge is.
     let proud = smoothstep(0.015, 0.09, 1.0 - saturate(dot(s.normal, geo_n)));
-    let water = smoothstep(reach, reach - 0.035, low + proud * 0.12);
+    let water = 1.0 - smoothstep(reach - 0.035, reach, low + proud * 0.12);
     // A damp rim round each pool: darker, a little glossier, not yet a mirror.
-    let rim = smoothstep(reach + 0.09, reach, low) * (1.0 - water);
+    let rim = (1.0 - smoothstep(reach, reach + 0.09, low)) * (1.0 - water);
     s.albedo = s.albedo * (1.0 - 0.28 * rim);
     s.roughness = s.roughness * (1.0 - 0.45 * rim);
     if water <= 0.0 {
@@ -104,9 +108,14 @@ fn apply_standing_water(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>,
     // into its blurred levels only), so a mirror here shows blue sky under an overcast: first stills, 11 Nov. At
     // this roughness the pool shows the deck, a little soft; rain roughens it further. A mirror needs the deck in
     // what reflections see.
-    s.albedo = mix(s.albedo, s.albedo * 0.5, water);
+    // (The lead's review, 16:30: pools read as snow. Seen from above a pool is darker than the wet ground round it;
+    // it is bright only at a grazing angle, by Fresnel. A darker bed, and rings that tilt it less.)
+    s.albedo = mix(s.albedo, s.albedo * 0.35, water);
     s.normal = normalize(mix(s.normal, up, water));
-    s.roughness = mix(s.roughness, mix(0.16, 0.22, saturate(rain * 2.0)), water);
+    // No smoother than the sky light's first blurred level (roughness 0.2): below it the lookup blends the clear
+    // sky back in, and a pool under a thunderstorm came out brighter and bluer than the deck it mirrors.
+    s.roughness = mix(s.roughness, mix(0.2, 0.25, saturate(rain * 2.0)), water);
+    sw_pool = water;
     s.metallic = mix(s.metallic, 0.0, water);
     s.f0 = mix(s.f0, vec3<f32>(0.02), water);
     return s;

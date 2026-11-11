@@ -237,6 +237,8 @@ pub struct ShadingPass {
     /// when no weather is driving, which makes the wetness path free rather
     /// than merely cheap.
     weather: wgpu::Buffer,
+    /// What `set_standing_water` asked for since the last `set_weather`, as the uniform's fourth value (f32 bits).
+    standing_water: std::sync::atomic::AtomicU32,
     /// CONTROL-O: the decal grid's four buffers, cloned so a resize can
     /// rebuild the bind group without threading the grid back through.
     decal_buffers: [wgpu::Buffer; 4],
@@ -669,11 +671,12 @@ impl ShadingPass {
             ..Default::default()
         });
 
-        // 16 bytes: `vec4` is the smallest uniform WGSL will align, and only x
-        // is used — the volume's range in metres, 0 when it is switched off.
+        // Two vec4: the volume's range in metres (0 when it is switched off) with the height fog's density, falloff
+        // and base; then the fog's flat top and its softness (`set_fog_top`; zero is no top). Water and the clouds
+        // bind the same buffer and read the first vec4 only.
         let volumetric_range = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Volumetric Range"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -899,6 +902,7 @@ impl ShadingPass {
             cloud_shadow_view: cloud_shadow_view.clone(),
             cloud_shadow_params: cloud_shadow_params.clone(),
             weather,
+            standing_water: std::sync::atomic::AtomicU32::new(0),
             decal_buffers,
             virtual_shadow_view,
             virtual_shadow_sampler,
@@ -1842,7 +1846,8 @@ impl ShadingPass {
         wet_specular: f32,
         puddles: f32,
     ) {
-        // The first three of four: the fourth is standing water's (`set_standing_water`).
+        // The fourth is standing water's, as asked since the last frame (`set_standing_water`); unasked, none.
+        let standing = f32::from_bits(self.standing_water.swap(0, std::sync::atomic::Ordering::Relaxed));
         queue.write_buffer(
             &self.weather,
             0,
@@ -1850,19 +1855,23 @@ impl ShadingPass {
                 wet_diffuse.clamp(0.0, 1.0),
                 wet_specular.clamp(0.0, 1.0),
                 puddles.clamp(0.0, 1.0),
+                standing,
             ]),
         );
     }
 
     /// Water standing on level ground (`standing_water.wgsl`; Sunscar weather, 11 Nov 2026): `level` 0..1 how much
     /// has collected, `rain` 0..1 how hard it is raining on it (the rings). Zero, the default, leaves the ground as
-    /// it was. Packed into the weather uniform's spare fourth value: the whole part over 100 the level, the fraction
+    /// it was. Ask every frame it is wanted: it is published with the frame's wetness (`set_weather`) and gone the
+    /// frame after nobody asks, so it cannot outlive the scene or the game that wanted it. Packed into the weather uniform's spare fourth value: the whole part over 100 the level, the fraction
     /// the rain.
     // ponytail: two values in one float, to stay out of shading's bind group while its layout is being reworked;
     // a uniform of its own (as snow has) when that is quiet.
-    pub fn set_standing_water(&self, queue: &wgpu::Queue, level: f32, rain: f32) {
+    // The queue is not used (it was, when this wrote the uniform itself); it stays so that a game built against the
+    // first form still builds.
+    pub fn set_standing_water(&self, _queue: &wgpu::Queue, level: f32, rain: f32) {
         let packed = (level.clamp(0.0, 1.0) * 100.0).round() + rain.clamp(0.0, 0.99);
-        queue.write_buffer(&self.weather, 12, bytemuck::bytes_of(&packed));
+        self.standing_water.store(packed.to_bits(), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Publish the volume's range for this frame. 0 disables the lookup.
@@ -1879,6 +1888,13 @@ impl ShadingPass {
             0,
             bytemuck::bytes_of(&[range, density, falloff, base]),
         );
+    }
+
+    /// The height fog's flat top (valley fog) and the metres it fades over, for the fog `shading.wgsl` carries past
+    /// the volume's range and lays over the sky. At or under the fog's base (zero, the default) there is no top, and
+    /// the sky and the far land are fogged as they always were: the sky not at all.
+    pub fn set_fog_top(&self, queue: &wgpu::Queue, top: f32, softness: f32) {
+        queue.write_buffer(&self.volumetric_range, 16, bytemuck::bytes_of(&[top, softness, 0.0, 0.0]));
     }
 
     pub fn set_lighting_extra(&self, queue: &wgpu::Queue, params: [f32; 4]) {

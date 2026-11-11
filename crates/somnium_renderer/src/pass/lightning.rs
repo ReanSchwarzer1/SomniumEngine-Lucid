@@ -25,6 +25,8 @@ pub struct Bolt {
     pub branching: f32,
     /// The share of its length that exists yet, from `from`: a crawling discharge grows; a return stroke is whole (1).
     pub grown: f32,
+    /// One straight span from end to end, with no bends and no forks: a meteor's trail, a beam. Lightning is not.
+    pub straight: bool,
 }
 
 /// One straight span of a channel.
@@ -100,6 +102,10 @@ impl Bolt {
         if !(self.from.is_finite() && self.to.is_finite()) {
             return;
         }
+        if self.straight {
+            out.push(Span { a: self.from, b: self.to, level: 1.0, along: 0.0 });
+            return;
+        }
         let start = out.len();
         let mut rng = Rng(self.seed.max(1).wrapping_mul(0x9E37_79B9) | 1);
         channel(self.from, self.to, 1.0, 0.0, 1.0, self.branching.clamp(0.0, 1.0), 3, &mut rng, out);
@@ -152,8 +158,6 @@ pub struct LightningPass {
     params: wgpu::Buffer,
     corners: wgpu::Buffer,
     bind_group: Option<wgpu::BindGroup>,
-    /// The depth view the bind group was built for (it follows the scene's size).
-    bound_size: (u32, u32),
     spans: Vec<Span>,
     count: u32,
 }
@@ -241,7 +245,6 @@ impl LightningPass {
                 mapped_at_creation: false,
             }),
             bind_group: None,
-            bound_size: (0, 0),
             spans: Vec::new(),
             count: 0,
         }
@@ -262,17 +265,15 @@ impl LightningPass {
         if self.bolts.is_empty() {
             return;
         }
-        if self.bind_group.is_none() || self.bound_size != size {
-            self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Lightning BG"),
-                layout: &self.layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.params.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth) },
-                ],
-            }));
-            self.bound_size = size;
-        }
+        // Built for this frame's depth every frame that has a bolt: the scene's depth can be rebuilt at the same size.
+        self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Lightning BG"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth) },
+            ],
+        }));
         let mut corners = Vec::new();
         for bolt in &self.bolts {
             self.spans.clear();
@@ -342,7 +343,7 @@ mod tests {
     use super::*;
 
     fn strike() -> Bolt {
-        Bolt { from: Vec3::new(0.0, 1200.0, 0.0), to: Vec3::new(150.0, 0.0, -80.0), seed: 7, candela_per_metre: Vec3::splat(2.0e7), branching: 0.7, grown: 1.0 }
+        Bolt { from: Vec3::new(0.0, 1200.0, 0.0), to: Vec3::new(150.0, 0.0, -80.0), seed: 7, candela_per_metre: Vec3::splat(2.0e7), branching: 0.7, grown: 1.0, straight: false }
     }
 
     /// The main channel is one unbroken line from its start to its end, crooked but not wandering off.
@@ -374,6 +375,15 @@ mod tests {
         Bolt { to: Vec3::new(f32::NAN, 0.0, 0.0), ..strike() }.grow(&mut spans);
         Bolt { from: Vec3::new(0.0, f32::INFINITY, 0.0), ..strike() }.grow(&mut spans);
         assert!(spans.is_empty());
+    }
+
+    /// A straight bolt is one span from end to end.
+    #[test]
+    fn a_straight_bolt_is_one_span() {
+        let mut spans = Vec::new();
+        let bolt = Bolt { straight: true, ..strike() };
+        bolt.grow(&mut spans);
+        assert!(spans.len() == 1 && spans[0].a == bolt.from && spans[0].b == bolt.to);
     }
 
     #[test]

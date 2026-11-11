@@ -187,8 +187,48 @@ fn skin_visibility(p: vec3<f32>, emitter: vec3<f32>, reach: f32) -> f32 {
 // a = surviving transmittance. See pass/volumetric.rs.
 @group(1) @binding(9) var volumetrics: texture_3d<f32>;
 @group(1) @binding(10) var volumetric_sampler: sampler;
-// Metres the volume spans; 0 when volumetrics are switched off.
-@group(1) @binding(11) var<uniform> volumetric_range: vec4<f32>;
+// a: x metres the volume spans (0 when volumetrics are switched off), y the height fog's density, z its falloff, w
+// its base. b: x the fog's flat top (at or under the base: none), y the metres it fades over.
+struct VolumetricRange {
+    a: vec4<f32>,
+    b: vec4<f32>,
+}
+@group(1) @binding(11) var<uniform> volumetric_range: VolumetricRange;
+
+/// The height fog's optical depth along `dir` from the volume's range on for `beyond` metres: its exponential
+/// integrated exactly, and only under its flat top where it has one (valley fog: a ridge above the top stands clear,
+/// and so does the sky over it). With no top this is the integral it always was.
+fn fog_depth_beyond(dir: vec3<f32>, beyond: f32) -> f32 {
+    let fog = volumetric_range.a.y;
+    if fog <= 0.0 || beyond <= 0.0 {
+        return 0.0;
+    }
+    let falloff = max(volumetric_range.a.z, 1.0);
+    let base = volumetric_range.a.w;
+    let top = volumetric_range.b.x + 0.5 * volumetric_range.b.y;
+    let y0 = view.camera_pos.y + dir.y * volumetric_range.a.x;
+    var enters = 0.0;
+    var leaves = beyond;
+    if volumetric_range.b.x > base {
+        if abs(dir.y) > 1e-5 {
+            let crossing = (top - y0) / dir.y;
+            if dir.y > 0.0 {
+                leaves = min(leaves, max(crossing, 0.0));
+            } else {
+                enters = max(crossing, 0.0);
+            }
+        } else if y0 > top {
+            return 0.0;
+        }
+    }
+    let run = leaves - enters;
+    if run <= 0.0 {
+        return 0.0;
+    }
+    let start = fog * exp(-max(y0 + dir.y * enters - base, 0.0) / falloff);
+    let k = clamp(dir.y * run / falloff, -20.0, 20.0);
+    return start * select(run * (1.0 - exp(-k)) / k, run, abs(k) < 1e-3);
+}
 // Phase 24L: traced indirect diffuse, as `gi_accumulate.wgsl` leaves it on the GI grid, in three layers (one
 // binding: this stage already holds the device's 16 sampled textures).
 // 0: `rgb` the light the scene bounces onto the surface (incoming: the GI pass does not know this surface's albedo
@@ -2364,7 +2404,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let eye = sky_eye(ray_dir, normalize(light.eye_direction), light.eye_tan_half_width, light.eye_color,
                           light.eye_intensity, light.eye_shape, view.time);
 
-        return vec4<f32>((sky + detail) * (1.0 - eye.a) + eye.rgb, 1.0);
+        var background = (sky + detail) * (1.0 - eye.a) + eye.rgb;
+        // Valley fog (a fog with a flat top) lies between the eye and the sky as it lies between the eye and a ridge:
+        // from inside it the sky is gone, and comes back as the eye looks up through less of it. The sky's own march
+        // has the air in it and not this fog; without this the sky stood clear and blue over a wall of fog (w9
+        // stills, 11 Nov 2026). Only a fog with a top: one without is every scene before this, left as it was.
+        if volumetric_range.a.x > 0.0 && volumetric_range.b.x > volumetric_range.a.w {
+            let slices = f32(textureDimensions(volumetrics).z);
+            let far = textureSampleLevel(volumetrics, volumetric_sampler, vec3<f32>(screen_uv, 1.0 - 0.5 / slices), 0.0);
+            let lit = exp(far.rgb);
+            background = background * far.a + lit;
+            // And on past the volume's range to the fog's top, in the colour the volume found it.
+            let through = exp(-fog_depth_beyond(ray_dir, 1.0e6));
+            background = background * through + lit / max(1.0 - far.a, 0.05) * (1.0 - through);
+        }
+        return vec4<f32>(background, 1.0);
     }
 
     // ── PBR surface ─────────────────────────────────────────────────────────
@@ -3168,6 +3222,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if weather.w > 0.0 && material.terrain_index >= 0 {
         surface = apply_standing_water(surface, hit_point, geo_normal, terrain_wetness_factor,
                                        floor(weather.w) / 100.0, fract(weather.w), view.time);
+        if sw_pool > 0.5 {
+            // A pool mirrors the land beyond it as often as the sky, and the sky light knows only the sky: pools in
+            // front of a hillside shone like snow (w9 stills). One ray the way the pool looks: where land or a wall
+            // stands within a kilometre and a half, it mirrors that, about a quarter of the sky's light.
+            let toward = reflect(-surface.view_dir, vec3<f32>(0.0, 1.0, 0.0));
+            let open = practical_visibility(hit_point, vec3<f32>(0.0, 1.0, 0.0), hit_point + toward * 1500.0);
+            surface.occlusion = min(surface.occlusion, mix(0.28, 1.0, open));
+        }
     }
     // Snow lying on the finished surface (snow.wgsl; sunscar-photoreal, 6 Nov 2026): before specular antialiasing
     // and f0, after terrain, decals and wetness. Off unless a scene has a SnowCover.
@@ -3791,21 +3853,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // The path tracer's bounced light is added after this pass, through the same transmittance (written below), so
     // the fog lies over it as over this (17 Oct: a traced picture composited after the fog wiped the fog out).
     var fog_transmittance = 1.0;
-    if volumetric_range.x > 0.0 {
+    if volumetric_range.a.x > 0.0 {
         let dist = length(hit_point - view.camera_pos);
         let slices = f32(textureDimensions(volumetrics).z);
 
         // Each texel is the integral over its *whole* slice, so sampling at a
         // slice boundary needs the previous slice's centre — hence the half
         // slice offset (bevy's aerial_view_lut sampling does the same).
-        let w = saturate(froxel_w(dist, volumetric_range.x) - 0.5 / slices);
+        let w = saturate(froxel_w(dist, volumetric_range.a.x) - 0.5 / slices);
         let sample = textureSampleLevel(
             volumetrics, volumetric_sampler, vec3<f32>(screen_uv, w), 0.0);
 
         // Anything nearer than the first slice centre clamps to that slice, so
         // without this fade the full first-slice scattering would be applied
         // right at the camera — fog appearing on the lens.
-        let fade = saturate(dist / froxel_t(1.0 / slices, volumetric_range.x));
+        let fade = saturate(dist / froxel_t(1.0 / slices, volumetric_range.a.x));
         let inscatter = exp(sample.rgb) * fade;
         let transmittance = mix(1.0, sample.a, fade);
 
@@ -3817,29 +3879,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // paler and bluer layer by layer). The rest of the ray loses its light to the air (the atmosphere's own
         // Rayleigh and Mie extinction at the eye's height) and to the height fog (its exponential, integrated
         // exactly), and gains the sky's colour toward that horizon, the limit long air scatters toward.
-        let beyond = dist - volumetric_range.x;
+        let beyond = dist - volumetric_range.a.x;
         if beyond > 0.0 {
             let dir = (hit_point - view.camera_pos) / max(dist, 1e-3);
             let h_km = max(view.camera_pos.y, 0.0) * 0.001;
             let air = (RAYLEIGH_SCATTERING * exp(-h_km / RAYLEIGH_SCALE_H)
                 + vec3<f32>(MIE_EXTINCTION * exp(-h_km / MIE_SCALE_H))) * 0.001;
-            var depth = air * beyond;
-            let fog = volumetric_range.y;
-            if fog > 0.0 {
-                let falloff = max(volumetric_range.z, 1.0);
-                let y0 = view.camera_pos.y + dir.y * volumetric_range.x;
-                let start = fog * exp(-max(y0 - volumetric_range.w, 0.0) / falloff);
-                let k = clamp(dir.y * beyond / falloff, -20.0, 20.0);
-                let along = select(beyond * (1.0 - exp(-k)) / k, beyond, abs(k) < 1e-3);
-                depth += vec3<f32>(start * along);
-            }
+            let fog_depth = fog_depth_beyond(dir, beyond);
+            let depth = air * beyond + vec3<f32>(fog_depth);
             let air_t = exp(-depth);
             let horizon = normalize(vec3<f32>(dir.x, max(dir.y, 0.02), dir.z));
             // With clouds, mip 1: the first mip the clouds' capture is laid over (mip 0 is the bare sky the
             // background draws under them), so the far land fades to the horizon the deck leaves, not the clear
             // sky's blue behind it (Sunscar, 6 Nov 2026).
             let sky_mip = select(0.0, 1.0, cloud_shadow_params.w > 0.0);
-            let sky = textureSampleLevel(env_cube, env_sampler, horizon, sky_mip).rgb;
+            var sky = textureSampleLevel(env_cube, env_sampler, horizon, sky_mip).rgb;
+            if volumetric_range.b.x > volumetric_range.a.w {
+                // Valley fog: what the far land fades into is the fog as the volume found it along this ray (its
+                // light over what it hid), by the fog's share of the depth; the air's share still goes to the sky.
+                let source = exp(sample.rgb) / max(1.0 - sample.a, 0.05);
+                sky = mix(sky, source, saturate(fog_depth / max(dot(depth, vec3<f32>(1.0 / 3.0)), 1e-6)));
+            }
             result = result * air_t + sky * (vec3<f32>(1.0) - air_t);
             fog_transmittance *= dot(air_t, vec3<f32>(0.2126, 0.7152, 0.0722));
         }
