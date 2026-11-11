@@ -290,7 +290,9 @@ fn storm_anvil(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
         let hang = v.b.z * 0.06 * smoothstep(0.45, 0.85, cells) * smoothstep(radius * 1.8, radius * 3.2, length(q.xz));
         var lobe = 0.0;
         if hang > 0.0 {
-            lobe = (1.0 - smoothstep(0.7, 1.0, e)) * smoothstep(under - hang, under - hang * 0.55, h);
+            // Under the anvil's body, not out at its rim: there the sun reaches them, and a ring of white puffs
+            // stood round the anvil (the windowless pictures, 12 Nov).
+            lobe = (1.0 - smoothstep(0.45, 0.7, e)) * smoothstep(under - hang, under - hang * 0.55, h);
         }
         if lobe > anvil {
             anvil = lobe;
@@ -503,6 +505,14 @@ fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
             let out = mid + from_mid * (1.0 + cut / max(length(from_mid), 1.0));
             qs = vec3<f32>(out.x, q.y + 0.6 * cut, out.y);
         }
+    } else if kind == 4 {
+        // A funnel's wall is condensing, turning air: it bulges and necks along its length.
+        let hc = clamp(q.y / v.size.y, 0.0, 1.0);
+        let axis = storm_funnel_axis(v, hc);
+        let lump = textureSampleLevel(base_noise_tex, cloud_sampler, vec3<f32>(q.x, q.y * 0.5 - turn * v.size.x, q.z) / v.size.w + vec3<f32>(0.47, 0.0, 0.29), 0.0);
+        let swell = clamp(1.0 + (lump.g - 0.6) * 0.55 + (lump.b - 0.6) * 0.3, 0.72, 1.3);
+        let rel = (q.xz - axis) / swell;
+        qs = vec3<f32>(axis.x + rel.x, q.y, axis.y + rel.y);
     } else if kind == 7 {
         // Rain comes down from the parts of a base that rain hardest: a shaft's edge wanders, in and out by a third.
         let wander = textureSampleLevel(base_noise_tex, cloud_sampler, vec3<f32>(q.x, q.y * 0.15, q.z) / (v.size.x * 2.4) + vec3<f32>(0.13, 0.0, 0.41), 0.0);
@@ -525,7 +535,7 @@ fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
             np = vec3<f32>(q.x, q.y * 2.0, q.z);
         }
         case 4 {
-            m = storm_funnel(v, q);
+            m = storm_funnel(v, qs);
             let hc = clamp(q.y / v.size.y, 0.0, 1.0);
             // The wall turns, faster low down, and its streaks climb.
             let r = storm_rot(q.xz - storm_funnel_axis(v, hc), turn * (1.5 - 0.5 * hc));
