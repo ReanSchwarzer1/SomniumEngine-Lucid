@@ -346,7 +346,10 @@ fn evaluate_clipmap_material(
         let local_pos = world_pos - vec3(tm.terrain_origin.x, 0.0, tm.terrain_origin.y);
         // The wall's own bed where the set names rock layers: the splat read here, on steep pixels only, since the
         // cache keeps colour but not which layer it came from.
-        var wall_layer = tm.cliff_layer;
+        var a = tm.cliff_layer;
+        var b = tm.cliff_layer;
+        var wa = 1.0;
+        var wb = 0.0;
         if tm.cliff_band.z + tm.cliff_band.w > 0.0 {
             let local_xz = world_xz - tm.terrain_origin;
             var weight = terrain_unpack_splats_painted(
@@ -355,25 +358,26 @@ fn evaluate_clipmap_material(
                     world_ddx * tm.inv_world_size, world_ddy * tm.inv_world_size),
                 tm, local_xz);
             let selected = terrain_strongest_four(&weight);
-            var strongest = selected[0];
+            // The two strongest beds (`terrain_wall_pbr`).
+            var ia = 0u;
             for (var s = 1u; s < 4u; s = s + 1u) {
-                if weight[selected[s]] > weight[strongest] {
-                    strongest = selected[s];
+                if weight[selected[s]] > weight[selected[ia]] {
+                    ia = s;
                 }
             }
-            wall_layer = terrain_wall_layer(tm, strongest);
+            var ib = select(0u, 1u, ia == 0u);
+            for (var s = 0u; s < 4u; s = s + 1u) {
+                if s != ia && weight[selected[s]] > weight[selected[ib]] {
+                    ib = s;
+                }
+            }
+            a = selected[ia];
+            b = selected[ib];
+            wa = weight[a];
+            wb = weight[b];
             taps += 4u;
         }
-        let cliff = terrain_projected_pbr(
-            tm,
-            terrain_index,
-            wall_layer,
-            local_pos,
-            geo_normal,
-            terrain_layer_tiling(tm, terrain_index, wall_layer),
-            world_ddx,
-            world_ddy,
-        );
+        let cliff = terrain_wall_pbr(tm, terrain_index, a, wa, b, wb, local_pos, geo_normal, world_ddx, world_ddy);
         taps += select(4u, 6u, tm.projection_mode != 0u);
         albedo = mix(albedo, cliff.albedo, cliff_blend);
         roughness = mix(roughness, cliff.roughness, cliff_blend);

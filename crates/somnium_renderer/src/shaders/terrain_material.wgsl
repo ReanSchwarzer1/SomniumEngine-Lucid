@@ -1037,6 +1037,45 @@ fn terrain_wall_layer(tm: TerrainMaterial, strongest: u32) -> u32 {
     return select(tm.cliff_layer, strongest, ((mask >> strongest) & 1u) != 0u);
 }
 
+/// A steep pixel's wall from its two strongest splat layers `a` (weight `wa`) and `b` (`wb <= wa`), each worn as
+/// `terrain_wall_layer` says and projected as the cliff layer is. Where both carry weight they are height-blended as
+/// the ground blends its layers: an even mix interleaves by each scan's relief, and the weaker one shows only on its own
+/// peaks as its share falls. Flipping to the single strongest per pixel dappled a wall painted half one granite and half
+/// another, and made the contact between two beds drip (the Vela, 11 Nov 2026). One projection where one bed rules.
+fn terrain_wall_pbr(
+    tm: TerrainMaterial,
+    terrain_index: u32,
+    a: u32,
+    wa: f32,
+    b: u32,
+    wb: f32,
+    local_pos: vec3<f32>,
+    n: vec3<f32>,
+    world_ddx: vec2<f32>,
+    world_ddy: vec2<f32>,
+) -> TerrainLayerSample {
+    let la = terrain_wall_layer(tm, a);
+    let lb = terrain_wall_layer(tm, b);
+    let sa = terrain_projected_pbr(
+        tm, terrain_index, la, local_pos, n, terrain_layer_tiling(tm, terrain_index, la), world_ddx, world_ddy);
+    let share = wb / max(wa + wb, 1e-4);
+    if la == lb || share < 0.15 {
+        return sa;
+    }
+    let sb = terrain_projected_pbr(
+        tm, terrain_index, lb, local_pos, n, terrain_layer_tiling(tm, terrain_index, lb), world_ddx, world_ddy);
+    // Heights are 0..1; at an even share the higher texel wins, and each tenth of share either way is worth 0.4 of
+    // height, so b keeps only its tallest relief by a share of 0.3.
+    let t = smoothstep(-0.08, 0.08, (sb.height - sa.height) + (share - 0.5) * 4.0);
+    var out = sa;
+    out.albedo = mix(sa.albedo, sb.albedo, t);
+    out.height = mix(sa.height, sb.height, t);
+    out.roughness = mix(sa.roughness, sb.roughness, t);
+    out.occlusion = mix(sa.occlusion, sb.occlusion, t);
+    out.normal_ts = normalize(mix(sa.normal_ts, sb.normal_ts, t));
+    return out;
+}
+
 // sunscar-look (11 Nov): untouched within 25 m, where the plants' near kinds still cover the ground; all of the far
 // colour by 200 m, where the far stand-ins (baked from the same layer_far_colour.json) take over without a seam.
 const TERRAIN_MACRO_NEAR: f32 = 25.0;
@@ -1622,27 +1661,25 @@ fn evaluate_terrain_material(
     albedo = albedo * terrain_macro_octaves(local_xz, tm.macro_octave_strength.xyz);
     albedo = albedo * albedo;
 
-    var strongest = selected[0];
-    var strongest_w = -1.0;
-    for (var s = 0u; s < 4u; s = s + 1u) {
-        if blend[s] > strongest_w {
-            strongest_w = blend[s];
-            strongest = selected[s];
+    // The wall's two strongest beds by the splat's own weights (`terrain_wall_pbr`).
+    var ia = 0u;
+    for (var s = 1u; s < 4u; s = s + 1u) {
+        if sel_w[s] > sel_w[ia] {
+            ia = s;
         }
     }
-    let wall_layer = terrain_wall_layer(tm, strongest);
+    var ib = select(0u, 1u, ia == 0u);
+    for (var s = 0u; s < 4u; s = s + 1u) {
+        if s != ia && sel_w[s] > sel_w[ib] {
+            ib = s;
+        }
+    }
+    let wall_layer = terrain_wall_layer(tm, selected[ia]);
     if cliff_blend > 0.0 {
         let local_pos = vec3(terrain_xz.x, world_pos.y, terrain_xz.y);
-        let cliff = terrain_projected_pbr(
-            tm,
-            terrain_index,
-            wall_layer,
-            local_pos,
-            geo_normal,
-            terrain_layer_tiling(tm, terrain_index, wall_layer),
-            world_ddx,
-            world_ddy,
-        );
+        let cliff = terrain_wall_pbr(
+            tm, terrain_index, selected[ia], sel_w[ia], selected[ib], sel_w[ib], local_pos, geo_normal, world_ddx,
+            world_ddy);
         taps += select(4u, 6u, tm.projection_mode != 0u);
         albedo = mix(albedo, cliff.albedo, cliff_blend);
         roughness = mix(roughness, cliff.roughness, cliff_blend);
