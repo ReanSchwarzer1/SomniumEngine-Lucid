@@ -3168,6 +3168,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if weather.w > 0.0 && material.terrain_index >= 0 {
         surface = apply_standing_water(surface, hit_point, geo_normal, terrain_wetness_factor,
                                        floor(weather.w) / 100.0, fract(weather.w), view.time);
+        if sw_pool > 0.5 {
+            // A pool mirrors the land beyond it as often as the sky, and the sky light knows only the sky: pools in
+            // front of a hillside shone like snow (w9 stills). One ray the way the pool looks: where land or a wall
+            // stands within a kilometre and a half, it mirrors that, about a quarter of the sky's light.
+            let toward = reflect(-surface.view_dir, vec3<f32>(0.0, 1.0, 0.0));
+            let open = practical_visibility(hit_point, vec3<f32>(0.0, 1.0, 0.0), hit_point + toward * 1500.0);
+            surface.occlusion = min(surface.occlusion, mix(0.28, 1.0, open));
+        }
     }
     // Snow lying on the finished surface (snow.wgsl; sunscar-photoreal, 6 Nov 2026): before specular antialiasing
     // and f0, after terrain, decals and wetness. Off unless a scene has a SnowCover.

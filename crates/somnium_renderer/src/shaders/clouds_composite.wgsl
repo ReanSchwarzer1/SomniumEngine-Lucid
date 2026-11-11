@@ -114,14 +114,41 @@ fn storm_entry(origin: vec3<f32>, dir: vec3<f32>) -> f32 {
     return nearest;
 }
 
+/// The cloud over a sky pixel: the four low-resolution texels round it, blended as a bilinear read blends them,
+/// except a texel that is centred on geometry and holds no cloud. Nothing was marched for that one (the geometry was
+/// nearer than the clouds), so it is not clear sky, and blending it in let the bare sky through: under a dark deck a
+/// bright blue fringe round every crown and in every gap between leaves (w9 stills, 11 Nov 2026). Where no such
+/// texel is among the four (open sky, and every clear sky) this is the bilinear read exactly.
+fn sky_cloud(uv: vec2<f32>, depth_dims: vec2<u32>) -> vec4<f32> {
+    let low = uv * comp.low_size - 0.5;
+    let base = floor(low);
+    let f = low - base;
+    var colour = vec4<f32>(0.0);
+    var weight_sum = 0.0;
+    for (var j = 0; j < 2; j = j + 1) {
+        for (var i = 0; i < 2; i = i + 1) {
+            let clamped = clamp(base + vec2<f32>(f32(i), f32(j)), vec2<f32>(0.0), comp.low_size - 1.0);
+            let tap_uv = (clamped + 0.5) * comp.inv_low_size;
+            let tap = textureSampleLevel(cloud_tex, cloud_samp, tap_uv, 0.0);
+            let tap_depth = textureLoad(comp_depth, vec2<i32>(tap_uv * vec2<f32>(depth_dims)), 0);
+            var w = mix(1.0 - f.x, f.x, f32(i)) * mix(1.0 - f.y, f.y, f32(j));
+            if tap_depth > 0.0 && tap_depth < 1.0 && tap.a >= 0.9999 && dot(tap.rgb, vec3<f32>(1.0)) <= 0.0 {
+                w *= 0.001;
+            }
+            colour += tap * w;
+            weight_sum += w;
+        }
+    }
+    return colour / max(weight_sum, 1e-6);
+}
+
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let depth_dims = textureDimensions(comp_depth);
     let here = textureLoad(comp_depth, vec2<i32>(in.uv * vec2<f32>(depth_dims)), 0);
-    // Sky: the cloud is behind nothing, so a plain bilinear read — through a
-    // canopy the march now carries cloud in every texel that sees any sky.
+    // Sky: the cloud is behind nothing, so a bilinear read of the texels that were marched (`sky_cloud`).
     if here <= 0.0 || here >= 1.0 {
-        let cloud = textureSampleLevel(cloud_tex, cloud_samp, in.uv, 0.0);
+        let cloud = sky_cloud(in.uv, depth_dims);
         if comp.eye_intensity <= 0.0 {
             return cloud;
         }

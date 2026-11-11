@@ -72,6 +72,10 @@ fn sw_rings(xz: vec2<f32>, time: f32, rate: f32) -> vec2<f32> {
 /// Water standing on the ground at `world`. `geo_n` is the ground's own normal (water stands only where it is nearly
 /// level); `hold` 0..1 how well this ground holds water (mud and paving do, scree does not); `level` 0..1 how much
 /// has collected; `rain` 0..1 the rings; `time` seconds.
+/// How much of the last surface `apply_standing_water` shaded is a pool, 0..1: the caller dims what it mirrors where
+/// land stands in the way (it has the rays; this file has none).
+var<private> sw_pool: f32 = 0.0;
+
 fn apply_standing_water(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, hold: f32, level: f32, rain: f32, time: f32) -> Surface {
     var s = surface_in;
     // Within about four degrees of level it stands; by ten it has run off.
@@ -108,7 +112,10 @@ fn apply_standing_water(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>,
     // it is bright only at a grazing angle, by Fresnel. A darker bed, and rings that tilt it less.)
     s.albedo = mix(s.albedo, s.albedo * 0.35, water);
     s.normal = normalize(mix(s.normal, up, water));
-    s.roughness = mix(s.roughness, mix(0.16, 0.22, saturate(rain * 2.0)), water);
+    // No smoother than the sky light's first blurred level (roughness 0.2): below it the lookup blends the clear
+    // sky back in, and a pool under a thunderstorm came out brighter and bluer than the deck it mirrors.
+    s.roughness = mix(s.roughness, mix(0.2, 0.25, saturate(rain * 2.0)), water);
+    sw_pool = water;
     s.metallic = mix(s.metallic, 0.0, water);
     s.f0 = mix(s.f0, vec3<f32>(0.02), water);
     return s;
