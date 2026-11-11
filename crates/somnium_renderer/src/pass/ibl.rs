@@ -39,7 +39,8 @@ struct GenParams {
     night: [f32; 4],
     /// `NightSky::tint`, then padding.
     night_tint: [f32; 4],
-    /// x: 1 lays the clouds' capture over the sky (`set_cloud_capture`).
+    /// x: 1 lays the clouds' capture over the sky (`set_cloud_capture`). y: how far the air under the clouds takes
+    /// the light they let through and not the open sky's (0..1: a deck closed to the horizon).
     clouds: [f32; 4],
 }
 
@@ -82,6 +83,7 @@ pub struct IblPass {
     prefilter_bgl: wgpu::BindGroupLayout,
     mip0_view: wgpu::TextureView,
     last_clouds: Option<u64>,
+    last_under: u32,
     prefilter_bind_group: wgpu::BindGroup,
     params_buffer: wgpu::Buffer,
 
@@ -331,6 +333,7 @@ impl IblPass {
             prefilter_bgl,
             mip0_view,
             last_clouds: None,
+            last_under: 0,
             prefilter_bind_group,
             params_buffer,
             last_sun: None,
@@ -379,7 +382,11 @@ impl IblPass {
     }
 
     /// `clouds`: which capture of the clouds to lay over the sky (`CloudPass::sky_light_clouds`); each new one
-    /// regenerates the cube, and with one the overcast dome stands down.
+    /// regenerates the cube, and with one the overcast dome stands down. `under` (0..1): how closed the deck is to
+    /// the horizon (`CloudPass::horizon_closure`); by that share the air below the horizon is lit by what the
+    /// clouds let through, so the far land under an overcast fades to the deck's grey and not to a clear day's
+    /// bright haze. Taken in eighths: a deck closing over a minute regenerates the cube eight times, not every
+    /// frame.
     pub fn generate_if_needed(
         &mut self,
         device: &wgpu::Device,
@@ -388,12 +395,18 @@ impl IblPass {
         sun_color: glam::Vec3,
         overcast: f32,
         clouds: Option<u64>,
+        under: f32,
     ) -> bool {
         let overcast = if clouds.is_some() { 0.0 } else { overcast.clamp(0.0, 1.0) };
         let key = (sun_direction.to_array(), sun_color.to_array(), overcast.to_bits());
-        if self.last_sun == Some(key) && self.last_night == Some(self.night) && self.last_clouds == clouds {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let eighths = if clouds.is_some() { (under.clamp(0.0, 1.0) * 8.0).round() as u32 } else { 0 };
+        if self.last_sun == Some(key) && self.last_night == Some(self.night) && self.last_clouds == clouds && self.last_under == eighths {
             return false;
         }
+        self.last_under = eighths;
+        #[allow(clippy::cast_precision_loss)]
+        let under = eighths as f32 / 8.0;
         self.last_sun = Some(key);
         self.last_night = Some(self.night);
         self.last_clouds = clouds;
@@ -407,7 +420,7 @@ impl IblPass {
 
         // Mip 0: capture the sky.
         for face in 0..6u32 {
-            self.write_params(queue, face, 0.0, dir, sun_color, overcast, clouds_on);
+            self.write_params(queue, face, 0.0, dir, sun_color, overcast, clouds_on, under);
             self.run_face(device, queue, 0, face, true);
         }
 
@@ -415,7 +428,7 @@ impl IblPass {
         for mip in 1..MIP_COUNT {
             let roughness = mip as f32 / (MIP_COUNT - 1) as f32;
             for face in 0..6u32 {
-                self.write_params(queue, face, roughness, dir, sun_color, overcast, clouds_on);
+                self.write_params(queue, face, roughness, dir, sun_color, overcast, clouds_on, under);
                 self.run_face(device, queue, mip, face, false);
             }
         }
@@ -431,6 +444,7 @@ impl IblPass {
         sun_color: glam::Vec3,
         overcast: f32,
         clouds: f32,
+        under: f32,
     ) {
         let p = GenParams {
             face,
@@ -458,7 +472,7 @@ impl IblPass {
             ],
             night: [self.night.glow.max(0.0), self.night.aurora, self.night.halo_road, self.night.thread],
             night_tint: [self.night.tint[0], self.night.tint[1], self.night.tint[2], 0.0],
-            clouds: [clouds, 0.0, 0.0, 0.0],
+            clouds: [clouds, under, 0.0, 0.0],
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&p));
     }

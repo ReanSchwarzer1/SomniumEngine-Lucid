@@ -139,6 +139,33 @@ fn sky_cloud(uv: vec2<f32>, depth_dims: vec2<u32>) -> vec4<f32> {
             weight_sum += w;
         }
     }
+    if weight_sum < 0.01 {
+        // None of the four was marched: a sliver of sky thinner than a low-resolution texel, as the gap between
+        // two pieces of far land at the horizon is. It showed the bare sky, bright dashes along the horizon
+        // under a dark deck (the summit stills, 12 Nov 2026). Its cloud is its neighbours': the marched texels
+        // in the two rings round the four, evenly.
+        var ring = vec4<f32>(0.0);
+        var found = 0.0;
+        for (var j = -2; j < 4; j = j + 1) {
+            for (var i = -2; i < 4; i = i + 1) {
+                if i >= 0 && i < 2 && j >= 0 && j < 2 {
+                    continue;
+                }
+                let clamped = clamp(base + vec2<f32>(f32(i), f32(j)), vec2<f32>(0.0), comp.low_size - 1.0);
+                let tap_uv = (clamped + 0.5) * comp.inv_low_size;
+                let tap = textureSampleLevel(cloud_tex, cloud_samp, tap_uv, 0.0);
+                let tap_depth = textureLoad(comp_depth, vec2<i32>(tap_uv * vec2<f32>(depth_dims)), 0);
+                if tap_depth > 0.0 && tap_depth < 1.0 && tap.a >= 0.9999 && dot(tap.rgb, vec3<f32>(1.0)) <= 0.0 {
+                    continue;
+                }
+                ring += tap;
+                found += 1.0;
+            }
+        }
+        if found > 0.0 {
+            return ring / found;
+        }
+    }
     return colour / max(weight_sum, 1e-6);
 }
 

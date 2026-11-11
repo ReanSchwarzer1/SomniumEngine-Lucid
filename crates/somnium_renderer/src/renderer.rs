@@ -5388,6 +5388,7 @@ impl SomniumRenderer {
             self.light_color,
             overcast,
             self.cloud_pass.sky_light_clouds(),
+            self.cloud_pass.horizon_closure,
         );
 
         // ── 1. Compute cascades and upload light buffer ───────────────────────

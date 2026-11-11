@@ -35,7 +35,8 @@ struct GenParams {
     night: vec4<f32>,
     /// `.rgb` the glow's colour.
     night_tint: vec4<f32>,
-    /// x: 1 lays the sky light's cloud cube over the sky (and `overcast` is 0); yzw unused.
+    /// x: 1 lays the sky light's cloud cube over the sky (and `overcast` is 0). y: how far the air under the clouds
+    /// takes the light they let through (`light_under_clouds`); zw unused.
     clouds: vec4<f32>,
 }
 
@@ -213,6 +214,39 @@ fn ground_radiance() -> vec3<f32> {
     return GROUND_ALBEDO / PI * e * (1.0 - smoothstep(0.35, 0.95, params.overcast));
 }
 
+/// The share of the open sky's light on level ground that still reaches it under the clouds laid over the sky: the
+/// sun through their mean transmittance and the sky as they leave it, against the bare sun and sky. The zenith and
+/// rings at 50 and 15 degrees, as the fog's own sky light takes them (volumetric.wgsl `cloud_sky_mean`). The air
+/// between the eye and the far land is lit by this much: below the horizon mip 0 holds that air's scatter under
+/// an open sky, and under a deck closed to the horizon the far land faded toward it, a haze twice as bright as the
+/// deck and blue (the summit stills, 12 Nov 2026). By `clouds.y`, which is 0 for every sky but a closed deck.
+fn light_under_clouds() -> f32 {
+    if params.clouds.x < 0.5 || params.clouds.y <= 0.0 {
+        return 1.0;
+    }
+    let lum = vec3<f32>(0.2126, 0.7152, 0.0722);
+    var through = 0.0;
+    var bare = 0.0;
+    var laid = 0.0;
+    for (var i = 0u; i < 9u; i = i + 1u) {
+        var d = vec3<f32>(0.0, 1.0, 0.0);
+        if i > 0u {
+            let a = f32(i) * 0.7853982;
+            let el = select(0.2617994, 0.8726646, i % 2u == 0u);
+            d = vec3<f32>(cos(a) * cos(el), sin(el), sin(a) * cos(el));
+        }
+        let sky = dot(textureSampleLevel(src_cube, src_samp, d, 0.0).rgb, lum);
+        let c = textureSampleLevel(cloud_capture, src_samp, d, 0.0);
+        through += c.a;
+        bare += sky;
+        laid += sky * c.a + dot(c.rgb, lum);
+    }
+    let sun = dot(params.sun_color.rgb, lum) * max(normalize(params.sun_direction.xyz).y, 0.0);
+    let open = sun + PI * bare / 9.0;
+    let under = sun * through / 9.0 + PI * laid / 9.0;
+    return mix(1.0, clamp(under / max(open, 1e-6), 0.0, 1.0), saturate(params.clouds.y));
+}
+
 /// Van der Corput radical inverse — the low-discrepancy half of Hammersley.
 fn radical_inverse_vdc(bits_in: u32) -> f32 {
     var bits = bits_in;
@@ -256,6 +290,7 @@ fn fs_prefilter(in: VOut) -> @location(0) vec4<f32> {
     let v = n;
 
     let ground = ground_radiance();
+    let under = light_under_clouds();
     let view_r = GROUND_RADIUS + 0.5;
     var total  = vec3(0.0);
     var weight = 0.0;
@@ -271,7 +306,9 @@ fn fs_prefilter(in: VOut) -> @location(0) vec4<f32> {
             var radiance = textureSampleLevel(src_cube, src_samp, l, 0.0).rgb;
             // Below the horizon the ray ends on the land, seen through the air near the ground (sky(): 0.5 km up).
             if ray_hits_ground(view_r, l.y) {
-                radiance += ground * exp(-atmosphere_extinction(0.25) * distance_to_ground(view_r, l.y));
+                // What mip 0 holds there is the air's scatter toward the ground, lit by an open sky: under a
+                // closed deck, by what the deck lets through.
+                radiance = radiance * under + ground * exp(-atmosphere_extinction(0.25) * distance_to_ground(view_r, l.y));
             }
             if params.clouds.x > 0.5 {
                 let c = textureSampleLevel(cloud_capture, src_samp, l, 0.0);
