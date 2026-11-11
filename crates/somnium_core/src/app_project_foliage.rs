@@ -21,6 +21,7 @@ impl<G: GameApp> Engine<G> {
             let path = source.to_path_buf();
             let compressing =
                 self.render_ctx.as_ref().is_some_and(somnium_renderer::SomniumRenderer::imported_compression);
+            somnium_asset::share_decoded_images(crate::cell_streaming::image_share_bytes());
             let (send, receive) = std::sync::mpsc::sync_channel(1);
             std::thread::spawn(move || {
                 let read = somnium_asset::load_gltf(&path).map_err(|error| error.to_string()).map(|scene| {

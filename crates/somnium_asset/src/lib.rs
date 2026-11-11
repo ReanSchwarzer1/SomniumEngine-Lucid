@@ -1221,6 +1221,140 @@ pub fn describe_gltf_parts(path: &Path) -> Result<Vec<GltfPart>, String> {
     Ok(parts)
 }
 
+/// Decoded image files, shared between loads while a host asks for it ([`share_decoded_images`]).
+///
+/// A streamed world decoded an image once for every glTF that names it: a start at Monargent read 2,495 files and
+/// decoded 9,070 images for them from 2,036 image files, four fifths of its readers' time (Sunscar, 12 Nov 2026).
+/// A load now takes a copy of an image another load decoded a moment ago, and waits for one being decoded instead
+/// of decoding it too. An image is known by its file and the file's size and date, so one saved again is decoded
+/// again. Each load still gets its own pixels: a sidecar alpha mask written into them touches no other load's.
+mod decoded {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
+
+    use super::LoadedTexture;
+
+    pub(super) type Key = (PathBuf, u64, Option<std::time::SystemTime>);
+    /// An image being decoded or decoded: `None` inside when it did not decode.
+    type Slot = Arc<OnceLock<Option<Arc<LoadedTexture>>>>;
+
+    #[derive(Default)]
+    struct Cache {
+        /// Each image with when it was last asked for and the bytes it is counted at (0 until it is decoded).
+        slots: HashMap<Key, (Slot, u64, usize)>,
+        bytes: usize,
+        tick: u64,
+    }
+
+    /// RGBA8 bytes kept at most; 0 is off, the default.
+    static BUDGET: AtomicUsize = AtomicUsize::new(0);
+    static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Mutex::default);
+
+    fn cache() -> MutexGuard<'static, Cache> {
+        CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(super) fn share(bytes: usize) {
+        BUDGET.store(bytes, Ordering::Relaxed);
+        if bytes == 0 {
+            let mut cache = cache();
+            cache.slots.clear();
+            cache.bytes = 0;
+        }
+    }
+
+    /// The file a glTF image names, with its stamp. `None` while nothing is shared, and for an image inside a
+    /// buffer or a data URI, or named by a scheme or with percent escapes: those are decoded as they always were.
+    pub(super) fn file_of(image: &gltf::Image, base_dir: &Path) -> Option<Key> {
+        if BUDGET.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let gltf::image::Source::Uri { uri, .. } = image.source() else {
+            return None;
+        };
+        if uri.contains(':') || uri.contains('%') {
+            return None;
+        }
+        let path = base_dir.join(uri);
+        let meta = std::fs::metadata(&path).ok()?;
+        Some((path, meta.len(), meta.modified().ok()))
+    }
+
+    /// The image `decode` makes for `key`: decoded once however many loads ask at the same time, then copied.
+    pub(super) fn shared(
+        key: Key,
+        decode: impl FnOnce() -> Result<LoadedTexture, String>,
+    ) -> Result<LoadedTexture, String> {
+        let slot = {
+            let mut cache = cache();
+            cache.tick += 1;
+            let tick = cache.tick;
+            let entry = cache.slots.entry(key.clone()).or_insert_with(|| (Slot::default(), tick, 0));
+            entry.1 = tick;
+            entry.0.clone()
+        };
+        let (mut decode, mut failed, mut fresh) = (Some(decode), None, false);
+        let image = slot.get_or_init(|| match decode.take().map(|decode| decode()) {
+            Some(Ok(texture)) => {
+                fresh = true;
+                Some(Arc::new(texture))
+            }
+            Some(Err(error)) => {
+                failed = Some(error);
+                None
+            }
+            None => None,
+        });
+        let Some(image) = image else {
+            // It did not decode: forgotten, and every load that asked says so for itself.
+            let mut cache = cache();
+            if cache.slots.get(&key).is_some_and(|(held, ..)| Arc::ptr_eq(held, &slot)) {
+                cache.slots.remove(&key);
+            }
+            drop(cache);
+            return match (failed, decode) {
+                (Some(error), _) => Err(error),
+                (None, Some(decode)) => decode(),
+                (None, None) => Err("glTF import failed: an image did not decode".to_owned()),
+            };
+        };
+        if fresh {
+            let mut cache = cache();
+            // Counted only while it is still the one kept (the host may have emptied the cache meanwhile).
+            if let Some((_, _, counted)) = cache.slots.get_mut(&key).filter(|(held, ..)| Arc::ptr_eq(held, &slot)) {
+                *counted = image.data.len();
+                cache.bytes += image.data.len();
+            }
+            // ponytail: one scan of the kept images for each one dropped; a few hundred at most. An ordered
+            // index if a cache ever holds thousands.
+            let budget = BUDGET.load(Ordering::Relaxed);
+            while cache.bytes > budget {
+                let oldest = cache
+                    .slots
+                    .iter()
+                    .filter(|(_, (_, _, counted))| *counted > 0)
+                    .min_by_key(|(_, (_, tick, _))| *tick)
+                    .map(|(key, _)| key.clone());
+                let Some((_, _, counted)) = oldest.and_then(|key| cache.slots.remove(&key)) else {
+                    break;
+                };
+                cache.bytes -= counted;
+            }
+        }
+        Ok(LoadedTexture { data: image.data.clone(), width: image.width, height: image.height })
+    }
+}
+
+/// Share each decoded image file between loads, keeping at most `bytes` of RGBA8 (the least recently asked for go
+/// first); 0 stops the sharing and frees what is kept. A host that reads many files naming the same images (a
+/// streamed world's cell readers) turns it on while it reads and off when it has nothing left to read. Off, every
+/// load decodes its own images, as it always did.
+pub fn share_decoded_images(bytes: usize) {
+    decoded::share(bytes);
+}
+
 /// Every image the document holds, decoded on all cores (only `wanted`, if
 /// given; the rest are 1×1 magenta stand-ins). The first failure fails the
 /// file, as `gltf::import` did.
@@ -1241,9 +1375,15 @@ fn decode_images(
                 scope.spawn(|| {
                     let mut done = Vec::new();
                     while let Some(&index) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        let texture = gltf::image::Data::from_source(images[index].source(), Some(base_dir), buffers)
-                            .map(|data| decode_to_rgba8(&data))
-                            .map_err(|e| format!("glTF import failed: image {index}: {e}"));
+                        let decode = || {
+                            gltf::image::Data::from_source(images[index].source(), Some(base_dir), buffers)
+                                .map(|data| decode_to_rgba8(&data))
+                                .map_err(|e| format!("glTF import failed: image {index}: {e}"))
+                        };
+                        let texture = match decoded::file_of(&images[index], base_dir) {
+                            Some(file) => decoded::shared(file, decode),
+                            None => decode(),
+                        };
                         done.push((index, texture));
                     }
                     done
@@ -1706,6 +1846,45 @@ mod normal_scale_tests {
         let used = full.nodes[0].material_index.unwrap();
         assert_eq!((part.materials[used].alpha_mode, part.materials[used].foliage),
                    (full.materials[used].alpha_mode, full.materials[used].foliage), "the drawn material keeps its cutout");
+    }
+
+    #[test]
+    fn loads_share_a_decoded_image_and_each_keeps_its_own_pixels() {
+        use super::decoded::shared;
+        // Keys no file has, so the other tests' loads (which share too while this runs) never ask for them.
+        let key = |name: &str| (std::path::PathBuf::from(name), 1, None);
+        let calls = std::cell::Cell::new(0);
+        let decode = || {
+            calls.set(calls.get() + 1);
+            Ok(super::LoadedTexture { data: vec![1, 2, 3, 4], width: 1, height: 1 })
+        };
+        super::share_decoded_images(usize::MAX);
+        let first = shared(key("shared decode a"), decode).unwrap();
+        let mut second = shared(key("shared decode a"), decode).unwrap();
+        assert_eq!(calls.get(), 1, "asked for twice, decoded once");
+        // A load's pixels are its own: a mask written into them does not reach the next load.
+        second.data[0] = 9;
+        assert_eq!(shared(key("shared decode a"), decode).unwrap().data, first.data);
+        // One that does not decode is not kept: each load reports it, and the next try decodes.
+        assert_eq!(shared(key("shared decode bad"), || Err("unreadable".to_owned())).err().as_deref(), Some("unreadable"));
+        assert_eq!(shared(key("shared decode bad"), decode).unwrap().data, first.data);
+        assert_eq!(calls.get(), 2);
+        // Past the budget the least recently asked for goes, and is decoded again when next asked for.
+        super::share_decoded_images(4);
+        shared(key("shared decode b"), decode).unwrap();
+        shared(key("shared decode a"), decode).unwrap();
+        assert_eq!(calls.get(), 4, "b's arrival dropped a");
+        // A real file, shared or not, loads the same pixels.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/foliage/fir_sapling/fir_sapling_2k.gltf");
+        super::share_decoded_images(usize::MAX);
+        let (once, again) = (super::load_gltf(&path).unwrap(), super::load_gltf(&path).unwrap());
+        super::share_decoded_images(0);
+        let alone = super::load_gltf(&path).unwrap();
+        assert!(alone.textures.iter().any(|t| t.width > 1));
+        for ((a, b), c) in alone.textures.iter().zip(&once.textures).zip(&again.textures) {
+            assert_eq!((a.width, a.height, &a.data), (b.width, b.height, &b.data));
+            assert_eq!((a.width, a.height, &a.data), (c.width, c.height, &c.data));
+        }
     }
 
     #[test]

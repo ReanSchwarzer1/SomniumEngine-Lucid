@@ -87,18 +87,26 @@ impl<G: GameApp> Engine<G> {
             // The foliage palette is read beside the cells: the tiles that are in ask for their kinds as they land.
             self.cell_streamer.filling = true;
             let mut palette = false;
+            // Where the fill's time goes: this thread's uploads and installs, its waits for the GPU, and its waits
+            // for the readers.
+            let mut spent = [std::time::Duration::ZERO; 3];
             // Round the readers without a frame budget, so all of them keep decoding while this thread uploads.
             while (!self.cell_streamer.reading.is_empty() || palette) && started.elapsed() < FIRST_FILL_LIMIT {
+                let round = std::time::Instant::now();
                 if self.pump_cell_reads(usize::MAX) {
                     self.prefetch_foliage_palette();
+                    spent[0] += round.elapsed();
+                    let flush = std::time::Instant::now();
                     // Uploads stage CPU copies until a submit; a fill is many frames' uploads in one, so it flushes as
                     // it goes (a 7-window Tyffir peaked at 15.8 of 16 GB without this).
                     if let Some((renderer, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref()) {
                         ctx.queue.submit(std::iter::empty());
                         renderer.wait_gpu(ctx);
                     }
+                    spent[1] += flush.elapsed();
                 } else {
                     std::thread::sleep(std::time::Duration::from_millis(1));
+                    spent[2] += round.elapsed();
                 }
                 self.schedule_cells(&settings, focus, cells::fill_readers());
                 // Each read that lands frees a reader for the next kind's source.
@@ -114,11 +122,20 @@ impl<G: GameApp> Engine<G> {
                 cells = self.cell_streamer.loaded.len(),
                 entities = self.cell_streamer.streamed_entities(),
                 seconds = format!("{:.1}", started.elapsed().as_secs_f64()),
+                uploading = format!("{:.1}", spent[0].as_secs_f64()),
+                gpu_wait = format!("{:.1}", spent[1].as_secs_f64()),
+                readers_wait = format!("{:.1}", spent[2].as_secs_f64()),
+                still_reading = self.cell_streamer.reading.len(),
                 "World cells: first fill"
             );
             self.warm_terrain_slots(SPARE_TERRAIN_SLOTS);
         } else {
             self.pump_cell_reads(settings.cells_per_frame.max(1) as usize);
+        }
+
+        // Nothing is being read: the decoded images the readers shared are let go.
+        if self.cell_streamer.reading.is_empty() && self.palette_reads.is_empty() {
+            somnium_asset::share_decoded_images(0);
         }
 
         self.zone_begin("Cell evict");
@@ -180,6 +197,7 @@ impl<G: GameApp> Engine<G> {
         for index in unload {
             self.unload_cell(index);
         }
+        self.cell_streamer.gate.set_limit(readers);
         let now = std::time::Instant::now();
         for index in load {
             if self.cell_streamer.reading.len() >= readers {
@@ -194,7 +212,8 @@ impl<G: GameApp> Engine<G> {
         self.world.put_cache(holds);
     }
 
-    /// Start a cell's reader: parse it, then decode and prepare each source it needs that is not uploaded yet.
+    /// Start a cell's reader: parse it, then decode and prepare each source it needs that is not uploaded yet, side
+    /// by side as the gate gives turns, then read and bake its ground.
     fn start_cell_read(&mut self, index: usize) {
         let path = self.cell_streamer.cells[index].file.clone();
         let root = self.config.project_root.clone();
@@ -204,6 +223,9 @@ impl<G: GameApp> Engine<G> {
             .as_ref()
             .is_some_and(somnium_renderer::SomniumRenderer::imported_compression);
         let drawing = self.renderer.is_some();
+        // The sources of one cell, and of the cells read beside it, name the same images over and over.
+        somnium_asset::share_decoded_images(cells::image_share_bytes());
+        let gate = self.cell_streamer.gate.clone();
         let (send, receive) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let document = match crate::scene_file::read(&path) {
@@ -214,28 +236,52 @@ impl<G: GameApp> Engine<G> {
                 }
             };
             let project = root.as_deref().map(crate::authoring::project::ProjectPaths::open);
-            for (source, parts) in cells::sources_of(&document).into_iter().filter(|_| drawing) {
-                let resolved = match &project {
-                    Some(Ok(project)) => project.resolve(Path::new(&source)),
-                    Some(Err(error)) => Err(error.clone()),
-                    None => Ok(PathBuf::from(&source)),
-                };
-                let Ok(resolved) = resolved else {
-                    continue; // the install reports it, as a scene open would
-                };
-                if resolved.canonicalize().is_ok_and(|canonical| uploaded.contains(&canonical)) {
-                    continue;
+            let needed: Vec<(PathBuf, HashSet<usize>)> = cells::sources_of(&document)
+                .into_iter()
+                .filter(|_| drawing)
+                .filter_map(|(source, parts)| {
+                    let resolved = match &project {
+                        Some(Ok(project)) => project.resolve(Path::new(&source)),
+                        Some(Err(error)) => Err(error.clone()),
+                        None => Ok(PathBuf::from(&source)),
+                    };
+                    // One that does not resolve is the install's to report, as a scene open would.
+                    let resolved = resolved.ok()?;
+                    let known = resolved.canonicalize().is_ok_and(|canonical| uploaded.contains(&canonical));
+                    (!known).then_some((resolved, parts))
+                })
+                .collect();
+            // Side by side: each worker takes the next source and a turn at the gate, which it keeps until this
+            // thread's one-piece channel has taken what it decoded.
+            let (next, dropped) = (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicBool::new(false));
+            std::thread::scope(|scope| {
+                for _ in 0..needed.len().min(cells::fill_readers()) {
+                    scope.spawn(|| {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        while let Some((resolved, parts)) = needed.get(next.fetch_add(1, Relaxed)) {
+                            let _turn = gate.take();
+                            if dropped.load(Relaxed) {
+                                return;
+                            }
+                            let Ok(scene) = somnium_asset::load_gltf_for(resolved, Some(parts)) else {
+                                continue; // the install retries it on the main thread and logs why
+                            };
+                            let prepared =
+                                somnium_renderer::SomniumRenderer::prepare_scene_for(&scene, Some(parts), compressing);
+                            let piece = Piece::Source { path: resolved.clone(), parts: parts.clone(), scene, prepared };
+                            if send.send(piece).is_err() {
+                                dropped.store(true, Relaxed); // the cell was dropped
+                            }
+                        }
+                    });
                 }
-                let Ok(scene) = somnium_asset::load_gltf_for(&resolved, Some(&parts)) else {
-                    continue; // the install retries it on the main thread and logs why
-                };
-                let prepared = somnium_renderer::SomniumRenderer::prepare_scene_for(&scene, Some(&parts), compressing);
-                if send.send(Piece::Source { path: resolved, parts, scene, prepared }).is_err() {
-                    return; // the cell was dropped
-                }
+            });
+            if dropped.into_inner() {
+                return;
             }
             // A tile's ground: each terrain's sidecar read and its horizon and relief baked here, not on the main
             // thread. Only for a drawn world, as with the sources.
+            let _turn = gate.take();
             let terrains = cells::terrains_of(&document)
                 .into_iter()
                 .filter(|_| drawing)
@@ -638,6 +684,7 @@ impl<G: GameApp> Engine<G> {
         let old = std::mem::take(&mut self.cell_streamer);
         self.cell_streamer.free_terrains = old.free_terrains;
         self.cell_streamer.terrain_resets = old.terrain_resets;
+        somnium_asset::share_decoded_images(0);
     }
 
     fn set_cell_status(&mut self, owner: Entity, status: String) {

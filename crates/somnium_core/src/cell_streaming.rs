@@ -579,6 +579,58 @@ pub struct CellStreamer {
     pub(crate) terrain_resets: u64,
     /// Cells whose ground did not read, read again after a pause ([`Self::ground_failed`]). Not in `failed`.
     pub(crate) ground_retries: HashMap<usize, GroundRetry>,
+    /// How many sources and grounds are read at once, over all the cells being read.
+    pub(crate) gate: std::sync::Arc<ReadGate>,
+}
+
+/// The readers' turnstile: a cell's sources are read side by side, and this bounds how many are being read at once
+/// over all cells (as many as cells are read at once). One cell with hundreds of sources then reads as fast as
+/// hundreds of cells with one: the Monargent piazza's own cell names 528 files, read them one after another on its
+/// one reader, and was the last thing in at a start, two minutes after the rest (Sunscar, 12 Nov 2026).
+pub(crate) struct ReadGate {
+    /// Turns taken, and how many may be taken.
+    turns: std::sync::Mutex<(usize, usize)>,
+    freed: std::sync::Condvar,
+}
+
+impl Default for ReadGate {
+    fn default() -> Self {
+        Self { turns: std::sync::Mutex::new((0, READERS)), freed: std::sync::Condvar::new() }
+    }
+}
+
+impl ReadGate {
+    fn turns(&self) -> std::sync::MutexGuard<'_, (usize, usize)> {
+        self.turns.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Let `limit` read at once from now on (those already reading finish).
+    pub(crate) fn set_limit(&self, limit: usize) {
+        let mut turns = self.turns();
+        if turns.1 != limit {
+            turns.1 = limit.max(1);
+            self.freed.notify_all();
+        }
+    }
+
+    /// Wait for a turn; it is given back when the value returned is dropped.
+    pub(crate) fn take(&self) -> ReadTurn<'_> {
+        let mut turns = self.turns();
+        while turns.0 >= turns.1 {
+            turns = self.freed.wait(turns).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        turns.0 += 1;
+        ReadTurn(self)
+    }
+}
+
+pub(crate) struct ReadTurn<'a>(&'a ReadGate);
+
+impl Drop for ReadTurn<'_> {
+    fn drop(&mut self) {
+        self.0.turns().0 -= 1;
+        self.0.freed.notify_one();
+    }
 }
 
 /// How long a streamed mesh no loaded cell uses stays uploaded (coming back soon costs nothing).
@@ -592,6 +644,18 @@ pub(crate) const READERS: usize = 4;
 /// seconds, and the rest streamed in over the first minutes of play (Sunscar, 11 Nov 2026).
 pub(crate) fn fill_readers() -> usize {
     std::thread::available_parallelism().map_or(READERS, |cores| cores.get().saturating_sub(2)).clamp(READERS, 12)
+}
+
+/// RGBA8 bytes of decoded images the readers share while anything is being read
+/// (`somnium_asset::share_decoded_images`): 4 GiB, about 250 images of 2K. `SOMNIUM_IMAGE_SHARE_MIB` sets it; 0 is
+/// off, and every source decodes its own images again. A Monargent start's first files read in 54 s with none
+/// shared, 38 s with 2 GiB, 26 s with 4 and 28 s with 8 (twelve to fourteen readers, 12 Nov 2026).
+pub(crate) fn image_share_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let mib = std::env::var("SOMNIUM_IMAGE_SHARE_MIB").ok().and_then(|mib| mib.trim().parse::<usize>().ok());
+        mib.unwrap_or(4096) << 20
+    })
 }
 
 /// Each source an entity list draws (`somnium.ImportedMesh` source -> node ordinals), from a scene document.
@@ -874,6 +938,36 @@ mod tests {
         release(&mut world, "caelan");
         assert!(held_points(&mut world).is_empty());
         assert!(hold(&mut world, "switch", glam::Vec3::X), "room again");
+    }
+
+    #[test]
+    fn the_gate_lets_only_its_limit_read_at_once_and_a_wider_limit_lets_the_waiting_in() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let gate = ReadGate::default();
+        gate.set_limit(2);
+        let (reading, most, done) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let _turn = gate.take();
+                    most.fetch_max(reading.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    reading.fetch_sub(1, Ordering::SeqCst);
+                    done.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!((done.load(Ordering::SeqCst), most.load(Ordering::SeqCst)), (8, 2));
+        // Two hold their turns; a third waits until the limit is raised, not for either to finish.
+        let (first, second) = (gate.take(), gate.take());
+        std::thread::scope(|scope| {
+            let third = scope.spawn(|| drop(gate.take()));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(!third.is_finished());
+            gate.set_limit(3);
+            third.join().unwrap();
+        });
+        drop((first, second));
     }
 
     #[test]
