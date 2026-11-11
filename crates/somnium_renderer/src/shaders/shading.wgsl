@@ -3153,9 +3153,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Meshes blending into the ground under them (ground_blend.wgsl; sunscar-photoreal, 11 Nov 2026): after paint and
     // decals, before f0, wetness and snow. Off unless the material or the scene gives a blend height; never for cut-outs,
-    // foliage, hair or far ground (flags 2, 4, 16, 32, 64).
+    // foliage, hair, far ground (flags 2, 4, 16, 32, 64) or skin. ponytail: instances carry no moving/static flag, so
+    // the scene's default suits a world of static meshes; anything that moves near the ground (first-person arms, a
+    // carried lamp) sets somnium_ground_blend -1.
     if material.terrain_index < 0 && ground_blend.params.x > 0.0 && material.alpha_cutoff <= 0.0
-        && (material.flags & 118u) == 0u {
+        && (material.flags & 118u) == 0u && material.subsurface <= 0.0 {
         let blend_m = select(ground_blend.params.y, material.ground_blend, material.ground_blend != 0.0)
             * length(instance.model[0].xyz);
         if blend_m > 0.0 {
