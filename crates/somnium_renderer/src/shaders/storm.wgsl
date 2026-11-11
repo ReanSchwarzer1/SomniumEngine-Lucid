@@ -1,10 +1,10 @@
 // Storm bodies and lightning (`pass/storm.rs`; Sunscar weather, 11 Nov 2026): what the cloud march (`clouds.wgsl`)
 // and its composite (`clouds_composite.wgsl`) share. Each binds the one uniform itself.
 
-/// A body: an analytic shape in world metres with the cloud noise as its detail. Kinds: 1 cell (cumulonimbus tower and
-/// anvil), 2 wall cloud, 3 shelf cloud, 4 funnel, 5 bowl (debris cloud and dust skirt), 7 shaft (rain, hail, virga),
+/// A body: an analytic shape in world metres with the cloud noise as its detail. Kinds: 1 cell (a cumulonimbus's
+/// tower), 2 wall cloud, 3 shelf cloud, 4 funnel, 5 bowl (debris cloud and dust skirt), 6 anvil, 7 shaft (rain, hail, virga),
 /// 8 ring (a wall of storm round a clear eye, with its anvil and its rain), 9 hole (takes cloud from the slab; adds
-/// none).
+/// none), 10 deck (a storm's wide, level base).
 struct StormVolume {
     /// xyz: its foot (y its bottom), w: kind.
     pos: vec4<f32>,
@@ -36,7 +36,7 @@ struct Storm {
 
 /// A body that only changes the slab (a hole): it has no place along a ray.
 fn storm_is_modifier(v: StormVolume) -> bool {
-    return v.pos.w > 8.5;
+    return v.pos.w > 8.5 && v.pos.w < 9.5;
 }
 
 /// Where a ray crosses a body's cylinder: (enter, exit) in metres along it; exit < enter when it misses.
