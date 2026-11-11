@@ -86,6 +86,8 @@ fn parse_leaf_transmission(rule: &str) -> Option<[f32; 2]> {
     let broad = shares.next()??;
     let needle = shares.next().flatten().unwrap_or(broad);
     (broad > 0.0 || needle > 0.0).then_some([broad, needle])
+}
+
 /// glTF material extras `somnium_terrain_blend`: metres over the ground within which the material cross-fades into
 /// the terrain (`shading.wgsl` `ground_blend`). `None` when the material does not say; 0 is "never".
 fn terrain_blend_extra(mat: &gltf::Material<'_>) -> Option<f32> {
