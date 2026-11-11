@@ -1417,6 +1417,8 @@ impl SomniumRenderer {
         ibl_pass.set_cloud_capture(&ctx.device, cloud_pass.sky_light_view());
         // What GI's escaped rays see: the sky reaches a surface only through what its rays find open.
         restir_gi_pass.set_environment(&ibl_pass.cube_view, &ibl_pass.sampler);
+        // And the sun its bounce rays' hits receive, through the deck.
+        restir_gi_pass.set_cloud_shadow(&cloud_pass.shadow_view, &cloud_pass.shadow_params);
 
         // Phase CONTROL-O. Built before the shading pass, like the clouds and
         // for the same reason: shading binds its buffers.
@@ -6308,6 +6310,7 @@ impl SomniumRenderer {
                     &self.vis_pass.depth_view,
                     &self.vis_pass.view,
                     self.view_proj_rel,
+                    self.view_proj_unjittered_rel,
                     self.camera_pos,
                     self.light_direction,
                     self.light_color,
@@ -6364,7 +6367,7 @@ impl SomniumRenderer {
                 &self.vis_pass.depth_view,
                 &self.vis_pass.view,
                 self.restir_gi_pass
-                    .radiance_view()
+                    .bounce_view()
                     .expect("ReSTIR GI always allocates its radiance target"),
                 &self.ibl_pass.cube_view,
                 &self.ibl_pass.sampler,

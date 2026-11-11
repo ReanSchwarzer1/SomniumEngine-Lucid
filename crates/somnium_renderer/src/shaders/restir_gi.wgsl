@@ -119,8 +119,72 @@ struct GiReservoir {
 // The environment cube (`ibl.rs`): what an escaped ray sees.
 @group(1) @binding(10) var gi_env: texture_cube<f32>;
 @group(1) @binding(11) var gi_env_sampler: sampler;
-/// Where a sky sample is put, far along its ray: reuse and the visibility ray treat it as a distant emitter.
-const GI_SKY_DISTANCE: f32 = 20000.0;
+
+// ── The sky's share (Sunscar, 11 Nov 2026) ───────────────────────────────────
+//
+// From 6 Nov an escaped ray put the sky's radiance into the reservoir, so the traced estimate held the whole of the
+// diffuse light. A reservoir is one sample and its weight: right for a small bright source (a sunlit patch through a
+// doorway), wrong for a dome that fills the hemisphere. Its noise does not average out, it is shared between
+// neighbours and frames, and under a cloud deck or in shade, where the sky is all the light there is, it stood on
+// every surface as dark smoky blotches 15-30 pixels wide (the developer, 7 and 11 Nov: "black splotches"). Inside a
+// crown it was worse: nearly every borrowed sky sample failed its visibility ray, and the leaves went black.
+//
+// The sky is now estimated as what it is. Each texel's ray adds to two sums: the environment's radiance along it
+// (`den`), and the same again if it left the scene (`num`). Their ratio is the share of the environment's light that
+// gets past the scene, and it is exact, with no noise at all, wherever nothing is in the way: open ground stays as
+// smooth as the cube. `gi_accumulate.wgsl` averages the sums over neighbours and over time, and the shading pass
+// multiplies the cube's own irradiance by the ratio. The reservoir keeps what it is good at: the bounce off what the
+// rays hit.
+/// This frame's (`num`, `den`) per GI texel, each relative to the sky's mean about the surface's normal: about 1
+/// by day and by night, so the half floats that hold them never run out of range or of precision, and a frame under
+/// a brightening sky weighs no more than the one before it.
+@group(1) @binding(12) var sky_out: texture_storage_2d<rgba16float, write>;
+/// The clouds' shadow on the ground (`clouds.wgsl` `cloud_shadow`) and its `[centre_x, centre_z, extent, strength]`:
+/// the sun a bounce ray's hit receives comes through the deck, as the sun on every shaded surface does.
+@group(1) @binding(13) var gi_cloud_shadow: texture_2d<f32>;
+@group(1) @binding(14) var<uniform> gi_cloud_shadow_params: vec4<f32>;
+
+/// The most one ray may weigh against the sky's mean: the sun's own texels in the cube stay a few times the mean,
+/// and nothing brighter is let turn the share into "did the one ray at the sun get out".
+const GI_SKY_CEILING: f32 = 16.0;
+/// The cube's roughest mip (`ibl.rs` MIP_COUNT 6): its mean radiance about a normal, the sky's irradiance over pi.
+const GI_ENV_ROUGHEST: f32 = 5.0;
+/// How much of the sky a hit on a mesh is taken to see. ponytail: a guess (walls and trunks see about half the dome
+/// and the cube's own ground term stands for the rest); read the accumulated ratio at the hit when it is on screen
+/// if bounced sky light ever proves wrong.
+const GI_HIT_SKY: f32 = 0.75;
+
+/// The sun's share through the cloud deck at a world point (shading.wgsl `cloud_shadow_at`, the same field and rule).
+fn gi_cloud_sun_at(p: vec3<f32>) -> f32 {
+    if gi_cloud_shadow_params.w <= 0.0 {
+        return 1.0;
+    }
+    let local = (p.xz - gi_cloud_shadow_params.xy) / max(gi_cloud_shadow_params.z, 1.0);
+    let near = clamp(textureSampleLevel(gi_cloud_shadow, default_sampler,
+        clamp(local, vec2<f32>(-1.0), vec2<f32>(1.0)) * 0.5 + 0.5, 0.0).r, 0.0, 1.0);
+    let past = max(abs(local.x), abs(local.y)) - 1.0;
+    if past <= 0.0 {
+        return near;
+    }
+    var mean = 0.0;
+    for (var i = 0; i < 16; i = i + 1) {
+        let g = (vec2<f32>(f32(i & 3), f32(i >> 2)) + 0.5) / 4.0;
+        mean += textureSampleLevel(gi_cloud_shadow, default_sampler, g, 0.0).r;
+    }
+    return mix(near, clamp(mean / 16.0, 0.0, 1.0), saturate(past * 2.0));
+}
+
+/// How much of the sky the ground sees at a terrain hit: the terrain's baked sky visibility (terrain_material.wgsl
+/// `terrain_sky_visibility`), 1 without a bake.
+fn gi_terrain_sky(terrain_index: u32, p: vec3<f32>) -> f32 {
+    let tm = terrain_materials[terrain_index];
+    if tm.skyvis_map < 0 {
+        return 1.0;
+    }
+    let uv = (p.xz - tm.terrain_origin) * tm.inv_world_size;
+    let seen = textureSampleLevel(textures[tm.skyvis_map], default_sampler, uv, 0.0).a;
+    return mix(1.0, seen, clamp(tm.sky_visibility_strength, 0.0, 1.0));
+}
 
 @group(1) @binding(5) var<storage, read_write> gi_a: array<GiReservoir>;
 @group(1) @binding(6) var<storage, read_write> gi_b: array<GiReservoir>;
@@ -143,9 +207,9 @@ fn gi_rand(seed: ptr<function, u32>) -> f32 {
 /// the diffuse BRDF's own cosine then cancels the sampling density exactly, so
 /// the estimator loses a multiply and, more importantly, stops spending samples
 /// on grazing directions that the cosine would have thrown away anyway.
-fn gi_sample_cosine(n: vec3<f32>, seed: ptr<function, u32>) -> vec3<f32> {
-    let u1 = gi_rand(seed);
-    let u2 = gi_rand(seed);
+fn gi_sample_cosine(n: vec3<f32>, u: vec2<f32>) -> vec3<f32> {
+    let u1 = u.x;
+    let u2 = u.y;
     let r = sqrt(u1);
     let theta = 6.28318530718 * u2;
     let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.99);
@@ -313,20 +377,31 @@ fn gi_direct_at(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>, terrain_index: i3
     let l = normalize(light.direction);
     let ndl = dot(n, l);
     var irradiance = gi_local_irradiance(p, n, seed);
-    if ndl > 0.0 && gi_luma(light.color) > 1.0e-6 && gi_visible(p + n * 0.02, p + l * 4000.0, 0.02) {
+    // The sun reaches the hit through the cloud deck, as it reaches every shaded surface (`cloud_shadow_at`). Without
+    // this a bounce under an overcast carried the full sun, several times the light of the sky that was really there.
+    let sun = light.color * (light.ibl_intensity * gi_cloud_sun_at(p));
+    if ndl > 0.0 && gi_luma(sun) > 1.0e-6 && gi_visible(p + n * 0.02, p + l * 4000.0, 0.02) {
         // Retain the established outdoor sun-bounce grading. Previously the
         // final IBL composite multiplied the whole reservoir by this value;
         // applying it here preserves that sun response while keeping practical
         // bounce independent of the sky-fill control.
-        irradiance += light.color * (ndl * light.ibl_intensity);
+        irradiance += sun * ndl;
     }
     // A leaf lit from the far side passes light through (thin Lambertian translucency, `Material.transmission`):
     // a canopy's underside glows green, and that, not the sky, is most of the light on a wood's floor (Sunscar,
     // 6 Nov 2026). The normal faces the ray, so the sun is behind it when ndl < 0.
-    if ndl < 0.0 && transmission > 0.0 && gi_luma(light.color) > 1.0e-6
+    if ndl < 0.0 && transmission > 0.0 && gi_luma(sun) > 1.0e-6
         && gi_visible(p - n * 0.02, p + l * 4000.0, 0.02) {
-        irradiance += light.color * (-ndl * transmission * light.ibl_intensity);
+        irradiance += sun * (-ndl * transmission);
     }
+    // The sky lights the hit too: under a deck it is the only light the ground has to send on, and without it a
+    // surface that faces the ground (an arch's underside, the lower leaves of a crown) had none at all. The cube's
+    // roughest mip about the hit's normal is the sky's irradiance over pi; the hit sees its share of it.
+    var seen = GI_HIT_SKY;
+    if terrain_index >= 0 {
+        seen = gi_terrain_sky(u32(terrain_index), p);
+    }
+    let sky = textureSampleLevel(gi_env, gi_env_sampler, n, GI_ENV_ROUGHEST).rgb * (light.ibl_intensity * seen);
     var direct_albedo = albedo;
     if rt_gi_deferred_terrain_albedo && terrain_index >= 0 {
         // Same lookup, position and arithmetic as eager rt_resolve; only its
@@ -337,7 +412,7 @@ fn gi_direct_at(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>, terrain_index: i3
     // `light.color` is already premultiplied by intensity (see
     // `DirectionalLight` in the pool) — the sort of detail that silently costs
     // a factor of 100 000 if assumed rather than checked.
-    return direct_albedo * (1.0 / 3.14159265) * irradiance;
+    return direct_albedo * ((1.0 / 3.14159265) * irradiance + sky);
 }
 
 /// Luminance, the target function ReSTIR resamples against.
@@ -505,15 +580,16 @@ fn initial_and_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
     let coord = gi_full_coord(gid.xy, full);
     let index = gid.y * dims.x + gid.x;
 
-    // A room can be lit entirely by practicals with the directional sun off.
-    if gi_luma(light.color) <= 1.0e-6 && cluster_params.num_local_lights == 0u {
-        gi_b[index] = gi_empty();
-        return;
-    }
     var seed = index * 9781u + gi.frame * 6271u + 17u;
+    // The ray's direction from two uniforms. With the shared masks on they come from the mask at this texel of the
+    // GI grid (not of the screen: the texels averaged together are grid neighbours), so neighbours and successive
+    // frames spread over the hemisphere instead of clumping, and the sky's share settles in far fewer rays. The 64
+    // slices repeat, so each round of them is turned by a further step of the R2 sequence.
+    var u = vec2<f32>(gi_rand(&seed), gi_rand(&seed));
     if gi.history_valid >= 2.0 {
-        let grain = textureLoad(grain_masks, vec2<i32>(coord & vec2<i32>(63)), i32(gi.frame & 63u), 0);
+        let grain = textureLoad(grain_masks, vec2<i32>(gid.xy & vec2<u32>(63u)), i32(gi.frame & 63u), 0);
         seed = seed ^ u32(grain.a * 4294967295.0);
+        u = fract(grain.rg + vec2<f32>(0.7548777, 0.5698403) * f32((gi.frame / 64u) & 1023u));
     }
 
     let surface = gi_primary_surface(coord, full);
@@ -524,14 +600,20 @@ fn initial_and_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     if !surface.valid {
         gi_b[index] = gi_empty();
+        textureStore(sky_out, vec2<i32>(gid.xy), vec4<f32>(0.0));
         return;
     }
 
     // ── Initial candidate: one bounce ────────────────────────────────────────
     var r = gi_empty();
-    let dir = gi_sample_cosine(surface.normal, &seed);
+    let dir = gi_sample_cosine(surface.normal, u);
     let origin = surface.pos + surface.normal * 0.05;
     let hit = gi_trace(origin, dir, 0.05, gi.max_distance);
+    // The sky's share: the environment along the ray, and again if the ray left the scene (see `sky_out`).
+    let env_mean = gi_luma(textureSampleLevel(gi_env, gi_env_sampler, surface.normal, GI_ENV_ROUGHEST).rgb);
+    let env = min(gi_luma(textureSampleLevel(gi_env, gi_env_sampler, dir, 2.0).rgb) / max(env_mean, 1.0e-9),
+        GI_SKY_CEILING);
+    textureStore(sky_out, vec2<i32>(gid.xy), vec4<f32>(select(env, 0.0, hit.hit), env, 0.0, 0.0));
     // Bevy Solari's NO_WORLD_CACHE path rejects emissive hits. This estimator
     // does not importance-sample emissive geometry, so retaining the extremely
     // rare hits produces high-variance fireflies that wander under temporal
@@ -553,21 +635,9 @@ fn initial_and_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
             r.m = 1.0;
         }
     } else {
-        // A ray that escaped sees the sky: it carries the sky's radiance that way (the prefiltered cube, clouds
-        // and all), so the traced estimate holds the whole of the diffuse light and the shading pass takes it in
-        // place of the unshadowed sky. Before, misses carried nothing and the sky reached the floor of a closed
-        // wood as if there were no canopy: ~1 stop under the meadow where real woods are 3.5-4.5 (sunscar-look,
-        // 6 Nov 2026).
-        let sky = textureSampleLevel(gi_env, gi_env_sampler, dir, 2.0).rgb * light.ibl_intensity;
-        let p_hat = gi_luma(sky);
+        // A ray that left the scene, or met something that glows, is a candidate that carries nothing: the sky it
+        // saw is counted in `sky_out`, not here.
         r.m = 1.0;
-        if p_hat > 0.0 && !hit.hit {
-            r.sample_pos = origin + dir * GI_SKY_DISTANCE;
-            r.sample_normal = -dir;
-            r.radiance = sky;
-            r.w_sum = p_hat;
-            r.w = 1.0 / p_hat;
-        }
     }
 
     // ── Temporal reuse ───────────────────────────────────────────────────────
@@ -616,11 +686,6 @@ fn spatial_and_shade(@builtin(global_invocation_id) gid: vec3<u32>) {
     let coord = gi_full_coord(gid.xy, full);
     let index = gid.y * dims.x + gid.x;
 
-    if gi_luma(light.color) <= 1.0e-6 && cluster_params.num_local_lights == 0u {
-        gi_a[index] = gi_empty();
-        textureStore(out_tex, g, vec4<f32>(0.0));
-        return;
-    }
     var seed = index * 26699u + gi.frame * 15487u + 91u;
     if gi.history_valid >= 2.0 {
         let grain = textureLoad(grain_masks, vec2<i32>(coord & vec2<i32>(63)), i32(gi.frame & 63u), 0);

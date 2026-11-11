@@ -3,7 +3,8 @@
 //! Two compute dispatches per frame over `restir_gi.wgsl`: the first draws one
 //! bounce per pixel and merges it with that pixel's history, the second borrows
 //! from spatial neighbours, traces the survivor's visibility ray and writes the
-//! indirect radiance the shading pass consumes.
+//! bounce. A third (`gi_accumulate.wgsl`) averages the bounce and the sky's share
+//! over neighbours and time, into the two layers the shading pass consumes.
 //!
 //! Like 24J and 24K it does nothing at all when the device did not grant ray
 //! query — the constant ambient term remains the fallback, and an output alpha
@@ -37,6 +38,29 @@ fn gi_scale() -> u32 {
 /// Matches `GiReservoir` in `restir_gi.wgsl`: 12 floats, 48 bytes.
 const RESERVOIR_BYTES: u64 = 48;
 const SURFACE_BYTES: u64 = 32;
+
+/// Most frames the sky's share averages (`gi_accumulate.wgsl`): it depends on the scene's shape alone, so a long
+/// memory costs nothing when the lights change. About two seconds at 30 frames a second.
+const SKY_FRAMES: f32 = 64.0;
+/// Most frames the bounce averages while the lights hold still, and while they change (a moving sun, a flickering
+/// lamp): the reservoirs' own shorter confidence, so the bounce follows the light within a few frames.
+const BOUNCE_FRAMES: f32 = 32.0;
+
+/// `AccumulateParams` in `gi_accumulate.wgsl`.
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct AccumulateParams {
+    inv_view_proj: [[f32; 4]; 4],
+    prev_view_proj: [[f32; 4]; 4],
+    camera_step: [f32; 3],
+    history_valid: f32,
+    inv_resolution: [f32; 2],
+    scale: f32,
+    frame: u32,
+    sky_frames: f32,
+    bounce_frames: f32,
+    _pad: [f32; 2],
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -74,6 +98,8 @@ mod tests {
     fn the_params_struct_is_the_112_byte_uniform_layout() {
         assert_eq!(std::mem::size_of::<GiParams>(), 112);
         assert_eq!(std::mem::size_of::<GiParams>() % 16, 0);
+        // gi_accumulate.wgsl's: two matrices, then a vec3 and scalars that pack to 176 in both languages.
+        assert_eq!(std::mem::size_of::<super::AccumulateParams>(), 176);
     }
 
     #[test]
@@ -166,11 +192,24 @@ pub struct RestirGiPass {
     grain_enabled: bool,
     out_view: Option<wgpu::TextureView>,
     out_tex: Option<wgpu::Texture>,
-    /// The radiance despeckled on the GI grid (`gi_despeckle.wgsl`): what the shading pass reads.
-    clean_view: Option<wgpu::TextureView>,
-    clean_tex: Option<wgpu::Texture>,
-    despeckle: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout)>,
-    despeckle_bind: Option<wgpu::BindGroup>,
+    /// This frame's sums for the sky's share, per GI texel (restir_gi.wgsl `sky_out`).
+    sky_view: Option<wgpu::TextureView>,
+    /// What the shading pass reads (`gi_accumulate.wgsl`): layer 0 the bounce and the surface's distance, layer 1 the
+    /// sky's sums and the frames behind them. `history` is its copy from the frame before.
+    result_tex: Option<wgpu::Texture>,
+    result_view: Option<wgpu::TextureView>,
+    result_layers: Option<[wgpu::TextureView; 2]>,
+    history_tex: Option<wgpu::Texture>,
+    history_view: Option<wgpu::TextureView>,
+    accumulate: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::Buffer)>,
+    accumulate_bind: Option<wgpu::BindGroup>,
+    /// Whether `history` holds last frame's result for this resolution, and the camera it was made from
+    /// (projection x view rotation, unjittered, and the position).
+    accumulated: bool,
+    prev_view_proj: glam::Mat4,
+    prev_camera: glam::Vec3,
+    /// The clouds' shadow field and its params, for the sun a bounce receives (`set_cloud_shadow`).
+    cloud_shadow: Option<(wgpu::TextureView, wgpu::Buffer)>,
     /// Set once the pass has written the target, so a disabled pass knows it
     /// still has stale contents to clear. Same trap 24K hit: switching the
     /// feature off left every surface pinned to the last traced result.
@@ -227,10 +266,18 @@ impl RestirGiPass {
                 && crate::pass::grain::enabled_by_default("SOMNIUM_DREAMS_GRAIN"),
             out_view: None,
             out_tex: None,
-            clean_view: None,
-            clean_tex: None,
-            despeckle: None,
-            despeckle_bind: None,
+            sky_view: None,
+            result_tex: None,
+            result_view: None,
+            result_layers: None,
+            history_tex: None,
+            history_view: None,
+            accumulate: None,
+            accumulate_bind: None,
+            accumulated: false,
+            prev_view_proj: glam::Mat4::IDENTITY,
+            prev_camera: glam::Vec3::ZERO,
+            cloud_shadow: None,
             dirty: false,
             frame: 0,
             history_valid: false,
@@ -366,6 +413,38 @@ impl RestirGiPass {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                // This frame's sums for the sky's share (`sky_out`).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 12,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: GI_FORMAT,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                // The clouds' shadow field and its params: the sun a bounce receives comes through the deck.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 13,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -420,7 +499,7 @@ impl RestirGiPass {
             })
         };
         pass.initial = Some(make("initial_and_temporal", "ReSTIR GI initial+temporal"));
-        pass.despeckle = Some(Self::despeckle_pipeline(device, shaders));
+        pass.accumulate = Some(Self::accumulate_pipeline(device, shaders));
         pass.spatial = Some(make("spatial_and_shade", "ReSTIR GI spatial+shade"));
         pass.layout = Some(layout);
         pass.params = Some(device.create_buffer(&wgpu::BufferDescriptor {
@@ -478,60 +557,94 @@ impl RestirGiPass {
         self.supported && self.enabled
     }
 
-    /// Indirect radiance, for the shading pass to use in place of the constant
-    /// ambient term.
+    /// What the traced GI gives the shading pass, as a two-layer array: the bounce and the surface's distance, then
+    /// the sky's sums and the frames behind them (`gi_accumulate.wgsl`). All zero where nothing was traced, and on a
+    /// device without ray query: the shading pass then lights by its fallback.
     pub fn radiance_view(&self) -> Option<&wgpu::TextureView> {
-        if self.despeckle.is_some() { self.clean_view.as_ref() } else { self.out_view.as_ref() }
+        self.result_view.as_ref()
     }
 
-    /// The despeckle pass (`gi_despeckle.wgsl`): the radiance in, its despeckled copy out, on the GI grid.
-    fn despeckle_pipeline(
+    /// The bounce alone (layer 0: rgb, with the surface's distance in alpha), for the passes that read it as a plain
+    /// texture.
+    pub fn bounce_view(&self) -> Option<&wgpu::TextureView> {
+        self.result_layers.as_ref().map(|layers| &layers[0])
+    }
+
+    /// The clouds' shadow on the ground and its params (`CloudPass::shadow_view`, `shadow_params`): the sun a bounce
+    /// ray's hit receives comes through the deck. Until it is set the pass binds nothing.
+    pub fn set_cloud_shadow(&mut self, field: &wgpu::TextureView, params: &wgpu::Buffer) {
+        self.cloud_shadow = Some((field.clone(), params.clone()));
+        self.bind = None;
+    }
+
+    /// The accumulate pass (`gi_accumulate.wgsl`): this frame's bounce and sky sums and last frame's result in, the
+    /// result out, on the GI grid.
+    fn accumulate_pipeline(
         device: &wgpu::Device,
         shaders: &crate::shaders::Shaders,
-    ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout) {
+    ) -> (wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::Buffer) {
+        let loaded = |binding: u32, view_dimension: wgpu::TextureViewDimension| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension,
+                multisampled: false,
+            },
+            count: None,
+        };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("GI despeckle BGL"),
+            label: Some("GI accumulate BGL"),
             entries: &[
+                loaded(0, wgpu::TextureViewDimension::D2),
+                loaded(1, wgpu::TextureViewDimension::D2),
+                loaded(2, wgpu::TextureViewDimension::D2Array),
                 wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
+                    binding: 3,
                     visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::StorageTexture {
                         access: wgpu::StorageTextureAccess::WriteOnly,
                         format: GI_FORMAT,
-                        view_dimension: wgpu::TextureViewDimension::D2,
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
                     count: None,
                 },
             ],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("GI despeckle PL"),
+            label: Some("GI accumulate PL"),
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
         let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("gi_despeckle.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(shaders.source_or_panic("gi_despeckle.wgsl").into()),
+            label: Some("gi_accumulate.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(shaders.source_or_panic("gi_accumulate.wgsl").into()),
         });
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("GI despeckle"),
+            label: Some("GI accumulate"),
             layout: Some(&pl),
             module: &module,
-            entry_point: Some("despeckle"),
+            entry_point: Some("accumulate"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
-        (pipeline, layout)
+        let params = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GI accumulate params"),
+            size: std::mem::size_of::<AccumulateParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        (pipeline, layout, params)
     }
 
     pub fn resize(&mut self, device: &wgpu::Device, width: u32, height: u32) {
@@ -561,21 +674,60 @@ impl RestirGiPass {
         });
         self.out_view = Some(tex.create_view(&wgpu::TextureViewDescriptor::default()));
         self.out_tex = Some(tex);
-        let clean = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("ReSTIR GI radiance (despeckled)"),
+        let sky = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ReSTIR GI sky sums"),
             size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: GI_FORMAT,
-            usage: wgpu::TextureUsages::STORAGE_BINDING
-                | wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        self.clean_view = Some(clean.create_view(&wgpu::TextureViewDescriptor::default()));
-        self.clean_tex = Some(clean);
-        self.despeckle_bind = None;
+        self.sky_view = Some(sky.create_view(&wgpu::TextureViewDescriptor::default()));
+        // Two layers each: the result the shading pass reads, and its copy from the frame before.
+        let layered = |label: &str, usage: wgpu::TextureUsages| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 2 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: GI_FORMAT,
+                usage,
+                view_formats: &[],
+            })
+        };
+        let array_view = |texture: &wgpu::Texture| {
+            texture.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2Array),
+                ..Default::default()
+            })
+        };
+        let result = layered(
+            "ReSTIR GI result",
+            wgpu::TextureUsages::STORAGE_BINDING
+                | wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+        );
+        let history =
+            layered("ReSTIR GI history", wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST);
+        let layer = |index: u32| {
+            result.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_array_layer: index,
+                array_layer_count: Some(1),
+                ..Default::default()
+            })
+        };
+        self.result_layers = Some([layer(0), layer(1)]);
+        self.result_view = Some(array_view(&result));
+        self.history_view = Some(array_view(&history));
+        self.result_tex = Some(result);
+        self.history_tex = Some(history);
+        self.accumulate_bind = None;
+        self.accumulated = false;
         self.dirty = false;
 
         if !self.supported {
@@ -619,7 +771,17 @@ impl RestirGiPass {
         if self.bind.is_some() {
             return;
         }
-        let (Some(layout), Some(params), Some(out), Some(a), Some(b), Some(surfaces), Some((env, env_sampler))) = (
+        let (
+            Some(layout),
+            Some(params),
+            Some(out),
+            Some(a),
+            Some(b),
+            Some(surfaces),
+            Some((env, env_sampler)),
+            Some(sky),
+            Some((cloud_field, cloud_params)),
+        ) = (
             self.layout.as_ref(),
             self.params.as_ref(),
             self.out_view.as_ref(),
@@ -627,6 +789,8 @@ impl RestirGiPass {
             self.gi_b.as_ref(),
             self.surfaces.as_ref(),
             self.environment.as_ref(),
+            self.sky_view.as_ref(),
+            self.cloud_shadow.as_ref(),
         ) else {
             return;
         };
@@ -682,6 +846,18 @@ impl RestirGiPass {
                     binding: 11,
                     resource: wgpu::BindingResource::Sampler(env_sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 12,
+                    resource: wgpu::BindingResource::TextureView(sky),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 13,
+                    resource: wgpu::BindingResource::TextureView(cloud_field),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: cloud_params.as_entire_binding(),
+                },
             ],
         }));
     }
@@ -702,7 +878,7 @@ impl RestirGiPass {
         if self.active() || !self.dirty {
             return;
         }
-        for view in self.out_view.iter().chain(self.clean_view.iter()) {
+        for view in self.out_view.iter().chain(self.result_layers.iter().flatten()) {
             // A load-op clear, not `clear_texture`: that needs the optional
             // CLEAR_TEXTURE feature this device never requests.
             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -723,6 +899,7 @@ impl RestirGiPass {
             });
             self.dirty = false;
             self.history_valid = false;
+            self.accumulated = false;
         }
     }
 
@@ -738,6 +915,8 @@ impl RestirGiPass {
         depth_view: &wgpu::TextureView,
         vis_view: &wgpu::TextureView,
         view_proj: glam::Mat4,
+        // The same without the frame's jitter (camera-relative too), kept to find this frame's surfaces next frame.
+        view_proj_unjittered: glam::Mat4,
         camera_pos: glam::Vec3,
         light_direction: glam::Vec3,
         light_color: glam::Vec3,
@@ -833,30 +1012,81 @@ impl RestirGiPass {
             cpass.dispatch_workgroups(groups.0, groups.1, 1);
         }
         profiler.end(encoder);
-        if let (Some((pipeline, layout)), Some(out), Some(clean)) =
-            (self.despeckle.as_ref(), self.out_view.as_ref(), self.clean_view.as_ref())
-        {
-            let bind = self.despeckle_bind.get_or_insert_with(|| {
+        if let (
+            Some((pipeline, layout, accumulate_params)),
+            Some(out),
+            Some(sky),
+            Some(result),
+            Some(history),
+            Some(result_tex),
+            Some(history_tex),
+        ) = (
+            self.accumulate.as_ref(),
+            self.out_view.as_ref(),
+            self.sky_view.as_ref(),
+            self.result_view.as_ref(),
+            self.history_view.as_ref(),
+            self.result_tex.as_ref(),
+            self.history_tex.as_ref(),
+        ) {
+            queue.write_buffer(
+                accumulate_params,
+                0,
+                bytemuck::bytes_of(&AccumulateParams {
+                    inv_view_proj: view_proj_unjittered.inverse().to_cols_array_2d(),
+                    prev_view_proj: self.prev_view_proj.to_cols_array_2d(),
+                    camera_step: (camera_pos - self.prev_camera).to_array(),
+                    history_valid: f32::from(u8::from(self.accumulated)),
+                    inv_resolution: [1.0 / width as f32, 1.0 / height as f32],
+                    scale: s as f32,
+                    frame: self.frame,
+                    sky_frames: SKY_FRAMES,
+                    // The bounce follows the lights: the reservoirs' confidence when they change, longer when not.
+                    bounce_frames: if light_changed || self.history_m_cap < HISTORY_M_CAP {
+                        self.history_m_cap.min(HISTORY_M_CAP_DRIFT)
+                    } else {
+                        BOUNCE_FRAMES
+                    },
+                    _pad: [0.0; 2],
+                }),
+            );
+            let bind = self.accumulate_bind.get_or_insert_with(|| {
                 device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("GI despeckle BG"),
+                    label: Some("GI accumulate BG"),
                     layout,
                     entries: &[
                         wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(out) },
-                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(clean) },
+                        wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(sky) },
+                        wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(history) },
+                        wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(result) },
+                        wgpu::BindGroupEntry { binding: 4, resource: accumulate_params.as_entire_binding() },
                     ],
                 })
             });
-            profiler.begin(encoder, "GI despeckle");
+            profiler.begin(encoder, "GI accumulate");
             {
                 let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("ReSTIR GI despeckle"),
+                    label: Some("ReSTIR GI accumulate"),
                     timestamp_writes: None,
                 });
                 cpass.set_pipeline(pipeline);
                 cpass.set_bind_group(0, &*bind, &[]);
                 cpass.dispatch_workgroups(groups.0, groups.1, 1);
             }
+            // Kept for the next frame as a copy (a few megabytes), so the view the shading pass binds never changes.
+            encoder.copy_texture_to_texture(
+                result_tex.as_image_copy(),
+                history_tex.as_image_copy(),
+                wgpu::Extent3d {
+                    width: width.div_ceil(s),
+                    height: height.div_ceil(s),
+                    depth_or_array_layers: 2,
+                },
+            );
             profiler.end(encoder);
+            self.accumulated = true;
+            self.prev_view_proj = view_proj_unjittered;
+            self.prev_camera = camera_pos;
         }
 
         self.dirty = true;

@@ -71,8 +71,8 @@ fn every_composed_root_validates() {
         "shading.wgsl",
         "restir_gi.wgsl",
         "restir_di.wgsl",
-        // 6 Nov 2026: GI despeckled on its own grid before the upsample.
-        "gi_despeckle.wgsl",
+        // 11 Nov 2026: GI averaged over neighbours and time on its own grid before the upsample.
+        "gi_accumulate.wgsl",
         "lighting_extra.wgsl",
         // 17 Oct 2026: the real-time path tracer and its denoiser.
         "path_tracer.wgsl",
