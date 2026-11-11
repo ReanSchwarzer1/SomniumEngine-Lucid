@@ -143,6 +143,18 @@ fn surfaces_ab_off(frame: u64) -> bool {
     }
 }
 
+/// A proof schedule for the night camera: `NAME=a,b,c` in the environment gives the value for the capture now being
+/// shot (one per capture written, the list wrapping round); `None` when it is unset. Read once per name.
+fn camera_cycle(name: &'static str) -> Option<f32> {
+    static LISTS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<&'static str, Vec<f32>>>> =
+        std::sync::LazyLock::new(Default::default);
+    let mut lists = LISTS.lock().ok()?;
+    let list = lists.entry(name).or_insert_with(|| {
+        std::env::var(name).map_or_else(|_| Vec::new(), |s| s.split(',').filter_map(|v| v.trim().parse().ok()).collect())
+    });
+    (!list.is_empty()).then(|| list[crate::capture::captures_written() % list.len()])
+}
+
 pub struct SomniumRenderer {
     /// Global descriptor pool (bindless arrays, includes light buffer at binding 6).
     pub global_pool: GlobalResourcePool,
@@ -7418,6 +7430,24 @@ impl SomniumRenderer {
                 );
                 self.profiler.end(&mut encoder);
             }
+        }
+
+        // Proof schedules for the night camera (`camera_cycle`): one value per capture written, so one launch shoots
+        // today's camera and a night camera at the same eye.
+        if let Some(v) = camera_cycle("SOMNIUM_MIN_EV_CYCLE") {
+            self.eye_adaptation.min_ev100 = v.min(self.eye_adaptation.max_ev100);
+        }
+        if let Some(v) = camera_cycle("SOMNIUM_LOW_LIGHT_CYCLE") {
+            self.grading.low_light = v.clamp(0.0, 1.0);
+        }
+        if let Some(v) = camera_cycle("SOMNIUM_NOISE_CYCLE") {
+            self.grading.sensor_noise = v.clamp(0.0, 4.0);
+        }
+        if let Some(v) = camera_cycle("SOMNIUM_GLARE_CYCLE") {
+            self.grading.lens_glare = v.clamp(0.0, 0.2);
+        }
+        if let Some(v) = camera_cycle("SOMNIUM_GLINTS_CYCLE") {
+            self.light_glints = v.max(0.0);
         }
 
         // ── 7.85 Far lamps as steady points (sunscar-photoreal, 12 Nov 2026) ─────────
