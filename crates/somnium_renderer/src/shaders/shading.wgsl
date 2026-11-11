@@ -188,13 +188,14 @@ fn skin_visibility(p: vec3<f32>, emitter: vec3<f32>, reach: f32) -> f32 {
 @group(1) @binding(10) var volumetric_sampler: sampler;
 // Metres the volume spans; 0 when volumetrics are switched off.
 @group(1) @binding(11) var<uniform> volumetric_range: vec4<f32>;
-// Phase 24L: traced indirect diffuse, as `gi_accumulate.wgsl` leaves it on the GI grid, in two layers (one binding:
-// this stage already holds the device's 16 sampled textures).
+// Phase 24L: traced indirect diffuse, as `gi_accumulate.wgsl` leaves it on the GI grid, in three layers (one
+// binding: this stage already holds the device's 16 sampled textures).
 // 0: `rgb` the light the scene bounces onto the surface (incoming: the GI pass does not know this surface's albedo
 //    and must not, or it would be applied twice), `a` the traced surface's camera distance. 0 there is "nothing
 //    traced", which an unsupported device and a switched-off pass both produce, and it sends `evaluate_ibl` back to
 //    the cubemap alone.
-// 1: the sky's share as two sums (`r` over `g`), and the frames behind the estimate (`b`).
+// 1: the sky's share as two sums (`r` over `g`), and the open sky a thin leaf's far side receives (`b` over `a`).
+// 2: the frames behind the estimate, in red.
 @group(1) @binding(12) var restir_gi: texture_2d_array<f32>;
 // Phase 24M/N/O/P/Q: world cache + scene specular / path tracer (2D) and the
 // clipmapped volume (cache rgb, SDF in alpha). Dummy 1×1 targets when off.
@@ -1515,11 +1516,14 @@ struct TracedLight {
     trust: f32,
     /// The screen-space visibility the sky's share is held under (`screen_occlusion`; 1 on a thin leaf).
     contact: f32,
+    /// The sky's light that comes through a thin leaf from its far side, as a share of the open sky overhead: what
+    /// the far side sees of the sky, times what the leaf lets through. 0 on anything that is not a leaf.
+    through: f32,
 }
 
 /// No traced estimate: the sky under the surface's occlusion, as on a device without ray query.
 fn untraced_light() -> TracedLight {
-    return TracedLight(vec3<f32>(0.0), 1.0, 0.0, 1.0);
+    return TracedLight(vec3<f32>(0.0), 1.0, 0.0, 1.0, 0.0);
 }
 
 /// Frames in view after which a place's traced estimate stands alone. Under that it is a handful of rays, and what
@@ -1536,11 +1540,12 @@ const GI_SETTLED_FRAMES: f32 = 4.0;
 /// their plain bilinear mean: the light around it is a better guess than none, and it does not flicker as the
 /// texels' traced pixels walk on and off the blade.
 ///
-/// Four taps of two layers. It was sixteen with a Gaussian falloff, and that footprint was the denoiser; the
+/// Four taps of three layers. It was sixteen with a Gaussian falloff, and that footprint was the denoiser; the
 /// averaging now happens once per GI texel, and per screen pixel it was 11 of a dense wood's 19.6 ms of shading.
 ///
-/// `contact` is passed through to the result: the upsample does not know the material.
-fn gi_upsample(pixel: vec2<f32>, dist: f32, contact: f32) -> TracedLight {
+/// The upsample does not know the material: `contact` is passed through to the result, and `leaf` (what a thin leaf
+/// lets through, 0 for anything else) scales the far side's sky into `through`.
+fn gi_upsample(pixel: vec2<f32>, dist: f32, contact: f32, leaf: f32) -> TracedLight {
     let gdims = vec2<i32>(textureDimensions(restir_gi));
     // The grid's step is whole and the grid rounds up, so the ratio of the two sizes falls a little short of it.
     let grid_step = round(vec2<f32>(textureDimensions(vis_buffer)) / vec2<f32>(gdims));
@@ -1548,7 +1553,8 @@ fn gi_upsample(pixel: vec2<f32>, dist: f32, contact: f32) -> TracedLight {
     let g0 = vec2<i32>(floor(gp));
     let f = gp - floor(gp);
     var bounce = vec3<f32>(0.0);
-    var sky = vec3<f32>(0.0);
+    var sky = vec4<f32>(0.0);
+    var frames = 0.0;
     var wsum = 0.0;
     for (var k = 0; k < 4; k = k + 1) {
         let d = vec2<i32>(k & 1, k >> 1);
@@ -1561,7 +1567,8 @@ fn gi_upsample(pixel: vec2<f32>, dist: f32, contact: f32) -> TracedLight {
         let wd = exp(-abs(t.a - dist) / (dist * 0.025 + 0.05));
         let w = (wb + 0.002) * (wd + 1.0e-4);
         bounce += t.rgb * w;
-        sky += textureLoad(restir_gi, at, 1, 0).rgb * w;
+        sky += textureLoad(restir_gi, at, 1, 0) * w;
+        frames += textureLoad(restir_gi, at, 2, 0).r * w;
         wsum += w;
     }
     if wsum <= 0.0 {
@@ -1570,7 +1577,9 @@ fn gi_upsample(pixel: vec2<f32>, dist: f32, contact: f32) -> TracedLight {
     // The ratio of the averaged sums, not the average of ratios: a texel whose rays met a dim part of the sky
     // weighs as little as they did. No sums at all is a black sky, and the share of nothing may as well be 1.
     let share = select(1.0, saturate(sky.x / max(sky.y, 1.0e-6)), sky.y > 1.0e-6);
-    return TracedLight(bounce / wsum, share, saturate(sky.z / wsum / GI_SETTLED_FRAMES), contact);
+    // The far side's sums are there only on a leaf; without them nothing comes through.
+    let far_side = select(0.0, sky.z / max(sky.w, 1.0e-6), sky.w > 1.0e-6);
+    return TracedLight(bounce / wsum, share, saturate(frames / wsum / GI_SETTLED_FRAMES), contact, leaf * far_side);
 }
 
 /// The terrain bake's sky visibility at this pixel (1 off terrain). `surface.occlusion` carries it for the sky light;
@@ -1598,6 +1607,10 @@ var<private> screen_occlusion: f32 = 1.0;
 /// under a cloud deck its blotches were the picture ("black splotches"). The bake comes back out (the rays saw the
 /// same crowns), GTAO bounds the sky's share instead of multiplying it, and only the material's own occlusion,
 /// which no ray sees, multiplies both.
+///
+/// A thin leaf adds what comes through it from its far side (`TracedLight.through`), measured against the sky
+/// overhead and not against the leaf's own normal: a leaf that hangs face down over the ground shows the sky above
+/// it, by as much as it lets through.
 fn gathered_light(surface: Surface, traced: TracedLight, sky: vec3<f32>) -> vec3<f32> {
     let untraced = sky * surface.occlusion;
     if traced.trust <= 0.0 {
@@ -1605,7 +1618,12 @@ fn gathered_light(surface: Surface, traced: TracedLight, sky: vec3<f32>) -> vec3
     }
     let fine = surface.occlusion / (max(screen_occlusion, 0.004) * max(baked_sky_vis, 0.05));
     gi_sky_seen = mix(1.0, saturate(traced.sky / max(baked_sky_vis, 0.05)), traced.trust);
-    return mix(untraced, (sky * min(traced.sky, traced.contact) + traced.bounce) * fine, traced.trust);
+    var gathered = sky * min(traced.sky, traced.contact) + traced.bounce;
+    if traced.through > 0.0 {
+        gathered += textureSampleLevel(env_cube, env_sampler, vec3<f32>(0.0, 1.0, 0.0), ENV_MAX_MIP).rgb
+            * (light.ibl_intensity * traced.through);
+    }
+    return mix(untraced, gathered * fine, traced.trust);
 }
 
 fn evaluate_ibl_diffuse(surface: Surface, traced_diffuse: TracedLight) -> vec3<f32> {
@@ -3555,7 +3573,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // it marks a sidecar mask, and a grown tree's leaves are cut out by their glTF's own alpha mode.
         let thin_leaf = (material.flags & 1u) != 0u && material.alpha_cutoff > 0.0;
         let gi_texel = gi_upsample(in.clip_pos.xy, length(hit_point - view.camera_pos),
-            select(screen_occlusion, 1.0, thin_leaf));
+            select(screen_occlusion, 1.0, thin_leaf), select(0.0, material.transmission, thin_leaf));
         var ambient = evaluate_ibl(surface, gi_texel);
         if (material.flags & 8u) != 0u {
             ambient += eye_glint(surface, ambient);
@@ -3831,11 +3849,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // share, green how far the estimate is trusted, blue the bounce against the sky's own light. It has no menu
     // entry; a proof run asks for it by number (editor script `view=36`).
     if dbg > 35.5 && dbg < 36.5 {
-        let gi = gi_upsample(in.clip_pos.xy, length(hit_point - view.camera_pos), 1.0);
+        let gi = gi_upsample(in.clip_pos.xy, length(hit_point - view.camera_pos), 1.0, 0.0);
         let luma = vec3<f32>(0.2126, 0.7152, 0.0722);
         let sky = dot(textureSampleLevel(env_cube, env_sampler, surface.normal, ENV_MAX_MIP).rgb, luma)
             * light.ibl_intensity;
         return vec4<f32>(gi.sky, gi.trust, dot(gi.bounce, luma) / max(sky, 1.0e-6), 1.0);
+    }
+    // 37: the leaf's side of it, the same way. Red what the material lets through, green 1 on a thin leaf (two-sided
+    // and cut out), blue the open sky its far side receives (0 to 1, before the material's share).
+    if dbg > 36.5 && dbg < 37.5 {
+        let leaf = (material.flags & 1u) != 0u && material.alpha_cutoff > 0.0;
+        let gi = gi_upsample(in.clip_pos.xy, length(hit_point - view.camera_pos), 1.0, 1.0);
+        return vec4<f32>(material.transmission, select(0.0, 1.0, leaf), gi.through, 1.0);
     }
 
     // Phase 24AB: lighting debug views (24–31). 0–23 remain the existing
@@ -3847,7 +3872,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             return vec4<f32>(t, 0.2 * (1.0 - t), 1.0 - t, 1.0) * 4.0;
         }
         if dbg < 25.5 {
-            let gi = gi_upsample(in.clip_pos.xy, length(hit_point - view.camera_pos), 1.0);
+            let gi = gi_upsample(in.clip_pos.xy, length(hit_point - view.camera_pos), 1.0, 0.0);
             return vec4<f32>(gi.bounce * 4.0, 1.0);
         }
         if dbg < 26.5 {

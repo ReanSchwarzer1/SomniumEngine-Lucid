@@ -135,9 +135,10 @@ struct GiReservoir {
 // smooth as the cube. `gi_accumulate.wgsl` averages the sums over neighbours and over time, and the shading pass
 // multiplies the cube's own irradiance by the ratio. The reservoir keeps what it is good at: the bounce off what the
 // rays hit.
-/// This frame's (`num`, `den`) per GI texel, each relative to the sky's mean about the surface's normal: about 1
-/// by day and by night, so the half floats that hold them never run out of range or of precision, and a frame under
-/// a brightening sky weighs no more than the one before it.
+/// This frame's sums per GI texel. `r` over `g` is the share for the side of the surface the camera sees. `b` over
+/// `a` is the open sky a thin leaf's far side receives (see `GiSurface.leaf`). Each ray's radiance is relative to
+/// the sky's mean overhead: about 1 by day and by night, so the half floats that hold them never run out of range
+/// or of precision, and a frame under a brightening sky weighs no more than the one before it.
 @group(1) @binding(12) var sky_out: texture_storage_2d<rgba16float, write>;
 /// The clouds' shadow on the ground (`clouds.wgsl` `cloud_shadow`) and its `[centre_x, centre_z, extent, strength]`:
 /// the sun a bounce ray's hit receives comes through the deck, as the sun on every shaded surface does.
@@ -463,7 +464,14 @@ fn gi_merge(
     other_pos: vec3<f32>,
     seed: ptr<function, u32>,
 ) {
-    if other.m <= 0.0 || other.w <= 0.0 {
+    if other.m <= 0.0 {
+        return;
+    }
+    if other.w <= 0.0 {
+        // Candidates that carried nothing are candidates still. They used all to carry the sky; now a ray that
+        // leaves the scene is one of these, and passing them over forgot every miss: one hit in fifty rays stood
+        // at a twenty-fifth of its light for good.
+        (*r).m += other.m;
         return;
     }
     let j = gi_jacobian(p, other_pos, other.sample_pos, other.sample_normal);
@@ -504,6 +512,12 @@ struct GiSurface {
     valid: bool,
     pos: vec3<f32>,
     normal: vec3<f32>,
+    /// On a thin leaf (a two-sided cut-out), the share of light it lets through (`Material.transmission`); 0 on
+    /// everything else. A leaf is lit from both sides: what the camera sees of it is the light its near side
+    /// reflects and the light its far side lets through. The near side of a leaf that hangs over dark ground gets
+    /// almost nothing, and with the far side left out every such leaf was black: the undersides of crowns, the
+    /// insides of bushes, the low plants seen at a slant (the developer's "black splotches", 11 Nov 2026).
+    leaf: f32,
 }
 
 // This cache stores exactly the geometry reconstructed by pass 1, at float32
@@ -519,7 +533,8 @@ struct GiCachedSurface {
 fn gi_spatial_surface(index: u32, coord: vec2<i32>, dims: vec2<u32>) -> GiSurface {
     if gi_cache_surfaces {
         let cached = gi_surfaces[index];
-        return GiSurface(cached.position_valid.w > 0.0, cached.position_valid.xyz, cached.normal.xyz);
+        return GiSurface(cached.position_valid.w > 0.0, cached.position_valid.xyz, cached.normal.xyz,
+            cached.normal.w);
     }
     return gi_primary_surface(coord, dims);
 }
@@ -529,6 +544,7 @@ fn gi_primary_surface(coord: vec2<i32>, dims: vec2<u32>) -> GiSurface {
     s.valid = false;
     s.pos = vec3<f32>(0.0);
     s.normal = vec3<f32>(0.0, 1.0, 0.0);
+    s.leaf = 0.0;
 
     let depth = textureLoad(depth_tex, coord, 0);
     if depth <= 0.0 {
@@ -565,6 +581,10 @@ fn gi_primary_surface(coord: vec2<i32>, dims: vec2<u32>) -> GiSurface {
     }
     s.normal = gn;
     s.valid = true;
+    // Two-sided and cut out: a leaf, a blade, a frond (shading.wgsl's `thin_leaf`, the same test).
+    if (materials[inst.material_id].flags & 1u) != 0u && materials[inst.material_id].alpha_cutoff > 0.0 {
+        s.leaf = materials[inst.material_id].transmission;
+    }
     return s;
 }
 
@@ -596,7 +616,7 @@ fn initial_and_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
     if gi_cache_surfaces {
         gi_surfaces[index] = GiCachedSurface(
             vec4<f32>(surface.pos, select(0.0, 1.0, surface.valid)),
-            vec4<f32>(surface.normal, 0.0));
+            vec4<f32>(surface.normal, surface.leaf));
     }
     if !surface.valid {
         gi_b[index] = gi_empty();
@@ -606,19 +626,28 @@ fn initial_and_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // ── Initial candidate: one bounce ────────────────────────────────────────
     var r = gi_empty();
-    let dir = gi_sample_cosine(surface.normal, u);
-    let origin = surface.pos + surface.normal * 0.05;
+    // A thin leaf's far side gets every other ray: a checkerboard that turns each frame, so each texel sees both
+    // sides in two frames and each neighbourhood sees both in one.
+    let far_side = surface.leaf > 0.0 && ((gid.x + gid.y + gi.frame) & 1u) == 1u;
+    let ray_normal = select(surface.normal, -surface.normal, far_side);
+    let dir = gi_sample_cosine(ray_normal, u);
+    let origin = surface.pos + ray_normal * 0.05;
     let hit = gi_trace(origin, dir, 0.05, gi.max_distance);
     // The sky's share: the environment along the ray, and again if the ray left the scene (see `sky_out`).
-    let env_mean = gi_luma(textureSampleLevel(gi_env, gi_env_sampler, surface.normal, GI_ENV_ROUGHEST).rgb);
-    let env = min(gi_luma(textureSampleLevel(gi_env, gi_env_sampler, dir, 2.0).rgb) / max(env_mean, 1.0e-9),
+    let env_up = gi_luma(textureSampleLevel(gi_env, gi_env_sampler, vec3<f32>(0.0, 1.0, 0.0), GI_ENV_ROUGHEST).rgb);
+    let env = min(gi_luma(textureSampleLevel(gi_env, gi_env_sampler, dir, 2.0).rgb) / max(env_up, 1.0e-9),
         GI_SKY_CEILING);
-    textureStore(sky_out, vec2<i32>(gid.xy), vec4<f32>(select(env, 0.0, hit.hit), env, 0.0, 0.0));
+    let open = select(env, 0.0, hit.hit);
+    textureStore(sky_out, vec2<i32>(gid.xy),
+        select(vec4<f32>(open, env, 0.0, 0.0), vec4<f32>(0.0, 0.0, open, 1.0), far_side));
     // Bevy Solari's NO_WORLD_CACHE path rejects emissive hits. This estimator
     // does not importance-sample emissive geometry, so retaining the extremely
     // rare hits produces high-variance fireflies that wander under temporal
     // and spatial reuse. Emissive GI needs a light-sampling strategy of its own.
-    if hit.hit && all(hit.emissive <= vec3<f32>(0.0)) {
+    if far_side {
+        // No candidate this frame: the far side's ray counted the sky and nothing else, and the reservoir, which
+        // holds the near side's bounce, goes on from its history as it stands.
+    } else if hit.hit && all(hit.emissive <= vec3<f32>(0.0)) {
         let radiance = gi_direct_at(hit.pos, hit.normal, hit.albedo, hit.terrain_index, hit.transmission, &seed);
         let p_hat = gi_luma(radiance);
         if p_hat > 0.0 {

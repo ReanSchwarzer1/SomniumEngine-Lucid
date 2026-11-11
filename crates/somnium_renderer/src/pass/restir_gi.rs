@@ -4,7 +4,7 @@
 //! bounce per pixel and merges it with that pixel's history, the second borrows
 //! from spatial neighbours, traces the survivor's visibility ray and writes the
 //! bounce. A third (`gi_accumulate.wgsl`) averages the bounce and the sky's share
-//! over neighbours and time, into the two layers the shading pass consumes.
+//! over neighbours and time, into the layers the shading pass consumes.
 //!
 //! Like 24J and 24K it does nothing at all when the device did not grant ray
 //! query — the constant ambient term remains the fallback, and an output alpha
@@ -45,6 +45,9 @@ const SKY_FRAMES: f32 = 64.0;
 /// Most frames the bounce averages while the lights hold still, and while they change (a moving sun, a flickering
 /// lamp): the reservoirs' own shorter confidence, so the bounce follows the light within a few frames.
 const BOUNCE_FRAMES: f32 = 32.0;
+
+/// Layers of the result the shading pass reads: the bounce, the sky's sums, the frames behind them.
+const RESULT_LAYERS: u32 = 3;
 
 /// `AccumulateParams` in `gi_accumulate.wgsl`.
 #[repr(C)]
@@ -195,10 +198,10 @@ pub struct RestirGiPass {
     /// This frame's sums for the sky's share, per GI texel (restir_gi.wgsl `sky_out`).
     sky_view: Option<wgpu::TextureView>,
     /// What the shading pass reads (`gi_accumulate.wgsl`): layer 0 the bounce and the surface's distance, layer 1 the
-    /// sky's sums and the frames behind them. `history` is its copy from the frame before.
+    /// sky's sums, layer 2 the frames behind them. `history` is its copy from the frame before.
     result_tex: Option<wgpu::Texture>,
     result_view: Option<wgpu::TextureView>,
-    result_layers: Option<[wgpu::TextureView; 2]>,
+    result_layers: Option<[wgpu::TextureView; RESULT_LAYERS as usize]>,
     history_tex: Option<wgpu::Texture>,
     history_view: Option<wgpu::TextureView>,
     accumulate: Option<(wgpu::ComputePipeline, wgpu::BindGroupLayout, wgpu::Buffer)>,
@@ -557,8 +560,8 @@ impl RestirGiPass {
         self.supported && self.enabled
     }
 
-    /// What the traced GI gives the shading pass, as a two-layer array: the bounce and the surface's distance, then
-    /// the sky's sums and the frames behind them (`gi_accumulate.wgsl`). All zero where nothing was traced, and on a
+    /// What the traced GI gives the shading pass, as a three-layer array: the bounce and the surface's distance, the
+    /// sky's sums, the frames behind them (`gi_accumulate.wgsl`). All zero where nothing was traced, and on a
     /// device without ray query: the shading pass then lights by its fallback.
     pub fn radiance_view(&self) -> Option<&wgpu::TextureView> {
         self.result_view.as_ref()
@@ -685,11 +688,11 @@ impl RestirGiPass {
             view_formats: &[],
         });
         self.sky_view = Some(sky.create_view(&wgpu::TextureViewDescriptor::default()));
-        // Two layers each: the result the shading pass reads, and its copy from the frame before.
+        // The result the shading pass reads, and its copy from the frame before.
         let layered = |label: &str, usage: wgpu::TextureUsages| {
             device.create_texture(&wgpu::TextureDescriptor {
                 label: Some(label),
-                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 2 },
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: RESULT_LAYERS },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -721,7 +724,7 @@ impl RestirGiPass {
                 ..Default::default()
             })
         };
-        self.result_layers = Some([layer(0), layer(1)]);
+        self.result_layers = Some([layer(0), layer(1), layer(2)]);
         self.result_view = Some(array_view(&result));
         self.history_view = Some(array_view(&history));
         self.result_tex = Some(result);
@@ -1080,7 +1083,7 @@ impl RestirGiPass {
                 wgpu::Extent3d {
                     width: width.div_ceil(s),
                     height: height.div_ceil(s),
-                    depth_or_array_layers: 2,
+                    depth_or_array_layers: RESULT_LAYERS,
                 },
             );
             profiler.end(encoder);

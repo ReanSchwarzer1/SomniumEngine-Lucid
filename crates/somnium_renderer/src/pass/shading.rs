@@ -371,7 +371,7 @@ impl ShadingPass {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        // Two layers: the bounce, and the sky's share (`RestirGiPass::radiance_view`).
+                        // Layers: the bounce, the sky's sums, the frames behind them (`RestirGiPass::radiance_view`).
                         view_dimension: wgpu::TextureViewDimension::D2Array,
                         multisampled: false,
                     },

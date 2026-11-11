@@ -6,7 +6,7 @@
 // - the bounce off what the ray hit (`gi_in`: rgb, with the surface's camera distance in alpha), a reservoir's
 //   estimate, noisy in blotches that neighbours and frames share;
 // - the sky's share (`sky_in`): the environment's radiance along the ray, and the same again if the ray left the
-//   scene (restir_gi.wgsl `sky_out`).
+//   scene; for a thin leaf, on alternate rays, the open sky its far side receives (restir_gi.wgsl `sky_out`).
 //
 // Shown as they come, they are the "black splotches": 15-30 pixel blobs on every surface the sky lights. Here each is
 // first averaged over the 3 x 3 texels round it (nine rays a frame instead of one; the sky's ratio is exact, with no
@@ -23,8 +23,8 @@
 // no texel may exceed SPECK_RATIO times the second brightest of its same-surface neighbourhood, nor FIREFLY_RATIO
 // times its mean.
 //
-// Out, two layers: 0 = bounce rgb and this frame's distance (0: nothing traced); 1 = the sky's sums (num, den), the
-// number of frames behind them, and nothing.
+// Out, three layers: 0 = bounce rgb and this frame's distance (0: nothing traced); 1 = the sky's four sums (near
+// side num and den, far side num and count); 2 = the number of frames behind them, in red.
 
 struct AccumulateParams {
     /// Camera-relative: inverse(projection x the view's rotation alone), this frame, without the frame's jitter.
@@ -93,6 +93,7 @@ fn accumulate(@builtin(global_invocation_id) gid: vec3<u32>) {
     if c.a <= 0.0 {
         textureStore(gi_out, g, 0, vec4<f32>(0.0));
         textureStore(gi_out, g, 1, vec4<f32>(0.0));
+        textureStore(gi_out, g, 2, vec4<f32>(0.0));
         return;
     }
 
@@ -101,7 +102,7 @@ fn accumulate(@builtin(global_invocation_id) gid: vec3<u32>) {
     var near: array<vec4<f32>, 9>;
     near[0] = vec4<f32>(c.rgb, accumulate_luma(c.rgb));
     var count = 1;
-    var sky = textureLoad(sky_in, g, 0).rg;
+    var sky = textureLoad(sky_in, g, 0);
     var sky_n = 1.0;
     for (var k = 0; k < 9; k = k + 1) {
         if k == 4 {
@@ -117,7 +118,7 @@ fn accumulate(@builtin(global_invocation_id) gid: vec3<u32>) {
             count = count + 1;
         }
         if same_region(c.a, t.a) {
-            sky += textureLoad(sky_in, at, 0).rg;
+            sky += textureLoad(sky_in, at, 0);
             sky_n += 1.0;
         }
     }
@@ -159,7 +160,7 @@ fn accumulate(@builtin(global_invocation_id) gid: vec3<u32>) {
             // In GI texels by the grid's step, not by `dims`: the grid rounds up, so its last texel overhangs.
             let at = uv / (acc.inv_resolution * max(acc.scale, 1.0)) - 0.5;
             var old_bounce = vec3<f32>(0.0);
-            var old_sky = vec2<f32>(0.0);
+            var old_sky = vec4<f32>(0.0);
             var old_frames = 0.0;
             var weight = 0.0;
             if all(uv >= vec2<f32>(0.0)) && all(uv <= vec2<f32>(1.0)) {
@@ -173,11 +174,10 @@ fn accumulate(@builtin(global_invocation_id) gid: vec3<u32>) {
                     if !same_region(expected, a.a) {
                         continue;
                     }
-                    let b = textureLoad(history, tap, 1, 0);
                     let w = mix(1.0 - f.x, f.x, f32(d.x)) * mix(1.0 - f.y, f.y, f32(d.y)) + 1.0e-3;
                     old_bounce += a.rgb * w;
-                    old_sky += b.rg * w;
-                    old_frames += b.b * w;
+                    old_sky += textureLoad(history, tap, 1, 0) * w;
+                    old_frames += textureLoad(history, tap, 2, 0).r * w;
                     weight += w;
                 }
             }
@@ -195,10 +195,9 @@ fn accumulate(@builtin(global_invocation_id) gid: vec3<u32>) {
                     if a.a <= 0.0 || (round_index == 0 && !same_region(expected, a.a)) {
                         continue;
                     }
-                    let b = textureLoad(history, tap, 1, 0);
                     old_bounce += a.rgb;
-                    old_sky += b.rg;
-                    old_frames += b.b;
+                    old_sky += textureLoad(history, tap, 1, 0);
+                    old_frames += textureLoad(history, tap, 2, 0).r;
                     weight += 1.0;
                     borrowed = round_index == 1;
                 }
@@ -217,5 +216,6 @@ fn accumulate(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
 
     textureStore(gi_out, g, 0, vec4<f32>(bounce, c.a));
-    textureStore(gi_out, g, 1, vec4<f32>(sky, min(frames + 1.0, max(acc.sky_frames, acc.bounce_frames)), 0.0));
+    textureStore(gi_out, g, 1, sky);
+    textureStore(gi_out, g, 2, vec4<f32>(min(frames + 1.0, max(acc.sky_frames, acc.bounce_frames)), 0.0, 0.0, 0.0));
 }
