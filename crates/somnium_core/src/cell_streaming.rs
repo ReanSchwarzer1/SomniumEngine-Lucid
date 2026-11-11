@@ -298,12 +298,24 @@ pub fn plan_many(
                 unload.push(index);
             }
         } else if wanted {
-            load.push((nearest, index));
+            // A stand-in or a backdrop cell goes ahead of the near cells its distance would put it behind: it is
+            // one light mesh, and it is the far land. Nearest first alone, a start or a jump far from where the
+            // scene opens filled every near cell before any far one, and for minutes the far land was missing and
+            // its skirts hung in the sky as ribbons (Sunscar, the Vela rim: 3 of 103 far tiles in after four
+            // minutes, 11 Nov 2026).
+            let far = cell.partner.is_some() || cell.reach.is_some_and(|reach| reach >= FAR_REACH);
+            load.push((if far { nearest * FAR_AHEAD } else { nearest }, index));
         }
     }
     load.sort_by(|a, b| a.0.total_cmp(&b.0));
     (load.into_iter().map(|(_, index)| index).collect(), unload)
 }
+
+/// A cell that reaches this far (metres) is far land: a backdrop cell, a horizon ring. Stand-ins count whatever
+/// their reach.
+const FAR_REACH: f32 = 4000.0;
+/// Far land loads as if it stood at this share of its distance: 8 km away, it goes with the cells 160 m away.
+const FAR_AHEAD: f32 = 0.02;
 
 /// The most places held at once (DUAL_PROTAGONISTS needs two: a joint mission's two men). Each adds a disc of cells,
 /// and a region's first fills already reach the GPU's memory.
@@ -728,6 +740,18 @@ mod tests {
 
     fn cell(min: [f32; 2], max: [f32; 2], reach: Option<f32>) -> CellEntry {
         CellEntry { file: PathBuf::from("c.json"), min, max, reach, stands_for: None, partner: None, stand_in: None }
+    }
+
+    #[test]
+    fn far_land_loads_ahead_of_all_but_the_nearest_cells() {
+        // From (0, 500): a cell 200 m off, a backdrop cell 5 km off, a cell 10 m off.
+        let cells = vec![
+            cell([200.0, 490.0], [210.0, 510.0], None),
+            cell([5000.0, 0.0], [6000.0, 1000.0], Some(1.0e6)),
+            cell([10.0, 490.0], [20.0, 510.0], None),
+        ];
+        let (load, _) = plan_many(&cells, [0.0, 500.0], 600.0, 100.0, &[], |_| false, |_| false);
+        assert_eq!(load, vec![2, 1, 0], "what is underfoot, then the far land, then the rest");
     }
 
     #[test]
