@@ -8341,6 +8341,11 @@ impl<G: GameApp> Engine<G> {
     /// before `apply_post_process` pushes the authored values they replace.
     fn apply_time_of_day(&mut self, dt: f32) {
         self.day_state = None;
+        // Set below only by a day clock that moves the sun; every other scene keeps the renderer's defaults.
+        if let Some(r) = self.renderer.as_mut() {
+            r.sun_moving = false;
+            r.snow_sun = None;
+        }
         let Some(entity) = self
             .world
             .entities_with::<crate::time_of_day::TimeOfDayComponent>()
@@ -8374,6 +8379,12 @@ impl<G: GameApp> Engine<G> {
             return;
         }
         let mut state = tod.evaluate();
+        // A sun on the solar clock: the snow turns from the climate's sun (the fixed-sun fields), not the hour's, and
+        // while the clock runs the sky light and the clouds' capture follow the sun in small steps (renderer.rs).
+        if !tod.fixed_sun && let Some(r) = self.renderer.as_mut() {
+            r.sun_moving = self.play_session_active && tod.timescale != 0.0;
+            r.snow_sun = Some(tod.climate_sun());
+        }
 
         // Seam 4: the environment variable is an override of a real system now,
         // not the only way to place the sun. It still wins, because every

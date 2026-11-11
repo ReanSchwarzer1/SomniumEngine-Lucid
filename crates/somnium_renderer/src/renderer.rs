@@ -385,8 +385,15 @@ pub struct SomniumRenderer {
     /// Tone-mapping curve index; matches `Tonemapper::as_index`.
     pub tonemapper: u32,
     /// Snow lying on surfaces (snow.wgsl's uniform, shading group 1 binding 34); all zero is none.
-    /// Its third vector (toward the sun) is filled from the light each frame.
+    /// Its third vector (toward the sun) is filled from the light each frame, or from `snow_sun`.
     pub snow: [f32; 16],
+    /// The sun the snow turns from (its facing bias), toward the sun; `None` is the light's. A day clock sets the
+    /// climate's sun here, so snow lies where a year of suns leaves it and does not creep round the slopes by the hour.
+    pub snow_sun: Option<glam::Vec3>,
+    /// A day clock is running: the sun moves a little every frame. The sky light (`IblPass`) is then rebuilt a few
+    /// faces a frame and crossfaded, and the clouds' sky capture re-marched when the sun has turned a quarter degree,
+    /// instead of both being rebuilt whole on every change. False, the default, rebuilds on change as always.
+    pub sun_moving: bool,
     /// The snowline map's placement for snow.wgsl (x0, z0, 1 / cell, on; width, height, -, -), set by `set_snow_map`
     /// (all zero is none), and its project path as last asked for.
     pub snow_map_params: [f32; 8],
@@ -1697,6 +1704,8 @@ impl SomniumRenderer {
             render_height: ctx.config.height,
             tonemapper: 0,
             snow: [0.0; 16],
+            snow_sun: None,
+            sun_moving: false,
             snow_map_params: [0.0; 8],
             snow_map_source: String::new(),
             surfaces_ab_was_off: false,
@@ -2800,7 +2809,7 @@ impl SomniumRenderer {
         let mut snow = [0.0f32; 24];
         snow[..16].copy_from_slice(&self.snow);
         snow[16..].copy_from_slice(&self.snow_map_params);
-        snow[8..11].copy_from_slice(&self.light_direction.normalize_or_zero().to_array());
+        snow[8..11].copy_from_slice(&self.snow_sun.unwrap_or(self.light_direction).normalize_or_zero().to_array());
         // Metres per pixel per metre of distance: the snow's finer patterns fade where a pixel cannot hold them.
         snow[11] = 2.0 / (self.proj_matrix.y_axis.y.abs().max(1e-6) * self.render_height.max(1) as f32);
         // SOMNIUM_SNOW_AB=1 (measuring its cost): the layer is off for alternate 120-frame stretches, offset by 60, so a
@@ -5356,6 +5365,7 @@ impl SomniumRenderer {
             self.light_color,
             overcast,
             self.cloud_pass.sky_light_clouds(),
+            self.sun_moving,
         );
 
         // ── 1. Compute cascades and upload light buffer ───────────────────────
@@ -6622,6 +6632,7 @@ impl SomniumRenderer {
         );
         self.cloud_pass.sky_eye = self.sky_eye;
         self.cloud_pass.time = self.time;
+        self.cloud_pass.sun_moving = self.sun_moving;
         self.cloud_pass.record(
             &mut encoder,
             &ctx.queue,
