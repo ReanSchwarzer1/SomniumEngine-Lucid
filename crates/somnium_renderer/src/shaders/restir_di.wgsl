@@ -35,8 +35,10 @@ struct RestirParams {
     /// Zero when history should be ignored.
     history_valid: f32,
     camera_pos: vec3<f32>,
-    /// 1: a sun ray from the ground passes the ground's underside (`occluded`). 0 under debug view 38.
-    ground_rule: f32,
+    /// How the sun's ray is traced (`occluded`). 0: opaque, as it was (debug view 38). 1: a ray from the ground
+    /// passes the ground's underside (debug view 39, and a game that switches cut-outs off). 2: that, and every ray
+    /// passes through a cut-out's holes.
+    sun_rays: f32,
 }
 
 /// A reservoir over light samples.
@@ -64,7 +66,7 @@ struct Reservoir {
 @group(1) @binding(4) var<storage, read>       prev_reservoirs: array<Reservoir>;
 @group(1) @binding(5) var<storage, read_write> curr_reservoirs: array<Reservoir>;
 @group(1) @binding(6) var grain_masks: texture_2d_array<f32>;
-/// For `rt_alpha.wgsl`'s cut-out test, which this pass does not ask (a leaf card shadows as a whole card here).
+/// For `rt_alpha.wgsl`'s cut-out test.
 @group(1) @binding(7) var default_sampler: sampler;
 /// The visibility buffer: x = instance + 1 (0: nothing drawn), y = triangle.
 @group(1) @binding(8) var vis_tex: texture_2d<u32>;
@@ -139,24 +141,37 @@ const RAY_BIAS_FOOTPRINTS: f32 = 6.0;
 
 /// Trace a shadow ray. True when something blocks it. `ground`: the ray starts on the ground.
 fn occluded(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, ground: bool) -> bool {
-    if ground {
+    let cutouts = params.sun_rays > 1.5;
+    if ground || cutouts {
+        // Two things an opaque ray gets wrong, both seen on Sunscar's far slopes in sun (11 Nov 2026).
+        //
         // The ground is drawn at a coarser level of detail with distance and traced at its finest, so a point on
         // the drawn ground can lie under the traced one. Its sun ray then starts inside the hill and meets the
-        // ground's own underside: far sunlit slopes wore dark blocks as wide as the coarse level's cells, in steps
-        // (Sunscar, the far ground's stair-steps, 11 Nov 2026). A ray from a heightfield can only meet its top, so
-        // the underside is passed through, as GI's rays pass it (`rt_alpha.wgsl`). Everything else blocks as it
-        // did: a leaf card is still a whole card to the sun.
+        // ground's own underside: sunlit slopes wore dark bands as wide as the coarse level's cells, in steps with
+        // saw-toothed edges. A ray from a heightfield can only meet its top, so the underside is passed through, as
+        // GI's rays pass it (`rt_alpha.wgsl`).
+        //
+        // And every BLAS is opaque, so a leaf card shadowed as a whole card: dark rectangles beside every far shrub
+        // and slabs under every crown. With cut-outs on, a candidate counts only where its texel is covered.
+        rt_ground_origin = ground;
         rt_ray_dir = dir;
-        var gq: ray_query;
-        rayQueryInitialize(&gq, accel, RayDesc(0x6u, 0x1u, t_min, 10000.0, origin, dir));
-        while rayQueryProceed(&gq) {
-            let candidate = rayQueryGetCandidateIntersection(&gq);
-            let inst = instances[candidate.instance_custom_data];
-            if materials[inst.material_id].terrain_index < 0 || !rt_ground_underside(inst, candidate) {
-                rayQueryConfirmIntersection(&gq);
+        var cq: ray_query;
+        rayQueryInitialize(&cq, accel, RayDesc(0x6u, 0x1u, t_min, 10000.0, origin, dir));
+        while rayQueryProceed(&cq) {
+            let candidate = rayQueryGetCandidateIntersection(&cq);
+            var blocks = true;
+            if cutouts {
+                blocks = rt_candidate_is_covered(candidate);
+            } else {
+                let inst = instances[candidate.instance_custom_data];
+                blocks = materials[inst.material_id].terrain_index < 0 || !rt_ground_underside(inst, candidate);
+            }
+            if blocks {
+                rayQueryConfirmIntersection(&cq);
             }
         }
-        return rayQueryGetCommittedIntersection(&gq).kind != RAY_QUERY_INTERSECTION_NONE;
+        rt_ground_origin = false;
+        return rayQueryGetCommittedIntersection(&cq).kind != RAY_QUERY_INTERSECTION_NONE;
     }
     var rq: ray_query;
     rayQueryInitialize(
@@ -244,7 +259,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // ── Visibility ──────────────────────────────────────────────────────────
     // One ray, for the sample that survived resampling.
     let drawn = textureLoad(vis_tex, coord, 0);
-    let on_ground = params.ground_rule > 0.5 && drawn.x != 0u
+    let on_ground = params.sun_rays > 0.5 && drawn.x != 0u
         && materials[instances[drawn.x - 1u].material_id].terrain_index >= 0;
     if r.w > 0.0 && occluded(origin, r.sample_dir, ray_t_min, on_ground) {
         // The running total has to go with the weight. Zeroing `w` alone left

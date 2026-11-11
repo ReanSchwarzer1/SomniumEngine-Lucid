@@ -25,9 +25,9 @@ struct RestirParams {
     frame: u32,
     history_valid: f32,
     camera_pos: [f32; 3],
-    /// 1: a sun ray from the ground passes the ground's underside. 0: it does not (debug view 38, for a before and
-    /// after in one launch).
-    ground_rule: f32,
+    /// How the sun's ray is traced: 0 opaque, as it was; 1 a ray from the ground passes the ground's underside;
+    /// 2 that, and every ray passes through a cut-out's holes (`restir_di.wgsl`).
+    sun_rays: f32,
 }
 
 pub struct RestirPass {
@@ -425,8 +425,8 @@ impl RestirPass {
         camera_pos: glam::Vec3,
         sun_direction: glam::Vec3,
         sun_angular_radius: f32,
-        // Whether a sun ray from the ground passes the ground's underside: off only under debug view 38.
-        ground_rule: bool,
+        // How the sun's ray is traced: 0, 1 or 2 (`RestirParams::sun_rays`).
+        sun_rays: f32,
         width: u32,
         height: u32,
     ) {
@@ -455,7 +455,7 @@ impl RestirPass {
                 history_valid: f32::from(u8::from(self.history_valid))
                     + 2.0 * f32::from(u8::from(self.grain_enabled)),
                 camera_pos: camera_pos.to_array(),
-                ground_rule: f32::from(u8::from(ground_rule)),
+                sun_rays,
             }),
         );
 

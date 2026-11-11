@@ -468,6 +468,8 @@ pub struct SomniumRenderer {
     terrain_materials: crate::material::pool::TerrainMaterialPool,
     /// Inspector override for `SOMNIUM_SHADOW_DEBUG` (0 = use env).
     pub shading_debug: f32,
+    /// The traced sun's rays pass through a cut-out's holes (a leaf card's): on unless `SOMNIUM_SUN_CUTOUTS=0`.
+    pub sun_cutouts: bool,
     /// CONTROL-G: the named pipeline switches, seeded from the environment.
     ///
     /// The individual fields below stay as they are — every pass reads them
@@ -1775,6 +1777,7 @@ impl SomniumRenderer {
             underwater_body: None,
             camera_submersion: 0.0,
             terrain_materials,
+            sun_cutouts: std::env::var("SOMNIUM_SUN_CUTOUTS").as_deref() != Ok("0"),
             // Every other debug lever in this renderer can be set from the
             // environment; the shading debug view could only be set from the
             // editor menu, which a headless capture has no way to click. The
@@ -6294,8 +6297,15 @@ impl SomniumRenderer {
                     self.camera_pos,
                     self.light_direction,
                     self.sun_angular_radius,
-                    // Debug view 38 is the lit picture with the traced sun as it was before the ground rule.
-                    self.shading_debug != 38.0,
+                    // Debug views 38 and 39 are the lit picture with the traced sun as it was: 38 opaque rays, 39
+                    // the ground rule alone. `SOMNIUM_SUN_CUTOUTS=0` keeps a game at 39's.
+                    if self.shading_debug == 38.0 {
+                        0.0
+                    } else if self.shading_debug == 39.0 || !self.sun_cutouts {
+                        1.0
+                    } else {
+                        2.0
+                    },
                     self.render_width,
                     self.render_height,
                 );
