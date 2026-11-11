@@ -330,6 +330,10 @@ pub struct GpuTerrainMaterial {
     pub macro_octave_strength: [f32; 4],
     /// Steepness (1 - |n.y|) where the projected cliff layer starts and where it is whole (x, y); zw unused.
     pub cliff_band: [f32; 4],
+    /// Strata by height (`terrain_strata_beds`): the tile's datum texture (bindless id, the renderer's), the terrain
+    /// origin's height (the renderer's), 1 where this tile has a datum and its set a bed table, unused. Each bed's
+    /// bottom above the datum rides in its layer's `layer_albedo[..][3]`, which no shader read before.
+    pub strata: [f32; 4],
 }
 
 /// Bindless indices of one terrain's textures, filled in at creation.
@@ -353,6 +357,8 @@ pub struct TerrainTextureIds {
     pub sky_visibility: i32,
     /// Phase TSUSHIMA-E: mip-chained relief normal + Toksvig length.
     pub relief_normal: i32,
+    /// The stack's base under the tile (`TerrainData::strata_gpu`), for strata by height; -1 when there is none.
+    pub strata: i32,
 }
 
 impl Default for TerrainTextureIds {
@@ -366,6 +372,7 @@ impl Default for TerrainTextureIds {
             horizon_maps: [-1, -1],
             sky_visibility: -1,
             relief_normal: -1,
+            strata: -1,
         }
     }
 }
@@ -605,6 +612,58 @@ pub struct TerrainData {
     /// The macro tier fades in with distance ([`MACRO_FADES`]): the layer set has far colours
     /// ([`textures::has_far_colours`]).
     pub macro_fades: bool,
+    /// The set's beds: layer and bottom above the stack's base ([`textures::layer_strata`]); empty without a table.
+    pub strata_beds: Vec<(u32, f32)>,
+    /// The stack's base under this slot's tile, metres above the terrain's origin, [`STRATA_SIZE`] square over its
+    /// extent (R32Float; `None` where the device cannot filter 32-bit floats). Written when a tile with a datum is
+    /// adopted ([`read_sidecar`], `{path}.strata`).
+    pub strata_gpu: Option<(wgpu::Texture, wgpu::TextureView)>,
+    /// The tile in this slot came with a datum.
+    pub strata_ready: bool,
+}
+
+/// The strata datum's grid: 65 x 65 samples over a terrain's extent, 15.6 m apart on Sunscar's 1 km tiles. Beds are
+/// nearly level, so their base needs no finer grid; a wall's contacts follow the pixel's own height (`terrain_strata_beds`,
+/// which spells this size too).
+pub const STRATA_SIZE: u32 = 65;
+
+/// `{path}.strata` beside a sidecar: `STRA`, then `STRATA_SIZE` as a little-endian u32, then STRATA_SIZE^2
+/// little-endian f32, rows along +z, the stack's base in metres above the terrain's origin. Optional; anything else is
+/// ignored with a warning.
+fn read_strata(path: &str) -> Option<Vec<f32>> {
+    // `SOMNIUM_STRATA_DIR=E:/x` previews datums kept apart from the tiles: `{dir}/{sidecar file name}.strata`.
+    let file = match std::env::var("SOMNIUM_STRATA_DIR") {
+        Ok(dir) => {
+            let name = std::path::Path::new(path).file_name()?.to_string_lossy().into_owned();
+            format!("{dir}/{name}.strata")
+        }
+        Err(_) => format!("{path}.strata"),
+    };
+    let bytes = std::fs::read(&file).ok()?;
+    let n = STRATA_SIZE as usize;
+    if bytes.len() != 8 + n * n * 4 || &bytes[..4] != b"STRA" || bytes[4..8] != STRATA_SIZE.to_le_bytes() {
+        tracing::warn!("{path}.strata: not a {n} x {n} strata datum; the splat decides the walls");
+        return None;
+    }
+    Some(bytemuck::cast_slice::<u8, f32>(&bytes[8..]).to_vec())
+}
+
+fn upload_strata(device: &wgpu::Device) -> Option<(wgpu::Texture, wgpu::TextureView)> {
+    if !device.features().contains(wgpu::Features::FLOAT32_FILTERABLE) {
+        return None;
+    }
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Terrain Strata Datum"),
+        size: wgpu::Extent3d { width: STRATA_SIZE, height: STRATA_SIZE, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    Some((texture, view))
 }
 
 /// `TerrainMaterial::macro_mode` bit 4 on the GPU: the macro map is the layers' colours seen from afar, so the tier
@@ -958,6 +1017,9 @@ impl TerrainData {
             layer_dir: asset_dir.to_path_buf(),
             rock_mask: textures::layer_rock_mask(asset_dir),
             macro_fades: textures::has_far_colours(asset_dir),
+            strata_beds: textures::layer_strata(asset_dir),
+            strata_gpu: upload_strata(device),
+            strata_ready: false,
         }
     }
 
@@ -1268,7 +1330,19 @@ impl TerrainData {
             macro_strength: self.macro_strength,
             detail_fade_start: self.detail_fade_start,
             detail_fade_end: self.detail_fade_end.max(self.detail_fade_start + 1.0),
-            layer_albedo: self.layer_textures.mean_albedo,
+            layer_albedo: {
+                // Each bed's bottom in its layer's fourth channel, unread until now; every other layer far under.
+                let mut a = self.layer_textures.mean_albedo;
+                if !self.strata_beds.is_empty() {
+                    for layer in &mut a {
+                        layer[3] = -1.0e9;
+                    }
+                    for &(slot, bottom) in &self.strata_beds {
+                        a[slot as usize][3] = bottom;
+                    }
+                }
+                a
+            },
             parallax_steps: if self.parallax_scale > 0.0 {
                 self.parallax_steps
             } else {
@@ -1351,10 +1425,12 @@ impl TerrainData {
             cliff_band: [
                 self.cliff_band[0],
                 self.cliff_band[1].max(self.cliff_band[0] + 1e-3),
-                // The rock layers' mask as two halves, each exact in an f32 (`terrain_wall_layer` in WGSL).
-                (self.rock_mask & 0xFFFF) as f32,
-                (self.rock_mask >> 16) as f32,
+                // The rock layers' mask as two halves, each exact in an f32 (`terrain_wall_layer` in WGSL); a bed is
+                // rock by being one.
+                (self.wall_mask() & 0xFFFF) as f32,
+                (self.wall_mask() >> 16) as f32,
             ],
+            strata: [-1.0, 0.0, if self.strata_ready && !self.strata_beds.is_empty() { 1.0 } else { 0.0 }, 0.0],
         }
     }
 
@@ -1481,6 +1557,11 @@ impl TerrainData {
     /// Rebuild the splat-weighted unique-colour macro after paint or biome.
     pub fn invalidate_unique_colour(&mut self) {
         self.macro_dirty = true;
+    }
+
+    /// The layers a wall may wear: the set's rock layers and its beds.
+    fn wall_mask(&self) -> u32 {
+        self.strata_beds.iter().fold(self.rock_mask, |m, &(slot, _)| m | (1 << slot))
     }
 
     /// Fill the heightmap with procedural FBM relief (Phase 25L).
@@ -2042,7 +2123,7 @@ impl TerrainData {
         model: glam::Mat4,
         geometry_distance: f32,
     ) -> Result<(), String> {
-        let TerrainSidecar { heights, splat, foliage, dims, baked, .. } = sidecar;
+        let TerrainSidecar { heights, splat, foliage, dims, baked, strata, .. } = sidecar;
         let [tx, tz, sw, sh] = dims;
         if dims != self.sidecar_dims()
             || heights.len() != (tx * tz) as usize
@@ -2053,6 +2134,28 @@ impl TerrainData {
         self.heightmap = heights;
         self.splatmap.data = splat;
         self.painted_foliage = foliage;
+        // The tile's strata datum, or none: a slot that took a tile with one and then one without must not keep it.
+        self.strata_ready = match (&self.strata_gpu, strata) {
+            (Some((texture, _)), Some(grid)) => {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    bytemuck::cast_slice(&grid),
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(STRATA_SIZE * 4),
+                        rows_per_image: Some(STRATA_SIZE),
+                    },
+                    wgpu::Extent3d { width: STRATA_SIZE, height: STRATA_SIZE, depth_or_array_layers: 1 },
+                );
+                true
+            }
+            _ => false,
+        };
         // Maps of another size would not fit the textures they are written into, so they are rebaked instead.
         match baked {
             Some((horizon_maps, relief_maps))
@@ -2109,6 +2212,7 @@ impl TerrainData {
         self.layer_dir = asset_dir.to_path_buf();
         self.rock_mask = textures::layer_rock_mask(asset_dir);
         self.macro_fades = textures::has_far_colours(asset_dir);
+        self.strata_beds = textures::layer_strata(asset_dir);
         let tiling = textures::layer_tiling_at(asset_dir);
         for (layer, tiling) in self.layers.iter_mut().zip(tiling) {
             layer.tiling = tiling;
@@ -2175,6 +2279,8 @@ pub struct TerrainSidecar {
     pub baked: Option<(horizon::HorizonMaps, relief::ReliefMaps)>,
     /// The canopy beside it (`{path}.canopy.png`), which the horizon bake stands on the ground as an occluder.
     pub canopy: Option<horizon::Canopy>,
+    /// The strata datum beside it (`{path}.strata`, [`STRATA_SIZE`] square), if there is one.
+    pub strata: Option<Vec<f32>>,
 }
 
 impl TerrainSidecar {
@@ -2237,7 +2343,15 @@ pub fn read_sidecar(path: &str, expected: [u32; 4]) -> Result<TerrainSidecar, St
     let foliage = foliage_paint::load_instances(path)?;
     let heights = bytemuck::cast_slice::<u8, f32>(&body[..h_bytes]).to_vec();
     let splat = splat::migrate_sidecar_splat(version, &body[h_bytes..], texel_count)?;
-    Ok(TerrainSidecar { heights, splat, foliage, dims: expected, baked: None, canopy: read_canopy(path) })
+    Ok(TerrainSidecar {
+        heights,
+        splat,
+        foliage,
+        dims: expected,
+        baked: None,
+        canopy: read_canopy(path),
+        strata: read_strata(path),
+    })
 }
 
 /// foliage-render's canopy bake beside a sidecar (`{path}.canopy.png`: RGBA8 over the tile's own 1000 m, alpha the

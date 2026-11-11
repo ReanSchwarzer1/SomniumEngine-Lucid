@@ -350,7 +350,13 @@ fn evaluate_clipmap_material(
         var b = tm.cliff_layer;
         var wa = 1.0;
         var wb = 0.0;
-        if tm.cliff_band.z + tm.cliff_band.w > 0.0 {
+        let beds = terrain_strata_beds(tm, terrain_index, world_xz - tm.terrain_origin, world_xz, world_pos.y);
+        if beds.y >= 0.0 {
+            a = u32(beds.x);
+            wa = beds.y;
+            b = u32(beds.z);
+            wb = beds.w;
+        } else if tm.cliff_band.z + tm.cliff_band.w > 0.0 {
             let local_xz = world_xz - tm.terrain_origin;
             var weight = terrain_unpack_splats_painted(
                 terrain_fetch_splats(
