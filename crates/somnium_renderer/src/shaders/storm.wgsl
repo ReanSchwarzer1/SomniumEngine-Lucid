@@ -3,7 +3,8 @@
 
 /// A body: an analytic shape in world metres with the cloud noise as its detail. Kinds: 1 cell (cumulonimbus tower and
 /// anvil), 2 wall cloud, 3 shelf cloud, 4 funnel, 5 bowl (debris cloud and dust skirt), 7 shaft (rain, hail, virga),
-/// 9 hole (takes cloud from the slab; adds none).
+/// 8 ring (a wall of storm round a clear eye, with its anvil and its rain), 9 hole (takes cloud from the slab; adds
+/// none).
 struct StormVolume {
     /// xyz: its foot (y its bottom), w: kind.
     pos: vec4<f32>,

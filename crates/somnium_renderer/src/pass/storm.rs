@@ -19,6 +19,7 @@ const SHELF: f32 = 3.0;
 const FUNNEL: f32 = 4.0;
 const BOWL: f32 = 5.0;
 const SHAFT: f32 = 7.0;
+const RING: f32 = 8.0;
 const HOLE: f32 = 9.0;
 
 /// What a cloud droplet scatters of the light it meets (`CLOUD_ALBEDO` in the shader).
@@ -163,6 +164,22 @@ impl StormVolume {
         v
     }
 
+    /// A ring of storm round `base` (y the cloud's underside): a wall `half_wall` metres thick each way about
+    /// `radius`, `height` tall, leaning `lean` metres outward by its top (from inside, a stadium of cloud round a
+    /// clear eye), with an anvil reaching `anvil` metres outward from its top whose underside starts `anvil_base`
+    /// (0..1) of the way up, and rain under the wall down `rain_depth` metres at `rain` of the cloud's density.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn ring(base: glam::Vec3, radius: f32, height: f32, half_wall: f32, lean: f32, anvil: f32, anvil_base: f32, rain: f32, rain_depth: f32) -> Self {
+        let mut v = Self::new(RING, base, radius, height, 1.0, (half_wall * 4.0).clamp(600.0, 6000.0));
+        v.a = [half_wall.max(1.0), lean, anvil.max(0.0), anvil_base.clamp(0.3, 0.95)];
+        v.b = [rain.clamp(0.0, 1.0), rain_depth.max(0.0), 0.0, 0.0];
+        v.bound[2] = radius + lean.abs() + anvil.max(0.0) + half_wall * 1.6;
+        v.bound[3] = (half_wall * 0.2).max(30.0);
+        v.bound_y = [base.y - rain_depth.max(0.0), base.y + height, 0.0, 0.0];
+        v
+    }
+
     /// A hole in the cloud layer `radius` wide round `centre` (its height is not used), soft over `soft` metres: a
     /// storm's clear slot, a fallstreak hole. It takes cloud away from the slab; it adds none.
     #[must_use]
@@ -258,6 +275,10 @@ mod tests {
         assert!(top.distance(glam::Vec2::new(funnel.bound[0], funnel.bound[1])) + 220.0 <= funnel.bound[2]);
         // Its finest feature is a fraction of its thinnest radius, so the march cannot step over it.
         assert!(funnel.bound[3] <= 60.0 * 0.5);
+
+        // A ring's cylinder reaches its anvil's rim and down to the ground its rain falls on.
+        let ring = StormVolume::ring(glam::Vec3::new(0.0, 700.0, 0.0), 1250.0, 4800.0, 450.0, 500.0, 3000.0, 0.78, 0.05, 650.0);
+        assert!(ring.bound[2] >= 1250.0 + 500.0 + 3000.0 && ring.bound_y[0] <= 50.0 && ring.bound_y[1] >= 5500.0);
     }
 
     #[test]

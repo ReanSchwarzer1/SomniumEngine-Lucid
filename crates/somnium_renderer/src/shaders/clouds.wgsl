@@ -369,6 +369,36 @@ fn storm_shaft(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
     return vec2<f32>(m, 1.0);
 }
 
+/// A ring of storm: a wall round a clear eye that leans outward as it climbs (from inside, a stadium), smooth on its
+/// inner face and ragged outside, an anvil spreading outward from its top, and a curtain of rain under it.
+fn storm_ring(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
+    let h = q.y / v.size.y;
+    let rho = length(q.xz);
+    if h > 1.02 {
+        return vec2<f32>(0.0);
+    }
+    if h < 0.0 {
+        if -q.y > v.b.y || v.b.x <= 0.0 {
+            return vec2<f32>(0.0);
+        }
+        return vec2<f32>(1.0 - smoothstep(0.5, 1.0, abs(rho - v.size.x) / (v.a.x * 1.3)), 1.0);
+    }
+    let mid = v.size.x + v.a.y * h * h;
+    let s = (rho - mid) / (v.a.x * (1.0 + 0.5 * h));
+    var wall = (1.0 - smoothstep(0.75, 1.0, abs(s))) * (1.0 - smoothstep(0.93, 1.0, h)) * smoothstep(0.0, 0.02, h);
+    var fray = mix(0.25, 1.0, smoothstep(-0.5, 0.5, s));
+    if v.a.z > 0.0 && rho > mid {
+        let e = (rho - mid) / v.a.z;
+        let under = mix(v.a.w, 0.92, smoothstep(0.1, 1.0, e));
+        let anvil = (1.0 - smoothstep(0.6, 1.0, e)) * smoothstep(under - 0.02, under + 0.03, h) * (1.0 - smoothstep(0.95, 0.99, h));
+        if anvil > wall {
+            wall = anvil;
+            fray = 1.0;
+        }
+    }
+    return vec2<f32>(wall, fray);
+}
+
 /// One body's density at a world point (not a hole's: `storm_slab`).
 fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
     let q = p - v.pos.xyz;
@@ -407,6 +437,16 @@ fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
             m = storm_shaft(v, q);
             np = vec3<f32>(q.x, q.y * 0.07 + turn, q.z);
         }
+        case 8 {
+            m = storm_ring(v, q);
+            if q.y < 0.0 {
+                // Its rain, drawn out along its fall.
+                np = vec3<f32>(q.x, q.y * 0.07 + turn * 30.0, q.z);
+            } else {
+                let r = storm_rot(q.xz, turn * (1.0 - 0.5 * clamp(q.y / v.size.y, 0.0, 1.0)));
+                np = vec3<f32>(r.x, q.y, r.y);
+            }
+        }
         default {}
     }
     if m.x <= 0.0 {
@@ -422,6 +462,10 @@ fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
         let detail = textureSampleLevel(detail_noise_tex, cloud_sampler, np / (v.size.w * 0.13), 0.0);
         let fbm = detail.r * 0.625 + detail.g * 0.25 + detail.b * 0.125;
         density = clamp(cloud_remap(density, fbm * 0.3 * m.y, 1.0, 0.0, 1.0), 0.0, 1.0);
+    }
+    // A ring's rain is thin beside its cloud.
+    if v.pos.w > 7.5 && q.y < 0.0 {
+        density *= v.b.x;
     }
     return density * v.size.z;
 }

@@ -1255,7 +1255,7 @@ impl CloudPass {
             &self.noise_params,
             0,
             bytemuck::bytes_of(&NoiseParams {
-                coverage: self.settings.coverage.clamp(0.0, 1.0),
+                coverage: self.settings.coverage.clamp(0.0, 3.0),
                 cloud_type: self.settings.cloud_type.clamp(0.0, 1.0),
                 precipitation: self.settings.precipitation.clamp(0.0, 1.0),
                 #[allow(clippy::cast_precision_loss)]

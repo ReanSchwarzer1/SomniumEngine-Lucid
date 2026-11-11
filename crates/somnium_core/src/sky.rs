@@ -36,7 +36,9 @@ pub struct SkyComponent {
     /// shading-dominated; §3 makes turning this on before the profiler speaks
     /// an explicit non-goal.
     pub enabled: bool,
-    /// Fraction of the sky with cloud in it. `0` is clear, `1` is solid.
+    /// Fraction of the sky with cloud in it. `0` is clear, `1` is the weather field at its fullest, which still has
+    /// thin places a stratus sheet shows as holes; above 1 (to 3) closes them: a rain deck with no blue in it
+    /// (Sunscar weather, 11 Nov 2026).
     pub coverage: f32,
     /// `0` stratus, `0.5` cumulus, `1` cumulonimbus. Selects the vertical
     /// density profile, which is what stops a cumulus having a flat top.
@@ -215,7 +217,7 @@ impl SkyComponent {
     #[must_use]
     pub fn to_settings(&self) -> somnium_renderer::pass::clouds::CloudSettings {
         somnium_renderer::pass::clouds::CloudSettings {
-            coverage: self.coverage.clamp(0.0, 1.0),
+            coverage: self.coverage.clamp(0.0, 3.0),
             cloud_type: self.cloud_type.clamp(0.0, 1.0),
             altitude: self.altitude.max(1.0),
             thickness: self.thickness.max(1.0),
