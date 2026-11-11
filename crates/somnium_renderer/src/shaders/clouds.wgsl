@@ -82,8 +82,10 @@ struct CloudParams {
     horizon_closure: f32,
     /// How far a cloud is heaped, 0..1 (`CloudPass::heap`; `slab_density`).
     heap: f32,
-    _pad2: f32,
-    _pad3: f32,
+    /// The share of the distance marched the step grows to, and the metres over which far cloud thins into the air
+    /// (`CloudPass::far_step`, `far_fade`; 0 is off).
+    far_step: f32,
+    far_fade: f32,
     _pad4: f32,
 }
 
@@ -158,7 +160,8 @@ fn slab_density(world_pos: vec3<f32>, cheap: bool) -> f32 {
     // column's profile is read as if the layer were thinner where the cloud's cover is thin: a third at its edge.
     var profile_height = height;
     if cp.heap > 0.0 {
-        profile_height = height / mix(1.0, mix(0.3, 1.0, smoothstep(0.0, 0.55, coverage)), cp.heap);
+        // (0.18 and a wide ramp: the smallest remnants of a field stood as upright dashes at 0.3.)
+        profile_height = height / mix(1.0, mix(0.18, 1.0, smoothstep(0.1, 0.85, coverage)), cp.heap);
     }
 
     // The wind carries the *shape* as well as the weather field, and the two
@@ -917,6 +920,10 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
             break;
         }
         var step_len = select(long_step, short_step, inside);
+        if cp.far_step > 0.0 {
+            // Far cloud is small in the picture: the step grows with the distance, and the iterations reach it.
+            step_len = max(step_len, t * cp.far_step * select(1.0, 0.35, inside));
+        }
         for (var k = 0; k < hits; k = k + 1) {
             if t + step_len >= hit_enter[k] && t <= hit_exit[k] {
                 // No finer than a body's own detail, and no finer than the eye can tell at that range (a body ten
@@ -1002,7 +1009,15 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
             luminance += storm_flashes(p, density);
         }
 
-        let step_transmittance = exp(-extinction * step_len);
+        // Far cloud thins into the air in front of it (`far_fade`), and past three lengths there is none to march.
+        var thinning = 1.0;
+        if cp.far_fade > 0.0 {
+            thinning = exp(-t / cp.far_fade);
+            if thinning < 0.05 {
+                break;
+            }
+        }
+        let step_transmittance = exp(-extinction * thinning * step_len);
         // Analytic segment integration with the scattering coefficient in (sigma_s = albedo sigma_t): what the
         // segment scatters toward the eye is albedo x radiance x its opacity. Water scatters nearly all it meets;
         // a storm body may scatter less, and by colour (dust).

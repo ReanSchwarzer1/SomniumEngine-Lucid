@@ -212,8 +212,8 @@ struct CloudParams {
     brightness: f32,
     horizon_closure: f32,
     heap: f32,
-    _pad2: f32,
-    _pad3: f32,
+    far_step: f32,
+    far_fade: f32,
     _pad4: f32,
 }
 
@@ -294,6 +294,14 @@ pub struct CloudPass {
     /// the side. At 1 a cloud is as tall as the layer over its middle and a third of that at its edge, on the same
     /// flat base. A game sets it for its cumulus skies; 0, the default, is every scene before this.
     pub heap: f32,
+    /// The layer's far field (Sunscar weather, 11 Nov 2026; both 0 by default, which is every scene before this).
+    /// `far_step`: the march's step grows to this share of the distance marched (0.02), so its iterations reach the
+    /// layer tens of kilometres off, where a cloud is a few pixels; without it the layer ended in a ruled line a few
+    /// degrees over the horizon, and a broken sky cost most of its time on far empty air. `far_fade`: metres over
+    /// which far cloud thins into the air in front of it (45 km), so a field of cloud fades toward the horizon as
+    /// one does, with no line where the march stops.
+    pub far_step: f32,
+    pub far_fade: f32,
     /// Toft & Bowles' blue-noise ray-start offset, behind a switch so the
     /// evidence plan's with-and-without row is a run rather than a rebuild.
     pub jitter: bool,
@@ -937,6 +945,8 @@ impl CloudPass {
             storm: crate::pass::storm::Storm::default(),
             horizon_closure: 0.0,
             heap: 0.0,
+            far_step: 0.0,
+            far_fade: 0.0,
             storm_params: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Cloud Storm"),
                 size: std::mem::size_of::<crate::pass::storm::StormGpu>() as u64,
@@ -1509,8 +1519,8 @@ impl CloudPass {
                 brightness: s.brightness.max(0.0),
                 horizon_closure: self.horizon_closure.clamp(0.0, 1.0),
                 heap: self.heap.clamp(0.0, 1.0),
-                _pad2: 0.0,
-                _pad3: 0.0,
+                far_step: self.far_step.clamp(0.0, 0.2),
+                far_fade: self.far_fade.max(0.0),
                 _pad4: 0.0,
             }),
         );
