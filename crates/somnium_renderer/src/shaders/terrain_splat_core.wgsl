@@ -66,6 +66,9 @@ struct TerrainMaterial {
     /// Steepness where the projected cliff layer starts and is whole (`TerrainData::cliff_band`), then the rock layers'
     /// mask as two 16-bit halves (`Terrain::rock_mask`, `terrain_wall_layer`).
     cliff_band: vec4<f32>,
+    /// Strata by height (`GpuTerrainMaterial::strata`, `terrain_strata_beds`): the datum's bindless id, the terrain
+    /// origin's height, 1 where the tile has a datum, unused.
+    strata: vec4<f32>,
 }
 
 @group(0) @binding(11) var<storage, read> terrain_materials: array<TerrainMaterial>;
