@@ -25,6 +25,7 @@
 // a still.
 
 //!include "sky_eye.wgsl"
+//!include "storm.wgsl"
 
 struct CompositeParams {
     inv_view_proj: mat4x4<f32>,
@@ -59,6 +60,8 @@ struct CompositeParams {
 @group(0) @binding(1) var cloud_tex: texture_2d<f32>;
 @group(0) @binding(2) var cloud_samp: sampler;
 @group(0) @binding(3) var comp_depth: texture_depth_2d;
+/// The storm's bodies (`storm.wgsl`): they stand below the layer, in front of ground the layer is behind.
+@group(0) @binding(4) var<uniform> comp_storm: Storm;
 
 struct VOut {
     @builtin(position) clip: vec4<f32>,
@@ -91,6 +94,22 @@ fn layer_entry(origin: vec3<f32>, dir: vec3<f32>) -> f32 {
         return 1e30;
     }
     return max(enter, 0.0);
+}
+
+/// Distance along a ray to the nearest storm body's cylinder (huge if it meets none).
+fn storm_entry(origin: vec3<f32>, dir: vec3<f32>) -> f32 {
+    var nearest = 1e30;
+    for (var i = 0u; i < comp_storm.counts.x; i = i + 1u) {
+        let v = comp_storm.volumes[i];
+        if storm_is_modifier(v) {
+            continue;
+        }
+        let c = storm_cylinder(v, origin, dir);
+        if c.y > c.x {
+            nearest = min(nearest, c.x);
+        }
+    }
+    return nearest;
 }
 
 @fragment
@@ -127,7 +146,8 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // Camera-relative (`inv_view_proj` is, since 5 Nov 2026): already the offset from the eye.
     let to = wp.xyz / wp.w;
     let distance = length(to);
-    if distance <= layer_entry(comp.camera_pos, to / max(distance, 1e-6)) {
+    let toward = to / max(distance, 1e-6);
+    if distance <= min(layer_entry(comp.camera_pos, toward), storm_entry(comp.camera_pos, toward)) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
 

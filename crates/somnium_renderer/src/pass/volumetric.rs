@@ -79,6 +79,21 @@ mod tests {
         assert_eq!(std::mem::size_of::<VolumetricParams>() % 16, 0);
     }
 
+    /// A weather transition moves the fog a little each frame; a preset change or a new range starts the volume again.
+    #[test]
+    fn a_small_step_in_the_fog_is_eased_and_a_jump_is_not() {
+        let at = |density: f32, base: f32, shafts: u32, range: f32| {
+            [density.to_bits(), 0.6_f32.to_bits(), 120.0_f32.to_bits(), base.to_bits(), shafts, 1.5_f32.to_bits(),
+             0.0_f32.to_bits(), 1.0_f32.to_bits(), 0.0_f32.to_bits(), 8.0_f32.to_bits(), range.to_bits()]
+        };
+        let was = at(0.0100, 300.0, 1, 1200.0);
+        assert!(super::eased(&was, &at(0.0103, 300.4, 1, 1200.0)));
+        assert!(!super::eased(&was, &at(0.0200, 300.0, 1, 1200.0)), "density doubled");
+        assert!(!super::eased(&was, &at(0.0100, 340.0, 1, 1200.0)), "the fog moved 40 m");
+        assert!(!super::eased(&was, &at(0.0100, 300.0, 0, 1200.0)), "shafts switched");
+        assert!(!super::eased(&was, &at(0.0100, 300.0, 1, 2400.0)), "the range changed");
+    }
+
     #[test]
     fn jittered_strata_are_strictly_ordered() {
         for jitter in [0.0_f32, 0.25, 0.618_034, 0.999_999] {
@@ -88,6 +103,20 @@ mod tests {
             assert!(a < b && a >= 0.0 && b < 1.0);
         }
     }
+}
+
+/// Whether one frame's fog settings are a small step from the last's (`VolumetricPass::eased_settings`): the switches
+/// and the range the same, every level within a twentieth or a small absolute step (two metres for the heights).
+fn eased(last: &[u32; 11], now: &[u32; 11]) -> bool {
+    // By index in `record`'s `settings`: 4 the shafts switch, 10 the range; 3 and 8 the base and top heights.
+    (0..11).all(|i| {
+        let (a, b) = (f32::from_bits(last[i]), f32::from_bits(now[i]));
+        match i {
+            4 | 10 => last[i] == now[i],
+            3 | 8 | 9 => (a - b).abs() <= 2.0,
+            _ => (a - b).abs() <= (a.abs() * 0.05).max(1e-5),
+        }
+    })
 }
 
 /// Artist-facing settings for the fog medium.
@@ -164,6 +193,10 @@ pub struct VolumetricPass {
     history_valid: bool,
     frame: u32,
     last_settings: Option<[u32; 11]>,
+    /// Weather eases the fog a little every frame (Sunscar, 11 Nov 2026): with this on, a small step in density,
+    /// height or top keeps last frame's volume, which a bit-for-bit change would throw away every frame of a
+    /// transition (the fog then never settles and shimmers). Off, any change starts the volume again, as before.
+    pub eased_settings: bool,
     pub enabled: bool,
     pub fog: FogSettings,
     pub max_distance: f32,
@@ -385,6 +418,7 @@ impl VolumetricPass {
             history_valid: false,
             frame: 0,
             last_settings: None,
+            eased_settings: false,
             // `SOMNIUM_VOLUMETRICS=0` switches the whole volume off, which is
             // the A/B both sub-phases are judged by.
             enabled: std::env::var("SOMNIUM_VOLUMETRICS").as_deref() != Ok("0"),
@@ -542,7 +576,7 @@ impl VolumetricPass {
             // A new range moves every slice: last frame's volume no longer lines up.
             self.max_distance.to_bits(),
         ];
-        if self.last_settings.is_some_and(|last| last != settings) {
+        if self.last_settings.is_some_and(|last| last != settings && !(self.eased_settings && eased(&last, &settings))) {
             self.history_valid = false;
         }
         self.last_settings = Some(settings);

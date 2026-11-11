@@ -276,6 +276,9 @@ pub struct CloudPass {
     /// to hold. `None` when the variable is unset, which is the ordinary case.
     pub env_override: Option<bool>,
     pub settings: CloudSettings,
+    /// Storm bodies and lightning for this frame (`storm.rs`; Sunscar weather, 11 Nov 2026). A game sets it; empty
+    /// is every scene that asks for none.
+    pub storm: crate::pass::storm::Storm,
     /// Toft & Bowles' blue-noise ray-start offset, behind a switch so the
     /// evidence plan's with-and-without row is a run rather than a rebuild.
     pub jitter: bool,
@@ -295,6 +298,9 @@ pub struct CloudPass {
     pub shadow_params: wgpu::Buffer,
     sampler: wgpu::Sampler,
     cloud_params: wgpu::Buffer,
+    /// `clouds.wgsl`'s `Storm`, and whether it already holds an empty one (then it is not written again).
+    storm_params: wgpu::Buffer,
+    storm_cleared: bool,
     noise_params: wgpu::Buffer,
     composite_params: wgpu::Buffer,
 
@@ -673,6 +679,16 @@ impl CloudPass {
                     count: None,
                 },
                 tex_3d(11),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 17,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let march_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -708,6 +724,16 @@ impl CloudPass {
                         access: wgpu::StorageTextureAccess::WriteOnly,
                         format: wgpu::TextureFormat::Rgba16Float,
                         view_dimension: wgpu::TextureViewDimension::D2Array,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 17,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
                     count: None,
                 },
@@ -824,6 +850,17 @@ impl CloudPass {
                     },
                     count: None,
                 },
+                // The storm's bodies: ground they stand in front of takes them (`storm_entry`).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let composite_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -882,6 +919,15 @@ impl CloudPass {
                 _ => None,
             },
             settings: CloudSettings::default(),
+            storm: crate::pass::storm::Storm::default(),
+            storm_params: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Cloud Storm"),
+                size: std::mem::size_of::<crate::pass::storm::StormGpu>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                // Zeroed: no bodies, no lights.
+                mapped_at_creation: false,
+            }),
+            storm_cleared: true,
             jitter: std::env::var("SOMNIUM_CLOUD_JITTER").as_deref() != Ok("0"),
             upsample_depth_sigma: 0.002,
             sky_eye: crate::SkyEyeParams::default(),
@@ -1028,6 +1074,7 @@ impl CloudPass {
                     entry(6, wgpu::BindingResource::TextureView(multiscatter)),
                     entry(7, wgpu::BindingResource::Sampler(lut_sampler)),
                     entry(16, wgpu::BindingResource::TextureView(&self.env_storage_view)),
+                    entry(17, self.storm_params.as_entire_binding()),
                 ],
             }));
         }
@@ -1084,6 +1131,10 @@ impl CloudPass {
                         binding: 11,
                         resource: wgpu::BindingResource::TextureView(volumetrics),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 17,
+                        resource: self.storm_params.as_entire_binding(),
+                    },
                 ],
             }));
         }
@@ -1108,6 +1159,10 @@ impl CloudPass {
                         wgpu::BindGroupEntry {
                             binding: 3,
                             resource: wgpu::BindingResource::TextureView(depth),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: self.storm_params.as_entire_binding(),
                         },
                     ],
                 }));
@@ -1157,6 +1212,10 @@ impl CloudPass {
                     wgpu::BindGroupEntry {
                         binding: 3,
                         resource: wgpu::BindingResource::TextureView(depth),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.storm_params.as_entire_binding(),
                     },
                 ],
             }));
@@ -1386,6 +1445,10 @@ impl CloudPass {
         // Before the bind group is borrowed: `ensure_fields` needs `&mut self`
         // and the borrow checker is right to insist the two do not overlap.
         self.ensure_fields(encoder, queue);
+        if !(self.storm.is_empty() && self.storm_cleared) {
+            queue.write_buffer(&self.storm_params, 0, bytemuck::bytes_of(&self.storm.pack()));
+            self.storm_cleared = self.storm.is_empty();
+        }
 
         let s = &self.settings;
         queue.write_buffer(

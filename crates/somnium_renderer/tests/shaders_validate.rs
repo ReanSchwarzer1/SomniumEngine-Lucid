@@ -88,6 +88,9 @@ fn every_composed_root_validates() {
         "clipmap_gen.wgsl",
         "volumetric.wgsl",
         "clouds.wgsl",
+        // 11 Nov 2026: lightning's channels (Sunscar weather).
+        "lightning.wgsl",
+        "precipitation.wgsl",
         "atmosphere_lut.wgsl",
         "ibl_gen.wgsl",
         "dof.wgsl",
