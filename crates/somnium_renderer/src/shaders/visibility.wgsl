@@ -1,5 +1,6 @@
 // Visibility Buffer - Rasterization Pass
 //!include "wind.wgsl"
+//!include "thin_strip.wgsl"
 //!include "depth_tie.wgsl"
 //!include "terrain_morph.wgsl"
 
@@ -39,7 +40,7 @@ struct View {
     time:          f32,
     lod_scale:     f32,  // see global_pool.wgsl
     depth_tie_slope: f32,  // pass/visibility.rs `depth_tie_slope`
-    _time_pad2:    f32,
+    strip_pixel:   f32,  // thin_strip.wgsl; 0 = off
     wind:          vec4<f32>,
     wind_time:     vec4<f32>,
 }
@@ -131,6 +132,8 @@ struct VertexOutput {
     // How much of an instance-batch copy shows across its LOD hand-over: 1 all (no hand-over), w in 0..1 a copy
     // fading out, -w one fading in (`foliage_fade_weight`). Alpha-tested parts dither by it in `fs_main`.
     @location(4) @interpolate(flat) fade: f32,
+    // A thin strip's true share of its widened width (`thin_strip.wgsl`); 1 for everything else.
+    @location(5) @interpolate(flat) strip_cover: f32,
 }
 
 // LOD hand-over of instance-batch copies (Sunscar, 6 Nov 2026; instance.rs `foliage_fade`, kept in step with
@@ -170,6 +173,7 @@ fn vs_main(
     out.uv = vec2<f32>(vertex.u, vertex.v);
     out.material_id = instance.material_id;
     var world = (instance.model * vec4<f32>(pos, 1.0)).xyz;
+    var strip_cover = 1.0;
     // Foliage wind. Terrain (packed != 0) never sways. The same displacement
     // runs in shadow.wgsl, the shading pass's reconstruction and velocity.wgsl.
     let handover = foliage_fade_word(packed);
@@ -177,6 +181,22 @@ fn vs_main(
         let m = materials[instance.material_id];
         world += wind_offset(world, instance.model[3].xyz, m.wind_bend, m.wind_flutter,
                              view.wind_time.x, view.wind, view.camera_pos);
+        // A strip under a pixel is drawn a pixel wide and kept by its coverage (`thin_strip.wgsl`): this corner's
+        // share of its own triangle's widening, from the triangle's rest pose as the shading pass rebuilds it.
+        if thin_strip_applies(view.strip_pixel, m.wind_bend, m.wind_flutter) {
+            let base = instance.index_offset + (v_idx / 3u) * 3u;
+            let q0 = vertices[instance.vertex_offset + indices[base]];
+            let q1 = vertices[instance.vertex_offset + indices[base + 1u]];
+            let q2 = vertices[instance.vertex_offset + indices[base + 2u]];
+            let ts = thin_strip((instance.model * vec4<f32>(q0.pos_x, q0.pos_y, q0.pos_z, 1.0)).xyz,
+                                (instance.model * vec4<f32>(q1.pos_x, q1.pos_y, q1.pos_z, 1.0)).xyz,
+                                (instance.model * vec4<f32>(q2.pos_x, q2.pos_y, q2.pos_z, 1.0)).xyz,
+                                vec2<f32>(q0.u, q0.v), vec2<f32>(q1.u, q1.v), vec2<f32>(q2.u, q2.v),
+                                view.camera_pos, view.strip_pixel);
+            let k = v_idx % 3u;
+            world += select(select(ts.o2, ts.o1, k == 1u), ts.o0, k == 0u);
+            strip_cover = ts.coverage;
+        }
     }
     out.clip_pos = depth_tie_clip(view.view_proj, world, view.camera_pos);
     // Ties between faces in one plane go the same way every frame (`depth_ties`), in steps sized for this plane.
@@ -193,6 +213,7 @@ fn vs_main(
     out.instance_id = inst_idx;
     out.prim_id = v_idx / 3u;
     out.fade = 1.0;
+    out.strip_cover = strip_cover;
     if handover {
         let w = foliage_fade_weight(packed, distance(instance.model[3].xz, view.camera_pos.xz));
         // Opaque parts (bark) switch at the edge, whole: two trunks dithered into each other would only shimmer,
@@ -215,6 +236,7 @@ fn fs_main(
     @location(2) uv: vec2<f32>,
     @location(3) @interpolate(flat) material_id: u32,
     @location(4) @interpolate(flat) fade: f32,
+    @location(5) @interpolate(flat) strip_cover: f32,
 ) -> @location(0) vec2<u32> {
     // Derivatives are taken at top level, where control flow is uniform, and
     // fed to textureSampleGrad below. Sampling inside the branch directly would
@@ -231,6 +253,16 @@ fn fs_main(
         let step = f32(u32(view.time * 60.0) % 64u);
         let n = fract(52.9829189 * fract(dot(frag.xy + 5.588238 * step, vec2<f32>(0.06711056, 0.00583715))));
         if (fade >= 0.0 && n >= fade) || (fade < 0.0 && n <= 1.0 + fade) {
+            discard;
+        }
+    }
+    // A thin strip drawn wider than it is keeps a pixel with its coverage, on a noise that moves every frame so TAA
+    // turns it into the faint line the strip is (`thin_strip.wgsl`).
+    if strip_cover < 1.0 {
+        let step = f32(u32(view.time * 60.0) % 64u);
+        let n = fract(52.9829189 * fract(dot(frag.xy + 5.588238 * step + vec2<f32>(37.0, 11.0),
+                                             vec2<f32>(0.06711056, 0.00583715))));
+        if n >= strip_cover {
             discard;
         }
     }

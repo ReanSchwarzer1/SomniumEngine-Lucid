@@ -239,6 +239,10 @@ pub struct SomniumRenderer {
     pub time: f32,
     /// Foliage wind (`wind.rs`), set by the scene's weather.
     pub foliage_wind: crate::wind::FoliageWind,
+    /// The thinnest a foliage strip is drawn, in pixels (`thin_strip.wgsl`): grass culms and twigs under it are
+    /// widened to it and kept by their coverage. 0 (the default) leaves every strip as it is; `set_min_strip_px`,
+    /// or `SOMNIUM_MIN_STRIP_PX` at start for a trial.
+    min_strip_px: f32,
     /// The wind's own clock, advanced by wall time once per frame so plants
     /// sway in the editor as well as in Play; `.1` is last frame's value, for
     /// motion vectors.
@@ -1636,6 +1640,8 @@ impl SomniumRenderer {
             camera_pos: glam::Vec3::ZERO,
             time: 0.0,
             foliage_wind: crate::wind::FoliageWind::default(),
+            min_strip_px: std::env::var("SOMNIUM_MIN_STRIP_PX").ok().and_then(|v| v.parse::<f32>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0).unwrap_or(0.0),
             wind_clock: (0.0, 0.0),
             wind_clock_at: None,
             brdf_multiscatter: brdf_term_enabled("SOMNIUM_TERRAIN_BRDF_MS"),
@@ -2802,7 +2808,13 @@ impl SomniumRenderer {
         view_data.extend_from_slice(bytemuck::bytes_of(&debug_flag));
         view_data.extend_from_slice(bytemuck::bytes_of(&self.time));
         let tie_slope = crate::pass::visibility::depth_tie_slope(&self.proj_matrix, self.render_height);
-        view_data.extend_from_slice(bytemuck::bytes_of(&[self.fsr_pass.lod_scale(), tie_slope, 0.0]));
+        // A pixel's angle (at the render resolution) times the thinnest strip, for `thin_strip.wgsl`; 0 = off.
+        let strip_pixel = if self.min_strip_px > 0.0 && self.proj_matrix.z_axis.w != 0.0 {
+            2.0 / (self.proj_matrix.y_axis.y * self.render_height.max(1) as f32) * self.min_strip_px
+        } else {
+            0.0
+        };
+        view_data.extend_from_slice(bytemuck::bytes_of(&[self.fsr_pass.lod_scale(), tie_slope, strip_pixel]));
         let mut wind = self.foliage_wind;
         let budget = self.graphics_budget();
         if !budget.foliage_wind {
@@ -2815,6 +2827,13 @@ impl SomniumRenderer {
         // viewport's near-eye rays use it too. Per-slot cameras when a multi-view editor needs them.
         view_data.extend_from_slice(bytemuck::bytes_of(&self.view_proj_rel.inverse().to_cols_array()));
         view_data
+    }
+
+    /// The thinnest a foliage strip is drawn, in pixels (`thin_strip.wgsl`): a grass culm or a twig under it is
+    /// widened to it and kept by its coverage, so it fades with its seed head or crown instead of vanishing first.
+    /// 0 turns it off (the default).
+    pub fn set_min_strip_px(&mut self, px: f32) {
+        self.min_strip_px = if px.is_finite() { px.max(0.0) } else { 0.0 };
     }
 
     /// The scene's wind for plants: velocity over the ground (m/s, x and z)

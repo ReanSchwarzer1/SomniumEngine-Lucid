@@ -5,6 +5,7 @@
 //!include "sampling.wgsl"
 //!include "terrain_splat_core.wgsl"
 //!include "wind.wgsl"
+//!include "thin_strip.wgsl"
 
 enable wgpu_ray_query;
 
@@ -300,6 +301,17 @@ fn pt_primary(coord: vec2<i32>, origin: vec3<f32>, ndc: vec2<f32>, textured: boo
         p0 += wind_offset(p0, pivot, mat.wind_bend, mat.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
         p1 += wind_offset(p1, pivot, mat.wind_bend, mat.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
         p2 += wind_offset(p2, pivot, mat.wind_bend, mat.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
+        // A thin strip widened as the visibility pass drew it (thin_strip.wgsl).
+        if thin_strip_applies(view.strip_pixel, mat.wind_bend, mat.wind_flutter) {
+            let ts = thin_strip((inst.model * vec4<f32>(v0.pos_x, v0.pos_y, v0.pos_z, 1.0)).xyz,
+                                (inst.model * vec4<f32>(v1.pos_x, v1.pos_y, v1.pos_z, 1.0)).xyz,
+                                (inst.model * vec4<f32>(v2.pos_x, v2.pos_y, v2.pos_z, 1.0)).xyz,
+                                vec2<f32>(v0.u, v0.v), vec2<f32>(v1.u, v1.v), vec2<f32>(v2.u, v2.v),
+                                view.camera_pos, view.strip_pixel);
+            p0 += ts.o0;
+            p1 += ts.o1;
+            p2 += ts.o2;
+        }
     }
     // Barycentrics exactly as the raster finds them (shading.wgsl `vis_barycentric`, `ray_barycentric` near the eye),
     // here and one pixel across and down, for the texture's gradients: sampled at full detail everywhere, a floor or a
