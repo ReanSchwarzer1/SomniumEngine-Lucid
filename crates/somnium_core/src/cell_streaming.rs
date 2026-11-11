@@ -581,8 +581,11 @@ pub struct CellStreamer {
     pub(crate) ground_retries: HashMap<usize, GroundRetry>,
     /// How many sources and grounds are read at once, over all the cells being read.
     pub(crate) gate: std::sync::Arc<ReadGate>,
-    /// Main-thread time spent uploading sources and installing cells, for the first fill's log line.
-    pub(crate) spent: [std::time::Duration; 2],
+    /// Main-thread time spent uploading sources and installing cells, then the install's steps (spawning, the
+    /// ground, the GPU state, the whole-world passes), for the first fill's log line.
+    pub(crate) spent: [std::time::Duration; 6],
+    /// Textures a streamed source had to compress on the main thread (not in the BC7 cache), and the seconds it took.
+    pub(crate) encoded: (u32, f64),
 }
 
 /// The readers' turnstile: a cell's sources are read side by side, and this bounds how many are being read at once
@@ -646,6 +649,18 @@ pub(crate) const READERS: usize = 4;
 /// seconds, and the rest streamed in over the first minutes of play (Sunscar, 11 Nov 2026).
 pub(crate) fn fill_readers() -> usize {
     std::thread::available_parallelism().map_or(READERS, |cores| cores.get().saturating_sub(2)).clamp(READERS, 12)
+}
+
+/// Free a value on a thread kept for it. A decoded source is tens to hundreds of megabytes of pixels and vertices,
+/// and a first fill takes thousands of them: giving that memory back is not the main thread's work.
+pub(crate) fn free_elsewhere<T: Send + 'static>(value: T) {
+    static FREES: std::sync::LazyLock<std::sync::mpsc::Sender<Box<dyn Send>>> = std::sync::LazyLock::new(|| {
+        let (send, receive) = std::sync::mpsc::channel::<Box<dyn Send>>();
+        std::thread::spawn(move || receive.into_iter().for_each(drop));
+        send
+    });
+    // With the thread gone the value is dropped here, as it would have been.
+    let _ = FREES.send(Box::new(value));
 }
 
 /// RGBA8 bytes of decoded images the readers share while anything is being read

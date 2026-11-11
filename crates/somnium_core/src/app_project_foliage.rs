@@ -72,6 +72,7 @@ impl<G: GameApp> Engine<G> {
                         })
                         .collect();
                     self.project_foliage_sources.insert(source, parts);
+                    crate::cell_streaming::free_elsewhere(scene);
                     uploaded = true;
                 }
                 (Ok(_), None) => {}

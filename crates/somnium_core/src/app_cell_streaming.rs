@@ -18,6 +18,9 @@ const FIRST_FILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(90)
 /// How often a first fill asks for the palette kinds its tiles draw. The ask walks every kind of every tile in: after
 /// each piece that arrived, it ran thousands of times in a fill.
 const PALETTE_ASK: std::time::Duration = std::time::Duration::from_millis(250);
+/// How often a first fill hands its staged uploads to the GPU and waits for them: often enough that the copies
+/// staged in between stay small, not after every piece.
+const FILL_FLUSH: std::time::Duration = std::time::Duration::from_millis(100);
 /// Retired terrain slots made at the end of a first fill, for tiles that stream in later ([`Engine::warm_terrain_slots`]).
 const SPARE_TERRAIN_SLOTS: usize = 4;
 
@@ -94,20 +97,25 @@ impl<G: GameApp> Engine<G> {
             // the readers, and the palette's asks and uploads.
             let mut spent = [std::time::Duration::ZERO; 4];
             self.cell_streamer.spent = Default::default();
+            self.cell_streamer.encoded = Default::default();
             let mut asked: Option<std::time::Instant> = None;
+            let mut flushed = std::time::Instant::now();
             // Round the readers without a frame budget, so all of them keep decoding while this thread uploads.
             while (!self.cell_streamer.reading.is_empty() || palette) && started.elapsed() < FIRST_FILL_LIMIT {
                 let round = std::time::Instant::now();
                 if self.pump_cell_reads(usize::MAX) {
                     spent[0] += round.elapsed();
-                    let flush = std::time::Instant::now();
                     // Uploads stage CPU copies until a submit; a fill is many frames' uploads in one, so it flushes as
                     // it goes (a 7-window Tyffir peaked at 15.8 of 16 GB without this).
-                    if let Some((renderer, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref()) {
+                    if flushed.elapsed() >= FILL_FLUSH
+                        && let Some((renderer, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref())
+                    {
+                        let flush = std::time::Instant::now();
                         ctx.queue.submit(std::iter::empty());
                         renderer.wait_gpu(ctx);
+                        spent[1] += flush.elapsed();
+                        flushed = std::time::Instant::now();
                     }
-                    spent[1] += flush.elapsed();
                 } else {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                     spent[2] += round.elapsed();
@@ -133,6 +141,15 @@ impl<G: GameApp> Engine<G> {
                 uploading = format!("{:.1}", spent[0].as_secs_f64()),
                 sources = format!("{:.1}", self.cell_streamer.spent[0].as_secs_f64()),
                 installs = format!("{:.1}", self.cell_streamer.spent[1].as_secs_f64()),
+                install_steps = format!(
+                    "spawn {:.1} ground {:.1} gpu {:.1} world {:.1}",
+                    self.cell_streamer.spent[2].as_secs_f64(),
+                    self.cell_streamer.spent[3].as_secs_f64(),
+                    self.cell_streamer.spent[4].as_secs_f64(),
+                    self.cell_streamer.spent[5].as_secs_f64()
+                ),
+                textures_encoded = self.cell_streamer.encoded.0,
+                encode_seconds = format!("{:.1}", self.cell_streamer.encoded.1),
                 palette = format!("{:.1}", spent[3].as_secs_f64()),
                 gpu_wait = format!("{:.1}", spent[1].as_secs_f64()),
                 readers_wait = format!("{:.1}", spent[2].as_secs_f64()),
@@ -330,6 +347,7 @@ impl<G: GameApp> Engine<G> {
                         self.zone_begin("Cell source upload");
                         self.upload_streamed_source(&path, &parts, &scene, prepared);
                         self.zone_end();
+                        cells::free_elsewhere(scene);
                         self.cell_streamer.spent[0] += uploading.elapsed();
                     }
                     Ok(Piece::Cell(parsed, terrains)) => {
@@ -391,7 +409,11 @@ impl<G: GameApp> Engine<G> {
         let Some((renderer, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref()) else {
             return;
         };
+        let before = renderer.texture_upload_stats;
         let nodes = renderer.upload_prepared_scene_for(ctx, scene, Some(parts), prepared);
+        let after = renderer.texture_upload_stats;
+        self.cell_streamer.encoded.0 += after.encoded.saturating_sub(before.encoded);
+        self.cell_streamer.encoded.1 += (after.encode_ms - before.encode_ms).max(0.0) / 1000.0;
         if let Some(stamp) = stamp {
             self.imported_uploads.insert(stamp, &nodes, Some(parts.clone()));
         }
@@ -411,12 +433,14 @@ impl<G: GameApp> Engine<G> {
         for (saved_id, read) in terrains {
             sidecars.insert(saved_id, read.map_err(|error| format!("terrain {saved_id}: {error}"))?);
         }
+        let step = std::time::Instant::now();
         self.zone_begin("Cell spawn");
         // The edit layer's entries for this cell (and moves not yet saved) go in before it spawns.
         let edited = self.edits_before_cell_spawn(index, document);
         let report =
             crate::scene_schema::scene_from_json(&mut self.world, &self.type_registry, edited.as_ref().unwrap_or(document));
         self.zone_end();
+        self.cell_streamer.spent[2] += step.elapsed();
         let report = report.map_err(|error| error.to_string())?;
         self.zone_begin("Cell sources");
         // Which uploads this cell keeps alive (for eviction once no loaded cell draws them).
@@ -434,18 +458,24 @@ impl<G: GameApp> Engine<G> {
         for &entity in &report.entities {
             let _ = self.world.insert_component(entity, Streamed { cell });
         }
+        let step = std::time::Instant::now();
         self.zone_begin("Cell terrain");
         self.adopt_cell_terrains(index, &report.entities, sidecars);
         self.zone_end();
+        self.cell_streamer.spent[3] += step.elapsed();
+        let step = std::time::Instant::now();
         self.zone_begin("Cell GPU restore");
         self.restore_entity_gpu(&report.entities);
         self.zone_end();
+        self.cell_streamer.spent[4] += step.elapsed();
+        let step = std::time::Instant::now();
         // ponytail: both passes walk the whole world once per installed cell; per-entity variants if they show up in
         // a profile (their own zone says).
         self.zone_begin("Cell whole-world passes");
         self.sync_authored_material_components();
         crate::propagate_transforms(&mut self.world);
         self.zone_end();
+        self.cell_streamer.spent[5] += step.elapsed();
         self.cell_streamer.loaded.insert(index, report.entities);
         Ok(())
     }
