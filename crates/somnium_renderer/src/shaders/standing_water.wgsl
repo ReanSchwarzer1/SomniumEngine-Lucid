@@ -66,7 +66,7 @@ fn sw_rings(xz: vec2<f32>, time: f32, rate: f32) -> vec2<f32> {
             tilt += off / max(d, 1e-4) * ring;
         }
     }
-    return tilt * 0.9;
+    return tilt * 0.45;
 }
 
 /// Water standing on the ground at `world`. `geo_n` is the ground's own normal (water stands only where it is nearly
@@ -104,7 +104,9 @@ fn apply_standing_water(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>,
     // into its blurred levels only), so a mirror here shows blue sky under an overcast: first stills, 11 Nov. At
     // this roughness the pool shows the deck, a little soft; rain roughens it further. A mirror needs the deck in
     // what reflections see.
-    s.albedo = mix(s.albedo, s.albedo * 0.5, water);
+    // (The lead's review, 16:30: pools read as snow. Seen from above a pool is darker than the wet ground round it;
+    // it is bright only at a grazing angle, by Fresnel. A darker bed, and rings that tilt it less.)
+    s.albedo = mix(s.albedo, s.albedo * 0.35, water);
     s.normal = normalize(mix(s.normal, up, water));
     s.roughness = mix(s.roughness, mix(0.16, 0.22, saturate(rain * 2.0)), water);
     s.metallic = mix(s.metallic, 0.0, water);
