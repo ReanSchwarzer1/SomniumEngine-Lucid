@@ -283,3 +283,15 @@ fn fs_prefilter(in: VOut) -> @location(0) vec4<f32> {
     }
     return vec4(total / max(weight, 1e-4), 1.0);
 }
+
+// ─── Crossfade (a running day clock, `IblPass::step_moving`) ─────────────────
+
+// One face and mip of the cube built for the newest sun, read texel for texel; the pipeline blends it over the same
+// face and mip of the cube everything reads by a constant share, so the sky light walks to the new sky in straight
+// steps too small to see instead of jumping to it.
+@group(0) @binding(7) var blend_src: texture_2d<f32>;
+
+@fragment
+fn fs_blend(in: VOut) -> @location(0) vec4<f32> {
+    return textureLoad(blend_src, vec2<i32>(in.clip.xy), 0);
+}

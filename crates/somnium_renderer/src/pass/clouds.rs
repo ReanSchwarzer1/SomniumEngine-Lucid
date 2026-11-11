@@ -47,6 +47,9 @@ const WEATHER_SIZE: u32 = 512;
 const ENV_SIZE: u32 = 64;
 /// Seconds between sky-light cloud captures while nothing about the sky changes (the deck drifts with the wind).
 const ENV_REFRESH_SECONDS: f32 = 4.0;
+/// While a day clock runs (`sun_moving`), the sky-light capture is marched again once the sun has turned this far
+/// from the one it was marched under (cos 0.25 degrees): every 2.5 s at a day an hour, not every frame.
+const ENV_MOVING_SUN_COS: f32 = 0.999_990_5;
 /// World-XZ cloud shadow resolution.
 const SHADOW_SIZE: u32 = 512;
 /// Default fraction of the scene resolution the march runs at.
@@ -269,6 +272,9 @@ pub struct CloudPass {
     /// renderer each frame), and the clock its flames run on.
     pub sky_eye: crate::SkyEyeParams,
     pub time: f32,
+    /// A day clock is running (`Renderer::sun_moving`): the sky-light capture follows the sun by quarter degrees
+    /// (`ENV_MOVING_SUN_COS`) rather than on every change of it.
+    pub sun_moving: bool,
     // ── Authoring ────────────────────────────────────────────────────────────
     /// Off until the `.somtime` row exists. See the module header.
     ///
@@ -985,6 +991,7 @@ impl CloudPass {
             env_generation: 0,
             env_at: 0.0,
             env_key: None,
+            sun_moving: false,
             shadow_pipeline,
             composite_layout,
             composite_bind_groups: [None, None],
@@ -1593,7 +1600,14 @@ impl CloudPass {
         });
         // The sky light's clouds: when the sky changed, and every few seconds as the deck drifts. The IBL reads the
         // cube next frame, once this encoder has run (`sky_light_clouds`).
-        let env_key = Some((self.settings, sun_direction.normalize_or_zero().to_array()));
+        // A running clock moves the sun every frame: the capture keeps the sun it was marched under until it has
+        // turned a quarter degree, so the key changes then and not on every frame.
+        let sun_now = sun_direction.normalize_or_zero();
+        let sun_key = match self.env_key {
+            Some((_, marched)) if self.sun_moving && glam::Vec3::from(marched).dot(sun_now) >= ENV_MOVING_SUN_COS => marched,
+            _ => sun_now.to_array(),
+        };
+        let env_key = Some((self.settings, sun_key));
         if let Some(env) = self.env_bind_group.as_ref()
             && (self.env_key != env_key || self.env_generation == 0 || !(0.0..ENV_REFRESH_SECONDS).contains(&(self.time - self.env_at)))
         {

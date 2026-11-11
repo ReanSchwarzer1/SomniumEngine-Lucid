@@ -1218,6 +1218,7 @@ fn time_of_day_schema() -> ComponentSchema {
             day_of_year { min: 1, max: 366, group: "Clock", display_name: "Day of Year" },
             latitude { min: -90.0, max: 90.0, step: 0.5, precision: 2, unit: "\u{b0}", group: "Location" },
             longitude { min: -180.0, max: 180.0, step: 0.5, precision: 2, unit: "\u{b0}", group: "Location" },
+            north_offset { min: -180.0, max: 180.0, step: 0.5, precision: 1, unit: "\u{b0}", group: "Location", display_name: "North Offset" },
             timescale { min: 0.0, soft_max: 60.0, step: 0.1, precision: 2, unit: "h/s", group: "Clock" },
             sun_color { group: "Tracks", display_name: "Sun Colour" },
             sun_intensity { group: "Tracks", min: 0.0, max: 130000.0,
