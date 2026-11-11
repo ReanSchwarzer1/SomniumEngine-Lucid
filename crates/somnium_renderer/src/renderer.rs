@@ -326,6 +326,8 @@ pub struct SomniumRenderer {
     pub taa_pass: crate::pass::taa::TaaPass,
     pub gtao_pass: crate::pass::gtao::GtaoPass,
     pub bloom_pass: crate::pass::bloom::BloomPass,
+    /// Far lamps as steady points (`light_glints.wgsl`), drawn when `light_glints` is above 0.
+    pub light_glints_pass: crate::pass::light_glints::LightGlintsPass,
     pub dof_pass: crate::pass::dof::DofPass,
     pub raytrace_pass: crate::pass::raytrace::RaytracePass,
     rt_debug_pass: crate::pass::raytrace::RtDebugPass,
@@ -426,6 +428,9 @@ pub struct SomniumRenderer {
     /// The scene's height, in metres, within which meshes blend into the ground where their material says nothing
     /// (`ground_blend.wgsl`, PostProcess `ground_blend_m`); 0 is off.
     pub ground_blend_default: f32,
+    /// Point and spot lamps drawn as their own light where they fall under a pixel (PostProcess `light_glints`, 1 the
+    /// physical amount); 0 (default) is off.
+    pub light_glints: f32,
     /// Last frame's [`surfaces_ab_off`], so a clipmap regenerates when its fade flips.
     surfaces_ab_was_off: bool,
     /// Radial vignette strength (0 = off, 1 = default, higher = stronger).
@@ -1361,6 +1366,7 @@ impl SomniumRenderer {
         );
 
         // Phase 24T: built before the post-process pass, which samples its result.
+        let light_glints_pass = crate::pass::light_glints::LightGlintsPass::new(&ctx.device, &shaders);
         let bloom_pass = crate::pass::bloom::BloomPass::new(
             &ctx.device,
             &shaders,
@@ -1678,6 +1684,7 @@ impl SomniumRenderer {
             taa_pass,
             gtao_pass,
             bloom_pass,
+            light_glints_pass,
             dof_pass,
             raytrace_pass,
             rt_debug_pass,
@@ -1755,6 +1762,7 @@ impl SomniumRenderer {
             snow_map_params: [0.0; 8],
             snow_map_source: String::new(),
             ground_blend_default: 0.0,
+            light_glints: 0.0,
             surfaces_ab_was_off: false,
             vignette_strength: 0.0,
             chromatic_aberration: 0.0,
@@ -7685,6 +7693,28 @@ impl SomniumRenderer {
                 );
                 self.profiler.end(&mut encoder);
             }
+        }
+
+        // ── 7.85 Far lamps as steady points (sunscar-photoreal, 12 Nov 2026) ─────────
+        // Onto the resolved HDR, before the capture, the meter, bloom and the upscale: a lamp under a pixel lands as its
+        // own light shared among four pixels, so it holds steady and the lens's glare gives it a halo.
+        if self.light_glints > 0.0 {
+            self.profiler.begin(&mut encoder, "Light glints");
+            self.light_glints_pass.record(
+                &ctx.device,
+                &ctx.queue,
+                &mut encoder,
+                &self.postprocess_pass.hdr_view,
+                &self.vis_pass.depth_view,
+                &self.global_pool.cluster_grid.light_buffer,
+                self.local_lights.len().min(crate::cluster::MAX_LOCAL_LIGHTS) as u32,
+                self.view_matrix,
+                self.proj_matrix,
+                self.camera_pos,
+                (self.render_width, self.render_height),
+                self.light_glints,
+            );
+            self.profiler.end(&mut encoder);
         }
 
         if capture_now && capture_after_taa {
