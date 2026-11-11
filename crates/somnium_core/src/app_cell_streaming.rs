@@ -77,7 +77,7 @@ impl<G: GameApp> Engine<G> {
         self.world.put_cache(pinned);
         let first_fill = !self.cell_streamer.filled;
         self.zone_begin("Cell schedule");
-        self.schedule_cells(&settings, focus);
+        self.schedule_cells(&settings, focus, if first_fill { cells::fill_readers() } else { cells::READERS });
         self.zone_end();
         if first_fill && !self.cell_streamer.reading.is_empty() {
             self.cell_streamer.filled = true;
@@ -96,7 +96,7 @@ impl<G: GameApp> Engine<G> {
                 } else {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
-                self.schedule_cells(&settings, focus);
+                self.schedule_cells(&settings, focus, cells::fill_readers());
             }
             info!(
                 cells = self.cell_streamer.loaded.len(),
@@ -147,9 +147,9 @@ impl<G: GameApp> Engine<G> {
         self.set_cell_status(owner, status);
     }
 
-    /// Unload what the view has left and start readers (up to `READERS`) for what it has reached, nearest first. The
+    /// Unload what the view has left and start readers (up to `readers`) for what it has reached, nearest first. The
     /// points held with `cell_streaming::hold` count as views too, and are marked ready once their cells are in.
-    fn schedule_cells(&mut self, settings: &CellStreamingComponent, focus: Option<glam::Vec3>) {
+    fn schedule_cells(&mut self, settings: &CellStreamingComponent, focus: Option<glam::Vec3>, readers: usize) {
         let mut holds: cells::Holds = self.world.take_cache();
         let streamer = &self.cell_streamer;
         let (load, unload) = match focus {
@@ -170,7 +170,7 @@ impl<G: GameApp> Engine<G> {
         }
         let now = std::time::Instant::now();
         for index in load {
-            if self.cell_streamer.reading.len() >= cells::READERS {
+            if self.cell_streamer.reading.len() >= readers {
                 break;
             }
             if self.cell_streamer.may_read(index, now) {

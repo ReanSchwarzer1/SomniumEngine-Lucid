@@ -585,6 +585,13 @@ pub(crate) const COLD_SECONDS: u64 = 30;
 /// Most cells read at once.
 pub(crate) const READERS: usize = 4;
 
+/// Cells read at once while a first fill holds the frame: nothing is drawn then, so the other cores read too, two
+/// left for the rest of the machine. At four readers Monargent's 243 cells did not finish inside the fill's 90
+/// seconds, and the rest streamed in over the first minutes of play (Sunscar, 11 Nov 2026).
+pub(crate) fn fill_readers() -> usize {
+    std::thread::available_parallelism().map_or(READERS, |cores| cores.get().saturating_sub(2)).clamp(READERS, 12)
+}
+
 /// Each source an entity list draws (`somnium.ImportedMesh` source -> node ordinals), from a scene document.
 #[must_use]
 pub fn sources_of(document: &serde_json::Value) -> BTreeMap<String, HashSet<usize>> {
