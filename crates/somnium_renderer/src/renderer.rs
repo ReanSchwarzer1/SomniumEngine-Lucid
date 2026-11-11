@@ -4070,6 +4070,10 @@ impl SomniumRenderer {
         ids.sky_visibility =
             self.add_terrain_texture(ctx, terrain.horizon_gpu.sky_view.clone()) as i32;
         ids.relief_normal = self.add_terrain_texture(ctx, terrain.relief_gpu.view.clone()) as i32;
+        ids.strata = terrain
+            .strata_gpu
+            .as_ref()
+            .map_or(-1, |(_, view)| self.add_terrain_texture(ctx, view.clone()) as i32);
         let hero = crate::terrain::textures::TERRAIN_HERO_LAYERS;
         // Virtual mode deliberately leaves every legacy layer id at -1. The
         // 4x4 arrays only keep the struct/fallback shape valid; publishing
@@ -5610,11 +5614,14 @@ impl SomniumRenderer {
             };
             let local_cam = model.inverse().transform_point3(self.camera_pos);
             let mut mat = terrain.gpu_material_for_camera(local_cam);
+            mat.strata[0] = terrain.texture_ids.strata as f32;
+            mat.strata[1] = model.w_axis.y;
             if surfaces_off {
                 // The macro tier holds at every distance and walls wear the cliff layer, as on lucid/sunscar.
                 mat.macro_mode &= !crate::terrain::MACRO_FADES;
                 mat.cliff_band[2] = 0.0;
                 mat.cliff_band[3] = 0.0;
+                mat.strata[2] = 0.0;
             }
             let terrain_index = terrain.terrain_index;
             let edit_revision = terrain.edit_revision;
