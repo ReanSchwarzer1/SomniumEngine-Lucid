@@ -86,7 +86,10 @@ struct CloudParams {
     /// (`CloudPass::far_step`, `far_fade`; 0 is off).
     far_step: f32,
     far_fade: f32,
-    _pad4: f32,
+    /// 1: `sun_illuminance` is the sun above the air (a running day clock, `Renderer::sky_above_air`), and each sample
+    /// takes the sun through the air above it and the planet's shadow where it stands, so a high cloud is lit after the
+    /// ground's sunset, and the sky's fill follows the twilight. 0: the sun on the ground, as it always was.
+    above_air: f32,
 }
 
 @group(0) @binding(0) var<uniform> cp: CloudParams;
@@ -899,7 +902,17 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
     // that captures it lit the land 2 stops over, and the clear sky between clouds read navy.
     let luma = vec3<f32>(0.2126, 0.7152, 0.0722);
     let sun_e = sun_transmittance * cp.sun_illuminance;
-    let sky_fill = ambient_sky / max(dot(ambient_sky, luma), 1e-6) * (CLOUD_SKY_PER_LUX * dot(sun_e, luma));
+    var sky_fill = ambient_sky / max(dot(ambient_sky, luma), 1e-6) * (CLOUD_SKY_PER_LUX * dot(sun_e, luma));
+    // Above the air (a running day clock): the fill follows the twilight. Its level is the clear sky's per lux of sun
+    // at noon, times what is left of the multiply scattered light for this sun (the planet's shadow is in that table),
+    // so it eases through dusk instead of stopping with the camera's last ray of sun.
+    let above_air = cp.above_air > 0.5;
+    if above_air {
+        let scattered = sample_multiscatter_twilight(multiscatter_lut, lut_sampler, r, sun.y);
+        let scattered_noon = sample_multiscatter(multiscatter_lut, lut_sampler, r, 1.0);
+        let noon = sample_transmittance(transmittance_lut, lut_sampler, r, 1.0) * cp.sun_illuminance;
+        sky_fill = scattered / max(dot(scattered_noon, luma), 1e-9) * (CLOUD_SKY_PER_LUX * dot(noon, luma));
+    }
 
     var scatter = vec3<f32>(0.0);
     var transmittance = 1.0;
@@ -1003,7 +1016,19 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
         // the sky's fill, which reaches inside as diffused light does.
         let diffusion = cloud_diffusion(optical_depth);
         let thick = 1.0 - exp(-4.0 * density);
-        var luminance = sun_e * (sun_energy + CLOUD_DIFFUSE * thick * diffusion * 0.5 / CLOUD_PI)
+        var sun_here = sun_e;
+        if above_air {
+            // The sun at this sample, through the air above it and past the planet's shadow where it stands: a
+            // kilometre up and tens of kilometres off, a cloud keeps the sun after the ground has lost it, and goes red.
+            let k = (p - cp.camera_pos) * 0.001;
+            let at = vec3<f32>(k.x, r + k.y, k.z);
+            let r_at = length(at);
+            let mu_at = dot(at, sun) / r_at;
+            let horizon_at = -sqrt(max(1.0 - (GROUND_RADIUS / r_at) * (GROUND_RADIUS / r_at), 0.0));
+            sun_here = sample_transmittance(transmittance_lut, lut_sampler, r_at, max(mu_at, horizon_at))
+                * smoothstep(horizon_at - 0.0047, horizon_at + 0.0047, mu_at) * cp.sun_illuminance;
+        }
+        var luminance = sun_here * (sun_energy + CLOUD_DIFFUSE * thick * diffusion * 0.5 / CLOUD_PI)
             + sky_fill * cp.ambient * diffusion;
         if flashes && storm.counts.y > 0u {
             luminance += storm_flashes(p, density);

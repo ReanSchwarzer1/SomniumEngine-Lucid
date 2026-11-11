@@ -114,7 +114,7 @@ struct DirectionalLight {
     direction:       vec3<f32>,               // offset   0
     _pad0:           f32,                     // offset  12
     color:           vec3<f32>,               // offset  16  pre-multiplied by intensity
-    _pad1:           f32,                     // offset  28
+    sky_above_air:   f32,                     // offset  28  1: the sky is lit above the air (stars by the air)
     view_proj:       array<mat4x4<f32>, 4>,   // offset  32  (256 bytes)
     cascade_splits:  vec4<f32>,               // offset 288  view-space far Z per cascade
     shadow_map_size: f32,                     // offset 304  total atlas texels (4096)

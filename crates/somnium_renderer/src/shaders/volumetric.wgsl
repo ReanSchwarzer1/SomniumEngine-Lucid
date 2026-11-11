@@ -100,7 +100,9 @@ struct VolumetricParams {
     /// 1 when the clouds' sky-light capture (`cloud_sky_tex`) holds a marched deck: the sky light the air and the fog
     /// scatter then comes through it. 0 leaves the clear sky's (the multiscatter LUT) as it was.
     cloud_sky: f32,
-    _cloud_pad0: f32,
+    /// 1: `sun_illuminance` is the sun above the air (a running day clock): the multiscatter table is read for a set
+    /// sun as its light falls (`sample_multiscatter_twilight`).
+    above_air: f32,
     _cloud_pad1: f32,
     _cloud_pad2: f32,
 }
@@ -402,12 +404,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // out — so every froxel went on being lit by the reddest possible
             // sunlight instead of by none. That is the red frame.
             var sun_transmittance = vec3<f32>(0.0);
-            var multiscatter = vec3<f32>(0.0);
             if !ray_hits_ground(sample_r, mu_sun) {
                 sun_transmittance = sample_transmittance(
                     transmittance_lut, lut_sampler, sample_r, mu_sun);
-                multiscatter = sample_multiscatter(
-                    multiscatter_lut, lut_sampler, sample_r, mu_sun);
+            }
+            // The multiply scattered sky stays after sunset: its table carries the planet's shadow itself, so a sun
+            // under the horizon reads the twilight's light, not the reddest grazing row. Under the light on the ground
+            // (no day clock) a set sun's light is zero and this is nothing, as before.
+            var multiscatter = sample_multiscatter(multiscatter_lut, lut_sampler, sample_r, mu_sun);
+            if vol.above_air > 0.5 {
+                multiscatter = sample_multiscatter_twilight(multiscatter_lut, lut_sampler, sample_r, mu_sun);
             }
 
             var sun_vis = 1.0;
