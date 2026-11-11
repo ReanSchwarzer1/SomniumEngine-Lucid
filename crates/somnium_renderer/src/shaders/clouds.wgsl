@@ -267,7 +267,10 @@ fn storm_anvil(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
         // Mammatus: smooth lobes about 350 m across hanging from the underside, away from the tower.
         let cells = textureSampleLevel(base_noise_tex, cloud_sampler, vec3<f32>(q.x, 0.0, q.z) / 2800.0 + vec3<f32>(0.0, 0.37, 0.0), 0.0).g;
         let hang = v.b.z * 0.06 * smoothstep(0.45, 0.85, cells) * smoothstep(radius * 1.8, radius * 3.2, length(q.xz));
-        let lobe = (1.0 - smoothstep(0.7, 1.0, e)) * smoothstep(under - hang, under - hang * 0.55, h);
+        var lobe = 0.0;
+        if hang > 0.0 {
+            lobe = (1.0 - smoothstep(0.7, 1.0, e)) * smoothstep(under - hang, under - hang * 0.55, h);
+        }
         if lobe > anvil {
             anvil = lobe;
             fray = 0.15;
@@ -381,7 +384,9 @@ fn storm_bowl(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
     var m = (1.0 - smoothstep(r * 0.4, r, rho)) * (1.0 - smoothstep(0.5, 1.0, hc)) * smoothstep(-0.05, 0.02, h);
     let spiral = 0.5 + 0.5 * sin(atan2(q.z, q.x) * 3.0 + log(max(rho, 1.0)) * 5.0 + v.albedo.w * 2.0);
     m *= mix(1.0, 0.45 + 0.55 * spiral, (1.0 - hc) * smoothstep(v.size.x * 0.5, v.size.x, rho));
-    m *= mix(0.35, 1.0, smoothstep(v.a.x * 0.6, v.a.x * 1.4, rho));
+    if v.a.x > 0.0 {
+        m *= mix(0.35, 1.0, smoothstep(v.a.x * 0.6, v.a.x * 1.4, rho));
+    }
     return vec2<f32>(m, 1.0);
 }
 
@@ -836,7 +841,8 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
     // has no motion vector for a sky pixel to reproject — a pattern that moved
     // every frame was not dithering, it was visible shimmer. Frame-stable
     // spatial jitter still breaks up the banding it was added for.
-    var t = interval.x + jitter * long_step;
+    var t = interval.x;
+    var first = true;
 
     let sun = normalize(cp.sun_direction);
     let cos_theta = dot(ray_dir, sun);
@@ -884,6 +890,12 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
                 // kilometres off is not stepped as one at one).
                 step_len = min(step_len, max(hit_step[k], t * 0.012) * select(2.5, 1.0, inside));
             }
+        }
+        if first {
+            // The start's jitter, as a share of the step the march starts with: of the slab's long step it skipped up
+            // to a hundred metres of a body's near side, differently in every pixel.
+            t += jitter * step_len;
+            first = false;
         }
         let p = cp.camera_pos + ray_dir * (t + step_len * 0.5);
 

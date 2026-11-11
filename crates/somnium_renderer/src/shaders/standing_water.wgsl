@@ -85,9 +85,9 @@ fn apply_standing_water(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>,
     let reach = mix(0.22, 0.52, level) * flat;
     // What stands proud of it: the detail normal leans where a stone or a ridge is.
     let proud = smoothstep(0.015, 0.09, 1.0 - saturate(dot(s.normal, geo_n)));
-    let water = smoothstep(reach, reach - 0.035, low + proud * 0.12);
+    let water = 1.0 - smoothstep(reach - 0.035, reach, low + proud * 0.12);
     // A damp rim round each pool: darker, a little glossier, not yet a mirror.
-    let rim = smoothstep(reach + 0.09, reach, low) * (1.0 - water);
+    let rim = (1.0 - smoothstep(reach, reach + 0.09, low)) * (1.0 - water);
     s.albedo = s.albedo * (1.0 - 0.28 * rim);
     s.roughness = s.roughness * (1.0 - 0.45 * rim);
     if water <= 0.0 {

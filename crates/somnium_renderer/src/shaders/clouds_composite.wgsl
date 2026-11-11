@@ -106,7 +106,9 @@ fn storm_entry(origin: vec3<f32>, dir: vec3<f32>) -> f32 {
         }
         let c = storm_cylinder(v, origin, dir);
         if c.y > c.x {
-            nearest = min(nearest, c.x);
+            // Never nearer than a body can veil anything: within forty metres even a downpour's air is clear, and
+            // an eye inside a body's cylinder would otherwise lay the far body over every leaf and hand in front of it.
+            nearest = min(nearest, max(c.x, 40.0));
         }
     }
     return nearest;
