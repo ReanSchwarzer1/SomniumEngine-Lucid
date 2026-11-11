@@ -101,6 +101,8 @@ const CLOUD_PI: f32 = 3.14159265;
 const CLOUD_MIN_TRANSMITTANCE: f32 = 0.01;
 /// Consecutive empty samples before the march goes back to long steps.
 const CLOUD_EMPTY_BEFORE_ESCAPE: i32 = 8;
+/// Samples a ray may light. The slab alone never reaches it (it is opaque long before).
+const CLOUD_MAX_LIT: i32 = 96;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Shape
@@ -406,14 +408,25 @@ fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
     var m = vec2<f32>(0.0);
     // Where its noise is read: turned with it, and for a shaft drawn out along its fall.
     var np = q;
-    switch i32(v.pos.w + 0.5) {
+    // A cloud this dense is opaque at a tenth of its density, so thinning its edge with noise leaves its outline the
+    // shape's own: a tower came out a smooth drum (first stills, 11 Nov). The noise has to move the outline. For the
+    // convective bodies the point is pushed in or out from the axis by the noise's large lumps (turrets about half
+    // a radius across) and its next octave, and up or down a little, before the shape is asked.
+    var qs = q;
+    let kind = i32(v.pos.w + 0.5);
+    if kind == 1 || kind == 2 || kind == 5 {
+        let lump = textureSampleLevel(base_noise_tex, cloud_sampler, q / v.size.w + vec3<f32>(0.31, 0.0, 0.17), 0.0);
+        let swell = 1.0 + (lump.r - 0.5) * 0.55 + (lump.g - 0.5) * 0.18;
+        qs = vec3<f32>(q.x / swell, q.y + (lump.b - 0.5) * 0.06 * v.size.y * step(0.05 * v.size.y, q.y), q.z / swell);
+    }
+    switch kind {
         case 1 {
-            m = storm_cell(v, q);
+            m = storm_cell(v, qs);
             let r = storm_rot(q.xz, turn * (1.0 - 0.5 * clamp(q.y / v.size.y, 0.0, 1.0)));
             np = vec3<f32>(r.x, q.y, r.y);
         }
         case 2 {
-            m = storm_wall(v, q);
+            m = storm_wall(v, qs);
             let r = storm_rot(q.xz, turn);
             np = vec3<f32>(r.x, q.y, r.y);
         }
@@ -429,7 +442,7 @@ fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
             np = vec3<f32>(r.x, q.y - turn * v.size.x * 0.6, r.y);
         }
         case 5 {
-            m = storm_bowl(v, q);
+            m = storm_bowl(v, qs);
             let r = storm_rot(q.xz, turn * mix(1.6, 0.8, clamp(length(q.xz) / v.size.x, 0.0, 1.0)));
             np = vec3<f32>(r.x, q.y - turn * 12.0, r.y);
         }
@@ -529,17 +542,17 @@ fn cloud_interval(origin: vec3<f32>, dir: vec3<f32>) -> vec2<f32> {
     return interval;
 }
 
-/// Optical depth toward the sun from inside a storm body, in `light_march`'s units: seven taps that double in reach
-/// from the body's own finest step, so a funnel a hundred metres wide shades itself and still sees the storm two
-/// kilometres above it. The slab's march steps by the layer's thickness, which would miss both.
+/// Optical depth toward the sun from inside a storm body, in `light_march`'s units: five taps that treble in reach
+/// from the body's own finest step (to 121 of them), so a funnel a hundred metres wide shades itself and still sees
+/// the storm two kilometres above it. The slab's march steps by the layer's thickness, which would miss both.
 fn storm_light_march(origin: vec3<f32>, sun: vec3<f32>, finest: f32) -> f32 {
     var optical_depth = 0.0;
     var width = finest;
     var near = 0.0;
-    for (var i = 0; i < 7; i = i + 1) {
+    for (var i = 0; i < 5; i = i + 1) {
         optical_depth += cloud_density(origin + sun * (near + width * 0.5), true) * width * 0.01;
         near += width;
-        width *= 2.0;
+        width *= 3.0;
     }
     return optical_depth;
 }
@@ -807,6 +820,7 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
     var scatter = vec3<f32>(0.0);
     var transmittance = 1.0;
     var empty_runs = 0;
+    var lit = 0;
     var inside = false;
     // Transmittance-weighted mean depth: a cloud has no single depth, and this
     // is what the aerial-perspective fetch and CONTROL-N's motion vectors both
@@ -821,7 +835,9 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
         var step_len = select(long_step, short_step, inside);
         for (var k = 0; k < hits; k = k + 1) {
             if t + step_len >= hit_enter[k] && t <= hit_exit[k] {
-                step_len = min(step_len, hit_step[k] * select(2.5, 1.0, inside));
+                // No finer than a body's own detail, and no finer than the eye can tell at that range (a body ten
+                // kilometres off is not stepped as one at one).
+                step_len = min(step_len, max(hit_step[k], t * 0.012) * select(2.5, 1.0, inside));
             }
         }
         let p = cp.camera_pos + ray_dir * (t + step_len * 0.5);
@@ -840,6 +856,12 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
             continue;
         }
 
+        // A ray grazing a storm's thin anvil for kilometres would light hundreds of samples: past a ceiling the rest of
+        // it is left unmarched (first stills: 10 ms a frame with one cell in view).
+        lit = lit + 1;
+        if lit > CLOUD_MAX_LIT {
+            break;
+        }
         let slab = slab_density(p, false);
         var body = StormSample(0.0, vec3<f32>(0.0), 1e9);
         if hits > 0 {
