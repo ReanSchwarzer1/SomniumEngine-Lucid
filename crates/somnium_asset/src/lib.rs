@@ -88,6 +88,16 @@ fn parse_leaf_transmission(rule: &str) -> Option<[f32; 2]> {
     (broad > 0.0 || needle > 0.0).then_some([broad, needle])
 }
 
+/// glTF material extras `somnium_ground_blend`: metres within which the mesh blends into the terrain under it
+/// (`LoadedMaterial::ground_blend`). 0 when absent; negative never blends.
+fn ground_blend(mat: &gltf::Material<'_>) -> f32 {
+    mat.extras()
+        .as_ref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.get()).ok())
+        .and_then(|v| v.get("somnium_ground_blend").and_then(serde_json::Value::as_f64))
+        .map_or(0.0, |m| (m as f32).clamp(-1.0, 8.0))
+}
+
 /// glTF material extras `somnium_interior_depth`: metres of room behind a
 /// window whose colour map is that room's back wall. 0 when absent.
 fn interior_depth(mat: &gltf::Material<'_>) -> f32 {
@@ -174,6 +184,10 @@ pub struct LoadedMaterial {
     /// of metres wide. The shading pass adds world-space relief and colour at the scales its pixels can show, so a
     /// slope 2-6 km out reads as ground, not a smooth wash (Sunscar, 7 Nov 2026).
     pub far_ground: bool,
+    /// Metres within which this mesh blends into the terrain under it (extras `somnium_ground_blend`, Sunscar 11 Nov
+    /// 2026): a boulder, a wall foot or a rubble heap takes the ground's colour, roughness and normal near it. 0 takes
+    /// the scene's height (PostProcess `ground_blend_m`); negative never blends.
+    pub ground_blend: f32,
     /// This material is painted on **flat cut-out cards whose `uv.x` runs
     /// across the blade**, which is what `shading.wgsl`'s curved-card normal
     /// needs to be true.
@@ -475,6 +489,7 @@ fn load_gltf_checked(path: &Path, parts: Option<&HashSet<usize>>) -> Result<Load
             hair: material_extra(&mat, "somnium_hair") > 0.5,
             hashed_alpha: material_extra(&mat, "somnium_hashed_alpha") > 0.5,
             far_ground: material_extra(&mat, "somnium_far_ground") > 0.5,
+            ground_blend: ground_blend(&mat),
             // Authored only: see the field's own note on why no import can
             // honestly infer it.
             foliage_card: false,
@@ -575,6 +590,7 @@ fn load_gltf_checked(path: &Path, parts: Option<&HashSet<usize>>) -> Result<Load
             hair: false,
             hashed_alpha: false,
             far_ground: false,
+            ground_blend: 0.0,
             foliage_card: false,
             emissive: [0.0; 3],
             emissive_intensity: 1.0,
