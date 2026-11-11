@@ -1723,12 +1723,21 @@ fn clamp_specular_radiance(radiance: vec3<f32>, sky_mean: vec3<f32>, roughness: 
     return radiance * (ceiling / max(lum, 1e-4));
 }
 
+/// The finest level of the sky cube a reflection may read. Level 0 is the bare sky (the background draws it under
+/// the marched clouds); the clouds' capture is laid over level 1 and coarser. Under a deck that lets no sun through
+/// (the cloud shadow at 0.95 or more: an overcast, rain) a mirror therefore reads from level 1: the far sea under an
+/// overcast mirrored a clear sky, a thin blue line along the horizon (Sunscar's summit stills, 12 Nov 2026). Under
+/// any other sky a reflection reads as it did.
+fn mirror_mip(mip: f32) -> f32 {
+    return max(mip, smoothstep(0.9, 0.97, cloud_shadow_params.w));
+}
+
 fn evaluate_ibl_specular(surface: Surface) -> vec3<f32> {
     let n = surface.normal;
     let v = surface.view_dir;
     let n_dot_v = max(dot(n, v), 1e-4);
     let r = reflect(-v, n);
-    let mip = surface.roughness * ENV_MAX_MIP;
+    let mip = mirror_mip(surface.roughness * ENV_MAX_MIP);
     let sky_mean = textureSampleLevel(env_cube, env_sampler, n, ENV_MAX_MIP).rgb;
     let prefiltered = clamp_specular_radiance(
         textureSampleLevel(env_cube, env_sampler, r, mip).rgb, sky_mean, surface.roughness);
@@ -1765,7 +1774,7 @@ fn evaluate_ibl_ms(surface: Surface, traced_diffuse: TracedLight) -> vec3<f32> {
     let r = reflect(-v, n);
     let sky_mean = textureSampleLevel(env_cube, env_sampler, n, ENV_MAX_MIP).rgb;
     let radiance = clamp_specular_radiance(
-        textureSampleLevel(env_cube, env_sampler, r, surface.roughness * ENV_MAX_MIP).rgb,
+        textureSampleLevel(env_cube, env_sampler, r, mirror_mip(surface.roughness * ENV_MAX_MIP)).rgb,
         sky_mean,
         surface.roughness,
     );
