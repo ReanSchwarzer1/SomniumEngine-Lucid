@@ -732,6 +732,7 @@ pub fn component_registry() -> TypeRegistry {
     crate::prop_set::register(&mut registry);
     registry.register(sky_schema());
     registry.register(sky_eye_schema());
+    registry.register(sky_planet_schema());
     registry.register(terrain_schema());
     registry.register(world_partition_schema());
     registry.register(ui_canvas_schema());
@@ -1239,6 +1240,7 @@ fn time_of_day_schema() -> ComponentSchema {
             night_aurora { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Night Sky", display_name: "Aurora" },
             night_halo_road { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Night Sky", display_name: "Halo Road" },
             night_thread { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Night Sky", display_name: "Thread" },
+            sun_wreck { min: -1, max: 2, group: "Sun", display_name: "Broken Sun (-1 whole, 0 cut, 1 shards, 2 bars)" },
         }
     }
 }
@@ -1322,6 +1324,22 @@ fn sky_eye_schema() -> ComponentSchema {
             pupil { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Shape", display_name: "Pupil Width" },
             pulse_hz { min: 0.0, soft_max: 2.0, step: 0.01, precision: 2, unit: "Hz", group: "Eye", display_name: "Pulse" },
             glow { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Eye" },
+        }
+    }
+}
+
+/// The planet over the horizon (Sunscar, 12 Nov 2026): see [`crate::sky::SkyPlanetComponent`].
+fn sky_planet_schema() -> ComponentSchema {
+    component_schema! {
+        crate::sky::SkyPlanetComponent as "somnium.SkyPlanet", display "Sky Planet", version 1,
+        fields {
+            enabled { group: "Planet" },
+            diameter_deg { min: 0.1, max: 60.0, step: 0.1, precision: 1, unit: "°", group: "Planet", display_name: "Angular Diameter" },
+            albedo { min: 0.0, max: 1.0, step: 0.005, precision: 3, group: "Planet", display_name: "Geometric Albedo" },
+            azimuth_deg { min: 0.0, max: 360.0, step: 0.5, precision: 1, unit: "°", group: "Place", display_name: "Azimuth" },
+            elevation_deg { min: -10.0, max: 89.0, step: 0.5, precision: 1, unit: "°", group: "Place", display_name: "Elevation" },
+            seed { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Surface" },
+            ember { min: 0.0, soft_max: 20.0, step: 0.1, precision: 1, unit: "cd/m²", group: "Surface", display_name: "Fissure Glow" },
         }
     }
 }
@@ -1637,7 +1655,7 @@ mod tests {
     #[test]
     fn every_built_in_schema_registers_without_a_clash() {
         let registry = component_registry();
-        assert_eq!(registry.len(), 54);
+        assert_eq!(registry.len(), 55);
         let names: Vec<_> = registry.iter().map(|s| s.stable_id.as_str()).collect();
         assert_eq!(
             names,
@@ -1682,6 +1700,7 @@ mod tests {
                 "somnium.ScatterSettings",
                 "somnium.Sky",
                 "somnium.SkyEye",
+                "somnium.SkyPlanet",
                 "somnium.Spline",
                 "somnium.StagedMirror",
                 "somnium.SurfaceTags",

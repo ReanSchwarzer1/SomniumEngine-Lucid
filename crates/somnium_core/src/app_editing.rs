@@ -2639,6 +2639,19 @@ impl<G: GameApp> Engine<G> {
                     }
                     Err(_) => warn!(action = %action, "editor script: hour wants a number"),
                 },
+                // The broken sun's form (`TimeOfDay.sun_wreck`: -1 whole, 0 cut, 1 shards, 2 bars), so one launch can
+                // show them all. `SOMNIUM_SUN_FORM` still wins.
+                Some(("form", f)) => match f.trim().parse::<i32>() {
+                    Ok(form) => {
+                        let clocks: Vec<_> = self.world.entities_with::<crate::time_of_day::TimeOfDayComponent>().collect();
+                        for e in clocks {
+                            if let Some(t) = self.world.get_mut::<crate::time_of_day::TimeOfDayComponent>(e) {
+                                t.sun_wreck = form.clamp(-1, 2);
+                            }
+                        }
+                    }
+                    Err(_) => warn!(action = %action, "editor script: form wants a number"),
+                },
                 // A picture of the scene alone (no editor) at this frame, so one launch can take several. With
                 // `SOMNIUM_CAPTURE_STILL_HDR=1` each also leaves its linear `.somcap`.
                 Some(("shot", path)) => {

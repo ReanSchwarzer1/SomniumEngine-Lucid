@@ -110,14 +110,33 @@ fn a_running_clock_moves_the_sky_light_without_a_step() {
     let probe = Probe::new(&device);
 
     // The first frame builds the cube whole, as a scene's first frame does.
-    assert!(ibl.generate_if_needed(&device, &queue, sun(6.0), light(6.0), 0.0, None, false, None));
+    assert!(ibl.generate_if_needed(&device, &queue, sun(6.0), light(6.0), 0.0, None, false, None, [[0.0; 4]; 3]));
     let mut seen = vec![probe.read(&device, &queue, &ibl)];
     let frames = 300;
+    let mut spent = Vec::with_capacity(frames);
     for frame in 1..=frames {
         let elevation = 6.0 - 0.01 * frame as f32;
-        ibl.generate_if_needed(&device, &queue, sun(elevation), light(elevation), 0.0, None, true, None);
+        let started = std::time::Instant::now();
+        ibl.generate_if_needed(&device, &queue, sun(elevation), light(elevation), 0.0, None, true, None, [[0.0; 4]; 3]);
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        spent.push(started.elapsed().as_secs_f64() * 1000.0);
         seen.push(probe.read(&device, &queue, &ibl));
     }
+    // What a frame of it costs, GPU and submission together (waited on here, overlapped in a game): against the cube
+    // rebuilt whole, which is what every frame of a running clock cost before.
+    let whole = {
+        let started = std::time::Instant::now();
+        ibl.generate_if_needed(&device, &queue, sun(40.0), light(40.0), 0.0, None, false, None, [[0.0; 4]; 3]);
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        started.elapsed().as_secs_f64() * 1000.0
+    };
+    spent.sort_by(f64::total_cmp);
+    println!(
+        "a moving frame: median {:.3} ms, worst {:.3} ms; the cube rebuilt whole: {whole:.3} ms",
+        spent[spent.len() / 2],
+        spent[spent.len() - 1]
+    );
+    ibl.generate_if_needed(&device, &queue, sun(3.0), light(3.0), 0.0, None, false, None, [[0.0; 4]; 3]);
     for p in 0..PROBES {
         let lum: Vec<f32> = seen.iter().map(|s| s[p]).collect();
         let step = lum.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0.0_f32, f32::max);
@@ -131,7 +150,7 @@ fn a_running_clock_moves_the_sky_light_without_a_step() {
 
     // A sun that jumps (a key that moves the clock an hour) is rebuilt at once, crossfade or not.
     let before = probe.read(&device, &queue, &ibl);
-    assert!(ibl.generate_if_needed(&device, &queue, sun(20.0), light(20.0), 0.0, None, true, None));
+    assert!(ibl.generate_if_needed(&device, &queue, sun(20.0), light(20.0), 0.0, None, true, None, [[0.0; 4]; 3]));
     let after = probe.read(&device, &queue, &ibl);
     assert!(after[0] > 1.5 * before[0], "an hour on is there the same frame: {before:?} -> {after:?}");
 }
@@ -154,7 +173,7 @@ fn a_sky_lit_above_the_air_keeps_its_light_after_sunset() {
         // Under the horizon the light on the ground is nothing (sun::transmittance), whichever way the sky is lit.
         let ground = if elevation > 0.0 { light(elevation) } else { glam::Vec3::ZERO };
         let sky_sun = if lit_above { above } else { ground };
-        ibl.generate_if_needed(&device, &queue, sun(elevation), sky_sun, 0.0, None, false, lit_above.then_some(ground));
+        ibl.generate_if_needed(&device, &queue, sun(elevation), sky_sun, 0.0, None, false, lit_above.then_some(ground), [[0.0; 4]; 3]);
         probe.read(&device, &queue, &ibl)[0]
     };
     let day = overhead(35.0, true);

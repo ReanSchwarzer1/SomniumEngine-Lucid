@@ -219,6 +219,9 @@ struct CloudParams {
     far_fade: f32,
     /// 1: `sun_illuminance` is the sun above the air (`CloudPass::above_air`).
     above_air: f32,
+    /// The planet over the horizon (`CloudPass::planet`).
+    planet_direction: [f32; 4],
+    planet_light: [f32; 4],
 }
 
 #[repr(C)]
@@ -279,6 +282,9 @@ pub struct CloudPass {
     /// `sun_illuminance` is the sun above the air (`Renderer::sky_above_air`): each sample takes its own sun through
     /// the air and the planet's shadow, and the sky's fill follows the twilight (clouds.wgsl `above_air`).
     pub above_air: bool,
+    /// The planet over the horizon, as the march takes it: toward it, w 1 by night (its light march, not the sun's);
+    /// its light above the air (rgb), w 1 when there is one. All zero: none (the renderer sets it each frame).
+    pub planet: [[f32; 4]; 2],
     // ── Authoring ────────────────────────────────────────────────────────────
     /// Off until the `.somtime` row exists. See the module header.
     ///
@@ -997,6 +1003,7 @@ impl CloudPass {
             env_key: None,
             sun_moving: false,
             above_air: false,
+            planet: [[0.0; 4]; 2],
             shadow_pipeline,
             composite_layout,
             composite_bind_groups: [None, None],
@@ -1534,6 +1541,8 @@ impl CloudPass {
                 far_step: self.far_step.clamp(0.0, 0.2),
                 far_fade: self.far_fade.max(0.0),
                 above_air: f32::from(u8::from(self.above_air)),
+                planet_direction: self.planet[0],
+                planet_light: self.planet[1],
             }),
         );
         #[allow(clippy::cast_precision_loss)]

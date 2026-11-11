@@ -114,6 +114,10 @@ impl Shaders {
             "storm.wgsl",
             "lightning.wgsl",
             "precipitation.wgsl",
+            // 12 Nov 2026: the planet over the horizon, drawn on the sky by shading (somnium.SkyPlanet; Sunscar).
+            "sky_planet.wgsl",
+            // 12 Nov 2026: the sun seen through the Lid's wreck (TimeOfDay sun_wreck; Sunscar).
+            "sky_sun.wgsl",
             "skinning.wgsl",
             "atmosphere_lut.wgsl",
             "auto_exposure.wgsl",
@@ -426,6 +430,8 @@ mod tests {
             "clipmap_shade.wgsl",
             "wind.wgsl",
             "sky_eye.wgsl",
+            "sky_planet.wgsl",
+            "sky_sun.wgsl",
             "shading.wgsl",
             "terrain_morph.wgsl",
             "froxel_depth.wgsl",

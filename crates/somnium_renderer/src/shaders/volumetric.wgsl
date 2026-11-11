@@ -105,6 +105,10 @@ struct VolumetricParams {
     above_air: f32,
     _cloud_pad1: f32,
     _cloud_pad2: f32,
+    /// The planet over the horizon: toward it, w 1 by night (the clouds' shadow field is then cast toward it); its
+    /// light above the air (rgb, lux), w 1 when there is one.
+    planet_direction: vec4<f32>,
+    planet_light: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> vol: VolumetricParams;
@@ -490,7 +494,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 / max(extinction, vec3<f32>(VOL_MIN_EXTINCTION));
             let integrated_local = (local_scatter - local_scatter * step_transmittance)
                 / max(extinction, vec3<f32>(VOL_MIN_EXTINCTION));
-            inscatter += throughput * (integrated * vol.sun_illuminance + integrated_local);
+            // The planet over the horizon lights the air and the fog as a second sun does: its light through the air
+            // above the sample, its glow on the air, and by night the clouds' shadow cast toward it. No shafts.
+            var integrated_planet = vec3<f32>(0.0);
+            if vol.planet_light.w > 0.5 {
+                let planet_dir = normalize(vol.planet_direction.xyz + vec3<f32>(0.0, 1e-6, 0.0));
+                var through_air = vec3<f32>(0.0);
+                if !ray_hits_ground(sample_r, planet_dir.y) {
+                    through_air = sample_transmittance(transmittance_lut, lut_sampler, sample_r, planet_dir.y);
+                }
+                if vol.planet_direction.w > 0.5 {
+                    through_air *= cloud_sun_at(world_pos);
+                }
+                let glow = sample_multiscatter_twilight(multiscatter_lut, lut_sampler, sample_r, planet_dir.y) * sky_through;
+                let cos_p = dot(ray_dir, planet_dir);
+                var planet_scatter = (scatter_rayleigh * rayleigh_phase(cos_p) + scatter_mie * mie_phase(cos_p)) * through_air
+                    + (scatter_rayleigh + scatter_mie) * glow;
+                if fog > 0.0 {
+                    planet_scatter += vec3<f32>(fog * hg_phase(cos_p, vol.fog_asymmetry)) * through_air
+                        + vec3<f32>(fog) * glow * sky_vis * vol.fog_skylight;
+                }
+                planet_scatter *= vol.planet_light.rgb;
+                integrated_planet = (planet_scatter - planet_scatter * step_transmittance)
+                    / max(extinction, vec3<f32>(VOL_MIN_EXTINCTION));
+            }
+            inscatter += throughput * (integrated * vol.sun_illuminance + integrated_local + integrated_planet);
             throughput *= step_transmittance;
         }
 

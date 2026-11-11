@@ -41,6 +41,11 @@ struct GenParams {
     /// its own transmittance and the planet's shadow, so twilight exists; rgb is then the sun on the ground, for the
     /// land below the horizon. w 0: `sun_color` is the sun on the ground, as it always was.
     sun_ground: vec4<f32>,
+    /// The planet over the horizon (`PlanetParams`): toward it, w 1 when there is one; its light above the air (rgb,
+    /// lux), which lights the air as a second sun does; its light on the ground (rgb), on the land below the horizon.
+    planet: vec4<f32>,
+    planet_light: vec4<f32>,
+    planet_ground: vec4<f32>,
 }
 
 /// The Undersun's night (`NightSky`, Rimeborn): no moon. A glow over the dome, brighter overhead and toward the hidden
@@ -164,6 +169,14 @@ fn sky(ray_dir: vec3<f32>) -> vec3<f32> {
             view_pos, ray_dir, sun_dir, 32,
         ) * sun_illuminance;
     }
+    // The planet lights the air too: by night its glow is the sky round it, blue-grey and brightest near it.
+    let planet_on = params.planet.w > 0.5;
+    if planet_on {
+        radiance += raymarch_sky_twilight(
+            transmittance_lut, multiscatter_lut, atmos_sampler,
+            view_pos, ray_dir, normalize(params.planet.xyz), 24,
+        ) * params.planet_light.rgb;
+    }
 
     // A cloud deck replaces the blue dome with the CIE overcast sky: neutral,
     // no sun disc, three times as bright at the zenith as at the horizon, and
@@ -183,6 +196,12 @@ fn sky(ray_dir: vec3<f32>) -> vec3<f32> {
                 transmittance_lut, multiscatter_lut, atmos_sampler,
                 view_pos, vec3<f32>(0.0, 1.0, 0.0), sun_dir, 16,
             ) * sun_illuminance;
+        }
+        if planet_on {
+            zenith += raymarch_sky_twilight(
+                transmittance_lut, multiscatter_lut, atmos_sampler,
+                view_pos, vec3<f32>(0.0, 1.0, 0.0), normalize(params.planet.xyz), 12,
+            ) * params.planet_light.rgb;
         }
         let lz = dot(zenith, vec3<f32>(0.2126, 0.7152, 0.0722)) * 1.6;
         let dome = select(0.2, (1.0 + 2.0 * ray_dir.y) / 3.0, ray_dir.y >= 0.0);
@@ -237,7 +256,16 @@ fn ground_radiance() -> vec3<f32> {
     // cosine-weighted mean against its zenith; a clear sky's brighter horizon makes up its lower zenith). The sun on
     // the land is the one on the ground, whichever the sky was lit by.
     let sun_on_land = select(params.sun_color.rgb, params.sun_ground.rgb, params.sun_ground.w > 0.5);
-    let e = sun_on_land * max(sun.y, 0.0) * sun_through + 0.85 * PI * sky_up;
+    var e = sun_on_land * max(sun.y, 0.0) * sun_through + 0.85 * PI * sky_up;
+    if params.planet.w > 0.5 {
+        // The planet's light on the land, through the clouds' capture in its direction.
+        let planet_dir = normalize(params.planet.xyz);
+        var planet_through = 1.0;
+        if params.clouds.x > 0.5 {
+            planet_through = textureSampleLevel(cloud_capture, src_samp, planet_dir, 0.0).a;
+        }
+        e += params.planet_ground.rgb * max(planet_dir.y, 0.0) * planet_through;
+    }
     return GROUND_ALBEDO / PI * e * (1.0 - smoothstep(0.35, 0.95, params.overcast));
 }
 
