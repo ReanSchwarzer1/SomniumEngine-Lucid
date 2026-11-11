@@ -142,6 +142,7 @@ impl Shaders {
             "dream_lens.wgsl",
             "tone_curves.wgsl",
             "snow.wgsl",
+            "standing_water.wgsl",
             "game_highlight.wgsl",
             "game_highlight_mask.wgsl",
             "editor_glow.wgsl",
@@ -432,6 +433,7 @@ mod tests {
             "spot_cookie.wgsl",
             // 7 Nov 2026: snow lying on surfaces (its own uniform at group 1 binding 34; off unless a look turns it on).
             "snow.wgsl",
+            "standing_water.wgsl",
         ];
         expected.sort_unstable();
         assert_eq!(

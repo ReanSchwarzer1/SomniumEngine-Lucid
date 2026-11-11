@@ -1842,6 +1842,7 @@ impl ShadingPass {
         wet_specular: f32,
         puddles: f32,
     ) {
+        // The first three of four: the fourth is standing water's (`set_standing_water`).
         queue.write_buffer(
             &self.weather,
             0,
@@ -1849,9 +1850,19 @@ impl ShadingPass {
                 wet_diffuse.clamp(0.0, 1.0),
                 wet_specular.clamp(0.0, 1.0),
                 puddles.clamp(0.0, 1.0),
-                0.0_f32,
             ]),
         );
+    }
+
+    /// Water standing on level ground (`standing_water.wgsl`; Sunscar weather, 11 Nov 2026): `level` 0..1 how much
+    /// has collected, `rain` 0..1 how hard it is raining on it (the rings). Zero, the default, leaves the ground as
+    /// it was. Packed into the weather uniform's spare fourth value: the whole part over 100 the level, the fraction
+    /// the rain.
+    // ponytail: two values in one float, to stay out of shading's bind group while its layout is being reworked;
+    // a uniform of its own (as snow has) when that is quiet.
+    pub fn set_standing_water(&self, queue: &wgpu::Queue, level: f32, rain: f32) {
+        let packed = (level.clamp(0.0, 1.0) * 100.0).round() + rain.clamp(0.0, 0.99);
+        queue.write_buffer(&self.weather, 12, bytemuck::bytes_of(&packed));
     }
 
     /// Publish the volume's range for this frame. 0 disables the lookup.

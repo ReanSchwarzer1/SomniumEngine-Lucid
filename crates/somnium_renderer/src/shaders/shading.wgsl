@@ -1,5 +1,6 @@
 //!include "spot_cookie.wgsl"
 //!include "snow.wgsl"
+//!include "standing_water.wgsl"
 // MORROWIND-C: composition is declared here rather than assembled by a
 // `format!` of `include_str!` calls at this pass's construction site. The
 // resolver (`somnium_shader`) emits each module once, in this order, and
@@ -214,7 +215,9 @@ fn skin_visibility(p: vec3<f32>, emitter: vec3<f32>, reach: f32) -> f32 {
 /// pass is off and the texture must not be read; that is what keeps a disabled
 /// cloud pass free rather than merely cheap.
 @group(1) @binding(18) var<uniform> cloud_shadow_params: vec4<f32>;
-/// CONTROL-N: `[wet_diffuse, wet_specular, puddles, unused]`.
+/// CONTROL-N: `[wet_diffuse, wet_specular, puddles, standing water]`. The last is Sunscar weather's (11 Nov 2026;
+/// `standing_water.wgsl`): its whole part over 100 is how much water has collected on level ground (0..1), its
+/// fraction how hard it is raining on it (0..1, the rings). Zero unless a game sets it.
 ///
 /// All zero when no weather is driving, and `apply_wetness` returns
 /// immediately in that case — so a scene with no Weather component shades
@@ -3160,6 +3163,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         apply_wetness(&surface, material.porosity);
     }
 
+    // Water standing on level ground, and rain's rings on it (standing_water.wgsl; Sunscar weather, 11 Nov 2026):
+    // terrain only, after its wetness. Off unless a game sets it.
+    if weather.w > 0.0 && material.terrain_index >= 0 {
+        surface = apply_standing_water(surface, hit_point, geo_normal, terrain_wetness_factor,
+                                       floor(weather.w) / 100.0, fract(weather.w), view.time);
+    }
     // Snow lying on the finished surface (snow.wgsl; sunscar-photoreal, 6 Nov 2026): before specular antialiasing
     // and f0, after terrain, decals and wetness. Off unless a scene has a SnowCover.
     if snow_params.p0.x > 0.5 {
