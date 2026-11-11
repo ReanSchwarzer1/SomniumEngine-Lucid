@@ -2772,7 +2772,13 @@ impl SomniumRenderer {
         view_data.extend_from_slice(bytemuck::bytes_of(&self.time));
         let tie_slope = crate::pass::visibility::depth_tie_slope(&self.proj_matrix, self.render_height);
         // A pixel's angle (at the render resolution) times the thinnest strip, for `thin_strip.wgsl`; 0 = off.
-        let strip_pixel = if self.min_strip_px > 0.0 && self.proj_matrix.z_axis.w != 0.0 {
+        // SOMNIUM_MIN_STRIP_AB=1 (measuring its cost, as SOMNIUM_SNOW_AB): off for alternate 120-frame stretches offset
+        // by 60, so a run with SOMNIUM_PROFILE_EVERY=120 logs blocks without it (frame=120, 360, ...) and with it (240,
+        // 480, ...) under the same clocks.
+        static STRIP_AB: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var("SOMNIUM_MIN_STRIP_AB").as_deref() == Ok("1"));
+        let strip_off = *STRIP_AB && (self.profiler.frame_index() + 60) / 120 % 2 == 1;
+        let strip_pixel = if self.min_strip_px > 0.0 && self.proj_matrix.z_axis.w != 0.0 && !strip_off {
             2.0 / (self.proj_matrix.y_axis.y * self.render_height.max(1) as f32) * self.min_strip_px
         } else {
             0.0
