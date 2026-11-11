@@ -1513,7 +1513,7 @@ struct TracedLight {
     /// How far to take the estimate over the untraced fallback: 0 where nothing was traced, rising to 1 over the
     /// first `GI_SETTLED_FRAMES` frames a place has been in view.
     trust: f32,
-    /// The screen-space visibility the sky's share is held under (`screen_occlusion`; 1 on thin leaves).
+    /// The screen-space visibility the sky's share is held under (`screen_occlusion`; 1 on a thin leaf).
     contact: f32,
 }
 
@@ -3550,10 +3550,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             }
         }
 
-        // Thin leaves take the sky's share as traced: in a crown GTAO is dark with the very leaves the rays met, and
-        // held under it the crowns went black.
+        // A thin leaf takes the sky's share as traced: in a crown GTAO is dark with the very leaves the rays met, and
+        // held under it the crowns went black. A leaf here is any two-sided cut-out. The foliage flag will not do:
+        // it marks a sidecar mask, and a grown tree's leaves are cut out by their glTF's own alpha mode.
+        let thin_leaf = (material.flags & 1u) != 0u && material.alpha_cutoff > 0.0;
         let gi_texel = gi_upsample(in.clip_pos.xy, length(hit_point - view.camera_pos),
-            select(screen_occlusion, 1.0, (material.flags & 2u) != 0u));
+            select(screen_occlusion, 1.0, thin_leaf));
         var ambient = evaluate_ibl(surface, gi_texel);
         if (material.flags & 8u) != 0u {
             ambient += eye_glint(surface, ambient);
@@ -3823,6 +3825,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             textureStore(path_surface_extra, pixel_coords,
                 vec4<f32>(select(micro_occlusion, -1.0, baked), fog_transmittance, 0.0, 0.0));
         }
+    }
+
+    // 36: what the traced GI says, as numbers for a linear capture to read (`.somcap`), not a picture: red the sky's
+    // share, green how far the estimate is trusted, blue the bounce against the sky's own light. It has no menu
+    // entry; a proof run asks for it by number (editor script `view=36`).
+    if dbg > 35.5 && dbg < 36.5 {
+        let gi = gi_upsample(in.clip_pos.xy, length(hit_point - view.camera_pos), 1.0);
+        let luma = vec3<f32>(0.2126, 0.7152, 0.0722);
+        let sky = dot(textureSampleLevel(env_cube, env_sampler, surface.normal, ENV_MAX_MIP).rgb, luma)
+            * light.ibl_intensity;
+        return vec4<f32>(gi.sky, gi.trust, dot(gi.bounce, luma) / max(sky, 1.0e-6), 1.0);
     }
 
     // Phase 24AB: lighting debug views (24–31). 0–23 remain the existing

@@ -2626,15 +2626,18 @@ impl<G: GameApp> Engine<G> {
                     }
                 }
                 // A debug view by its id (`somnium_ui::debug::DEBUG_VIEWS`): lit, sun_only, ambient_only, albedo, ...
-                Some(("view", id)) => match somnium_ui::debug::debug_view(id) {
-                    Some(view) => {
-                        self.terrain_debug_view = view.code;
-                        if let Some(renderer) = self.renderer.as_mut() {
-                            renderer.shading_debug = view.code;
+                // Or by its number, for the shaders' views that have no menu entry.
+                Some(("view", id)) => {
+                    match somnium_ui::debug::debug_view(id).map(|view| view.code).or_else(|| id.trim().parse().ok()) {
+                        Some(code) => {
+                            self.terrain_debug_view = code;
+                            if let Some(renderer) = self.renderer.as_mut() {
+                                renderer.shading_debug = code;
+                            }
                         }
+                        None => warn!(id, "editor script: no such debug view"),
                     }
-                    None => warn!(id, "editor script: no such debug view"),
-                },
+                }
                 Some(("select", part)) => {
                     let found = self.world.iter_with::<Name>().find(|(_, name)| name.as_str().contains(part)).map(|(e, _)| e);
                     if found.is_none() {
