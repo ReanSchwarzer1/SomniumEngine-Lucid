@@ -394,6 +394,13 @@ pub struct SomniumRenderer {
     /// faces a frame and crossfaded, and the clouds' sky capture re-marched when the sun has turned a quarter degree,
     /// instead of both being rebuilt whole on every change. False, the default, rebuilds on change as always.
     pub sun_moving: bool,
+    /// The sky, the clouds and the fog take the sun above the air (`sun_above_air`) and do their own transmittance
+    /// and planet shadow, so the sky keeps its light after sunset and twilight exists; stars are always there, outshone
+    /// by day. A day clock sets it. False, the default: they take the light on the ground (`light_color`), as always.
+    pub sky_above_air: bool,
+    /// The sun's light above the air (the directional light's own colour times its lux, before `sun::transmittance`),
+    /// set by the game layer with the light; read only under `sky_above_air`.
+    pub sun_above_air: glam::Vec3,
     /// The snowline map's placement for snow.wgsl (x0, z0, 1 / cell, on; width, height, -, -), set by `set_snow_map`
     /// (all zero is none), and its project path as last asked for.
     pub snow_map_params: [f32; 8],
@@ -1706,6 +1713,8 @@ impl SomniumRenderer {
             snow: [0.0; 16],
             snow_sun: None,
             sun_moving: false,
+            sky_above_air: false,
+            sun_above_air: glam::Vec3::ZERO,
             snow_map_params: [0.0; 8],
             snow_map_source: String::new(),
             surfaces_ab_was_off: false,
@@ -2898,6 +2907,12 @@ impl SomniumRenderer {
             b: f64::from(sky.z),
             a: 1.0,
         }
+    }
+
+    /// The sun the sky, the clouds and the fog are lit by: above the air under `sky_above_air` (they do their own
+    /// transmittance), else the light on the ground, as always.
+    fn sky_sun(&self) -> glam::Vec3 {
+        if self.sky_above_air { self.sun_above_air } else { self.light_color }
     }
 
     /// Set the directional light parameters for this frame.
@@ -5362,10 +5377,11 @@ impl SomniumRenderer {
             &ctx.device,
             &ctx.queue,
             self.light_direction,
-            self.light_color,
+            self.sky_sun(),
             overcast,
             self.cloud_pass.sky_light_clouds(),
             self.sun_moving,
+            self.sky_above_air.then_some(self.light_color),
         );
 
         // ── 1. Compute cascades and upload light buffer ───────────────────────
@@ -5407,7 +5423,7 @@ impl SomniumRenderer {
             direction: self.light_direction.to_array(),
             _pad0: 0.0,
             color: self.light_color.to_array(),
-            _pad1: 0.0,
+            sky_above_air: f32::from(u8::from(self.sky_above_air)),
             view_proj: std::array::from_fn(|i| cascades[i].view_proj.to_cols_array_2d()),
             cascade_splits: [
                 cascades[0].split_depth,
@@ -6593,6 +6609,7 @@ impl SomniumRenderer {
         );
         self.profiler.end(&mut encoder);
         self.profiler.begin(&mut encoder, "Volumetrics");
+        self.volumetric_pass.above_air = self.sky_above_air;
         self.volumetric_pass.record(
             &mut encoder,
             &ctx.queue,
@@ -6601,7 +6618,7 @@ impl SomniumRenderer {
             self.view_matrix,
             self.camera_pos,
             self.light_direction,
-            self.light_color,
+            self.sky_sun(),
             self.cloud_pass.sky_light_clouds().is_some(),
         );
         self.profiler.end(&mut encoder);
@@ -6633,13 +6650,14 @@ impl SomniumRenderer {
         self.cloud_pass.sky_eye = self.sky_eye;
         self.cloud_pass.time = self.time;
         self.cloud_pass.sun_moving = self.sun_moving;
+        self.cloud_pass.above_air = self.sky_above_air;
         self.cloud_pass.record(
             &mut encoder,
             &ctx.queue,
             self.view_proj_unjittered_rel.inverse(),
             self.camera_pos,
             self.light_direction,
-            self.light_color,
+            self.sky_sun(),
             self.volumetric_pass.max_distance(),
         );
         self.profiler.end(&mut encoder);

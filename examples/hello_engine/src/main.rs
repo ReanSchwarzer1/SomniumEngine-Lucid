@@ -2638,6 +2638,9 @@ impl GameApp for HelloGame {
                                     to_light,
                                     light.photometric_color() * survives,
                                 );
+                                // The same light above the air: under a day clock the sky, the clouds and the fog
+                                // take this and do their own transmittance (`sky_above_air`), so dusk exists.
+                                renderer.sun_above_air = light.photometric_color();
                                 renderer.set_directional_shadow_policy(
                                     somnium_renderer::shadow::virtual_map::ShadowLightPolicy {
                                         light_id: 0,

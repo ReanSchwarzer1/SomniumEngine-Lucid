@@ -2355,7 +2355,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // orbital model in sun.rs, not the old `-sun_dir` full-moon hack.
         let moon_dir = normalize(light.moon_direction);
         let moon_strength = saturate(1.0 - sun_illuminance / 10.0);
-        let detail = sky_detail(ray_dir, sun_dir, sun_illuminance, moon_dir, moon_strength);
+        // Under a sky lit above the air (a running day clock) the stars are always there, dimmed only by the air toward
+        // the horizon: the day's sky outshines them, and they come out as the twilight fades, not at the sun's last ray.
+        let star_strength = select(moon_strength, star_extinction(ray_dir.y), light.sky_above_air > 0.5);
+        let detail = sky_detail(ray_dir, sun_dir, sun_illuminance, moon_dir, moon_strength, star_strength);
         // The eye in the sky (somnium.SkyEye): drawn here, behind the cloud
         // composite, where fog does not reach.
         let eye = sky_eye(ray_dir, normalize(light.eye_direction), light.eye_tan_half_width, light.eye_color,

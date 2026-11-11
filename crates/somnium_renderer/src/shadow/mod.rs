@@ -55,7 +55,7 @@ pub const CASCADE_UV_OFFSETS: [(f32, f32); 4] = [(0.0, 0.0), (0.5, 0.0), (0.0, 0
 /// offset   0 :  direction     vec3<f32>          (12 bytes)
 /// offset  12 :  _pad0         f32                ( 4 bytes)
 /// offset  16 :  color         vec3<f32>          (12 bytes)  pre-multiplied by intensity
-/// offset  28 :  _pad1         f32                ( 4 bytes)
+/// offset  28 :  sky_above_air f32                ( 4 bytes)  1: sky lit above the air
 /// offset  32 :  view_proj     array<mat4x4, 4>   (256 bytes) one VP per cascade
 /// offset 288 :  cascade_splits vec4<f32>         (16 bytes)  view-space far Z per cascade
 /// offset 304 :  shadow_map_size f32              ( 4 bytes)  total atlas size in texels
@@ -75,7 +75,9 @@ pub struct GpuDirectionalLight {
     pub direction: [f32; 3],
     pub _pad0: f32,
     pub color: [f32; 3],
-    pub _pad1: f32,
+    /// 1 when the sky, clouds and fog are lit above the air (`Renderer::sky_above_air`): the shading pass's sky then
+    /// draws the stars dimmed only by the air, outshone by day. Was padding; every other pass still reads it as such.
+    pub sky_above_air: f32,
     /// Four cascade view-projection matrices, each column-major.
     pub view_proj: [[[f32; 4]; 4]; 4],
     pub cascade_splits: [f32; 4],
@@ -118,7 +120,7 @@ impl Default for GpuDirectionalLight {
             direction: [0.447, 0.894, -0.0],
             _pad0: 0.0,
             color: [5.0, 5.0, 5.0],
-            _pad1: 0.0,
+            sky_above_air: 0.0,
             view_proj: [identity; 4],
             cascade_splits: [5.0, 20.0, 50.0, 100.0],
             shadow_map_size: ATLAS_SIZE as f32,

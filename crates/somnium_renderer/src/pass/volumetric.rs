@@ -67,7 +67,9 @@ struct VolumetricParams {
     fog_top_softness: f32,
     /// 1: the clouds' sky-light capture holds a deck, and the fog's sky light comes through it.
     cloud_sky: f32,
-    _cloud_pad: [f32; 3],
+    /// 1: `sun_illuminance` is the sun above the air (`VolumetricPass::above_air`).
+    above_air: f32,
+    _cloud_pad: [f32; 2],
 }
 
 #[cfg(test)]
@@ -167,6 +169,9 @@ pub struct VolumetricPass {
     pub enabled: bool,
     pub fog: FogSettings,
     pub max_distance: f32,
+    /// `sun_illuminance` is the sun above the air (`Renderer::sky_above_air`): the sky's multiply scattered light is
+    /// then read for a sun near and under the horizon as it falls (`sample_multiscatter_twilight`).
+    pub above_air: bool,
 }
 
 impl VolumetricPass {
@@ -390,6 +395,7 @@ impl VolumetricPass {
             enabled: std::env::var("SOMNIUM_VOLUMETRICS").as_deref() != Ok("0"),
             fog: FogSettings::default(),
             max_distance: DEFAULT_MAX_DISTANCE,
+            above_air: false,
         }
     }
 
@@ -584,7 +590,8 @@ impl VolumetricPass {
                 fog_top_height: self.fog.top_height,
                 fog_top_softness: self.fog.top_softness.max(0.1),
                 cloud_sky: f32::from(u8::from(cloud_sky)),
-                _cloud_pad: [0.0; 3],
+                above_air: f32::from(u8::from(self.above_air)),
+                _cloud_pad: [0.0; 2],
             }),
         );
 

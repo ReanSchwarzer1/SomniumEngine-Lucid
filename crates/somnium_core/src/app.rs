@@ -8345,6 +8345,7 @@ impl<G: GameApp> Engine<G> {
         if let Some(r) = self.renderer.as_mut() {
             r.sun_moving = false;
             r.snow_sun = None;
+            r.sky_above_air = false;
         }
         let Some(entity) = self
             .world
@@ -8384,6 +8385,8 @@ impl<G: GameApp> Engine<G> {
         if !tod.fixed_sun && let Some(r) = self.renderer.as_mut() {
             r.sun_moving = self.play_session_active && tod.timescale != 0.0;
             r.snow_sun = Some(tod.climate_sun());
+            // The sky, clouds and fog take the sun above the air and do their own transmittance: twilight.
+            r.sky_above_air = true;
         }
 
         // Seam 4: the environment variable is an override of a real system now,

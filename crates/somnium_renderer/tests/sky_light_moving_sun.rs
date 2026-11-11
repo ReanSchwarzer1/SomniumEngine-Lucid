@@ -110,12 +110,12 @@ fn a_running_clock_moves_the_sky_light_without_a_step() {
     let probe = Probe::new(&device);
 
     // The first frame builds the cube whole, as a scene's first frame does.
-    assert!(ibl.generate_if_needed(&device, &queue, sun(6.0), light(6.0), 0.0, None, false));
+    assert!(ibl.generate_if_needed(&device, &queue, sun(6.0), light(6.0), 0.0, None, false, None));
     let mut seen = vec![probe.read(&device, &queue, &ibl)];
     let frames = 300;
     for frame in 1..=frames {
         let elevation = 6.0 - 0.01 * frame as f32;
-        ibl.generate_if_needed(&device, &queue, sun(elevation), light(elevation), 0.0, None, true);
+        ibl.generate_if_needed(&device, &queue, sun(elevation), light(elevation), 0.0, None, true, None);
         seen.push(probe.read(&device, &queue, &ibl));
     }
     for p in 0..PROBES {
@@ -131,7 +131,41 @@ fn a_running_clock_moves_the_sky_light_without_a_step() {
 
     // A sun that jumps (a key that moves the clock an hour) is rebuilt at once, crossfade or not.
     let before = probe.read(&device, &queue, &ibl);
-    assert!(ibl.generate_if_needed(&device, &queue, sun(20.0), light(20.0), 0.0, None, true));
+    assert!(ibl.generate_if_needed(&device, &queue, sun(20.0), light(20.0), 0.0, None, true, None));
     let after = probe.read(&device, &queue, &ibl);
     assert!(after[0] > 1.5 * before[0], "an hour on is there the same frame: {before:?} -> {after:?}");
+}
+
+/// Dusk (sunscar-sky, item 2): a sky lit by the sun above the air (`generate_if_needed`'s `ground_sun`) marches its own
+/// transmittance and the planet's shadow, so it keeps its light after sunset and fades through the twilight, as the
+/// real sky does: civil dusk's zenith a few cd/m2, nautical's a hundredth of that. Lit by the light on the ground, as
+/// every other scene's sky is, it goes out with the sun's last ray.
+#[test]
+#[ignore = "Requires a graphics adapter; run for changes to the sky's twilight"]
+fn a_sky_lit_above_the_air_keeps_its_light_after_sunset() {
+    let (device, queue) = gpu::device();
+    let shaders = somnium_renderer::shaders::Shaders::new();
+    let mut atmosphere = AtmospherePass::new(&device, &shaders);
+    atmosphere.ensure_built(&device, &queue);
+    let mut ibl = IblPass::new(&device, &shaders, &atmosphere);
+    let probe = Probe::new(&device);
+    let above = glam::Vec3::splat(80_000.0);
+    let mut overhead = |elevation: f32, lit_above: bool| {
+        // Under the horizon the light on the ground is nothing (sun::transmittance), whichever way the sky is lit.
+        let ground = if elevation > 0.0 { light(elevation) } else { glam::Vec3::ZERO };
+        let sky_sun = if lit_above { above } else { ground };
+        ibl.generate_if_needed(&device, &queue, sun(elevation), sky_sun, 0.0, None, false, lit_above.then_some(ground));
+        probe.read(&device, &queue, &ibl)[0]
+    };
+    let day = overhead(35.0, true);
+    let civil = overhead(-4.0, true);
+    let nautical = overhead(-10.0, true);
+    let night = overhead(-25.0, true);
+    let gone = overhead(-4.0, false);
+    println!("overhead sky light: day {day:.1}, -4 deg {civil:.3}, -10 deg {nautical:.5}, -25 deg {night:.7}; on the ground's light at -4: {gone:.7}");
+    assert!(civil > 0.3 && civil < 60.0, "civil dusk's sky: {civil} cd/m2");
+    assert!(nautical < civil / 20.0 && nautical > civil / 5000.0, "nautical dusk's: {nautical} against {civil}");
+    assert!(night < nautical / 10.0, "night: {night}");
+    assert!(gone < 0.01, "lit by the ground's light the sky is gone at -4 degrees: {gone}");
+    assert!(day > 100.0 * civil, "day {day} against dusk {civil}");
 }

@@ -34,8 +34,10 @@ const MOVING_QUICK_COS: f32 = 0.999_962;
 /// it whole at once, as a still scene's does: cos 5 degrees.
 const MOVING_JUMP_COS: f32 = 0.996_194_7;
 
-/// What a cube was built for: the sun's direction, its colour and the overcast's bits; the night; the clouds' capture.
-type SkyKey = (([f32; 3], [f32; 3], u32), NightSky, Option<u64>);
+/// What a cube was built for: the sun's direction, its colour, the overcast's bits and the sun on the ground (`GenParams`
+/// `sun_ground`); the night; the clouds' capture.
+type SunKey = ([f32; 3], [f32; 3], u32, [f32; 4]);
+type SkyKey = (SunKey, NightSky, Option<u64>);
 
 /// Where a running clock's rebuild stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +87,9 @@ struct GenParams {
     night_tint: [f32; 4],
     /// x: 1 lays the clouds' capture over the sky (`set_cloud_capture`).
     clouds: [f32; 4],
+    /// The sun on the ground and 1 when `sun_color` is the sun above the air (`generate_if_needed`'s `ground_sun`);
+    /// all zero is the sky as it always was.
+    sun_ground: [f32; 4],
 }
 
 /// A night sky with no moon (Rimeborn's Undersun under the Lid), drawn into the environment cubemap so the background,
@@ -130,7 +135,7 @@ pub struct IblPass {
     params_buffer: wgpu::Buffer,
 
     /// Last sun the cubemap was built for, so we only regenerate on change.
-    last_sun: Option<([f32; 3], [f32; 3], u32)>,
+    last_sun: Option<SunKey>,
     /// The night the cube was last built with.
     last_night: Option<NightSky>,
 
@@ -506,6 +511,10 @@ impl IblPass {
     /// on each change (36 passes a frame): a second cube is built two faces a frame (twelve for a fast clock), and the
     /// bound cube crossfades to it, then the next (`step_moving`). A sun further than 5 degrees from the one the cube
     /// holds is rebuilt at once, as always.
+    ///
+    /// `ground_sun`: `Some` when `sun_color` is the sun above the air (a running day clock, `Renderer::sky_above_air`):
+    /// the sky then marches its own transmittance and the planet's shadow (twilight), and this, the sun on the ground,
+    /// lights the land below the horizon. `None`: `sun_color` is the sun on the ground, as it always was.
     #[allow(clippy::too_many_arguments)]
     pub fn generate_if_needed(
         &mut self,
@@ -516,14 +525,16 @@ impl IblPass {
         overcast: f32,
         clouds: Option<u64>,
         moving: bool,
+        ground_sun: Option<glam::Vec3>,
     ) -> bool {
         let overcast = if clouds.is_some() { 0.0 } else { overcast.clamp(0.0, 1.0) };
-        let key = (sun_direction.to_array(), sun_color.to_array(), overcast.to_bits());
+        let ground = ground_sun.map_or([0.0; 4], |g| [g.x, g.y, g.z, 1.0]);
+        let key = (sun_direction.to_array(), sun_color.to_array(), overcast.to_bits(), ground);
         let toward = sun_direction.normalize_or(glam::Vec3::Y);
         if moving
             && self
                 .last_sun
-                .is_some_and(|(sun, _, _)| glam::Vec3::from(sun).normalize_or(glam::Vec3::Y).dot(toward) >= MOVING_JUMP_COS)
+                .is_some_and(|(sun, ..)| glam::Vec3::from(sun).normalize_or(glam::Vec3::Y).dot(toward) >= MOVING_JUMP_COS)
         {
             return self.step_moving(device, queue, (key, self.night, clouds));
         }
@@ -548,7 +559,7 @@ impl IblPass {
 
         // Mip 0: capture the sky.
         for face in 0..6u32 {
-            self.write_params(queue, face, 0.0, dir, sun_color, overcast, clouds_on);
+            self.write_params(queue, face, 0.0, dir, sun_color, overcast, clouds_on, ground);
             self.run_face(device, queue, &self.face_mip_views[face as usize], true, &self.prefilter_bind_group);
         }
 
@@ -556,7 +567,7 @@ impl IblPass {
         for mip in 1..MIP_COUNT {
             let roughness = mip as f32 / (MIP_COUNT - 1) as f32;
             for face in 0..6u32 {
-                self.write_params(queue, face, roughness, dir, sun_color, overcast, clouds_on);
+                self.write_params(queue, face, roughness, dir, sun_color, overcast, clouds_on, ground);
                 let view = &self.face_mip_views[(mip * 6 + face) as usize];
                 self.run_face(device, queue, view, false, &self.prefilter_bind_group);
             }
@@ -617,7 +628,7 @@ impl IblPass {
     /// The cycle's next faces and mips of the second cube, for the sky it is being built for; the last of them starts
     /// the crossfade. Mip 0's faces come first: the prefilter reads them.
     fn build_jobs(&self, device: &wgpu::Device, queue: &wgpu::Queue, m: &mut MovingSky) {
-        let (MovingPhase::Building { mut job, per_frame, blend }, Some(((sun, color, overcast), _, clouds))) =
+        let (MovingPhase::Building { mut job, per_frame, blend }, Some(((sun, color, overcast, ground), _, clouds))) =
             (m.phase, m.key)
         else {
             return;
@@ -627,7 +638,7 @@ impl IblPass {
         for _ in 0..per_frame {
             let (mip, face) = (job / 6, job % 6);
             let roughness = mip as f32 / (MIP_COUNT - 1) as f32;
-            self.write_params(queue, face, roughness, dir, color.into(), f32::from_bits(overcast), clouds_on);
+            self.write_params(queue, face, roughness, dir, color.into(), f32::from_bits(overcast), clouds_on, ground);
             self.run_face(device, queue, &m.face_mip_views[job as usize], mip == 0, &m.prefilter_bind_group);
             job += 1;
             if job == MIP_COUNT * 6 {
@@ -735,6 +746,7 @@ impl IblPass {
         sun_color: glam::Vec3,
         overcast: f32,
         clouds: f32,
+        ground: [f32; 4],
     ) {
         let p = GenParams {
             face,
@@ -763,6 +775,7 @@ impl IblPass {
             night: [self.night.glow.max(0.0), self.night.aurora, self.night.halo_road, self.night.thread],
             night_tint: [self.night.tint[0], self.night.tint[1], self.night.tint[2], 0.0],
             clouds: [clouds, 0.0, 0.0, 0.0],
+            sun_ground: ground,
         };
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&p));
     }
