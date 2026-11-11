@@ -599,7 +599,7 @@ fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
         if kind == 7 {
             // Combed into fall streaks a hundred metres or so across, drawn out along the fall.
             let comb = textureSampleLevel(detail_noise_tex, cloud_sampler, vec3<f32>(q.x, q.y * 0.04 + turn, q.z) / 420.0, 0.0);
-            density *= 0.3 + 1.1 * comb.r;
+            density *= 0.55 + 0.7 * comb.r;
         }
     }
     // A ring's rain is thin beside its cloud.
@@ -679,6 +679,11 @@ fn storm_light_march(origin: vec3<f32>, sun: vec3<f32>, finest: f32) -> f32 {
         optical_depth += cloud_density(origin + sun * (near + width * 0.5), true) * width * 0.01;
         near += width;
         width *= 3.0;
+    }
+    // A small body's four taps end a few hundred metres up: one more, far along the ray, finds the storm over it. A
+    // funnel under a storm's base stood in full sun, white (the windowless pictures, 12 Nov).
+    if near < 4000.0 {
+        optical_depth += cloud_density(origin + sun * 2600.0, true) * 2400.0 * 0.01;
     }
     return optical_depth;
 }
