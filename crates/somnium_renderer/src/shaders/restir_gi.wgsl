@@ -518,6 +518,24 @@ struct GiSurface {
     /// almost nothing, and with the far side left out every such leaf was black: the undersides of crowns, the
     /// insides of bushes, the low plants seen at a slant (the developer's "black splotches", 11 Nov 2026).
     leaf: f32,
+    /// Metres the surface's rays start off it, along its normal: 5 cm, and more on far ground.
+    ///
+    /// The ground is drawn at a coarser level of detail with distance and traced at its finest, so a point on the
+    /// drawn ground can lie under the traced one: its rays started inside the hill and met the ground's own back.
+    /// It showed as rows of dark blobs on every far slope, as far apart as the coarse level's vertices (the
+    /// developer's video, 11 Nov 2026: "smoky" blobs on the hill behind Monargent). The coarse level's vertex spacing
+    /// doubles with each doubling of distance (terrain/mod.rs `select_lods`), and what a chord can miss of a curve
+    /// grows as the square of its length, so the start is lifted by the square of the distance.
+    lift: f32,
+}
+
+/// The lift that clears the ground's coarse levels: half a metre where the second level begins (192 m with the
+/// default `lod_base_range` of 96 and 2 m cells), four times that at each doubling, never under 5 cm nor over 12 m.
+/// ponytail: the terrain's own base range and cell size are not read; a terrain that sets them far from the defaults
+/// needs them passed in its material.
+fn gi_ground_lift(distance: f32) -> f32 {
+    let levels = distance / 192.0;
+    return clamp(0.5 * levels * levels, 0.05, 12.0);
 }
 
 // This cache stores exactly the geometry reconstructed by pass 1, at float32
@@ -533,8 +551,9 @@ struct GiCachedSurface {
 fn gi_spatial_surface(index: u32, coord: vec2<i32>, dims: vec2<u32>) -> GiSurface {
     if gi_cache_surfaces {
         let cached = gi_surfaces[index];
+        // `w` of the position is the lift, which is never zero on a surface.
         return GiSurface(cached.position_valid.w > 0.0, cached.position_valid.xyz, cached.normal.xyz,
-            cached.normal.w);
+            cached.normal.w, cached.position_valid.w);
     }
     return gi_primary_surface(coord, dims);
 }
@@ -545,6 +564,7 @@ fn gi_primary_surface(coord: vec2<i32>, dims: vec2<u32>) -> GiSurface {
     s.pos = vec3<f32>(0.0);
     s.normal = vec3<f32>(0.0, 1.0, 0.0);
     s.leaf = 0.0;
+    s.lift = 0.05;
 
     let depth = textureLoad(depth_tex, coord, 0);
     if depth <= 0.0 {
@@ -585,6 +605,9 @@ fn gi_primary_surface(coord: vec2<i32>, dims: vec2<u32>) -> GiSurface {
     if (materials[inst.material_id].flags & 1u) != 0u && materials[inst.material_id].alpha_cutoff > 0.0 {
         s.leaf = materials[inst.material_id].transmission;
     }
+    if materials[inst.material_id].terrain_index >= 0 {
+        s.lift = gi_ground_lift(distance(s.pos, gi.camera_pos));
+    }
     return s;
 }
 
@@ -615,7 +638,7 @@ fn initial_and_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
     let surface = gi_primary_surface(coord, full);
     if gi_cache_surfaces {
         gi_surfaces[index] = GiCachedSurface(
-            vec4<f32>(surface.pos, select(0.0, 1.0, surface.valid)),
+            vec4<f32>(surface.pos, select(0.0, surface.lift, surface.valid)),
             vec4<f32>(surface.normal, surface.leaf));
     }
     if !surface.valid {
@@ -631,7 +654,7 @@ fn initial_and_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
     let far_side = surface.leaf > 0.0 && ((gid.x + gid.y + gi.frame) & 1u) == 1u;
     let ray_normal = select(surface.normal, -surface.normal, far_side);
     let dir = gi_sample_cosine(ray_normal, u);
-    let origin = surface.pos + ray_normal * 0.05;
+    let origin = surface.pos + ray_normal * surface.lift;
     let hit = gi_trace(origin, dir, 0.05, gi.max_distance);
     // The sky's share: the environment along the ray, and again if the ray left the scene (see `sky_out`).
     let env_up = gi_luma(textureSampleLevel(gi_env, gi_env_sampler, vec3<f32>(0.0, 1.0, 0.0), GI_ENV_ROUGHEST).rgb);
@@ -781,7 +804,7 @@ fn spatial_and_shade(@builtin(global_invocation_id) gid: vec3<u32>) {
     // would make an occluded sample impossible to recover from and leave dark
     // trails behind moving geometry.
     gi_a[index] = r;
-    if r.w > 0.0 && !gi_visible(surface.pos + surface.normal * 0.05, r.sample_pos, 0.05) {
+    if r.w > 0.0 && !gi_visible(surface.pos + surface.normal * surface.lift, r.sample_pos, 0.05) {
         r.w = 0.0;
     }
 

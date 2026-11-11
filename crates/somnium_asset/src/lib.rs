@@ -73,6 +73,21 @@ fn material_extra(mat: &gltf::Material<'_>, key: &str) -> f32 {
         .map_or(0.0, |w| (w as f32).clamp(0.0, 1.0))
 }
 
+/// `SOMNIUM_LEAF_TRANSMISSION=broad,needle`: the share of light a glTF's own cut-out leaves let through when the
+/// material does not say (two numbers in 0..1; one number serves both). Unset or 0, nothing is inferred and such
+/// leaves stay opaque to light, as they were: a game opts in.
+fn leaf_transmission() -> Option<[f32; 2]> {
+    static RULE: std::sync::OnceLock<Option<[f32; 2]>> = std::sync::OnceLock::new();
+    *RULE.get_or_init(|| parse_leaf_transmission(&std::env::var("SOMNIUM_LEAF_TRANSMISSION").unwrap_or_default()))
+}
+
+fn parse_leaf_transmission(rule: &str) -> Option<[f32; 2]> {
+    let mut shares = rule.split(',').map(|share| share.trim().parse::<f32>().ok().map(|s| s.clamp(0.0, 1.0)));
+    let broad = shares.next()??;
+    let needle = shares.next().flatten().unwrap_or(broad);
+    (broad > 0.0 || needle > 0.0).then_some([broad, needle])
+}
+
 /// glTF material extras `somnium_interior_depth`: metres of room behind a
 /// window whose colour map is that room's back wall. 0 when absent.
 fn interior_depth(mat: &gltf::Material<'_>) -> f32 {
@@ -515,6 +530,22 @@ fn load_gltf_checked(path: &Path, parts: Option<&HashSet<usize>>) -> Result<Load
             // every leaf opaque.
             if m.transmission <= 0.0 {
                 m.transmission = 0.5;
+            }
+        }
+    }
+
+    // A leaf the glTF cuts out itself (MASK, two-sided, fluttering in the wind) never meets the rule above, which
+    // looks for a sidecar mask: every grown tree's leaves came in letting no light through, and a crown seen from
+    // below or against the light was black (Sunscar, 11 Nov 2026). A game says what such leaves pass
+    // (`leaf_transmission`); needles pass less than broad leaves. An authored factor stands.
+    if let Some([broad, needle]) = leaf_transmission() {
+        for m in &mut scene.materials {
+            if m.alpha_mode == AlphaMode::Mask && m.double_sided && m.wind_flutter > 0.0 && m.transmission <= 0.0 {
+                let name = m.name.to_ascii_lowercase();
+                let needles = ["needle", "pine", "cypress", "juniper", "cedar", "spruce", "fir"]
+                    .iter()
+                    .any(|kind| name.contains(kind));
+                m.transmission = if needles { needle } else { broad };
             }
         }
     }
@@ -1675,6 +1706,15 @@ mod normal_scale_tests {
         let used = full.nodes[0].material_index.unwrap();
         assert_eq!((part.materials[used].alpha_mode, part.materials[used].foliage),
                    (full.materials[used].alpha_mode, full.materials[used].foliage), "the drawn material keeps its cutout");
+    }
+
+    #[test]
+    fn the_leaf_rule_reads_one_share_or_two_and_is_off_when_unset() {
+        assert_eq!(super::parse_leaf_transmission(""), None);
+        assert_eq!(super::parse_leaf_transmission("0"), None);
+        assert_eq!(super::parse_leaf_transmission("0.5"), Some([0.5, 0.5]));
+        assert_eq!(super::parse_leaf_transmission(" 0.5, 0.2 "), Some([0.5, 0.2]));
+        assert_eq!(super::parse_leaf_transmission("7,-1"), Some([1.0, 0.0]));
     }
 
     #[test]
