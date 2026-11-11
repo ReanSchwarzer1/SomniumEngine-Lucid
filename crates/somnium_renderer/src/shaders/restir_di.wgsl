@@ -36,8 +36,8 @@ struct RestirParams {
     history_valid: f32,
     camera_pos: vec3<f32>,
     /// How the sun's ray is traced (`occluded`). 0: opaque, as it was (debug view 38). 1: a ray from the ground
-    /// passes the ground's underside (debug view 39, and a game that switches cut-outs off). 2: that, and every ray
-    /// passes through a cut-out's holes.
+    /// passes the ground's underside (the default, and debug view 39). 2: that, and every ray passes through a
+    /// cut-out's holes (a game that sets `SOMNIUM_SUN_CUTOUTS=1`).
     sun_rays: f32,
 }
 
