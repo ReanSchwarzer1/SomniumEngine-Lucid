@@ -372,6 +372,9 @@ pub struct SomniumRenderer {
     /// (all zero is none), and its project path as last asked for.
     pub snow_map_params: [f32; 8],
     pub snow_map_source: String,
+    /// The scene's height, in metres, within which meshes blend into the ground where their material says nothing
+    /// (`ground_blend.wgsl`, PostProcess `ground_blend_m`); 0 is off.
+    pub ground_blend_default: f32,
     /// Radial vignette strength (0 = off, 1 = default, higher = stronger).
     ///
     /// Defaults to **off**: an always-on vignette darkens the viewport edges,
@@ -1673,6 +1676,7 @@ impl SomniumRenderer {
             snow: [0.0; 16],
             snow_map_params: [0.0; 8],
             snow_map_source: String::new(),
+            ground_blend_default: 0.0,
             vignette_strength: 0.0,
             chromatic_aberration: 0.0,
             fxaa_pass: crate::pass::fxaa::FxaaPass::new(
@@ -2290,7 +2294,7 @@ impl SomniumRenderer {
                         detile: if mat.detile { 1.0 } else { 0.0 },
                         wind: [mat.wind_bend, mat.wind_flutter],
                         subsurface: mat.subsurface,
-                        reserved: 0.0,
+                        ground_blend: mat.ground_blend,
                     },
                 );
                 // Phase 17D: remember double-sidedness so the visibility pass can
@@ -4042,6 +4046,10 @@ impl SomniumRenderer {
         ids.sky_visibility =
             self.add_terrain_texture(ctx, terrain.horizon_gpu.sky_view.clone()) as i32;
         ids.relief_normal = self.add_terrain_texture(ctx, terrain.relief_gpu.view.clone()) as i32;
+        ids.height = terrain
+            .height_gpu
+            .as_ref()
+            .map_or(-1, |(_, view)| self.add_terrain_texture(ctx, view.clone()) as i32);
         let hero = crate::terrain::textures::TERRAIN_HERO_LAYERS;
         // Virtual mode deliberately leaves every legacy layer id at -1. The
         // 4x4 arrays only keep the struct/fallback shape valid; publishing
@@ -4134,7 +4142,7 @@ impl SomniumRenderer {
                 detile: 0.0,
                 wind: [0.0; 2],
                 subsurface: 0.0,
-                reserved: 0.0,
+                ground_blend: 0.0,
             },
         );
         // Opaque and single-sided, which is what an unregistered material
@@ -5596,6 +5604,43 @@ impl SomniumRenderer {
             self.terrain_materials
                 .write(&ctx.queue, terrain_index, &mat);
         }
+        // Meshes blending into the ground (ground_blend.wgsl): the live terrains' rectangles, heights and indices.
+        // ponytail: a terrain's model is a translation (Sunscar's tiles); a turned or scaled one needs its inverse.
+        let mut ground = [0.0f32; 4 + 32 * 12];
+        let mut count = 0;
+        for &(id, model) in &self.terrain_queue {
+            let Some(terrain) = self.terrains.get(id as usize) else {
+                continue;
+            };
+            if terrain.texture_ids.height < 0 || count == 32 {
+                continue;
+            }
+            let [wx, wz] = terrain.desc.world_size();
+            let o = model.w_axis;
+            ground[4 + count * 12..4 + (count + 1) * 12].copy_from_slice(&[
+                o.x,
+                o.z,
+                1.0 / wx,
+                1.0 / wz,
+                o.y,
+                terrain.texture_ids.height as f32,
+                terrain.terrain_index as f32,
+                terrain.desc.total_vertices_x() as f32,
+                terrain.desc.total_vertices_z() as f32,
+                0.0,
+                0.0,
+                0.0,
+            ]);
+            count += 1;
+        }
+        // SOMNIUM_GROUND_BLEND_AB=1 (measuring its cost), as SOMNIUM_SNOW_AB: no blending in the frame=120, 360, ...
+        // blocks of a run with SOMNIUM_PROFILE_EVERY=120.
+        static GROUND_AB: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var("SOMNIUM_GROUND_BLEND_AB").as_deref() == Ok("1"));
+        let ab_off = *GROUND_AB && (self.profiler.frame_index() + 60) / 120 % 2 == 1;
+        ground[0] = if ab_off { 0.0 } else { count as f32 };
+        ground[1] = self.ground_blend_default;
+        self.shading_pass.set_ground_blend(&ctx.queue, &ground);
 
         self.profiler.cpu_end();
         self.profiler.cpu_begin("Draw sort");

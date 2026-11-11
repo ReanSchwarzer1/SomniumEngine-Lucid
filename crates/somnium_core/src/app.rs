@@ -9128,6 +9128,7 @@ impl<G: GameApp> Engine<G> {
             };
             // Snow lying on surfaces (snow.wgsl's uniform, shading group 1 binding 34); all zero is none. The renderer
             // fills the direction toward the sun itself.
+            r.ground_blend_default = pp.ground_blend_m.max(0.0);
             r.snow = if pp.snow {
                 let wind = pp.snow_wind_deg.to_radians();
                 [
@@ -11926,7 +11927,7 @@ impl<G: GameApp> Engine<G> {
                                     detile: 0.0,
                                     wind: [0.0; 2],
                                     subsurface: 0.0,
-                                    reserved: 0.0,
+                                    ground_blend: 0.0,
                                 },
                             );
                             self.default_material_id = Some(id);

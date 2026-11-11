@@ -1,5 +1,6 @@
 //!include "spot_cookie.wgsl"
 //!include "snow.wgsl"
+//!include "ground_blend.wgsl"
 // MORROWIND-C: composition is declared here rather than assembled by a
 // `format!` of `include_str!` calls at this pass's construction site. The
 // resolver (`somnium_shader`) emits each module once, in this order, and
@@ -3150,6 +3151,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         apply_decals(&surface, hit_point, decal_froxel);
     }
 
+    // Meshes blending into the ground under them (ground_blend.wgsl; sunscar-photoreal, 11 Nov 2026): after paint and
+    // decals, before f0, wetness and snow. Off unless the material or the scene gives a blend height; never for cut-outs,
+    // foliage, hair or far ground (flags 2, 4, 16, 32, 64).
+    if material.terrain_index < 0 && ground_blend.params.x > 0.0 && material.alpha_cutoff <= 0.0
+        && (material.flags & 118u) == 0u {
+        let blend_m = select(ground_blend.params.y, material.ground_blend, material.ground_blend != 0.0)
+            * length(instance.model[0].xyz);
+        if blend_m > 0.0 {
+            surface = apply_ground_blend(surface, hit_point, geo_normal, blend_m);
+        }
+    }
     surface.f0       = mix(vec3<f32>(0.04), surface.albedo, surface.metallic);
     if material.terrain_index >= 0 {
         surface.f0 = surface.f0 + vec3<f32>(terrain_wet_f0);
