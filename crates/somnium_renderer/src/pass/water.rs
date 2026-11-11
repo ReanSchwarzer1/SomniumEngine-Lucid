@@ -3,6 +3,7 @@
 pub struct WaterMaterialData {
     pub deep_color: [f32; 4],
     pub shallow_color: [f32; 4],
+    /// rgb is not read by the shader; alpha is the body's turbidity, 0..1 (`water.wgsl`).
     pub edge_color: [f32; 4],
     pub absorption_roughness: [f32; 4],
     pub scattering_anisotropy: [f32; 4],
