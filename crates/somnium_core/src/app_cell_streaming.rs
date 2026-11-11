@@ -97,7 +97,7 @@ impl<G: GameApp> Engine<G> {
             // the readers, and the palette's asks and uploads.
             let mut spent = [std::time::Duration::ZERO; 4];
             self.cell_streamer.spent = Default::default();
-            self.cell_streamer.encoded = Default::default();
+            let compressed = somnium_renderer::imported_bc::encoded();
             let mut asked: Option<std::time::Instant> = None;
             let mut flushed = std::time::Instant::now();
             // Round the readers without a frame budget, so all of them keep decoding while this thread uploads.
@@ -148,8 +148,8 @@ impl<G: GameApp> Engine<G> {
                     self.cell_streamer.spent[4].as_secs_f64(),
                     self.cell_streamer.spent[5].as_secs_f64()
                 ),
-                textures_encoded = self.cell_streamer.encoded.0,
-                encode_seconds = format!("{:.1}", self.cell_streamer.encoded.1),
+                textures_encoded = somnium_renderer::imported_bc::encoded().0 - compressed.0,
+                encode_seconds = format!("{:.1}", somnium_renderer::imported_bc::encoded().1 - compressed.1),
                 palette = format!("{:.1}", spent[3].as_secs_f64()),
                 gpu_wait = format!("{:.1}", spent[1].as_secs_f64()),
                 readers_wait = format!("{:.1}", spent[2].as_secs_f64()),
@@ -409,11 +409,7 @@ impl<G: GameApp> Engine<G> {
         let Some((renderer, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref()) else {
             return;
         };
-        let before = renderer.texture_upload_stats;
         let nodes = renderer.upload_prepared_scene_for(ctx, scene, Some(parts), prepared);
-        let after = renderer.texture_upload_stats;
-        self.cell_streamer.encoded.0 += after.encoded.saturating_sub(before.encoded);
-        self.cell_streamer.encoded.1 += (after.encode_ms - before.encode_ms).max(0.0) / 1000.0;
         if let Some(stamp) = stamp {
             self.imported_uploads.insert(stamp, &nodes, Some(parts.clone()));
         }

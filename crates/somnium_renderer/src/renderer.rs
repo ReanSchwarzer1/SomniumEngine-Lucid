@@ -2197,7 +2197,16 @@ impl SomniumRenderer {
                 let key = imported_texture_key(tex, is_colour[index]);
                 let chain = (compressing && crate::imported_bc::compressible(tex.width, tex.height)).then(|| {
                     let alpha = crate::imported_bc::has_alpha(&tex.data);
-                    (alpha, crate::imported_bc::load(&key, tex.width, tex.height, alpha))
+                    // A texture the cache has never seen is compressed here, on the thread that prepares it, and
+                    // kept. Left to the upload it stalled the thread that draws for most of a second a texture: a
+                    // start after sessions had changed 74 of Monargent's spent 58 s of its fill on them, and each
+                    // new texture met on a walk was a frozen frame (Sunscar, 12 Nov 2026).
+                    let blocks = crate::imported_bc::load(&key, tex.width, tex.height, alpha).unwrap_or_else(|| {
+                        let blocks = crate::imported_bc::encode(&build_mip_chain(&tex.data, tex.width, tex.height), alpha);
+                        crate::imported_bc::store(&key, tex.width, tex.height, alpha, &blocks);
+                        blocks
+                    });
+                    (alpha, Some(blocks))
                 });
                 (index, key, chain)
             })

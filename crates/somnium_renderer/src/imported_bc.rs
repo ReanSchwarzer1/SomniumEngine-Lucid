@@ -121,9 +121,26 @@ fn encode_level(rgba: &[u8], width: u32, height: u32, alpha: bool) -> Vec<u8> {
     parts.concat()
 }
 
+/// Chains this process has compressed, and the milliseconds they took, on whichever threads made them.
+static ENCODED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static ENCODE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many chains this process has compressed so far, and the seconds they took: a load's log takes the
+/// difference, so a slow one says whether its textures were new to the cache.
+#[must_use]
+pub fn encoded() -> (u32, f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (ENCODED.load(Relaxed), ENCODE_MS.load(Relaxed) as f64 / 1000.0)
+}
+
 /// BC7 for every level of a mip chain (`(width, height, rgba8)` per level).
 pub fn encode(levels: &[(u32, u32, Vec<u8>)], alpha: bool) -> Vec<Vec<u8>> {
-    levels.iter().map(|(w, h, data)| encode_level(data, *w, *h, alpha)).collect()
+    use std::sync::atomic::Ordering::Relaxed;
+    let started = std::time::Instant::now();
+    let chain = levels.iter().map(|(w, h, data)| encode_level(data, *w, *h, alpha)).collect();
+    ENCODED.fetch_add(1, Relaxed);
+    ENCODE_MS.fetch_add(started.elapsed().as_millis() as u64, Relaxed);
+    chain
 }
 
 /// Whether a chain for this texture is on disk (not read or checked).

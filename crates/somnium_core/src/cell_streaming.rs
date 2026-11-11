@@ -584,8 +584,6 @@ pub struct CellStreamer {
     /// Main-thread time spent uploading sources and installing cells, then the install's steps (spawning, the
     /// ground, the GPU state, the whole-world passes), for the first fill's log line.
     pub(crate) spent: [std::time::Duration; 6],
-    /// Textures a streamed source had to compress on the main thread (not in the BC7 cache), and the seconds it took.
-    pub(crate) encoded: (u32, f64),
 }
 
 /// The readers' turnstile: a cell's sources are read side by side, and this bounds how many are being read at once
