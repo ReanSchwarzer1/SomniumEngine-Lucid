@@ -97,13 +97,16 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) drop: u3
     // Most drops are small and a few are large (Marshall and Palmer); a larger drop falls faster.
     let big = k.x * k.x;
     let diameter = pp.size * mix(0.5, 2.2, big);
-    var velocity = pp.velocity * mix(0.75, 1.3, big);
-    velocity += pp.wander * vec3<f32>(
-        sin(pp.time * 1.3 + k.y * 40.0), 0.3 * sin(pp.time * 0.9 + k.z * 40.0), cos(pp.time * 1.1 + k.y * 23.0));
+    let fall = pp.velocity * mix(0.75, 1.3, big);
+    // Its wander: a velocity for its streak, and that velocity's own integral for where it is, which stays within a
+    // metre of its fall. (The two were once one sum multiplied by the clock: snow drifted faster every second.)
+    let wa = vec3<f32>(pp.time * 1.3 + k.y * 40.0, pp.time * 0.9 + k.z * 40.0, pp.time * 1.1 + k.y * 23.0);
+    let velocity = fall + pp.wander * vec3<f32>(sin(wa.x), 0.3 * sin(wa.y), cos(wa.z));
+    let strayed = pp.wander * vec3<f32>(-cos(wa.x) / 1.3, -0.3 * cos(wa.y) / 0.9, sin(wa.z) / 1.1);
 
     // Where it is: its own start, carried by its fall, wrapped into the box round the eye.
     let box = pp.extent * 2.0;
-    let u = fract(h + velocity * (pp.time / box) - pp.centre / box + 0.5) - 0.5;
+    let u = fract(h + (fall * pp.time + strayed) / box - pp.centre / box + 0.5) - 0.5;
     let head = pp.centre + u * box - pp.camera_pos;
     let fade = smoothstep(0.0, 0.15, 1.0 - 2.0 * max(max(abs(u.x), abs(u.y)), abs(u.z)));
 

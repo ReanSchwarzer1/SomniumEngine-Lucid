@@ -183,8 +183,9 @@ impl StormVolume {
     }
 
     /// A shaft of rain or hail from the cloud's base `height` metres above `foot` down to the ground, `radius` wide,
-    /// its foot carried `drift` metres (world XZ) from under its top by the wind. `virga` 0..1 ends it that share of
-    /// the way down, evaporated. `opacity` is extinction relative to cloud (rain about 0.03, a hail core 0.1).
+    /// its foot carried `drift` metres (world XZ) from under its top by the wind. `virga` 0..1 is the share of its
+    /// height above the ground it never reaches, evaporated on the way (0.3 ends it 70% of the way down).
+    /// `opacity` is extinction relative to cloud (rain about 0.03, a hail core 0.1).
     #[must_use]
     pub fn shaft(foot: glam::Vec3, radius: f32, height: f32, drift: glam::Vec2, virga: f32, opacity: f32, tint: [f32; 3]) -> Self {
         let mut v = Self::new(SHAFT, foot, radius, height, opacity, (radius * 0.9).clamp(150.0, 3000.0)).coloured(tint);

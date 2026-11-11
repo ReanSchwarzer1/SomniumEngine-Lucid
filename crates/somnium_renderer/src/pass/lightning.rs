@@ -152,8 +152,6 @@ pub struct LightningPass {
     params: wgpu::Buffer,
     corners: wgpu::Buffer,
     bind_group: Option<wgpu::BindGroup>,
-    /// The depth view the bind group was built for (it follows the scene's size).
-    bound_size: (u32, u32),
     spans: Vec<Span>,
     count: u32,
 }
@@ -241,7 +239,6 @@ impl LightningPass {
                 mapped_at_creation: false,
             }),
             bind_group: None,
-            bound_size: (0, 0),
             spans: Vec::new(),
             count: 0,
         }
@@ -262,17 +259,15 @@ impl LightningPass {
         if self.bolts.is_empty() {
             return;
         }
-        if self.bind_group.is_none() || self.bound_size != size {
-            self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Lightning BG"),
-                layout: &self.layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.params.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth) },
-                ],
-            }));
-            self.bound_size = size;
-        }
+        // Built for this frame's depth every frame that has a bolt: the scene's depth can be rebuilt at the same size.
+        self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Lightning BG"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth) },
+            ],
+        }));
         let mut corners = Vec::new();
         for bolt in &self.bolts {
             self.spans.clear();
