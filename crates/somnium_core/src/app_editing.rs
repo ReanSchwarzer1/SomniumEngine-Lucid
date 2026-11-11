@@ -2616,6 +2616,25 @@ impl<G: GameApp> Engine<G> {
                         None => warn!(x, z, "editor script: no ground loaded under the eye"),
                     }
                 }
+                // A picture of the scene alone (no editor) at this frame, so one launch can take several. With
+                // `SOMNIUM_CAPTURE_STILL_HDR=1` each also leaves its linear `.somcap`.
+                Some(("shot", path)) => {
+                    if let Some(renderer) = self.renderer.as_mut() {
+                        if let Err(error) = renderer.request_authoring_capture(std::path::Path::new(path), false) {
+                            warn!(path, %error, "editor script: shot not taken");
+                        }
+                    }
+                }
+                // A debug view by its id (`somnium_ui::debug::DEBUG_VIEWS`): lit, sun_only, ambient_only, albedo, ...
+                Some(("view", id)) => match somnium_ui::debug::debug_view(id) {
+                    Some(view) => {
+                        self.terrain_debug_view = view.code;
+                        if let Some(renderer) = self.renderer.as_mut() {
+                            renderer.shading_debug = view.code;
+                        }
+                    }
+                    None => warn!(id, "editor script: no such debug view"),
+                },
                 Some(("select", part)) => {
                     let found = self.world.iter_with::<Name>().find(|(_, name)| name.as_str().contains(part)).map(|(e, _)| e);
                     if found.is_none() {
