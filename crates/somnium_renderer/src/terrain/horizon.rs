@@ -255,12 +255,22 @@ pub struct Canopy {
 }
 
 impl Canopy {
+    /// The crown top at a point, read between texel centres: a crown is a dome. Read as the box of its texel, each
+    /// crown's shadow on the ground past the trees' own was an angular block four metres wide, and a thin wood's
+    /// were black patches with stepped edges all over it (Sunscar, the ring tiles from the air, 11 Nov 2026).
     fn at(&self, x_m: f32, z_m: f32) -> f32 {
-        let (i, j) = ((x_m / self.metres) as isize, (z_m / self.metres) as isize);
-        if i < 0 || j < 0 || i >= self.size as isize || j >= self.size as isize {
-            return 0.0;
-        }
-        self.top[j as usize * self.size + i as usize]
+        let (u, v) = (x_m / self.metres - 0.5, z_m / self.metres - 0.5);
+        let (i, j) = (u.floor(), v.floor());
+        let texel = |i: f32, j: f32| {
+            if i < 0.0 || j < 0.0 || i >= self.size as f32 || j >= self.size as f32 {
+                0.0
+            } else {
+                self.top[j as usize * self.size + i as usize]
+            }
+        };
+        let near = texel(i, j) + (texel(i + 1.0, j) - texel(i, j)) * (u - i);
+        let far = texel(i, j + 1.0) + (texel(i + 1.0, j + 1.0) - texel(i, j + 1.0)) * (u - i);
+        near + (far - near) * (v - j)
     }
 }
 
@@ -591,6 +601,25 @@ mod tests {
 
     fn flat(total: u32) -> Vec<f32> {
         vec![0.0; (total * total) as usize]
+    }
+
+    /// One crown ten metres tall in a canopy of 4 m texels: full at its texel's centre, half way down half a texel
+    /// on, and gone at the next texel's centre and past the canopy's edge.
+    #[test]
+    fn a_crown_is_a_dome_not_the_box_of_its_texel() {
+        let mut top = vec![0.0; 9];
+        top[4] = 10.0;
+        let canopy = Canopy { top, size: 3, metres: 4.0 };
+        assert_eq!(canopy.at(6.0, 6.0), 10.0);
+        assert_eq!(canopy.at(8.0, 6.0), 5.0, "at the texel's edge, where the box stood full height");
+        assert_eq!(canopy.at(10.0, 6.0), 0.0);
+        assert_eq!(canopy.at(6.0, 4.0), 5.0);
+        assert_eq!(canopy.at(-3.0, 6.0), 0.0);
+        let mut edge = vec![0.0; 9];
+        edge[5] = 10.0; // the last texel of the middle row
+        let canopy = Canopy { top: edge, size: 3, metres: 4.0 };
+        assert_eq!(canopy.at(12.0, 6.0), 5.0, "past the last centre a crown falls off as it does anywhere");
+        assert_eq!(canopy.at(14.5, 6.0), 0.0);
     }
 
     #[test]
