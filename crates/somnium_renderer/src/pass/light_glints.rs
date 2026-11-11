@@ -13,7 +13,7 @@ use crate::pass::postprocess::HDR_FORMAT;
 struct GlintParams {
     view_proj: [[f32; 4]; 4],
     camera: [f32; 4],
-    target: [f32; 4],
+    frame: [f32; 4],
     reach: [f32; 4],
 }
 
@@ -143,7 +143,7 @@ impl LightGlintsPass {
         let params = GlintParams {
             view_proj: (proj * view).to_cols_array_2d(),
             camera: [camera.x, camera.y, camera.z, crate::view::near_plane(proj)],
-            target: [size.0 as f32, size.1 as f32, 1.0 / (pixel * pixel), strength],
+            frame: [size.0 as f32, size.1 as f32, 1.0 / (pixel * pixel), strength],
             reach: [EXTINCTION_PER_M, FARTHEST_M, pixel, 0.0],
         };
         queue.write_buffer(&self.params, 0, bytemuck::bytes_of(&params));
