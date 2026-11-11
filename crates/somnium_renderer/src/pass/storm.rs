@@ -315,11 +315,12 @@ mod tests {
         assert!((at + dir * (600.0 + 800.0 * 1.63)).distance(centre) <= cell.bound[2], "tower's top outside");
         assert!((at - dir * 800.0 * 1.4).distance(centre) <= cell.bound[2], "tower's back outside");
         assert!(cell.bound[2] < 3000.0 && cell.bound_y[1] >= 900.0 + 6000.0 + 400.0);
-        // The anvil's far tip is inside its own, which starts at its underside: the air below it is nobody's.
+        // The anvil's far tip is inside its own, which starts at its underside (it comes down a quarter of the height
+        // round the tower): the air below it is nobody's.
         let anvil = StormVolume::anvil(glam::Vec3::new(1000.0, 900.0, -500.0), 800.0, 6000.0, dir, 9000.0, 0.72, 0.5);
         let centre = glam::Vec2::new(anvil.bound[0], anvil.bound[1]);
         assert!((at + dir * 9000.0 * 1.04).distance(centre) <= anvil.bound[2], "anvil tip outside");
-        assert!(anvil.bound_y[0] > 900.0 + 6000.0 * 0.6 && anvil.bound_y[1] >= 900.0 + 6000.0);
+        assert!(anvil.bound_y[0] > 900.0 + 6000.0 * 0.35 && anvil.bound_y[0] < 900.0 + 6000.0 * 0.45 && anvil.bound_y[1] >= 900.0 + 6000.0);
 
         // A deck's cylinder reaches its downwind end and stops at its own top.
         let deck = StormVolume::deck(glam::Vec3::new(1000.0, 900.0, -500.0), 7000.0, 900.0, dir * 6000.0);
