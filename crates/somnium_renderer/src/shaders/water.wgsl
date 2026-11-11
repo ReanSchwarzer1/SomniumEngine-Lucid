@@ -934,6 +934,24 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> Sh
     let single_scatter = (vec3<f32>(1.0) - transmittance)
         * sigma_s / max(sigma_t, vec3<f32>(1e-5))
         * ((sun_scatter + moon_scatter) / PI + env_up);
+    // Turbid water (glacial flour, brine, travertine, iron-red springs): light scatters many times before it comes
+    // back out, so the body answers sun and sky as a matte surface does, by its diffuse reflectance, and one
+    // scattering's phase function no longer says where the light goes. Without this a milky lake had the sky's
+    // share of its colour and a twelfth of the sun's, and lay dark beside sunlit ground. `edge_color.a` is the
+    // body's turbidity: 0 keeps the single scattering above, as every body had before.
+    let turbidity = clamp(material.edge_color.a, 0.0, 1.0);
+    var volume_scatter = single_scatter;
+    if turbidity > 0.0 {
+        // Forward scattering barely turns light: only (1 - g) of it counts towards turning it round (similarity).
+        let turned = sigma_s * (1.0 - phase_g);
+        // The diffuse reflectance of a deep scattering medium by its albedo (van de Hulst's fit): with
+        // s = sqrt(1 - albedo), 0 at albedo 0 and 1 at albedo 1.
+        let s = sqrt(sigma_a / max(sigma_a + turned, vec3<f32>(1e-5)));
+        let matte = (vec3<f32>(1.0) - s) * (vec3<f32>(1.0) - 0.139 * s) / (vec3<f32>(1.0) + 1.17 * s);
+        let lit = env_up + (light.color * shadow * max(dot(n, sun_l), 0.0)
+            + moon_color * max(dot(n, moon_l), 0.0)) / PI;
+        volume_scatter = mix(single_scatter, (vec3<f32>(1.0) - transmittance) * matte * lit, turbidity);
+    }
     let tint = mix(material.shallow_color.rgb, material.deep_color.rgb,
         smoothstep(0.5, max(material.surface_params.y * 6.0, 2.0), authored_depth));
     var transmitted = refracted * tint * transmittance;
@@ -978,10 +996,14 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> Sh
             backdrop_distance),
         base_has_backdrop,
     );
+    // Foam at a shore is water thrown about, so it takes waves: a body's swell under 5 cm scales it away. Without
+    // this the contact term whitened every pixel of water shallower than a third of a metre, moving or not, and a
+    // shallow river lay white as snow from bank to bank (the Vela Canyon's river, Sunscar, 11 Nov 2026).
+    let agitation = saturate(material.surface_params.z / 0.05);
     let shore_foam = max(
         shore_band * clamp(0.28 + breaker * 0.82 + foam_noise * 0.38, 0.0, 1.0),
         depth_contact * (0.62 + foam_noise * 0.28),
-    );
+    ) * agitation;
     // Whitecap coverage. The 0.75 scale and the distance fade are the
     // reference's: foam is a thin film that stops resolving long before the
     // waves carrying it do, so it has to disappear faster than the geometry.
@@ -1089,7 +1111,7 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> Sh
     // the only part that fades out with depth. The volume scatter and the crest
     // glow carry open water on their own.
     let shallow_transmission = 1.0 - smoothstep(0.5, 6.0, authored_depth);
-    let below_surface = transmitted * shallow_transmission + single_scatter + crest_glow;
+    let below_surface = transmitted * shallow_transmission + volume_scatter + crest_glow;
 
     // Where foam covers the surface it replaces the water body entirely: a
     // whitecap is air and droplets, and nothing below it reaches the eye.
@@ -1216,10 +1238,11 @@ fn fs_prepass(input: VertexOutput, @builtin(front_facing) front_facing: bool) ->
             backdrop_distance),
         base_has_backdrop,
     );
+    // As in the surface's shading above: no swell, no shore foam.
     let shore_foam = max(
         shore_band * clamp(0.28 + breaker * 0.82 + foam_noise * 0.38, 0.0, 1.0),
         depth_contact * (0.62 + foam_noise * 0.28),
-    );
+    ) * saturate(material.surface_params.z / 0.05);
     let crest_foam = smoothstep(0.0, 1.0, spectrum.a * 0.75)
         * exp(-water_view_depth * 0.0075)
         * smoothstep(0.5, 2.0, authored_depth);

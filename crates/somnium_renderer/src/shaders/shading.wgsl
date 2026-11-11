@@ -3233,7 +3233,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     // Snow lying on the finished surface (snow.wgsl; sunscar-photoreal, 6 Nov 2026): before specular antialiasing
     // and f0, after terrain, decals and wetness. Off unless a scene has a SnowCover.
-    if snow_params.p0.x > 0.5 {
+    // Never on cut-out cards (leaves, needles, grass, billboards): a card's normal stands for a whole spray, so snow
+    // whitened each upward card edge to edge and a crown read as "solid pale quads" (the developer, 11 Nov,
+    // notes/dev_20261111/02_leaf_cards.png). Bark and branches keep it; leaves and grass tips stand out of a snowfall.
+    if snow_params.p0.x > 0.5 && material.alpha_cutoff <= 0.0 {
         surface = apply_snow(surface, hit_point, geo_normal);
     }
     // ── Geometric specular antialiasing (TSUSHIMA-E) ─────────────────────────

@@ -468,6 +468,10 @@ pub struct SomniumRenderer {
     terrain_materials: crate::material::pool::TerrainMaterialPool,
     /// Inspector override for `SOMNIUM_SHADOW_DEBUG` (0 = use env).
     pub shading_debug: f32,
+    /// The traced sun's rays pass through a cut-out's holes (a leaf card's), so a card no longer shadows as a
+    /// whole card. Off unless `SOMNIUM_SUN_CUTOUTS=1`: built and costing nothing measurable (11 Nov 2026), but
+    /// not yet proven in a picture under trees.
+    pub sun_cutouts: bool,
     /// CONTROL-G: the named pipeline switches, seeded from the environment.
     ///
     /// The individual fields below stay as they are — every pass reads them
@@ -1237,6 +1241,7 @@ impl SomniumRenderer {
         let restir_pass = crate::pass::restir::RestirPass::new(
             &ctx.device,
             &shaders,
+            &global_pool.layout,
             raytrace_pass.supported(),
             grain_masks.view(),
             ctx.config.width,
@@ -1784,6 +1789,7 @@ impl SomniumRenderer {
             underwater_body: None,
             camera_submersion: 0.0,
             terrain_materials,
+            sun_cutouts: std::env::var("SOMNIUM_SUN_CUTOUTS").as_deref() == Ok("1"),
             // Every other debug lever in this renderer can be set from the
             // environment; the shading debug view could only be set from the
             // editor menu, which a headless capture has no way to click. The
@@ -5454,7 +5460,8 @@ impl SomniumRenderer {
                 set_splat_resident(terrain, &mut self.texture_pool, &mut self.global_pool, &ctx.device, resident);
                 self.profiler.cpu_end();
             }
-            terrain.select_lods(local_cam, &shoreline_regions);
+            // Debug view 40 is the lit picture with the ground's levels picked by a chunk's centre alone, as they were.
+            terrain.select_lods(local_cam, &shoreline_regions, self.shading_debug != 40.0);
             self.rebuilt_chunks.clear();
             self.profiler.cpu_begin("Terrain chunk rebuild");
             terrain.rebuild_dirty_chunks(&ctx.queue, &mut self.geometry, &mut self.rebuilt_chunks);
@@ -6295,12 +6302,24 @@ impl SomniumRenderer {
                     &ctx.device,
                     &ctx.queue,
                     &mut encoder,
+                    &self.global_pool.bind_group,
                     tlas,
                     &self.vis_pass.depth_view,
+                    &self.vis_pass.view,
                     self.view_proj_rel,
                     self.camera_pos,
                     self.light_direction,
                     self.sun_angular_radius,
+                    // Debug views 38 and 39 are the lit picture with the traced sun another way: 38 opaque rays, as
+                    // before the ground rule; 39 the ground rule alone, which is also what a game gets unless it
+                    // sets `SOMNIUM_SUN_CUTOUTS=1`.
+                    if self.shading_debug == 38.0 {
+                        0.0
+                    } else if self.shading_debug == 39.0 || !self.sun_cutouts {
+                        1.0
+                    } else {
+                        2.0
+                    },
                     self.render_width,
                     self.render_height,
                 );

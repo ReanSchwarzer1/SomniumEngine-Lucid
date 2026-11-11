@@ -1,3 +1,6 @@
+//!include "global_pool.wgsl"
+//!include "rt_alpha.wgsl"
+
 enable wgpu_ray_query;
 
 // Phase 24K: ReSTIR direct lighting.
@@ -32,7 +35,10 @@ struct RestirParams {
     /// Zero when history should be ignored.
     history_valid: f32,
     camera_pos: vec3<f32>,
-    _pad: f32,
+    /// How the sun's ray is traced (`occluded`). 0: opaque, as it was (debug view 38). 1: a ray from the ground
+    /// passes the ground's underside (the default, and debug view 39). 2: that, and every ray passes through a
+    /// cut-out's holes (a game that sets `SOMNIUM_SUN_CUTOUTS=1`).
+    sun_rays: f32,
 }
 
 /// A reservoir over light samples.
@@ -51,13 +57,19 @@ struct Reservoir {
     _pad: f32,
 }
 
-@group(0) @binding(0) var accel:      acceleration_structure;
-@group(0) @binding(1) var depth_tex:  texture_depth_2d;
-@group(0) @binding(2) var out_tex:    texture_storage_2d<rgba16float, write>;
-@group(0) @binding(3) var<uniform> params: RestirParams;
-@group(0) @binding(4) var<storage, read>       prev_reservoirs: array<Reservoir>;
-@group(0) @binding(5) var<storage, read_write> curr_reservoirs: array<Reservoir>;
-@group(0) @binding(6) var grain_masks: texture_2d_array<f32>;
+// Group 0 is the shared global pool (the scene's instances, materials and meshes), as for ReSTIR GI: a sun ray from
+// the ground has to know the ground when it meets it.
+@group(1) @binding(0) var accel:      acceleration_structure;
+@group(1) @binding(1) var depth_tex:  texture_depth_2d;
+@group(1) @binding(2) var out_tex:    texture_storage_2d<rgba16float, write>;
+@group(1) @binding(3) var<uniform> params: RestirParams;
+@group(1) @binding(4) var<storage, read>       prev_reservoirs: array<Reservoir>;
+@group(1) @binding(5) var<storage, read_write> curr_reservoirs: array<Reservoir>;
+@group(1) @binding(6) var grain_masks: texture_2d_array<f32>;
+/// For `rt_alpha.wgsl`'s cut-out test.
+@group(1) @binding(7) var default_sampler: sampler;
+/// The visibility buffer: x = instance + 1 (0: nothing drawn), y = triangle.
+@group(1) @binding(8) var vis_tex: texture_2d<u32>;
 
 fn empty_reservoir() -> Reservoir {
     return Reservoir(vec3<f32>(0.0), 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -127,8 +139,40 @@ fn sample_sun_direction(seed: ptr<function, u32>) -> vec3<f32> {
 /// shadow-map bias touched it.
 const RAY_BIAS_FOOTPRINTS: f32 = 6.0;
 
-/// Trace a shadow ray. True when something blocks it.
-fn occluded(origin: vec3<f32>, dir: vec3<f32>, t_min: f32) -> bool {
+/// Trace a shadow ray. True when something blocks it. `ground`: the ray starts on the ground.
+fn occluded(origin: vec3<f32>, dir: vec3<f32>, t_min: f32, ground: bool) -> bool {
+    let cutouts = params.sun_rays > 1.5;
+    if ground || cutouts {
+        // Two things an opaque ray gets wrong, both seen on Sunscar's far slopes in sun (11 Nov 2026).
+        //
+        // The ground is drawn at a coarser level of detail with distance and traced at its finest, so a point on
+        // the drawn ground can lie under the traced one. Its sun ray then starts inside the hill and meets the
+        // ground's own underside: sunlit slopes wore dark bands as wide as the coarse level's cells, in steps with
+        // saw-toothed edges. A ray from a heightfield can only meet its top, so the underside is passed through, as
+        // GI's rays pass it (`rt_alpha.wgsl`).
+        //
+        // And every BLAS is opaque, so a leaf card shadowed as a whole card: dark rectangles beside every far shrub
+        // and slabs under every crown. With cut-outs on, a candidate counts only where its texel is covered.
+        rt_ground_origin = ground;
+        rt_ray_dir = dir;
+        var cq: ray_query;
+        rayQueryInitialize(&cq, accel, RayDesc(0x6u, 0x1u, t_min, 10000.0, origin, dir));
+        while rayQueryProceed(&cq) {
+            let candidate = rayQueryGetCandidateIntersection(&cq);
+            var blocks = true;
+            if cutouts {
+                blocks = rt_candidate_is_covered(candidate);
+            } else {
+                let inst = instances[candidate.instance_custom_data];
+                blocks = materials[inst.material_id].terrain_index < 0 || !rt_ground_underside(inst, candidate);
+            }
+            if blocks {
+                rayQueryConfirmIntersection(&cq);
+            }
+        }
+        rt_ground_origin = false;
+        return rayQueryGetCommittedIntersection(&cq).kind != RAY_QUERY_INTERSECTION_NONE;
+    }
     var rq: ray_query;
     rayQueryInitialize(
         &rq,
@@ -214,7 +258,10 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     // ── Visibility ──────────────────────────────────────────────────────────
     // One ray, for the sample that survived resampling.
-    if r.w > 0.0 && occluded(origin, r.sample_dir, ray_t_min) {
+    let drawn = textureLoad(vis_tex, coord, 0);
+    let on_ground = params.sun_rays > 0.5 && drawn.x != 0u
+        && materials[instances[drawn.x - 1u].material_id].terrain_index >= 0;
+    if r.w > 0.0 && occluded(origin, r.sample_dir, ray_t_min, on_ground) {
         // The running total has to go with the weight. Zeroing `w` alone left
         // `w_sum` holding the candidates' contribution, and the temporal
         // combine below recomputes `w = w_sum / (m * p_hat)` from it — which

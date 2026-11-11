@@ -2759,6 +2759,10 @@ pub struct WaterComponent {
     pub underwater_enabled: bool,
     /// Half-width of a channel body, metres. Ignored by every other kind.
     pub half_width: f32,
+    /// How turbid the body is, 0..1. At 0 its own light is one scattering by the phase function, as clear water's
+    /// is. At 1 it is the diffuse reflectance of `absorption` and `scattering`, lit by sun and sky as a matte
+    /// surface is: glacial flour, brine, travertine and iron-red water, which are as bright in sun as the land.
+    pub turbidity: f32,
 }
 
 impl Default for WaterComponent {
@@ -2804,6 +2808,7 @@ impl Default for WaterComponent {
             // a sane default for the one kind that reads it and inert
             // for the other three.
             half_width: 3.0,
+            turbidity: 0.0,
         }
     }
 }

@@ -25,7 +25,9 @@ struct RestirParams {
     frame: u32,
     history_valid: f32,
     camera_pos: [f32; 3],
-    _pad: f32,
+    /// How the sun's ray is traced: 0 opaque, as it was; 1 a ray from the ground passes the ground's underside;
+    /// 2 that, and every ray passes through a cut-out's holes (`restir_di.wgsl`).
+    sun_rays: f32,
 }
 
 pub struct RestirPass {
@@ -36,6 +38,8 @@ pub struct RestirPass {
     /// single buffer cannot be read and written in the same dispatch.
     reservoirs: Vec<wgpu::Buffer>,
     binds: Vec<wgpu::BindGroup>,
+    /// For the binding the shared cut-out test wants (`rt_alpha.wgsl`, included by `restir_di.wgsl`).
+    sampler: Option<wgpu::Sampler>,
     grain_view: wgpu::TextureView,
     grain_enabled: bool,
     vis_view: Option<wgpu::TextureView>,
@@ -54,6 +58,7 @@ impl RestirPass {
     pub fn new(
         device: &wgpu::Device,
         shaders: &crate::shaders::Shaders,
+        global_layout: &wgpu::BindGroupLayout,
         supported: bool,
         grain_view: &wgpu::TextureView,
         width: u32,
@@ -70,6 +75,7 @@ impl RestirPass {
                 params: None,
                 reservoirs: Vec::new(),
                 binds: Vec::new(),
+                sampler: None,
                 grain_view: grain_view.clone(),
                 grain_enabled: false,
                 vis_view: None,
@@ -154,12 +160,29 @@ impl RestirPass {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 8,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
+        // The global pool first, as for ReSTIR GI: a sun ray from the ground looks its hit up there.
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ReSTIR PL"),
-            bind_group_layouts: &[Some(&layout)],
+            bind_group_layouts: &[Some(global_layout), Some(&layout)],
             immediate_size: 0,
         });
 
@@ -183,6 +206,12 @@ impl RestirPass {
             })),
             reservoirs: Vec::new(),
             binds: Vec::new(),
+            sampler: Some(device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("ReSTIR sampler"),
+                mag_filter: wgpu::FilterMode::Linear,
+                min_filter: wgpu::FilterMode::Linear,
+                ..Default::default()
+            })),
             grain_view: grain_view.clone(),
             grain_enabled: crate::pass::grain::enabled_by_default("SOMNIUM_DREAMS_GRAIN"),
             vis_view: None,
@@ -277,14 +306,16 @@ impl RestirPass {
         device: &wgpu::Device,
         tlas: &wgpu::Tlas,
         depth: &wgpu::TextureView,
+        ids: &wgpu::TextureView,
     ) {
         if !self.binds.is_empty() {
             return;
         }
-        let (Some(layout), Some(params), Some(vis)) = (
+        let (Some(layout), Some(params), Some(vis), Some(sampler)) = (
             self.layout.as_ref(),
             self.params.as_ref(),
             self.vis_view.as_ref(),
+            self.sampler.as_ref(),
         ) else {
             return;
         };
@@ -325,6 +356,14 @@ impl RestirPass {
                         wgpu::BindGroupEntry {
                             binding: 6,
                             resource: wgpu::BindingResource::TextureView(&self.grain_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::Sampler(sampler),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
+                            resource: wgpu::BindingResource::TextureView(ids),
                         },
                     ],
                 }));
@@ -377,19 +416,24 @@ impl RestirPass {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
+        global_bind: &wgpu::BindGroup,
         tlas: &wgpu::Tlas,
         depth_view: &wgpu::TextureView,
+        // The visibility buffer (instance and triangle a pixel drew): which pixels are the ground.
+        id_view: &wgpu::TextureView,
         view_proj: glam::Mat4,
         camera_pos: glam::Vec3,
         sun_direction: glam::Vec3,
         sun_angular_radius: f32,
+        // How the sun's ray is traced: 0, 1 or 2 (`RestirParams::sun_rays`).
+        sun_rays: f32,
         width: u32,
         height: u32,
     ) {
         if !self.active() {
             return;
         }
-        self.ensure_binds(device, tlas, depth_view);
+        self.ensure_binds(device, tlas, depth_view, id_view);
         let (Some(pipeline), Some(params)) = (self.pipeline.as_ref(), self.params.as_ref()) else {
             return;
         };
@@ -411,7 +455,7 @@ impl RestirPass {
                 history_valid: f32::from(u8::from(self.history_valid))
                     + 2.0 * f32::from(u8::from(self.grain_enabled)),
                 camera_pos: camera_pos.to_array(),
-                _pad: 0.0,
+                sun_rays,
             }),
         );
 
@@ -420,7 +464,8 @@ impl RestirPass {
             timestamp_writes: None,
         });
         pass.set_pipeline(pipeline);
-        pass.set_bind_group(0, &self.binds[self.write_index], &[]);
+        pass.set_bind_group(0, global_bind, &[]);
+        pass.set_bind_group(1, &self.binds[self.write_index], &[]);
         pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
         drop(pass);
 

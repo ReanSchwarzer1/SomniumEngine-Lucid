@@ -1052,6 +1052,7 @@ fn water_schema() -> ComponentSchema {
             // default width — the schema is what serialises, and a field
             // missing from it is a field that silently does not persist.
             half_width { min: 0.1, soft_max: 40.0, unit: "m" },
+            turbidity { min: 0.0, max: 1.0 },
         }
     }
 }

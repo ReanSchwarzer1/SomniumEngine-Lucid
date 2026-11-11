@@ -2948,7 +2948,8 @@ impl GameApp for HelloGame {
                         somnium_renderer::pass::water::WaterMaterialData {
                             deep_color: water.deep_color,
                             shallow_color: water.shallow_color,
-                            edge_color: water.edge_color,
+                            // The shader reads no edge colour; its alpha carries the body's turbidity.
+                            edge_color: [water.edge_color[0], water.edge_color[1], water.edge_color[2], water.turbidity],
                             absorption_roughness: [
                                 water.absorption[0],
                                 water.absorption[1],
