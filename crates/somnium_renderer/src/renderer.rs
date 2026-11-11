@@ -2774,10 +2774,19 @@ impl SomniumRenderer {
         // A pixel's angle (at the render resolution) times the thinnest strip, for `thin_strip.wgsl`; 0 = off.
         // SOMNIUM_MIN_STRIP_AB=1 (measuring its cost, as SOMNIUM_SNOW_AB): off for alternate 120-frame stretches offset
         // by 60, so a run with SOMNIUM_PROFILE_EVERY=120 logs blocks without it (frame=120, 360, ...) and with it (240,
-        // 480, ...) under the same clocks.
-        static STRIP_AB: std::sync::LazyLock<bool> =
-            std::sync::LazyLock::new(|| std::env::var("SOMNIUM_MIN_STRIP_AB").as_deref() == Ok("1"));
-        let strip_off = *STRIP_AB && (self.profiler.frame_index() + 60) / 120 % 2 == 1;
+        // 480, ...) under the same clocks. `=captures` (proof stills, as SOMNIUM_SURFACES_AB): off until the run's first
+        // capture is written, then on, off, ... by each one, so a walk naming every view twice shoots before and after.
+        static STRIP_AB: std::sync::LazyLock<u8> =
+            std::sync::LazyLock::new(|| match std::env::var("SOMNIUM_MIN_STRIP_AB").as_deref() {
+                Ok("1") => 1,
+                Ok("captures") => 2,
+                _ => 0,
+            });
+        let strip_off = match *STRIP_AB {
+            1 => (self.profiler.frame_index() + 60) / 120 % 2 == 1,
+            2 => crate::capture::captures_written() % 2 == 0,
+            _ => false,
+        };
         let strip_pixel = if self.min_strip_px > 0.0 && self.proj_matrix.z_axis.w != 0.0 && !strip_off {
             2.0 / (self.proj_matrix.y_axis.y * self.render_height.max(1) as f32) * self.min_strip_px
         } else {
