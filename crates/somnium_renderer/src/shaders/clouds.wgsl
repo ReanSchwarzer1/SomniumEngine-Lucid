@@ -283,11 +283,16 @@ fn storm_anvil(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
     let radius = v.size.x;
     let along = dot(q.xz, dir);
     let across = dot(q.xz, vec2<f32>(-dir.y, dir.x));
-    let e = length(vec2<f32>((along - reach * 0.42) / (reach * 0.62 + radius), across / (reach * 0.34 + radius)));
+    // Downwind its whole reach; upwind little more than the tower's own width (the back-sheared edge), so a sun
+    // on that side still reaches the tower's flank.
+    let e = length(vec2<f32>((along - reach * 0.5) / (reach * 0.5 + radius * 1.1), across / (reach * 0.34 + radius)));
     if e >= 1.0 {
         return vec2<f32>(0.0);
     }
-    let under = mix(v.a.w, 0.9, smoothstep(0.1, 1.0, e));
+    // Its underside is lowest round the tower, where the updraft spreads into it, and climbs away from there: seen
+    // from the side the two are one mushroom, not a plate laid on a post (the windowless pictures, 12 Nov).
+    let from_tower = length(q.xz);
+    let under = max(mix(v.a.w, 0.9, smoothstep(0.1, 1.0, e)) - 0.24 * (1.0 - smoothstep(radius * 0.9, radius * 4.2, from_tower)), 0.3);
     let top = 0.985 - 0.07 * smoothstep(0.2, 1.0, e);
     var anvil = (1.0 - smoothstep(0.6, 1.0, e)) * smoothstep(under - 0.02, under + 0.03, h) * (1.0 - smoothstep(top - 0.045, top, h));
     var fray = 1.0;

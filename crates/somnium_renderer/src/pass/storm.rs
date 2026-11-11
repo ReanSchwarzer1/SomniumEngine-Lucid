@@ -106,10 +106,11 @@ impl StormVolume {
         let mut v = Self::new(ANVIL, base, radius, height, 1.0, (radius * 2.2).clamp(600.0, 6000.0));
         v.a = [dir.x, dir.y, reach.max(0.0), under];
         v.b = [0.0, 0.0, mammatus.clamp(0.0, 1.0), 0.0];
-        let centre = glam::Vec2::new(base.x, base.z) + dir * (reach * 0.42);
-        v.bound = [centre.x, centre.y, reach * 0.62 + radius * 2.0, (radius * 0.15).max(60.0)];
+        let centre = glam::Vec2::new(base.x, base.z) + dir * (reach * 0.5);
+        v.bound = [centre.x, centre.y, reach * 0.5 + radius * 2.0, (radius * 0.15).max(60.0)];
         // From its lowest mammatus to its top.
-        v.bound_y = [base.y + height * (under - 0.08), base.y + height, 0.0, 0.0];
+        // From its lowest (round the tower its underside comes down a quarter of the height; mammatus under that).
+        v.bound_y = [base.y + height * (under - 0.32).max(0.22), base.y + height, 0.0, 0.0];
         v
     }
 
