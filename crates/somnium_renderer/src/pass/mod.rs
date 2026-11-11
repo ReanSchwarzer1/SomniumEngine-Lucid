@@ -21,6 +21,7 @@ pub mod gtao;
 pub mod hiz;
 pub mod ibl;
 pub mod light_gizmo;
+pub mod light_glints;
 pub mod lighting_extra;
 pub mod path_tracer;
 pub mod motion_blur;

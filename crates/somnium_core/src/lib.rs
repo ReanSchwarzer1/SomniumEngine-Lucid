@@ -1510,6 +1510,10 @@ pub struct PostProcessComponent {
     /// A local snowline map, project-relative (`SNOWLN01`, see `somnium_renderer::snow_map`): where it covers, its
     /// snowline replaces `snowline_m` and already carries the sun's shade. Empty for none.
     pub snow_map: String,
+    /// Point and spot lamps also land as their own light where they fall under a pixel (`light_glints.wgsl`), so a
+    /// far lantern or a lit window holds steady at night and carries its glare; 1 is the physical amount, 0 (default)
+    /// off.
+    pub light_glints: f32,
 }
 
 impl Default for PostProcessComponent {
@@ -1703,6 +1707,7 @@ impl Default for PostProcessComponent {
             snow_scour: 0.3,
             snow_bare_slope_deg: 65.0,
             snow_map: String::new(),
+            light_glints: 0.0,
         }
     }
 }

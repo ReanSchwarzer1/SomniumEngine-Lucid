@@ -983,6 +983,8 @@ fn post_process_schema() -> ComponentSchema {
                 doc: "Steeper faces keep no snow; between Steepest Slope and this it keeps to gullies and ledges." },
             snow_map { group: "Snow", display_name: "Snowline Map",
                 doc: "A SNOWLN01 snowline map, project-relative: where it covers, its snowline replaces Snowline. Empty for none." },
+            light_glints { min: 0.0, max: 4.0, step: 0.05, group: "Lens", display_name: "Lamp Points",
+                doc: "Far lamps under a pixel land as their own light, steady and with their glare (1: physical; 0: off)." },
         }
     };
     if let Some(field) = schema.fields.iter_mut().find(|f| f.name == "dream_mode") {
