@@ -482,6 +482,14 @@ pub fn with_far_colours(
 /// (Sunscar, 11 Nov 2026: the Vela Canyon's beds vanished on its walls under the one cliff layer).
 #[must_use]
 pub fn layer_rock_mask(asset_dir: &Path) -> u32 {
+    // `SOMNIUM_TERRAIN_ROCK_LAYERS=21,9,3` previews a list on every set before a set writes its file.
+    if let Ok(slots) = std::env::var("SOMNIUM_TERRAIN_ROCK_LAYERS") {
+        return slots
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .filter(|&s| s < TERRAIN_LAYER_COUNT)
+            .fold(0, |mask, s| mask | (1 << s));
+    }
     let path = asset_dir.join("layer_rock.json");
     let Ok(text) = std::fs::read_to_string(&path) else {
         return 0;
