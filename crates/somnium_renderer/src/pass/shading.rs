@@ -176,6 +176,9 @@ impl Drop for WorkerGuard {
     }
 }
 
+/// Floats in ground_blend.wgsl's `GroundBlendList`: a header and 32 terrains of three vectors each.
+pub const GROUND_BLEND_FLOATS: usize = 4 + 32 * 12;
+
 pub struct ShadingPass {
     /// The fullscreen pipeline for `spec`. `None` until the first frame's `ensure_pipeline`, so startup does not wait
     /// on a compile the workers are already doing.
@@ -259,6 +262,8 @@ pub struct ShadingPass {
     /// The local snowline map (snow.wgsl, binding 35): f32 metres row by row, one cell when there is none. A storage
     /// buffer, not a texture: the fragment stage already holds the device's 16 sampled textures.
     snow_map: wgpu::Buffer,
+    /// The live terrains for meshes blending into the ground (ground_blend.wgsl, binding 36), written each frame.
+    ground_blend: wgpu::Buffer,
     /// Kept so growing the paint buffer can rebuild the bind group.
     visibility_view: wgpu::TextureView,
     _virtual_shadow_dummy: wgpu::Texture,
@@ -627,16 +632,19 @@ impl ShadingPass {
             count: None,
         });
         // binding 35: the local snowline map (snow.wgsl), a read-only storage buffer.
-        layout_entries.push(wgpu::BindGroupLayoutEntry {
-            binding: 35,
-            visibility: wgpu::ShaderStages::FRAGMENT,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only: true },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        });
+        // binding 36: the live terrains meshes blend into (ground_blend.wgsl), likewise.
+        for binding in [35, 36] {
+            layout_entries.push(wgpu::BindGroupLayoutEntry {
+                binding,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            });
+        }
         if local_shadow_tlas.is_some() {
             layout_entries.push(wgpu::BindGroupLayoutEntry {
                 binding: 29,
@@ -746,6 +754,13 @@ impl ShadingPass {
             mapped_at_creation: false,
         });
         let snow_map = Self::make_snow_map(device, 1);
+        // Zeroed: no terrains, so nothing blends until the first frame lists them.
+        let ground_blend = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Ground Blend Terrains"),
+            size: GROUND_BLEND_FLOATS as u64 * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
         let bind_group = Self::make_bind_group(
             device,
             &bind_group_layout,
@@ -780,6 +795,7 @@ impl ShadingPass {
             path_surface,
             &snow_buffer,
             &snow_map,
+            &ground_blend,
         );
 
         // MORROWIND-C: composition is declared in `shading.wgsl` and
@@ -914,6 +930,7 @@ impl ShadingPass {
             path_surface: path_surface.map(Clone::clone),
             snow_buffer,
             snow_map,
+            ground_blend,
             visibility_view: visibility_view.clone(),
             _virtual_shadow_dummy: virtual_shadow_dummy,
             clipmap_layout,
@@ -1406,6 +1423,7 @@ impl ShadingPass {
         path_surface: [&wgpu::TextureView; 3],
         snow: &wgpu::Buffer,
         snow_map: &wgpu::Buffer,
+        ground_blend: &wgpu::Buffer,
     ) -> wgpu::BindGroup {
         let mut entries = vec![
                 wgpu::BindGroupEntry {
@@ -1539,6 +1557,7 @@ impl ShadingPass {
         }
         entries.push(wgpu::BindGroupEntry { binding: 34, resource: snow.as_entire_binding() });
         entries.push(wgpu::BindGroupEntry { binding: 35, resource: snow_map.as_entire_binding() });
+        entries.push(wgpu::BindGroupEntry { binding: 36, resource: ground_blend.as_entire_binding() });
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Shading Pass Bind Group"), layout, entries: &entries,
         })
@@ -1760,6 +1779,7 @@ impl ShadingPass {
             [&self.path_surface[0], &self.path_surface[1], &self.path_surface[2]],
             &self.snow_buffer,
             &self.snow_map,
+            &self.ground_blend,
         );
     }
 
@@ -1801,6 +1821,12 @@ impl ShadingPass {
     /// scour, -), the snowline map's (x0, z0, 1 / cell, on) and (width, height, -, -). All zero turns it off.
     pub fn set_snow(&self, queue: &wgpu::Queue, snow: &[f32; 24]) {
         queue.write_buffer(&self.snow_buffer, 0, bytemuck::cast_slice(snow));
+    }
+
+    /// The live terrains meshes blend into (ground_blend.wgsl's `GroundBlendList`): a count and the scene's blend height,
+    /// then per terrain its corner, inverse size, origin height, heights' texture id, terrain index and vertex counts.
+    pub fn set_ground_blend(&self, queue: &wgpu::Queue, list: &[f32; GROUND_BLEND_FLOATS]) {
+        queue.write_buffer(&self.ground_blend, 0, bytemuck::cast_slice(list));
     }
 
     fn make_snow_map(device: &wgpu::Device, cells: u64) -> wgpu::Buffer {
