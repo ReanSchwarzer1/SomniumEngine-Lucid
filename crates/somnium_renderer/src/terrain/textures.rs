@@ -476,6 +476,42 @@ pub fn with_far_colours(
     out
 }
 
+/// The beds of a layer set's stack (`layer_strata.json` beside the layers: `{"beds": [[layer, bottom_m], ...]}`, a
+/// layer by material name as [`LAYER_MATERIALS`] spells it or by slot, and the height of its bottom above the stack's
+/// base, which terrain bakes per tile as the strata datum, `{tile}.strata`): a steep pixel wears the bed its own height
+/// lies in, so contacts run level along a wall. Empty with no file (the splat decides, as before).
+#[must_use]
+pub fn layer_strata(asset_dir: &Path) -> Vec<(u32, f32)> {
+    // `SOMNIUM_STRATA_TABLE=E:/x.json` previews one table on every set before a set writes its own.
+    let path = std::env::var("SOMNIUM_STRATA_TABLE")
+        .map_or_else(|_| asset_dir.join("layer_strata.json"), std::path::PathBuf::from);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!("{}: {err}", path.display());
+            return Vec::new();
+        }
+    };
+    let Some(beds) = value.get("beds").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    beds.iter()
+        .filter_map(|b| {
+            let b = b.as_array()?;
+            let slot = b.first().and_then(|v| {
+                v.as_u64().map(|s| s as usize).or_else(|| {
+                    v.as_str().and_then(|name| LAYER_MATERIALS.iter().position(|m| *m == name))
+                })
+            })?;
+            let bottom = b.get(1)?.as_f64()? as f32;
+            (slot < TERRAIN_LAYER_COUNT as usize && bottom.is_finite()).then_some((slot as u32, bottom))
+        })
+        .collect()
+}
+
 /// Whether a layer set names its layers' colours from afar (`layer_far_colour.json`, [`with_far_colours`]): then the
 /// macro tier fades in with distance ([`super::MACRO_FADES`]); without, it holds at every distance as it always has.
 #[must_use]
@@ -2244,5 +2280,23 @@ mod layer_rock_tests {
         assert_eq!(layer_rock_mask(&dir), (1 << 2) | (1 << 21));
         std::fs::write(dir.join("layer_rock.json"), "not json").unwrap();
         assert_eq!(layer_rock_mask(&dir), 0);
+    }
+}
+
+#[cfg(test)]
+mod layer_strata_tests {
+    use super::*;
+
+    #[test]
+    fn a_set_names_its_beds_by_material_or_slot() {
+        let dir = std::env::temp_dir().join(format!("somnium_layer_strata_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(layer_strata(&dir).is_empty(), "no file: the splat decides");
+        std::fs::write(
+            dir.join("layer_strata.json"),
+            format!(r#"{{"beds": [["{}", 42.0], [21, 422], [99, 0], [8]]}}"#, LAYER_MATERIALS[2]),
+        )
+        .unwrap();
+        assert_eq!(layer_strata(&dir), vec![(2, 42.0), (21, 422.0)]);
     }
 }
