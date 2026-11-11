@@ -95,6 +95,11 @@ fn channel(a: Vec3, b: Vec3, level: f32, from: f32, to: f32, branching: f32, for
 impl Bolt {
     /// Its spans, in order along it (forks after the bend they leave).
     pub fn grow(&self, out: &mut Vec<Span>) {
+        // A bolt with an end that is not a place is no bolt: its length is never under the finest span, so the
+        // recursion below would not end.
+        if !(self.from.is_finite() && self.to.is_finite()) {
+            return;
+        }
         let start = out.len();
         let mut rng = Rng(self.seed.max(1).wrapping_mul(0x9E37_79B9) | 1);
         channel(self.from, self.to, 1.0, 0.0, 1.0, self.branching.clamp(0.0, 1.0), 3, &mut rng, out);
@@ -360,6 +365,15 @@ mod tests {
         // Crooked: its path is longer than the straight line, as a real channel's is.
         let path: f32 = main.iter().map(|s| s.a.distance(s.b)).sum();
         assert!(path > 1.03 * bolt.from.distance(bolt.to) && path < 1.6 * bolt.from.distance(bolt.to), "{path}");
+    }
+
+    /// A bolt whose end is not a place grows nothing (and returns: it used to recurse until the stack ran out).
+    #[test]
+    fn a_bolt_with_no_place_grows_nothing() {
+        let mut spans = Vec::new();
+        Bolt { to: Vec3::new(f32::NAN, 0.0, 0.0), ..strike() }.grow(&mut spans);
+        Bolt { from: Vec3::new(0.0, f32::INFINITY, 0.0), ..strike() }.grow(&mut spans);
+        assert!(spans.is_empty());
     }
 
     #[test]

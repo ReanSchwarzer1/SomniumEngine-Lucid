@@ -382,7 +382,8 @@ mod tests {
             ..SkyComponent::default()
         };
         let s = wild.to_settings();
-        assert_eq!(s.coverage, 1.0);
+        // Above 1 closes the deck's holes (the weather field at 1 is the noise itself); 3 is the ceiling.
+        assert_eq!(s.coverage, 3.0);
         assert_eq!(s.cloud_type, 0.0);
         assert!(s.altitude >= 1.0);
         assert!(s.thickness >= 1.0);

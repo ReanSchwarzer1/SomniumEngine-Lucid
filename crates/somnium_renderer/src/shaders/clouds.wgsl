@@ -974,6 +974,9 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cloud_distance = cloud.depth;
     let aerial = cloud_aerial(uv, cloud_distance);
     scatter = scatter * aerial.a + aerial.rgb * (1.0 - transmittance);
+    // The target is 16-bit float: cloud beside a flash can pass its ceiling, and an infinity there becomes a NaN in
+    // the history's variance and black in the picture.
+    scatter = min(scatter, vec3<f32>(6.0e4));
 
     textureStore(
         scatter_out,
