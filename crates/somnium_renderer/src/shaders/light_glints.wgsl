@@ -23,7 +23,7 @@ struct GpuLocalLight {
 struct GlintParams {
     view_proj: mat4x4<f32>,
     camera: vec4<f32>,  // the eye, then the near plane (reversed infinite Z: view depth = near / depth)
-    target: vec4<f32>,  // render width and height, one over a pixel's solid angle (1/sr), strength
+    frame: vec4<f32>,   // render width and height, one over a pixel's solid angle (1/sr), strength
     reach: vec4<f32>,   // extinction per metre, the farthest light drawn (m), a pixel's angle (rad), unused
 }
 
@@ -61,7 +61,7 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) li: u32) -> VOut 
     if any(abs(ndc.xy) > vec2<f32>(1.02)) {
         return out;
     }
-    let size = params.target.xy;
+    let size = params.frame.xy;
     let px = (ndc.xy * vec2<f32>(0.5, -0.5) + 0.5) * size;
     // Behind the scene: what the light's pixel shows is nearer than the light by more than the lamp's own size.
     let texel = clamp(vec2<i32>(px), vec2<i32>(0), vec2<i32>(size) - vec2<i32>(1));
@@ -77,7 +77,7 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) li: u32) -> VOut 
     // A source wider than about a pixel draws itself.
     let across = 2.0 * max(l.radius, 0.0) / d / params.reach.z;
     let small = 1.0 - smoothstep(0.5, 1.5, across);
-    let light = l.color * (toward * small * params.target.w * exp(-params.reach.x * d) / (d * d) * params.target.z);
+    let light = l.color * (toward * small * params.frame.w * exp(-params.reach.x * d) / (d * d) * params.frame.z);
     if max(light.x, max(light.y, light.z)) <= 0.0 {
         return out;
     }
