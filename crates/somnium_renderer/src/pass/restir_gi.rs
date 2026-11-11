@@ -130,6 +130,14 @@ mod tests {
         assert!(classify_light_change(&[lamp([5.0, 3.0, 0.0], 100.0)], &base).0);
         assert!(classify_light_change(&[], &base).0);
         assert_eq!(classify_light_change(&base, &base), (false, false, false));
+        // A far lantern fading in at the edge of the kept set, and gone again: drift, not a cut. A bright one is.
+        let with_faint = [lamp([0.0, 3.0, 0.0], 100.0), lamp([400.0, 3.0, 0.0], 0.5)];
+        assert_eq!(classify_light_change(&with_faint, &base), (false, true, false));
+        assert_eq!(classify_light_change(&base, &with_faint), (false, true, false));
+        // The kept set's order shifted by the faint one's place in it.
+        let faint_first = [lamp([400.0, 3.0, 0.0], 0.5), lamp([0.0, 3.0, 0.0], 100.0)];
+        assert_eq!(classify_light_change(&faint_first, &base), (false, true, false));
+        assert!(classify_light_change(&[lamp([0.0, 3.0, 0.0], 100.0), lamp([400.0, 3.0, 0.0], 60.0)], &base).0);
     }
 }
 
@@ -148,20 +156,17 @@ fn classify_light_change(
     now: &[crate::cluster::GpuLocalLight],
     before: &[crate::cluster::GpuLocalLight],
 ) -> (bool, bool, bool) {
-    if now.len() != before.len() {
-        return (true, true, true);
-    }
-    let (mut structural, mut changed, mut strong) = (false, false, false);
-    for (a, b) in now.iter().zip(before) {
+    let place = |light: &crate::cluster::GpuLocalLight| glam::Vec3::from_array(light.position_ws);
+    let output = |light: &crate::cluster::GpuLocalLight| glam::Vec3::from_array(light.color).max_element();
+    // `(changed, strong)` between a light and the one it was.
+    let pair = |a: &crate::cluster::GpuLocalLight, b: &crate::cluster::GpuLocalLight| {
         let color_a = glam::Vec3::from_array(a.color);
         let color_b = glam::Vec3::from_array(b.color);
         let scale = color_a.abs().max(color_b.abs()).max_element().max(0.001);
-        let moved = glam::Vec3::from_array(a.position_ws).distance(glam::Vec3::from_array(b.position_ws));
+        let moved = place(a).distance(place(b));
         let (lum_a, lum_b) = (color_a.max_element(), color_b.max_element());
-        structural |= a.light_type != b.light_type || moved > 1.0;
-        strong |= moved > 0.25 || lum_a > 2.0 * lum_b + 1e-3 || lum_b > 2.0 * lum_a + 1e-3;
-        changed |= a.light_type != b.light_type
-            || (color_a - color_b).abs().max_element() > 0.02 * scale
+        let strong = moved > 0.25 || lum_a > 2.0 * lum_b + 1e-3 || lum_b > 2.0 * lum_a + 1e-3;
+        let changed = (color_a - color_b).abs().max_element() > 0.02 * scale
             || moved > 0.05
             || glam::Vec3::from_array(a.direction_ws).distance(glam::Vec3::from_array(b.direction_ws)) > 0.01
             || (a.range - b.range).abs() > 0.01
@@ -169,8 +174,43 @@ fn classify_light_change(
             || a._pad != b._pad
             || a.spot_cos_inner != b.spot_cos_inner
             || a.spot_cos_outer != b.spot_cos_outer;
+        (changed, strong)
+    };
+    // The same lights in the same order, none retyped or moved over a metre: each against the one it was.
+    if now.len() == before.len()
+        && now.iter().zip(before).all(|(a, b)| a.light_type == b.light_type && place(a).distance(place(b)) <= 1.0)
+    {
+        return now.iter().zip(before).fold((false, false, false), |all, (a, b)| {
+            let (changed, strong) = pair(a, b);
+            (false, all.1 | changed, all.2 | strong)
+        });
     }
-    (structural, changed, strong)
+    // Lights came, went or changed places in the list: past the cap a frame keeps the ones nearest the eye
+    // (`cluster::keep_most_seen`), and a streamed cell brings and takes its lamps. Each is paired with the one that
+    // stood where it stands. One with no partner is a cut only if it gives real light: a lamp fading in from nothing
+    // at the edge of the kept set, or out to nothing, is drift, and dropping every reservoir for it flashed the
+    // bounce light of a whole street as the player walked (Sunscar, 11 Nov 2026).
+    let brightest = now.iter().chain(before).map(output).fold(0.0f32, f32::max);
+    let faint = |light: &crate::cluster::GpuLocalLight| output(light) <= 0.02 * brightest;
+    let mut paired = vec![false; before.len()];
+    let (mut structural, mut strong) = (false, false);
+    for a in now {
+        let partner = before
+            .iter()
+            .enumerate()
+            .filter(|(i, b)| !paired[*i] && b.light_type == a.light_type && place(a).distance(place(b)) <= 1.0)
+            .min_by(|x, y| place(a).distance(place(x.1)).total_cmp(&place(a).distance(place(y.1))))
+            .map(|(i, _)| i);
+        match partner {
+            Some(i) => {
+                paired[i] = true;
+                strong |= pair(a, &before[i]).1;
+            }
+            None => structural |= !faint(a),
+        }
+    }
+    structural |= before.iter().zip(&paired).any(|(b, paired)| !paired && !faint(b));
+    (structural, true, strong || structural)
 }
 
 pub struct RestirGiPass {

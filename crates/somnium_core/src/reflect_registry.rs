@@ -653,6 +653,14 @@ pub fn component_registry() -> TypeRegistry {
     registry.register(decal_schema());
     registry.register(light_flicker_schema());
     registry.register(component_schema! {
+        crate::light_flicker::LampComponent as "somnium.Lamp", display "Lamp", version 1,
+        fields {
+            enabled { group: "Lamp", doc: "Burns while the open sky is dark, and is out by day. Off: burns always." },
+            flicker { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Lamp",
+                doc: "How far the flame dips, as a fraction of the light's output." },
+        }
+    });
+    registry.register(component_schema! {
         crate::vertex_paint::VertexPaintComponent as "somnium.VertexPaint", display "Vertex Paint", version 1,
         fields {
             enabled { group: "Vertex Paint",

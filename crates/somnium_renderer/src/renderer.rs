@@ -2954,11 +2954,10 @@ impl SomniumRenderer {
         self.shadow_caster_content_revision = self.shadow_caster_content_revision.wrapping_add(1);
     }
 
-    /// Add a local light (Point or Spot) for this frame (Phase 13C).
+    /// Add a local light (Point or Spot) for this frame (Phase 13C). Past the cap the frame keeps the ones that
+    /// matter most at the eye (`cluster::keep_most_seen`), not the first submitted.
     pub fn submit_local_light(&mut self, light: crate::cluster::GpuLocalLight) {
-        if self.local_lights.len() < crate::cluster::MAX_LOCAL_LIGHTS {
-            self.local_lights.push(light);
-        }
+        self.local_lights.push(light);
     }
 
     /// Toggle the cascade debug overlay (tints pixels by cascade index).
@@ -5267,6 +5266,7 @@ impl SomniumRenderer {
             shading_mode |= 256;
         }
         shading_mode |= ((self.light_ramp.clamp(0.0, 1.0) * 255.0).round() as u32) << 24;
+        crate::cluster::keep_most_seen(&mut self.local_lights, self.camera_pos);
         self.global_pool.cluster_grid.assign_and_upload(
             &ctx.queue,
             &self.local_lights,

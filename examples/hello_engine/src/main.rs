@@ -763,6 +763,11 @@ pub struct HelloGame {
     /// detail, foliage distances and the cutaway fallback are chosen from it. The shell's editor camera stays where
     /// the scene left it while such a game plays, kilometres away in an open world. `None` keeps the shell's camera.
     pub game_eye: Option<Vec3>,
+    /// The share of the open sky's light a cloud deck or the weather lets through, `0..1` (1: a clear sky). A game's
+    /// weather sets it, so the living's lamps light under a storm's dark as they do at dusk.
+    pub sky_dim: f32,
+    /// Whether the living's lamps burn (`somnium.Lamp` beside a light; somnium_core::light_flicker).
+    lamps: somnium_core::light_flicker::LampSwitch,
     /// Roofs and upper floors opened for the camera while the viewer is inside (somnium_core::cutaway).
     cutaways: somnium_core::cutaway::Cutaways,
     /// Levels of detail not drawn this frame (somnium_core::lod_group).
@@ -897,6 +902,8 @@ impl HelloGame {
         Self {
             play_character: true,
             game_eye: None,
+            sky_dim: 1.0,
+            lamps: Default::default(),
             cutaways: Default::default(),
             imported_draws: Default::default(),
             lods: Default::default(),
@@ -2544,6 +2551,9 @@ impl GameApp for HelloGame {
                     ComponentId::of::<Transform>(),
                     ComponentId::of::<LightComponent>(),
                 ]);
+                // How far the living's lamps are lit, as the last frame's sun left it. Debug view 41 is the lit
+                // picture with them out, for a lamp-lit frame's cost against the same frame without.
+                let night = if renderer.shading_debug == 41.0 { 0.0 } else { self.lamps.night() };
                 for archetype in ctx
                     .world
                     .query_archetypes(&light_req, &ComponentSet::empty())
@@ -2564,6 +2574,8 @@ impl GameApp for HelloGame {
                     let flicker_col = archetype.column_index(ComponentId::of::<
                         somnium_core::light_flicker::LightFlickerComponent,
                     >());
+                    let lamp_col =
+                        archetype.column_index(ComponentId::of::<somnium_core::light_flicker::LampComponent>());
                     for row in 0..archetype.len() {
                         if let Some(col) = flags_col
                             && unsafe { archetype.column(col).get::<EditorFlags>(row) }.hidden
@@ -2638,6 +2650,18 @@ impl GameApp for HelloGame {
                                     to_light,
                                     light.photometric_color() * survives,
                                 );
+                                // The living's lamps are lit by what the open sky gives.
+                                let sun = light.photometric_color();
+                                let lux = glam::Vec3::new(0.2126, 0.7152, 0.0722);
+                                self.lamps.step(
+                                    self.sky_dim
+                                        * somnium_core::light_flicker::open_sky_lux(
+                                            sun.dot(lux),
+                                            (sun * survives).dot(lux),
+                                            to_light.y,
+                                        ),
+                                    ctx.time.elapsed().as_secs_f32(),
+                                );
                                 renderer.set_directional_shadow_policy(
                                     somnium_renderer::shadow::virtual_map::ShadowLightPolicy {
                                         light_id: 0,
@@ -2659,8 +2683,16 @@ impl GameApp for HelloGame {
                                     unsafe { archetype.column(col).get::<somnium_core::light_flicker::LightFlickerComponent>(row) }
                                         .factor(ctx.time.elapsed().as_secs_f32())
                                 });
+                                // One of the living's lamps burns only while the open sky is dark.
+                                let lit = lamp_col.map_or(1.0, |col| {
+                                    unsafe { archetype.column(col).get::<somnium_core::light_flicker::LampComponent>(row) }
+                                        .factor(night, transform.translation, ctx.time.elapsed().as_secs_f32())
+                                });
+                                if lit <= 0.0 {
+                                    continue;
+                                }
                                 // Spot/rect axis = travel direction. A spot keeps its cookie.
-                                if let Some(lamp) = light.local_light(transform.translation, forward, flicker) {
+                                if let Some(lamp) = light.local_light(transform.translation, forward, flicker * lit) {
                                     renderer.submit_local_light(lamp);
                                 }
                             }

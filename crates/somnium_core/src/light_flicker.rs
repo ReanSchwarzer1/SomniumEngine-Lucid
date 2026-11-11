@@ -78,9 +78,126 @@ impl LightFlickerComponent {
     }
 }
 
+/// A light of the living (an oil lantern, a candle, a watch fire): it burns while the open sky is dark and is out by
+/// day, and it wavers as a flame does. A tag beside a `LightComponent`; the light itself is never written.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LampComponent {
+    /// Off: the light burns always, as one without the tag.
+    pub enabled: bool,
+    /// How far the flame dips, `0..1` of the light's output.
+    pub flicker: f32,
+}
+
+impl Component for LampComponent {}
+
+impl Default for LampComponent {
+    fn default() -> Self {
+        Self { enabled: true, flicker: 0.15 }
+    }
+}
+
+/// Lamps are lit when the open sky gives less than this, lux: dusk, a storm's dark.
+pub const LAMP_LUX: f32 = 1000.0;
+/// Seconds over which a land's lamps are lit, one after another, once it is dark, and put out once it is light.
+pub const LAMP_STAGGER_S: f32 = 90.0;
+
+impl LampComponent {
+    /// Output multiplier for the lamp at `position`, `time` seconds in, when the lamps are `night` of the way lit
+    /// ([`LampSwitch::night`]). Each lamp has its own turn in the lighting (by where it stands) and catches over a
+    /// few seconds.
+    #[must_use]
+    pub fn factor(&self, night: f32, position: glam::Vec3, time: f32) -> f32 {
+        if !self.enabled {
+            return 1.0;
+        }
+        let turn = hash(position.x * 0.731 + position.y * 0.117 + position.z * 1.933);
+        let lit = ((night - 0.02 - 0.93 * turn) / 0.03).clamp(0.0, 1.0);
+        let flame = 0.6 * value_noise(time * 3.1, turn * 40.0) + 0.4 * value_noise(time * 9.7, turn * 91.0);
+        lit * (1.0 - self.flicker.clamp(0.0, 1.0) * flame)
+    }
+}
+
+/// Whether the living's lamps burn: `night` runs from 0 (all out) to 1 (all lit) over [`LAMP_STAGGER_S`] once the
+/// open sky gives under [`LAMP_LUX`], and back when the light returns. One per game, stepped once a frame.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LampSwitch {
+    night: f32,
+    /// The last step's time, seconds; `None` before the first, which sets `night` whole.
+    last: Option<f32>,
+}
+
+impl LampSwitch {
+    /// Step to `time` seconds under an open sky giving `lux`.
+    pub fn step(&mut self, lux: f32, time: f32) {
+        let dark = lux < LAMP_LUX;
+        self.night = match self.last {
+            None => f32::from(u8::from(dark)),
+            Some(last) => {
+                let turn = (time - last).clamp(0.0, 1.0) / LAMP_STAGGER_S;
+                (self.night + if dark { turn } else { -turn }).clamp(0.0, 1.0)
+            }
+        };
+        self.last = Some(time);
+    }
+
+    /// How far the lamps are lit, `0..=1`.
+    #[must_use]
+    pub fn night(&self) -> f32 {
+        self.night
+    }
+}
+
+/// The light an open, level place takes from the sky, lux: the sun through the air (`sun_lux`, at its own bearing)
+/// on the level, and the sky's own light as a share of the sun above the air (`sun_above_air_lux`) that follows the
+/// twilight: about an eighth with the sun high, 0.4% with it on the horizon, a hundredth of that six degrees under.
+/// `sun_up` is the sine of the sun's elevation. With the sun at 80,000 lux it passes 1,000 lux about two degrees up.
+#[must_use]
+pub fn open_sky_lux(sun_above_air_lux: f32, sun_lux: f32, sun_up: f32) -> f32 {
+    // (elevation in degrees, ln of the sky's share)
+    const SKY: [(f32, f32); 6] =
+        [(-12.0, -16.3), (-6.0, -10.3), (0.0, -5.52), (5.0, -3.5), (15.0, -2.5), (90.0, -2.0)];
+    let elevation = sun_up.clamp(-1.0, 1.0).asin().to_degrees();
+    let share = match SKY.windows(2).find(|pair| elevation < pair[1].0) {
+        _ if elevation <= SKY[0].0 => 0.0,
+        Some(pair) => (pair[0].1 + (pair[1].1 - pair[0].1) * (elevation - pair[0].0) / (pair[1].0 - pair[0].0)).exp(),
+        None => SKY[5].1.exp(),
+    };
+    sun_lux * sun_up.max(0.0) + sun_above_air_lux * share
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lamps_light_one_by_one_at_dusk_and_go_out_at_dawn() {
+        // Noon, the sun on the horizon, and six degrees under: 80,000 lux above the air.
+        assert!(open_sky_lux(80_000.0, 70_000.0, 0.57) > 40_000.0);
+        let dusk = open_sky_lux(80_000.0, 2_000.0, 0.0);
+        assert!((200.0..LAMP_LUX).contains(&dusk), "{dusk}");
+        assert!(open_sky_lux(80_000.0, 0.0, (-6.0f32).to_radians().sin()) < 5.0);
+        assert!(open_sky_lux(80_000.0, 20_000.0, 5.0f32.to_radians().sin()) > LAMP_LUX, "by day they are out");
+        // A game that starts in the dark starts with its lamps lit; day puts them out over the stagger.
+        let lamp = LampComponent { flicker: 0.0, ..Default::default() };
+        let places: Vec<glam::Vec3> = (0..40).map(|i| glam::Vec3::new(i as f32 * 7.3, 2.0, i as f32 * -3.1)).collect();
+        let lit = |switch: &LampSwitch| places.iter().filter(|p| lamp.factor(switch.night(), **p, 0.0) >= 1.0).count();
+        let mut switch = LampSwitch::default();
+        switch.step(dusk, 0.0);
+        assert_eq!((switch.night(), lit(&switch)), (1.0, 40));
+        let mut counts = Vec::new();
+        for second in 1..=100 {
+            switch.step(50_000.0, second as f32);
+            counts.push(lit(&switch));
+        }
+        assert!(counts.windows(2).all(|pair| pair[1] <= pair[0]), "{counts:?}");
+        assert!(counts[30] > 5 && counts[30] < 35, "a third of the way through some are out: {}", counts[30]);
+        assert_eq!((counts[95], switch.night()), (0, 0.0));
+        // Without the tag's switch a light burns always; a flame dips no deeper than its flicker.
+        assert_eq!(LampComponent { enabled: false, ..Default::default() }.factor(0.0, places[3], 1.0), 1.0);
+        let wavering = LampComponent::default();
+        let dips: Vec<f32> = (0..500).map(|i| wavering.factor(1.0, places[3], i as f32 * 0.05)).collect();
+        assert!(dips.iter().all(|f| (0.85..=1.0).contains(f)) && dips.iter().any(|f| *f < 0.95));
+    }
 
     #[test]
     fn disabled_is_exactly_the_authored_light() {
