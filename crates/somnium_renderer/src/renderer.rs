@@ -1233,6 +1233,7 @@ impl SomniumRenderer {
         let restir_pass = crate::pass::restir::RestirPass::new(
             &ctx.device,
             &shaders,
+            &global_pool.layout,
             raytrace_pass.supported(),
             grain_masks.view(),
             ctx.config.width,
@@ -6285,8 +6286,10 @@ impl SomniumRenderer {
                     &ctx.device,
                     &ctx.queue,
                     &mut encoder,
+                    &self.global_pool.bind_group,
                     tlas,
                     &self.vis_pass.depth_view,
+                    &self.vis_pass.view,
                     self.view_proj_rel,
                     self.camera_pos,
                     self.light_direction,
