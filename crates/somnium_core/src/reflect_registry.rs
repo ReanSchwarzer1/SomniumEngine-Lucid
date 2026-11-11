@@ -985,6 +985,8 @@ fn post_process_schema() -> ComponentSchema {
                 doc: "A SNOWLN01 snowline map, project-relative: where it covers, its snowline replaces Snowline. Empty for none." },
             ground_blend_m { min: 0.0, max: 4.0, step: 0.05, unit: "m", group: "Ground Blend", display_name: "Mesh Blend Height",
                 doc: "Meshes blend into the ground within this height unless their material says otherwise (0: off)." },
+            light_glints { min: 0.0, max: 4.0, step: 0.05, group: "Lens", display_name: "Lamp Points",
+                doc: "Far lamps under a pixel land as their own light, steady and with their glare (1: physical; 0: off)." },
         }
     };
     if let Some(field) = schema.fields.iter_mut().find(|f| f.name == "dream_mode") {

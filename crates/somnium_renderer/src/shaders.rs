@@ -149,6 +149,7 @@ impl Shaders {
             "hiz.wgsl",
             "ibl_gen.wgsl",
             "light_gizmo.wgsl",
+            "light_glints.wgsl",
             "lighting_extra.wgsl",
             "motion_blur.wgsl",
             "path_denoise.wgsl",

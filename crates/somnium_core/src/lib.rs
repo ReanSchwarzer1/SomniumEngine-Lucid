@@ -1514,6 +1514,10 @@ pub struct PostProcessComponent {
     /// and normal cross-fade to the ground's on a ragged line. Materials that set `somnium_ground_blend` use their own
     /// (negative: never); scaled by each instance's size. 0 (default) is off.
     pub ground_blend_m: f32,
+    /// Point and spot lamps also land as their own light where they fall under a pixel (`light_glints.wgsl`), so a
+    /// far lantern or a lit window holds steady at night and carries its glare; 1 is the physical amount, 0 (default)
+    /// off.
+    pub light_glints: f32,
 }
 
 impl Default for PostProcessComponent {
@@ -1708,6 +1712,7 @@ impl Default for PostProcessComponent {
             snow_bare_slope_deg: 65.0,
             snow_map: String::new(),
             ground_blend_m: 0.0,
+            light_glints: 0.0,
         }
     }
 }
