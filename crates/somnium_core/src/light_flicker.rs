@@ -78,12 +78,12 @@ impl LightFlickerComponent {
     }
 }
 
-/// A light of the living (an oil lantern, a candle, a watch fire): it burns while the open sky is dark and is out by
-/// day, and it wavers as a flame does. A tag beside a `LightComponent`; the light itself is never written.
+/// A light of the living (an oil lantern, a candle, a watch fire): it wavers as a flame does, and a lamp burns while
+/// the open sky is dark and is out by day. A tag beside a `LightComponent`; the light itself is never written.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LampComponent {
-    /// Off: the light burns always, as one without the tag.
-    pub enabled: bool,
+    /// A lamp, lit from dusk to dawn. Off for a fire that burns all day.
+    pub switched: bool,
     /// How far the flame dips, `0..1` of the light's output.
     pub flicker: f32,
 }
@@ -92,12 +92,14 @@ impl Component for LampComponent {}
 
 impl Default for LampComponent {
     fn default() -> Self {
-        Self { enabled: true, flicker: 0.15 }
+        Self { switched: true, flicker: 0.15 }
     }
 }
 
-/// Lamps are lit when the open sky gives less than this, lux: dusk, a storm's dark.
+/// Lamps are lit when the open sky gives less than this, lux (dusk, a storm's dark), and put out when it gives
+/// more than [`LAMP_OFF_LUX`]: between the two they stay as they are, so a cloud's edge does not flick a village.
 pub const LAMP_LUX: f32 = 1000.0;
+pub const LAMP_OFF_LUX: f32 = 1200.0;
 /// Seconds over which a land's lamps are lit, one after another, once it is dark, and put out once it is light.
 pub const LAMP_STAGGER_S: f32 = 90.0;
 
@@ -107,11 +109,8 @@ impl LampComponent {
     /// few seconds.
     #[must_use]
     pub fn factor(&self, night: f32, position: glam::Vec3, time: f32) -> f32 {
-        if !self.enabled {
-            return 1.0;
-        }
         let turn = hash(position.x * 0.731 + position.y * 0.117 + position.z * 1.933);
-        let lit = ((night - 0.02 - 0.93 * turn) / 0.03).clamp(0.0, 1.0);
+        let lit = if self.switched { ((night - 0.02 - 0.93 * turn) / 0.03).clamp(0.0, 1.0) } else { 1.0 };
         let flame = 0.6 * value_noise(time * 3.1, turn * 40.0) + 0.4 * value_noise(time * 9.7, turn * 91.0);
         lit * (1.0 - self.flicker.clamp(0.0, 1.0) * flame)
     }
@@ -122,6 +121,7 @@ impl LampComponent {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct LampSwitch {
     night: f32,
+    dark: bool,
     /// The last step's time, seconds; `None` before the first, which sets `night` whole.
     last: Option<f32>,
 }
@@ -129,12 +129,12 @@ pub struct LampSwitch {
 impl LampSwitch {
     /// Step to `time` seconds under an open sky giving `lux`.
     pub fn step(&mut self, lux: f32, time: f32) {
-        let dark = lux < LAMP_LUX;
+        self.dark = if lux < LAMP_LUX { true } else if lux > LAMP_OFF_LUX { false } else { self.dark };
         self.night = match self.last {
-            None => f32::from(u8::from(dark)),
+            None => f32::from(u8::from(self.dark)),
             Some(last) => {
                 let turn = (time - last).clamp(0.0, 1.0) / LAMP_STAGGER_S;
-                (self.night + if dark { turn } else { -turn }).clamp(0.0, 1.0)
+                (self.night + if self.dark { turn } else { -turn }).clamp(0.0, 1.0)
             }
         };
         self.last = Some(time);
@@ -192,8 +192,19 @@ mod tests {
         assert!(counts.windows(2).all(|pair| pair[1] <= pair[0]), "{counts:?}");
         assert!(counts[30] > 5 && counts[30] < 35, "a third of the way through some are out: {}", counts[30]);
         assert_eq!((counts[95], switch.night()), (0, 0.0));
-        // Without the tag's switch a light burns always; a flame dips no deeper than its flicker.
-        assert_eq!(LampComponent { enabled: false, ..Default::default() }.factor(0.0, places[3], 1.0), 1.0);
+        // Between 1,000 and 1,200 lux nothing changes: lit lamps stay lit, and lamps that are out stay out.
+        let mut dusk_edge = LampSwitch::default();
+        dusk_edge.step(900.0, 0.0);
+        dusk_edge.step(1100.0, 1.0);
+        assert_eq!(dusk_edge.night(), 1.0);
+        dusk_edge.step(1300.0, 2.0);
+        assert!(dusk_edge.night() < 1.0);
+        let mut dawn_edge = LampSwitch::default();
+        dawn_edge.step(5000.0, 0.0);
+        dawn_edge.step(1100.0, 1.0);
+        assert_eq!(dawn_edge.night(), 0.0);
+        // A fire is never switched: it burns by day; a flame dips no deeper than its flicker.
+        assert_eq!(LampComponent { switched: false, flicker: 0.0 }.factor(0.0, places[3], 1.0), 1.0);
         let wavering = LampComponent::default();
         let dips: Vec<f32> = (0..500).map(|i| wavering.factor(1.0, places[3], i as f32 * 0.05)).collect();
         assert!(dips.iter().all(|f| (0.85..=1.0).contains(f)) && dips.iter().any(|f| *f < 0.95));
