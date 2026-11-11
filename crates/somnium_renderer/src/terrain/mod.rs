@@ -24,6 +24,7 @@ pub mod clipmap;
 pub mod collider;
 pub mod foliage;
 pub mod foliage_paint;
+pub mod ground;
 pub mod heightmap;
 /// Phase TSUSHIMA-B/C: baked horizon angles and sky visibility.
 pub mod horizon;
@@ -328,8 +329,13 @@ pub struct GpuTerrainMaterial {
     /// a `vec4` and not the three scalars the shader actually reads plus one
     /// more pad word.
     pub macro_octave_strength: [f32; 4],
-    /// Steepness (1 - |n.y|) where the projected cliff layer starts and where it is whole (x, y); zw unused.
-    pub cliff_band: [f32; 4],
+    /// Steepness (1 - |n.y|) where the projected cliff layer starts and where it is whole.
+    pub cliff_band: [f32; 2],
+    /// Bindless index of the ground's height texture (`ground`), or -1: what a mesh blends into the terrain by.
+    /// With `ground_base` it takes the two words the cliff band left unused, so the struct keeps its size.
+    pub ground_map: i32,
+    /// World height of the terrain's own zero: the model's translation.
+    pub ground_base: f32,
 }
 
 /// Bindless indices of one terrain's textures, filled in at creation.
@@ -353,6 +359,8 @@ pub struct TerrainTextureIds {
     pub sky_visibility: i32,
     /// Phase TSUSHIMA-E: mip-chained relief normal + Toksvig length.
     pub relief_normal: i32,
+    /// The ground's height, one texel per heightfield sample (`ground`).
+    pub ground_height: i32,
 }
 
 impl Default for TerrainTextureIds {
@@ -366,6 +374,7 @@ impl Default for TerrainTextureIds {
             horizon_maps: [-1, -1],
             sky_visibility: -1,
             relief_normal: -1,
+            ground_height: -1,
         }
     }
 }
@@ -432,6 +441,11 @@ pub struct TerrainData {
     pub sky_visibility_strength: f32,
     /// Set when the heightfield changes under a baked map.
     pub horizon_dirty: bool,
+    /// The heightfield as a texture, for meshes that blend into the ground (`ground`). Written again on
+    /// `ground_dirty`, which unlike `horizon_dirty` a streamed tile always sets: its baked maps arrive with it, its
+    /// heights are only here.
+    pub ground_gpu: ground::GroundGpu,
+    pub ground_dirty: bool,
     /// Phase TSUSHIMA-E: the relief normal chain. Rewritten in place with the
     /// horizon bake, on the same `horizon_dirty` flag — both read the
     /// heightfield and both go stale for exactly the same reasons.
@@ -854,10 +868,21 @@ impl TerrainData {
             ),
         );
 
+        let ground_gpu = ground::upload(
+            device,
+            queue,
+            &heightmap,
+            desc.total_vertices_x(),
+            desc.total_vertices_z(),
+            desc.height_scale,
+        );
+
         Self {
             macro_texture,
             macro_view,
             relief_gpu,
+            ground_gpu,
+            ground_dirty: false,
             relief_normal: std::env::var("SOMNIUM_TERRAIN_RELIEF").as_deref() != Ok("0"),
             // The last cascade's far edge, matching TSUSHIMA-B's cross-fade.
             // Inside it the mesh is at a fine LOD and its own normals are
@@ -1337,7 +1362,9 @@ impl TerrainData {
                     self.skyvis_tint.max(0.0),
                 ]
             },
-            cliff_band: [self.cliff_band[0], self.cliff_band[1].max(self.cliff_band[0] + 1e-3), 0.0, 0.0],
+            cliff_band: [self.cliff_band[0], self.cliff_band[1].max(self.cliff_band[0] + 1e-3)],
+            ground_map: self.texture_ids.ground_height,
+            ground_base: origin.y,
         }
     }
 
@@ -1493,6 +1520,7 @@ impl TerrainData {
         // would make the brush unusable, and a slightly stale long shadow
         // under an active brush is not what anyone is looking at.
         self.horizon_dirty = true;
+        self.ground_dirty = true;
         for chunk in &mut self.chunks {
             chunk.dirty = true;
         }
@@ -1723,6 +1751,16 @@ impl TerrainData {
         // Baking once at creation and never again is exactly the bug this
         // fixes: every horizon angle was zero, every sky visibility was fully
         // open, and the on/off capture pair was byte-identical.
+        if std::mem::take(&mut self.ground_dirty) {
+            ground::rewrite(
+                queue,
+                &self.ground_gpu,
+                &self.heightmap,
+                self.desc.total_vertices_x(),
+                self.desc.total_vertices_z(),
+                self.desc.height_scale,
+            );
+        }
         if std::mem::take(&mut self.horizon_dirty) {
             let t = std::time::Instant::now();
             let maps = horizon::bake(
@@ -1987,6 +2025,7 @@ impl TerrainData {
         self.painted_foliage = sidecar.foliage;
         self.macro_dirty = true;
         self.horizon_dirty = true;
+        self.ground_dirty = true;
         for chunk in &mut self.chunks {
             chunk.dirty = true;
         }
@@ -2038,6 +2077,7 @@ impl TerrainData {
             }
             _ => self.horizon_dirty = true,
         }
+        self.ground_dirty = true;
         self.macro_dirty = true;
         for chunk in &mut self.chunks {
             chunk.dirty = true;

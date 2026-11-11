@@ -2290,7 +2290,7 @@ impl SomniumRenderer {
                         detile: if mat.detile { 1.0 } else { 0.0 },
                         wind: [mat.wind_bend, mat.wind_flutter],
                         subsurface: mat.subsurface,
-                        reserved: 0.0,
+                        terrain_blend: mat.terrain_blend,
                     },
                 );
                 // Phase 17D: remember double-sidedness so the visibility pass can
@@ -4042,6 +4042,7 @@ impl SomniumRenderer {
         ids.sky_visibility =
             self.add_terrain_texture(ctx, terrain.horizon_gpu.sky_view.clone()) as i32;
         ids.relief_normal = self.add_terrain_texture(ctx, terrain.relief_gpu.view.clone()) as i32;
+        ids.ground_height = self.add_terrain_texture(ctx, terrain.ground_gpu.view.clone()) as i32;
         let hero = crate::terrain::textures::TERRAIN_HERO_LAYERS;
         // Virtual mode deliberately leaves every legacy layer id at -1. The
         // 4x4 arrays only keep the struct/fallback shape valid; publishing
@@ -4134,7 +4135,7 @@ impl SomniumRenderer {
                 detile: 0.0,
                 wind: [0.0; 2],
                 subsurface: 0.0,
-                reserved: 0.0,
+                terrain_blend: 0.0,
             },
         );
         // Opaque and single-sided, which is what an unregistered material

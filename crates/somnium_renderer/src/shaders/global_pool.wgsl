@@ -77,7 +77,8 @@ struct Material {
     wind_flutter: f32,
     // Light under the surface, 0..1 (`pool.rs` `subsurface`): skin; see `shading.wgsl` `skin_scatter`.
     subsurface: f32,
-    _reserved: f32,
+    // Metres over the ground within which the surface cross-fades into the terrain (`pool.rs` `terrain_blend`); 0 off.
+    terrain_blend: f32,
 }
 
 // Phase 11D: view matrix added at offset 128 (Option A — buffer expanded to 208 bytes).

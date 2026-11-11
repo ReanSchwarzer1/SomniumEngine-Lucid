@@ -1757,6 +1757,166 @@ fn evaluate_ibl(surface: Surface, traced_diffuse: TracedLight) -> vec3<f32> {
     return diffuse + evaluate_ibl_specular(surface) * light.ibl_intensity;
 }
 
+// ─── A mesh that stands in the ground (Sunscar, 11 Nov 2026) ─────────────────
+//
+// A scanned rock set on a slope met the ground along a hard line: stone on one side, the terrain's layers on the
+// other, and the eye read "an object placed on a floor" in every rock, cliff foot, wall base and rubble heap. Real
+// stone sits in the ground. Soil and litter bank up against it, fill its crevices and lie on its ledges, and there is
+// no line.
+//
+// A material that asks (`Material.terrain_blend`, metres) cross-fades to the terrain's own material within that
+// distance of the ground under it: colour, normal and roughness. For that the shader has to know two things about a
+// pixel that is not ground: how high the ground is under it (the terrain's height texture, terrain/ground.rs), and
+// what the ground is made of there (the terrain's material, evaluated at that point exactly as a ground pixel
+// evaluates it, so the two sides of the old line are the same stuff).
+//
+// The line the fade follows is ragged on purpose. A height threshold alone is a contour line, as artificial as the
+// edge it replaces. So the threshold moves with two octaves of world-space noise, comes up where the material's own
+// occlusion says there is a crevice, and comes up on faces that look at the sky: soil lies on ledges and in cracks,
+// and leaves the steep faces between them bare.
+
+/// One texel of a terrain's height texture as metres above the terrain's base (terrain/ground.rs `encode`).
+fn ground_decode(texel: vec4<f32>) -> f32 {
+    let steps = round(texel.rgb * 255.0);
+    return (steps.r * 65536.0 + steps.g * 256.0 + steps.b) / 2048.0 - 2048.0;
+}
+
+struct GroundUnder {
+    /// The terrain under the point, or -1 when there is none.
+    terrain: i32,
+    /// The ground's world height there.
+    height: f32,
+    normal: vec3<f32>,
+    /// The point in the terrain's own 0..1 square.
+    uv: vec2<f32>,
+}
+
+/// The ground under a world point: which terrain, how high, facing where.
+///
+/// The terrains are few (a streamed neighbourhood of tiles) and do not overlap, so this walks them and takes the
+/// first whose square holds the point. It reads three words of each, not the 2 KB struct. The height is the bilinear
+/// patch over the four heightfield samples round the point, read by hand (the height is split across the texel's
+/// channels, which a sampler cannot interpolate), and the normal is that patch's own slope.
+fn ground_under(world_xz: vec2<f32>) -> GroundUnder {
+    var under = GroundUnder(-1, 0.0, vec3<f32>(0.0, 1.0, 0.0), vec2<f32>(0.0));
+    let count = arrayLength(&terrain_materials);
+    for (var i = 0u; i < count; i = i + 1u) {
+        let map = terrain_materials[i].ground_map;
+        let inv = terrain_materials[i].inv_world_size;
+        // A slot never filled is all zeros: no size.
+        if map < 0 || inv.x <= 0.0 || inv.y <= 0.0 {
+            continue;
+        }
+        let uv = (world_xz - terrain_materials[i].terrain_origin) * inv;
+        if any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) {
+            continue;
+        }
+        let samples = vec2<i32>(textureDimensions(textures[map]));
+        let at = uv * vec2<f32>(samples - 1);
+        let base = clamp(vec2<i32>(floor(at)), vec2<i32>(0), max(samples - 2, vec2<i32>(0)));
+        let f = at - vec2<f32>(base);
+        let h00 = ground_decode(textureLoad(textures[map], base, 0));
+        let h10 = ground_decode(textureLoad(textures[map], min(base + vec2<i32>(1, 0), samples - 1), 0));
+        let h01 = ground_decode(textureLoad(textures[map], min(base + vec2<i32>(0, 1), samples - 1), 0));
+        let h11 = ground_decode(textureLoad(textures[map], min(base + vec2<i32>(1, 1), samples - 1), 0));
+        // Metres between samples along x and z.
+        let cell = 1.0 / (inv * vec2<f32>(max(samples - 1, vec2<i32>(1))));
+        let slope = vec2<f32>(mix(h10 - h00, h11 - h01, f.y), mix(h01 - h00, h11 - h10, f.x)) / cell;
+        under.terrain = i32(i);
+        under.height = mix(mix(h00, h10, f.x), mix(h01, h11, f.x), f.y) + terrain_materials[i].ground_base;
+        under.normal = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
+        under.uv = uv;
+        break;
+    }
+    return under;
+}
+
+/// A terrain's material at a point of it, by whichever path this pipeline shades terrain with.
+///
+/// `enable_live_terrain` is checked first and is a pipeline override, so when the clipmap owns every queued terrain
+/// the live branch is statically dead and `evaluate_terrain_material` is dropped from the module. The
+/// `clipmap_enabled` test is a storage read the compiler cannot prove uniform: it branches correctly at runtime, but
+/// it cannot delete either body, and occupancy is the union of both.
+fn terrain_surface_at(
+    tm_idx: u32,
+    world_pos: vec3<f32>,
+    terrain_xz: vec2<f32>,
+    normal: vec3<f32>,
+    uv: vec2<f32>,
+    world_ddx: vec2<f32>,
+    world_ddy: vec2<f32>,
+) -> TerrainSurface {
+    if !enable_live_terrain {
+        return evaluate_clipmap_material(terrain_materials[tm_idx], tm_idx, world_pos, normal, uv, world_ddx, world_ddy);
+    } else if enable_clipmap && terrain_materials[tm_idx].clipmap_enabled != 0u {
+        return evaluate_clipmap_material(terrain_materials[tm_idx], tm_idx, world_pos, normal, uv, world_ddx, world_ddy);
+    }
+    return evaluate_terrain_material(tm_idx, world_pos, terrain_xz, normal, uv, world_ddx, world_ddy);
+}
+
+/// Past this the band is a pixel or two wide and not worth a terrain's material; it fades out over the last fifth.
+const GROUND_BLEND_REACH: f32 = 220.0;
+
+/// Make `surface` the ground as far as it stands in it at `world_pos`.
+///
+/// `blend` is the material's blend distance in metres. `offset_xz` is the pixel's place from its instance's origin
+/// along the world's axes and `instance_xz` that origin: the terrain's layers are addressed from the two apart,
+/// because a world position 13-17 km out holds only 1-2 mm (see the terrain branch). `offset_ddx/ddy` are the
+/// screen derivatives of `offset_xz`, for the layers' mips.
+fn ground_blend(
+    surface: ptr<function, Surface>,
+    blend: f32,
+    world_pos: vec3<f32>,
+    offset_xz: vec2<f32>,
+    instance_xz: vec2<f32>,
+    offset_ddx: vec2<f32>,
+    offset_ddy: vec2<f32>,
+) {
+    let reach = 1.0 - smoothstep(GROUND_BLEND_REACH * 0.8, GROUND_BLEND_REACH, distance(world_pos, view.camera_pos));
+    if reach <= 0.0 {
+        return;
+    }
+    let under = ground_under(world_pos.xz);
+    if under.terrain < 0 {
+        return;
+    }
+    // Height over the ground measured across the slope, not straight up: on a steep bank straight up is several
+    // times the way to the ground, and the band would thin to nothing exactly where rocks sit in banks.
+    let above = (world_pos.y - under.height) * under.normal.y;
+    // The furthest the ragged threshold below can lift the band.
+    if above > blend * 1.75 {
+        return;
+    }
+    let coarse = terrain_value_noise(world_pos.xz * 1.9 + vec2<f32>(world_pos.y * 0.7, 3.1));
+    let fine = terrain_value_noise(world_pos.xz * 7.7 + vec2<f32>(11.3, world_pos.y * 2.9));
+    // A crevice by the material's own occlusion, and a ledge by its facing: where soil lies.
+    let crevice = 1.0 - micro_occlusion;
+    let ledge = max((*surface).normal.y, 0.0);
+    let level = above / max(blend, 1.0e-3) + (coarse - 0.5) * 0.7 + (fine - 0.5) * 0.3 - crevice * 0.6 - ledge * 0.25;
+    let t = (1.0 - smoothstep(0.3, 0.8, level)) * reach;
+    if t <= 0.0 {
+        return;
+    }
+    let tm_idx = u32(under.terrain);
+    let ground = terrain_surface_at(
+        tm_idx,
+        vec3<f32>(world_pos.x, under.height, world_pos.z),
+        offset_xz + (instance_xz - terrain_materials[tm_idx].terrain_origin),
+        under.normal,
+        under.uv,
+        offset_ddx,
+        offset_ddy,
+    );
+    (*surface).albedo = mix((*surface).albedo, ground.albedo, t);
+    (*surface).roughness = mix((*surface).roughness, ground.roughness, t);
+    (*surface).metallic = (*surface).metallic * (1.0 - t);
+    (*surface).normal = normalize(mix((*surface).normal, ground.normal, t));
+    // The material's own occlusion gives way to the ground's; GTAO, which is in `occlusion` too, stays.
+    let own = max(micro_occlusion, 0.05);
+    (*surface).occlusion = (*surface).occlusion * mix(1.0, ground.occlusion / own, t);
+    micro_occlusion = mix(micro_occlusion, ground.occlusion, t);
+}
+
 // ─── Vertex shader ───────────────────────────────────────────────────────────
 
 struct VertexOutput {
@@ -2913,23 +3073,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             + (instance.model[3].xz - terrain_materials[tm_idx].terrain_origin);
         let world_ddx = dpdx(terrain_xz);
         let world_ddy = dpdy(terrain_xz);
-        var terrain: TerrainSurface;
-        // `enable_live_terrain` is checked first and is a pipeline override, so
-        // when the clipmap owns every queued terrain the live branch is
-        // statically dead and `evaluate_terrain_material` is dropped from the
-        // module. The `clipmap_enabled` test below is a storage read the
-        // compiler cannot prove uniform: it branches correctly at runtime, but
-        // it cannot delete either body, and occupancy is the union of both.
-        if !enable_live_terrain {
-            terrain = evaluate_clipmap_material(
-                terrain_materials[tm_idx], tm_idx, hit_point, geo_normal, uv, world_ddx, world_ddy);
-        } else if enable_clipmap && terrain_materials[tm_idx].clipmap_enabled != 0u {
-            terrain = evaluate_clipmap_material(
-                terrain_materials[tm_idx], tm_idx, hit_point, geo_normal, uv, world_ddx, world_ddy);
-        } else {
-            terrain = evaluate_terrain_material(
-                tm_idx, hit_point, terrain_xz, geo_normal, uv, world_ddx, world_ddy);
-        }
+        let terrain = terrain_surface_at(tm_idx, hit_point, terrain_xz, geo_normal, uv, world_ddx, world_ddy);
         surface.albedo = terrain.albedo;
         surface.roughness = terrain.roughness;
         surface.metallic = 0.0;
@@ -3090,6 +3234,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let composed = normalize(surface.bent_normal + terrain_sky_bent);
             surface.bent_normal = normalize(mix(composed, geo_normal, 0.25));
         }
+    } else if material.terrain_blend > 0.0 {
+        // A mesh that stands in the ground becomes the ground where they meet (`ground_blend`).
+        let offset_xz = (instance.model * vec4<f32>(local_hit, 0.0)).xz;
+        ground_blend(&surface, material.terrain_blend, hit_point, offset_xz, instance.model[3].xz,
+            dpdx(offset_xz), dpdy(offset_xz));
     }
 
 

@@ -86,6 +86,42 @@ fn parse_leaf_transmission(rule: &str) -> Option<[f32; 2]> {
     let broad = shares.next()??;
     let needle = shares.next().flatten().unwrap_or(broad);
     (broad > 0.0 || needle > 0.0).then_some([broad, needle])
+/// glTF material extras `somnium_terrain_blend`: metres over the ground within which the material cross-fades into
+/// the terrain (`shading.wgsl` `ground_blend`). `None` when the material does not say; 0 is "never".
+fn terrain_blend_extra(mat: &gltf::Material<'_>) -> Option<f32> {
+    mat.extras()
+        .as_ref()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.get()).ok())
+        .and_then(|v| v.get("somnium_terrain_blend").and_then(serde_json::Value::as_f64))
+        .map(|metres| (metres as f32).clamp(0.0, 4.0))
+}
+
+/// The blend distance a glTF's opaque materials take when they do not say themselves, by where the file is.
+///
+/// `SOMNIUM_TERRAIN_BLEND_PATHS` is `part=metres;part=metres`: a file whose path contains a part (forward slashes,
+/// any case) takes that distance, the first part that matches. A game names its rock kit and its ruins there once,
+/// so every stone in them sits in the ground without each asset being rewritten; a game that sets nothing blends
+/// nothing unless a material asks.
+fn terrain_blend_for_path(path: &Path) -> f32 {
+    static RULES: std::sync::OnceLock<Vec<(String, f32)>> = std::sync::OnceLock::new();
+    let rules = RULES.get_or_init(|| parse_terrain_blend_paths(&std::env::var("SOMNIUM_TERRAIN_BLEND_PATHS").unwrap_or_default()));
+    if rules.is_empty() {
+        return 0.0;
+    }
+    let path = path.to_string_lossy().replace('\\', "/").to_lowercase();
+    rules.iter().find(|(part, _)| path.contains(part.as_str())).map_or(0.0, |(_, metres)| *metres)
+}
+
+fn parse_terrain_blend_paths(rules: &str) -> Vec<(String, f32)> {
+    rules
+        .split(';')
+        .filter_map(|rule| {
+            let (part, metres) = rule.split_once('=')?;
+            let metres = metres.trim().parse::<f32>().ok()?;
+            let part = part.trim().replace('\\', "/").to_lowercase();
+            (!part.is_empty()).then_some((part, metres.clamp(0.0, 4.0)))
+        })
+        .collect()
 }
 
 /// glTF material extras `somnium_interior_depth`: metres of room behind a
@@ -174,6 +210,10 @@ pub struct LoadedMaterial {
     /// of metres wide. The shading pass adds world-space relief and colour at the scales its pixels can show, so a
     /// slope 2-6 km out reads as ground, not a smooth wash (Sunscar, 7 Nov 2026).
     pub far_ground: bool,
+    /// Metres over the ground within which the material cross-fades into the terrain it stands on: its colour,
+    /// normal and roughness become the ground's, along a ragged line (glTF material extras `somnium_terrain_blend`,
+    /// or `SOMNIUM_TERRAIN_BLEND_PATHS` by the file's path). 0: the mesh meets the ground along a hard edge.
+    pub terrain_blend: f32,
     /// This material is painted on **flat cut-out cards whose `uv.x` runs
     /// across the blade**, which is what `shading.wgsl`'s curved-card normal
     /// needs to be true.
@@ -475,6 +515,10 @@ fn load_gltf_checked(path: &Path, parts: Option<&HashSet<usize>>) -> Result<Load
             hair: material_extra(&mat, "somnium_hair") > 0.5,
             hashed_alpha: material_extra(&mat, "somnium_hashed_alpha") > 0.5,
             far_ground: material_extra(&mat, "somnium_far_ground") > 0.5,
+            // A cut-out or see-through material is not ground-like: it blends only if it asks.
+            terrain_blend: terrain_blend_extra(&mat).unwrap_or_else(|| {
+                if mat.alpha_mode() == gltf::material::AlphaMode::Opaque { terrain_blend_for_path(path) } else { 0.0 }
+            }),
             // Authored only: see the field's own note on why no import can
             // honestly infer it.
             foliage_card: false,
@@ -575,6 +619,7 @@ fn load_gltf_checked(path: &Path, parts: Option<&HashSet<usize>>) -> Result<Load
             hair: false,
             hashed_alpha: false,
             far_ground: false,
+            terrain_blend: 0.0,
             foliage_card: false,
             emissive: [0.0; 3],
             emissive_intensity: 1.0,
@@ -1715,6 +1760,14 @@ mod normal_scale_tests {
         assert_eq!(super::parse_leaf_transmission("0.5"), Some([0.5, 0.5]));
         assert_eq!(super::parse_leaf_transmission(" 0.5, 0.2 "), Some([0.5, 0.2]));
         assert_eq!(super::parse_leaf_transmission("7,-1"), Some([1.0, 0.0]));
+    }
+
+    #[test]
+    fn the_blend_path_rules_take_the_first_part_that_matches() {
+        let rules = super::parse_terrain_blend_paths("Assets\\Rocks/=0.8; architecture/ruin = 0.4;bad;=1;x=nine");
+        assert_eq!(rules, vec![("assets/rocks/".to_string(), 0.8), ("architecture/ruin".to_string(), 0.4)]);
+        assert!(super::parse_terrain_blend_paths("").is_empty());
+        assert_eq!(super::parse_terrain_blend_paths("far=99")[0].1, 4.0, "a distance is held to four metres");
     }
 
     #[test]
