@@ -2,7 +2,7 @@
 //!
 //! A rock set on a slope meets the ground along a hard line: scanned stone on one side, the terrain's layers on the
 //! other, and nothing between them. The shading pass blends a mesh into the terrain where they meet
-//! (`shading.wgsl` `ground_blend`), and for that it must know how high the ground is under a pixel that is not
+//! (`shading.wgsl` `ground_stand`), and for that it must know how high the ground is under a pixel that is not
 //! ground. Nothing held that for it: the heightfield lived in the chunks' vertices.
 //!
 //! This is the heightfield as a texture, one texel per heightfield sample, registered in the bindless pool like the

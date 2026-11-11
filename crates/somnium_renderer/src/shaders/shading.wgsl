@@ -1857,56 +1857,46 @@ fn terrain_surface_at(
 /// Past this the band is a pixel or two wide and not worth a terrain's material; it fades out over the last fifth.
 const GROUND_BLEND_REACH: f32 = 220.0;
 
-/// Make `surface` the ground as far as it stands in it at `world_pos`.
-///
-/// `blend` is the material's blend distance in metres. `offset_xz` is the pixel's place from its instance's origin
-/// along the world's axes and `instance_xz` that origin: the terrain's layers are addressed from the two apart,
-/// because a world position 13-17 km out holds only 1-2 mm (see the terrain branch). `offset_ddx/ddy` are the
-/// screen derivatives of `offset_xz`, for the layers' mips.
-fn ground_blend(
-    surface: ptr<function, Surface>,
-    blend: f32,
-    world_pos: vec3<f32>,
-    offset_xz: vec2<f32>,
-    instance_xz: vec2<f32>,
-    offset_ddx: vec2<f32>,
-    offset_ddy: vec2<f32>,
-) {
+/// How far a mesh's pixel stands in the ground: 0 when it does not, with the ground under it when it does.
+struct GroundStand {
+    /// 0: the pixel keeps its own material. 1: it is the ground's.
+    t: f32,
+    under: GroundUnder,
+}
+
+/// How far the pixel at `world_pos`, of a material whose blend distance is `blend` metres and whose normal is
+/// `normal`, has become the ground. The ground's own material is not read here: the caller evaluates it at the one
+/// place the shader evaluates any ground, for a terrain pixel and for this alike. A second copy of that evaluation
+/// cost every pixel on screen 2 ms of shading whether it blended or not (its locals are the shader's stack).
+fn ground_stand(normal: vec3<f32>, blend: f32, world_pos: vec3<f32>) -> GroundStand {
+    var stand = GroundStand(0.0, GroundUnder(-1, 0.0, vec3<f32>(0.0, 1.0, 0.0), vec2<f32>(0.0)));
     let reach = 1.0 - smoothstep(GROUND_BLEND_REACH * 0.8, GROUND_BLEND_REACH, distance(world_pos, view.camera_pos));
     if reach <= 0.0 {
-        return;
+        return stand;
     }
-    let under = ground_under(world_pos.xz);
-    if under.terrain < 0 {
-        return;
+    stand.under = ground_under(world_pos.xz);
+    if stand.under.terrain < 0 {
+        return stand;
     }
     // Height over the ground measured across the slope, not straight up: on a steep bank straight up is several
     // times the way to the ground, and the band would thin to nothing exactly where rocks sit in banks.
-    let above = (world_pos.y - under.height) * under.normal.y;
+    let above = (world_pos.y - stand.under.height) * stand.under.normal.y;
     // The furthest the ragged threshold below can lift the band.
     if above > blend * 1.75 {
-        return;
+        return stand;
     }
     let coarse = terrain_value_noise(world_pos.xz * 1.9 + vec2<f32>(world_pos.y * 0.7, 3.1));
     let fine = terrain_value_noise(world_pos.xz * 7.7 + vec2<f32>(11.3, world_pos.y * 2.9));
     // A crevice by the material's own occlusion, and a ledge by its facing: where soil lies.
     let crevice = 1.0 - micro_occlusion;
-    let ledge = max((*surface).normal.y, 0.0);
+    let ledge = max(normal.y, 0.0);
     let level = above / max(blend, 1.0e-3) + (coarse - 0.5) * 0.7 + (fine - 0.5) * 0.3 - crevice * 0.6 - ledge * 0.25;
-    let t = (1.0 - smoothstep(0.3, 0.8, level)) * reach;
-    if t <= 0.0 {
-        return;
-    }
-    let tm_idx = u32(under.terrain);
-    let ground = terrain_surface_at(
-        tm_idx,
-        vec3<f32>(world_pos.x, under.height, world_pos.z),
-        offset_xz + (instance_xz - terrain_materials[tm_idx].terrain_origin),
-        under.normal,
-        under.uv,
-        offset_ddx,
-        offset_ddy,
-    );
+    stand.t = (1.0 - smoothstep(0.3, 0.8, level)) * reach;
+    return stand;
+}
+
+/// Cross-fade `surface` to the ground's material `ground` by `t`.
+fn ground_mix(surface: ptr<function, Surface>, ground: TerrainSurface, t: f32) {
     (*surface).albedo = mix((*surface).albedo, ground.albedo, t);
     (*surface).roughness = mix((*surface).roughness, ground.roughness, t);
     (*surface).metallic = (*surface).metallic * (1.0 - t);
@@ -3060,20 +3050,42 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // shared too, which is what finally gives terrain GTAO, contact shadows,
     // traced sun visibility, IBL and correct cascade blending, and what stops
     // the next lighting change having to be written twice.
-    if material.terrain_index >= 0 {
+    //
+    // What ground to evaluate, if any: the pixel's own when it is terrain, or the ground a mesh's pixel stands in
+    // (`ground_stand`). Either way the ground's material is evaluated once, below, at this one call.
+    var ground_index = material.terrain_index;
+    var ground_at = hit_point;
+    var ground_normal = geo_normal;
+    var ground_uv = uv;
+    var ground_t = 0.0;
+    // The pixel's place from its instance's origin along the world's axes: the vertices' own tile-local positions,
+    // turned and scaled by the model but not moved by it. A world position 13-17 km from the origin holds only
+    // 1-2 mm in f32, a texel or two of a ground layer, and subtracting the origin afterwards can't give those digits
+    // back (Sunscar, 31 Oct 2026: blocky texels at the feet on every layer).
+    let offset_xz = (instance.model * vec4<f32>(local_hit, 0.0)).xz;
+    if material.terrain_index < 0 && material.terrain_blend > 0.0 {
+        let stand = ground_stand(surface.normal, material.terrain_blend, hit_point);
+        if stand.t > 0.0 {
+            ground_index = stand.under.terrain;
+            ground_at = vec3<f32>(hit_point.x, stand.under.height, hit_point.z);
+            ground_normal = stand.under.normal;
+            ground_uv = stand.under.uv;
+            ground_t = stand.t;
+        }
+    }
+    if ground_index >= 0 {
+        let tm_idx = u32(ground_index);
         // Derivatives of world position, which the hex-tiled layer sampling
         // needs explicitly. Taken here rather than inside the material because
         // that is where the terrain UVs are derived from.
-        let tm_idx = u32(material.terrain_index);
-        // Terrain coordinates from the vertices' own tile-local positions, turned and scaled by the model but not
-        // moved by it (its translation is the terrain's origin): a world position 13-17 km from the origin holds
-        // only 1-2 mm in f32, a texel or two of a ground layer, and subtracting the origin afterwards can't give
-        // those digits back (Sunscar, 31 Oct 2026: blocky texels at the feet on every layer).
-        let terrain_xz = (instance.model * vec4<f32>(local_hit, 0.0)).xz
-            + (instance.model[3].xz - terrain_materials[tm_idx].terrain_origin);
-        let world_ddx = dpdx(terrain_xz);
-        let world_ddy = dpdy(terrain_xz);
-        let terrain = terrain_surface_at(tm_idx, hit_point, terrain_xz, geo_normal, uv, world_ddx, world_ddy);
+        let terrain_xz = offset_xz + (instance.model[3].xz - terrain_materials[tm_idx].terrain_origin);
+        let world_ddx = dpdx(offset_xz);
+        let world_ddy = dpdy(offset_xz);
+        let terrain = terrain_surface_at(tm_idx, ground_at, terrain_xz, ground_normal, ground_uv, world_ddx, world_ddy);
+      if material.terrain_index < 0 {
+        // A mesh that stands in the ground becomes the ground where they meet.
+        ground_mix(&surface, terrain, ground_t);
+      } else {
         surface.albedo = terrain.albedo;
         surface.roughness = terrain.roughness;
         surface.metallic = 0.0;
@@ -3234,11 +3246,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let composed = normalize(surface.bent_normal + terrain_sky_bent);
             surface.bent_normal = normalize(mix(composed, geo_normal, 0.25));
         }
-    } else if material.terrain_blend > 0.0 {
-        // A mesh that stands in the ground becomes the ground where they meet (`ground_blend`).
-        let offset_xz = (instance.model * vec4<f32>(local_hit, 0.0)).xz;
-        ground_blend(&surface, material.terrain_blend, hit_point, offset_xz, instance.model[3].xz,
-            dpdx(offset_xz), dpdy(offset_xz));
+      }
     }
 
 

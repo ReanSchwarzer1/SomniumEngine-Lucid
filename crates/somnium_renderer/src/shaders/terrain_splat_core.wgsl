@@ -66,7 +66,7 @@ struct TerrainMaterial {
     /// Steepness where the projected cliff layer starts and is whole (`TerrainData::cliff_band`).
     cliff_band: vec2<f32>,
     /// Bindless index of the ground's height texture (terrain/ground.rs), or -1, and the world height of the
-    /// terrain's own zero: what a mesh blends into the ground by (shading.wgsl `ground_blend`).
+    /// terrain's own zero: what a mesh blends into the ground by (shading.wgsl `ground_stand`).
     ground_map: i32,
     ground_base: f32,
 }

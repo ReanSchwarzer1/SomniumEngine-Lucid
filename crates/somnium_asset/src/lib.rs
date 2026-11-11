@@ -89,7 +89,7 @@ fn parse_leaf_transmission(rule: &str) -> Option<[f32; 2]> {
 }
 
 /// glTF material extras `somnium_terrain_blend`: metres over the ground within which the material cross-fades into
-/// the terrain (`shading.wgsl` `ground_blend`). `None` when the material does not say; 0 is "never".
+/// the terrain (`shading.wgsl` `ground_stand`). `None` when the material does not say; 0 is "never".
 fn terrain_blend_extra(mat: &gltf::Material<'_>) -> Option<f32> {
     mat.extras()
         .as_ref()
