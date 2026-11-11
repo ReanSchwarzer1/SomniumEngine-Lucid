@@ -90,6 +90,10 @@ struct CloudParams {
     /// takes the sun through the air above it and the planet's shadow where it stands, so a high cloud is lit after the
     /// ground's sunset, and the sky's fill follows the twilight. 0: the sun on the ground, as it always was.
     above_air: f32,
+    /// The planet over the horizon: toward it, w 1 by night (the sun too far down to light any cloud: the light
+    /// march goes toward the planet); its light above the air (rgb, lux), w 1 when there is one.
+    planet_direction: vec4<f32>,
+    planet_light: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> cp: CloudParams;
@@ -717,6 +721,20 @@ fn beer_powder(optical_depth: f32) -> f32 {
 /// Cone-spread rather than a straight line because a straight march
 /// under-samples the neighbouring cloud that is actually casting the shadow,
 /// and the error shows up as a cloud lit as though it were alone in the sky.
+/// A body's light at a cloud sample `p`, per unit of its light above the air: through the air above the sample toward
+/// it, and past the planet's shadow where the sample stands, eased over `soft` (the body's radius, in its cosine). A
+/// kilometre up and tens of kilometres off, a cloud keeps a set sun's light after the ground has lost it, and reddens.
+/// `r_eye`: the eye's radius from the planet's centre, km.
+fn cloud_light_at(p: vec3<f32>, r_eye: f32, toward: vec3<f32>, soft: f32) -> vec3<f32> {
+    let k = (p - cp.camera_pos) * 0.001;
+    let at = vec3<f32>(k.x, r_eye + k.y, k.z);
+    let r_at = length(at);
+    let mu_at = dot(at, toward) / r_at;
+    let horizon_at = -sqrt(max(1.0 - (GROUND_RADIUS / r_at) * (GROUND_RADIUS / r_at), 0.0));
+    return sample_transmittance(transmittance_lut, lut_sampler, r_at, max(mu_at, horizon_at))
+        * smoothstep(horizon_at - soft, horizon_at + soft, mu_at);
+}
+
 fn light_march(origin: vec3<f32>, sun: vec3<f32>) -> f32 {
     let steps = max(i32(cp.light_steps), 1);
     // Spread across the layer rather than across the ray, for the same reason
@@ -913,6 +931,21 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
         let noon = sample_transmittance(transmittance_lut, lut_sampler, r, 1.0) * cp.sun_illuminance;
         sky_fill = scattered / max(dot(scattered_noon, luma), 1e-9) * (CLOUD_SKY_PER_LUX * dot(noon, luma));
     }
+    // The planet over the horizon: a second light. By night (the sun too far down to light any cloud) the light march
+    // goes toward it and it lights the cloud as the sun does; by day and at dusk its light, ten thousand times less
+    // than the sun's, is diffused light only. Its glow on the air fills the cloud from the sky, as the sun's does.
+    let planet_on = cp.planet_light.w > 0.5;
+    let planet_night = planet_on && cp.planet_direction.w > 0.5;
+    let planet_dir = normalize(cp.planet_direction.xyz + vec3<f32>(0.0, 1e-6, 0.0));
+    let light_dir = select(sun, planet_dir, planet_night);
+    let cos_planet = dot(ray_dir, planet_dir);
+    if planet_on {
+        let glow = sample_multiscatter_twilight(multiscatter_lut, lut_sampler, r, planet_dir.y);
+        let glow_noon = sample_multiscatter(multiscatter_lut, lut_sampler, r, 1.0);
+        let noon_through = sample_transmittance(transmittance_lut, lut_sampler, r, 1.0);
+        sky_fill += glow / max(dot(glow_noon, luma), 1e-9)
+            * (CLOUD_SKY_PER_LUX * dot(noon_through * cp.planet_light.rgb, luma));
+    }
 
     var scatter = vec3<f32>(0.0);
     var transmittance = 1.0;
@@ -1000,14 +1033,14 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
         var optical_depth = 0.0;
         if body.density > 0.0 {
             if body_light_age >= 2 || extinction * step_len > 0.3 {
-                body_light = storm_light_march(p, sun, body.step) * 4.0;
+                body_light = storm_light_march(p, light_dir, body.step) * 4.0;
                 body_light_age = 0;
             } else {
                 body_light_age = body_light_age + 1;
             }
             optical_depth = body_light;
         } else {
-            optical_depth = light_march(p, sun) * 4.0;
+            optical_depth = light_march(p, light_dir) * 4.0;
         }
         let sun_energy = sun_octaves(optical_depth, cos_theta);
 
@@ -1018,18 +1051,19 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
         let thick = 1.0 - exp(-4.0 * density);
         var sun_here = sun_e;
         if above_air {
-            // The sun at this sample, through the air above it and past the planet's shadow where it stands: a
-            // kilometre up and tens of kilometres off, a cloud keeps the sun after the ground has lost it, and goes red.
-            let k = (p - cp.camera_pos) * 0.001;
-            let at = vec3<f32>(k.x, r + k.y, k.z);
-            let r_at = length(at);
-            let mu_at = dot(at, sun) / r_at;
-            let horizon_at = -sqrt(max(1.0 - (GROUND_RADIUS / r_at) * (GROUND_RADIUS / r_at), 0.0));
-            sun_here = sample_transmittance(transmittance_lut, lut_sampler, r_at, max(mu_at, horizon_at))
-                * smoothstep(horizon_at - 0.0047, horizon_at + 0.0047, mu_at) * cp.sun_illuminance;
+            // The sun at this sample, through the air above it and past the planet's shadow where it stands.
+            sun_here = cloud_light_at(p, r, sun, 0.0047) * cp.sun_illuminance;
+        }
+        if planet_night {
+            sun_here = vec3<f32>(0.0);
         }
         var luminance = sun_here * (sun_energy + CLOUD_DIFFUSE * thick * diffusion * 0.5 / CLOUD_PI)
             + sky_fill * cp.ambient * diffusion;
+        if planet_on {
+            let planet_here = cloud_light_at(p, r, planet_dir, 0.06) * cp.planet_light.rgb;
+            let planet_energy = select(0.0, sun_octaves(optical_depth, cos_planet), planet_night);
+            luminance += planet_here * (planet_energy + CLOUD_DIFFUSE * thick * diffusion * 0.5 / CLOUD_PI);
+        }
         if flashes && storm.counts.y > 0u {
             luminance += storm_flashes(p, density);
         }
@@ -1225,7 +1259,11 @@ fn cloud_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
         cp.camera_pos.z + (uv.y * 2.0 - 1.0) * cp.shadow_extent,
     );
 
-    let sun = normalize(cp.sun_direction);
+    var sun = normalize(cp.sun_direction);
+    if cp.planet_light.w > 0.5 && cp.planet_direction.w > 0.5 {
+        // By night the deck's shadow on the land is the planet's, the night's light.
+        sun = normalize(cp.planet_direction.xyz);
+    }
     if sun.y <= 0.02 {
         // A sun on or below the horizon casts no cloud shadow worth the name,
         // and the slab intersection degenerates.

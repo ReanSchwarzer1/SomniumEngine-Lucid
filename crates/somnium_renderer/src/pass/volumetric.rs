@@ -70,6 +70,9 @@ struct VolumetricParams {
     /// 1: `sun_illuminance` is the sun above the air (`VolumetricPass::above_air`).
     above_air: f32,
     _cloud_pad: [f32; 2],
+    /// The planet over the horizon (`VolumetricPass::planet`).
+    planet_direction: [f32; 4],
+    planet_light: [f32; 4],
 }
 
 #[cfg(test)]
@@ -205,6 +208,8 @@ pub struct VolumetricPass {
     /// `sun_illuminance` is the sun above the air (`Renderer::sky_above_air`): the sky's multiply scattered light is
     /// then read for a sun near and under the horizon as it falls (`sample_multiscatter_twilight`).
     pub above_air: bool,
+    /// The planet over the horizon, as the cloud pass takes it (`CloudPass::planet`); all zero is none.
+    pub planet: [[f32; 4]; 2],
 }
 
 impl VolumetricPass {
@@ -430,6 +435,7 @@ impl VolumetricPass {
             fog: FogSettings::default(),
             max_distance: DEFAULT_MAX_DISTANCE,
             above_air: false,
+            planet: [[0.0; 4]; 2],
         }
     }
 
@@ -626,6 +632,8 @@ impl VolumetricPass {
                 cloud_sky: f32::from(u8::from(cloud_sky)),
                 above_air: f32::from(u8::from(self.above_air)),
                 _cloud_pad: [0.0; 2],
+                planet_direction: self.planet[0],
+                planet_light: self.planet[1],
             }),
         );
 

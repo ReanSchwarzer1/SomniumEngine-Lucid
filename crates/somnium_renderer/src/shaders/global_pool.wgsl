@@ -130,6 +130,14 @@ struct DirectionalLight {
     eye_color:          vec3<f32>,            // offset 352
     eye_intensity:      f32,                  // offset 364
     eye_shape:          vec4<f32>,            // offset 368  openness, pupil, pulse_hz, glow
+    // The planet over the horizon (somnium.SkyPlanet); planet_direction.w 0 draws none.
+    planet_direction:   vec4<f32>,            // offset 384  toward it, angular radius (rad)
+    planet_light:       vec4<f32>,            // offset 400  its light on the ground (lux per channel), albedo
+    planet_surface:     vec4<f32>,            // offset 416  seed, spin turns, fissure glow cd/m2, our light share
+    planet_sun:         vec4<f32>,            // offset 432  the sun's light above the air (luminance), night, -, -
+    // The sun seen through the Lid's wreck (TimeOfDay sun_wreck); sun_form.y 0 draws the whole disc as always.
+    sun_above:          vec4<f32>,            // offset 448  the sun's light above the air (rgb lux), latitude (deg)
+    sun_form:           vec4<f32>,            // offset 464  form 0..2, on, -, -
 }
 
 struct GpuLocalLight {

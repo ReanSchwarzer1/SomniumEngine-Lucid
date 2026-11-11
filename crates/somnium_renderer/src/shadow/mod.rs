@@ -67,7 +67,9 @@ pub const CASCADE_UV_OFFSETS: [(f32, f32); 4] = [(0.0, 0.0), (0.5, 0.0), (0.0, 0
 /// offset 336 :  eye_direction vec3<f32>, eye_tan_half_width f32   (16) sky eye
 /// offset 352 :  eye_color     vec3<f32>, eye_intensity f32        (16)
 /// offset 368 :  eye_shape     vec4<f32> openness, pupil, pulse_hz, glow (16)
-///              total                             384 bytes
+/// offset 384 :  planet_direction, planet_light, planet_surface, planet_sun   (4 x 16) the planet
+/// offset 448 :  sun_above, sun_form                                         (2 x 16) the broken sun
+///              total                             480 bytes
 /// ```
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -106,6 +108,17 @@ pub struct GpuDirectionalLight {
     pub eye_color: [f32; 3],
     pub eye_intensity: f32,
     pub eye_shape: [f32; 4],
+    /// The planet over the horizon (`PlanetParams`; Sunscar), declared by the shading pass alone: toward it and its
+    /// angular radius (0: none); its light on the ground (lux per channel) and its geometric albedo; its surface; the
+    /// sun's light above the air (luminance), which lights its disc.
+    pub planet_direction: [f32; 4],
+    pub planet_light: [f32; 4],
+    pub planet_surface: [f32; 4],
+    pub planet_sun: [f32; 4],
+    /// The sun seen through the Lid's wreck (`Renderer::sun_wreck`; Sunscar): its light above the air (rgb lux) and
+    /// the latitude (degrees, for the celestial pole the wreck's axes keep to); its form (0..2) and 1 when drawn.
+    pub sun_above: [f32; 4],
+    pub sun_form: [f32; 4],
 }
 
 impl Default for GpuDirectionalLight {
@@ -135,6 +148,12 @@ impl Default for GpuDirectionalLight {
             eye_color: [0.0; 3],
             eye_intensity: 0.0,
             eye_shape: [0.42, 0.14, 0.0, 0.0],
+            planet_direction: [0.0; 4],
+            planet_light: [0.0; 4],
+            planet_surface: [0.0; 4],
+            planet_sun: [0.0; 4],
+            sun_above: [0.0; 4],
+            sun_form: [0.0; 4],
         }
     }
 }

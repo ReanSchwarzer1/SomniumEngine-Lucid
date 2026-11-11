@@ -120,6 +120,10 @@ pub struct TimeOfDayComponent {
     pub night_halo_road: f32,
     /// The Thread (a line of light from the horizon below the sun toward it), 0..1.
     pub night_thread: f32,
+    /// The sun seen through the Lid's wreck (Sunscar): -1 the whole disc (the default); 0 the cut sun (a degree wide,
+    /// cut into three or four pieces by drifting lanes); 1 five shards; 2 the true-size sun crossed by two bars, which
+    /// take 30% of its light. Its debris ring lights the night. `SOMNIUM_SUN_FORM` overrides it.
+    pub sun_wreck: i32,
 }
 
 impl Component for TimeOfDayComponent {}
@@ -149,6 +153,7 @@ impl Default for TimeOfDayComponent {
             night_aurora: 0.0,
             night_halo_road: 0.0,
             night_thread: 0.0,
+            sun_wreck: -1,
         }
     }
 }
@@ -251,8 +256,14 @@ pub fn solar_position(day_of_year: i32, hour: f32, latitude: f32, longitude: f32
     let timezone = (longitude / 15.0).round();
     let true_solar_minutes = hour * 60.0 + eqtime + 4.0 * longitude - 60.0 * timezone;
     let hour_angle_deg = true_solar_minutes / 4.0 - 180.0;
-    let ha = hour_angle_deg.to_radians();
+    sky_position(latitude, decl, hour_angle_deg)
+}
 
+/// Where a body on the sky stands for an observer at `latitude` (degrees north): `(azimuth, elevation)` in degrees,
+/// as [`solar_position`] gives them, from its declination (radians) and hour angle (degrees, west of the meridian).
+#[must_use]
+pub fn sky_position(latitude: f32, decl: f32, hour_angle_deg: f32) -> (f32, f32) {
+    let ha = hour_angle_deg.to_radians();
     let lat = latitude.clamp(-89.9, 89.9).to_radians();
     let cos_zenith = (lat.sin() * decl.sin() + lat.cos() * decl.cos() * ha.cos()).clamp(-1.0, 1.0);
     let zenith = cos_zenith.acos();
@@ -266,7 +277,7 @@ pub fn solar_position(day_of_year: i32, hour: f32, latitude: f32, longitude: f32
     } else {
         let cos_az = ((lat.sin() * cos_zenith - decl.sin()) / denom).clamp(-1.0, 1.0);
         let az = 180.0 - cos_az.acos().to_degrees();
-        if hour_angle_deg > 0.0 { 360.0 - az } else { az }
+        if hour_angle_deg.rem_euclid(360.0) < 180.0 && hour_angle_deg.rem_euclid(360.0) > 0.0 { 360.0 - az } else { az }
     };
 
     (azimuth.rem_euclid(360.0), elevation)

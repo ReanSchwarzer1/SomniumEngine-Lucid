@@ -1330,6 +1330,7 @@ pub struct Engine<G: GameApp> {
     /// enabled. Recomputed every frame and never persisted — it is a cache of
     /// one evaluation, not state.
     day_state: Option<crate::time_of_day::DayState>,
+    /// The day clock's hour last frame: the planet over the horizon counts the hours it moves (`apply_sky`).
     /// Fingerprint of the content root at the last inventory scan. `None`
     /// forces one, which is what every explicit invalidation point sets.
     asset_scan_stamp: Option<(u64, u64)>,
@@ -8355,6 +8356,7 @@ impl<G: GameApp> Engine<G> {
             r.sun_moving = false;
             r.snow_sun = None;
             r.sky_above_air = false;
+            r.sun_wreck = None;
         }
         let Some(entity) = self
             .world
@@ -8391,6 +8393,22 @@ impl<G: GameApp> Engine<G> {
         let mut state = tod.evaluate();
         // A sun on the solar clock: the snow turns from the climate's sun (the fixed-sun fields), not the hour's, and
         // while the clock runs the sky light and the clouds' capture follow the sun in small steps (renderer.rs).
+        // The sun seen through the Lid's wreck: its form from the clock, or `SOMNIUM_SUN_FORM` (0..2, -1 whole).
+        static FORM: std::sync::LazyLock<Option<i32>> =
+            std::sync::LazyLock::new(|| std::env::var("SOMNIUM_SUN_FORM").ok().and_then(|v| v.trim().parse().ok()));
+        let form = FORM.unwrap_or(tod.sun_wreck);
+        if let Some(r) = self.renderer.as_mut() {
+            #[allow(clippy::cast_sign_loss)]
+            let wreck = (form >= 0).then(|| (form.min(2) as u32, tod.latitude, tod.north_offset));
+            r.sun_wreck = wreck;
+            // The light is the form's disc, so the shadows' penumbra follows it: the cut sun a degree wide (1.75 cm a
+            // metre), the five shards' Heart 0.55 degrees, the whole and the true-size sun 0.53.
+            r.sun_angular_radius = match wreck {
+                Some((0, ..)) => 0.5_f32.to_radians(),
+                Some((1, ..)) => 0.275_f32.to_radians(),
+                _ => 0.004_654,
+            };
+        }
         if !tod.fixed_sun && let Some(r) = self.renderer.as_mut() {
             r.sun_moving = self.play_session_active && tod.timescale != 0.0;
             r.snow_sun = Some(tod.climate_sun());
@@ -8445,6 +8463,41 @@ impl<G: GameApp> Engine<G> {
         self.day_state = Some(state);
     }
 
+    /// The planet over the horizon (`somnium.SkyPlanet`): the day clock carries it, and its own count of days takes
+    /// every hour the clock moves (running, a key, a script's `hour=`), so its slow path survives midnight and a jump.
+    /// Its parameters (where it is, its phase, its light above the air and on the ground) go to the renderer, which
+    /// draws it and lights the night with it. None, or no clock: no planet, and the moon as it was.
+    fn apply_planet(&mut self) {
+        let clock = self
+            .world
+            .entities_with::<crate::time_of_day::TimeOfDayComponent>()
+            .find_map(|e| self.world.get::<crate::time_of_day::TimeOfDayComponent>(e).cloned());
+        let planet = self
+            .world
+            .entities_with::<crate::sky::SkyPlanetComponent>()
+            .find(|e| !crate::is_hidden(&self.world, *e));
+        let (Some(entity), Some(_), Some(state)) = (planet, clock, self.day_state) else {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.planet = somnium_renderer::PlanetParams::default();
+            }
+            return;
+        };
+        let Some(p) = self.world.get::<crate::sky::SkyPlanetComponent>(entity).copied() else {
+            return;
+        };
+        if let Some(renderer) = self.renderer.as_mut() {
+            // ponytail: the true-size sun's alternative brings its own planet (the design's physics proposal: 7 degrees
+            // wide, 9 up at bearing 76, beside the sunrise); it goes with the alternatives once the developer picks.
+            let p = if matches!(renderer.sun_wreck, Some((2, ..))) {
+                crate::sky::SkyPlanetComponent { azimuth_deg: 104.0, elevation_deg: 9.0, diameter_deg: 7.0, ..p }
+            } else {
+                p
+            };
+            let sun = -(state.rotation * glam::Vec3::NEG_Z);
+            renderer.planet = p.to_params(sun, renderer.sun_above_air);
+        }
+    }
+
     /// CONTROL-M: push the authored sky to the renderer.
     ///
     /// Runs after [`Self::apply_time_of_day`] so the day cycle's cloud-coverage
@@ -8462,6 +8515,7 @@ impl<G: GameApp> Engine<G> {
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.sky_eye = eye.map_or_else(somnium_renderer::SkyEyeParams::default, |e| e.to_params());
         }
+        self.apply_planet();
         let sky = self
             .world
             .entities_with::<crate::sky::SkyComponent>()

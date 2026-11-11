@@ -324,6 +324,14 @@ fn star_extinction(dir_y: f32) -> f32 {
     return exp(-0.14 * air_mass) * step(0.0, dir_y);
 }
 
+/// The same per channel, through the sea-level zenith optical depths `atmosphere_extinction` integrates (Rayleigh,
+/// Mie and ozone: 0.061, 0.142, 0.271): what dims and reddens a body low on the horizon (the planet's disc).
+fn view_extinction_rgb(dir_y: f32) -> vec3<f32> {
+    let up = max(dir_y, 0.0);
+    let air_mass = 1.0 / (up + 0.50572 * pow(degrees(asin(up)) + 6.07995, -1.6364));
+    return exp(-vec3<f32>(0.0614, 0.1420, 0.2713) * air_mass) * step(0.0, dir_y);
+}
+
 // ── Phase 24D: what is left when the sun goes down ──────────────────────────
 
 /// Cheap 3-D hash, for star placement.
