@@ -994,8 +994,33 @@ fn macro_octaves_land_between_the_macro_blend_and_the_squaring() {
     }
     assert_eq!(
         found, 2,
-        "the live and clipmap-generate paths each blend a macro map; \
-         a terrain shades through whichever the distance picks and they must agree"
+        "the live and clipmap-generate paths each blend a macro map in place, before its octaves and squaring \
+         (the generator only where the tier does not fade)"
+    );
+    // The clipmap path (11 Nov 2026): where the tier fades with the eye's distance (MACRO_FADES, a set with far
+    // colours), the generator caches the detail with its octaves and no macro lerp, and shading lerps the octave-tinted
+    // detail toward the octave-tinted far colour, which is the live path's result exactly for Lerp and Multiply. Where
+    // it does not fade (TSF's terrains), the generator bakes it as it always has.
+    let generate = &source[source.find("fn terrain_generate_texel(").expect("the clipmap generator")..];
+    let generate = &generate[..generate.find("\n}").expect("its end")];
+    let baked = generate.find("terrain_macro_blend(").expect("the generator bakes a tier that does not fade");
+    assert_eq!(generate.matches("terrain_macro_blend(").count(), 1);
+    assert!(
+        generate[..baked].contains("if (tm.macro_mode & MACRO_FADES) == 0u {"),
+        "a cached texel cannot know the eye's distance: only a tier that does not fade is baked"
+    );
+    let shade = &source[source.find("fn evaluate_clipmap_material(").expect("clipmap shading")..];
+    let shade = &shade[..shade.find("\n}").expect("its end")];
+    assert!(
+        shade.contains("(tm.macro_mode & MACRO_FADES) != 0u")
+            && shade.contains("terrain_macro_blend(detail, macro_c.rgb * octaves, terrain_macro_mode(tm), fade)")
+            && shade.contains("terrain_macro_weight(tm, macro_c.a, world_pos)"),
+        "clipmap shading lerps a fading tier between the octave-tinted detail and far colour, faded with distance"
+    );
+    assert_eq!(
+        source.matches("terrain_macro_weight(tm, macro_c.a, world_pos)").count(),
+        2,
+        "the live and clipmap paths fade the macro tier the same way"
     );
 }
 

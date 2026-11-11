@@ -600,7 +600,16 @@ pub struct TerrainData {
     /// The folder `layer_textures` were loaded from: the one the terrain was made with, or the last
     /// [`Self::set_layer_dir`]'s (a streamed tile's slot taking another region's ground).
     pub layer_dir: std::path::PathBuf,
+    /// The layers steep ground may wear in place of the cliff layer, one bit per slot ([`textures::layer_rock_mask`]).
+    pub rock_mask: u32,
+    /// The macro tier fades in with distance ([`MACRO_FADES`]): the layer set has far colours
+    /// ([`textures::has_far_colours`]).
+    pub macro_fades: bool,
 }
+
+/// `TerrainMaterial::macro_mode` bit 4 on the GPU: the macro map is the layers' colours seen from afar, so the tier
+/// fades in from 25 m and is whole by 200 m (sunscar-look, 11 Nov 2026). Never set on a set without far colours.
+pub const MACRO_FADES: u32 = 16;
 
 /// Map one physical clipmap dirty interval through its toroidal origin into at
 /// most two monotonically increasing world-space intervals.
@@ -947,6 +956,8 @@ impl TerrainData {
             painted_foliage: Vec::new(),
             edit_revision: 0,
             layer_dir: asset_dir.to_path_buf(),
+            rock_mask: textures::layer_rock_mask(asset_dir),
+            macro_fades: textures::has_far_colours(asset_dir),
         }
     }
 
@@ -1253,7 +1264,7 @@ impl TerrainData {
             layer_parallax: std::array::from_fn(|i| {
                 self.layers.get(i).map_or(0.0, |l| l.blend.parallax_depth) * self.parallax_scale
             }),
-            macro_mode: self.macro_mode as u32,
+            macro_mode: self.macro_mode as u32 | if self.macro_fades { MACRO_FADES } else { 0 },
             macro_strength: self.macro_strength,
             detail_fade_start: self.detail_fade_start,
             detail_fade_end: self.detail_fade_end.max(self.detail_fade_start + 1.0),
@@ -1337,7 +1348,13 @@ impl TerrainData {
                     self.skyvis_tint.max(0.0),
                 ]
             },
-            cliff_band: [self.cliff_band[0], self.cliff_band[1].max(self.cliff_band[0] + 1e-3), 0.0, 0.0],
+            cliff_band: [
+                self.cliff_band[0],
+                self.cliff_band[1].max(self.cliff_band[0] + 1e-3),
+                // The rock layers' mask as two halves, each exact in an f32 (`terrain_wall_layer` in WGSL).
+                (self.rock_mask & 0xFFFF) as f32,
+                (self.rock_mask >> 16) as f32,
+            ],
         }
     }
 
@@ -2090,6 +2107,8 @@ impl TerrainData {
         }
         self.layer_textures = shared_layer_textures(device, queue, bc_supported, false, asset_dir);
         self.layer_dir = asset_dir.to_path_buf();
+        self.rock_mask = textures::layer_rock_mask(asset_dir);
+        self.macro_fades = textures::has_far_colours(asset_dir);
         let tiling = textures::layer_tiling_at(asset_dir);
         for (layer, tiling) in self.layers.iter_mut().zip(tiling) {
             layer.tiling = tiling;

@@ -63,7 +63,8 @@ struct TerrainMaterial {
     weight_noise_strength: f32,
     weight_noise_scale: f32,
     macro_octave_strength: vec4<f32>,
-    /// Steepness where the projected cliff layer starts and is whole (`TerrainData::cliff_band`).
+    /// Steepness where the projected cliff layer starts and is whole (`TerrainData::cliff_band`), then the rock layers'
+    /// mask as two 16-bit halves (`Terrain::rock_mask`, `terrain_wall_layer`).
     cliff_band: vec4<f32>,
 }
 

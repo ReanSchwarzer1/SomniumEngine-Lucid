@@ -318,6 +318,23 @@ fn evaluate_clipmap_material(
         tap.valid = true;
     }
     var albedo = tap.albedo;
+    // The macro tier, where it fades with the eye's distance (MACRO_FADES; otherwise the cache has it baked), as on the
+    // live path. The cache holds (detail x octaves)^2 x wet darkening; the lerp goes between the octave-tinted detail
+    // and the octave-tinted far colour in the same perceptual space, so the result is the live path's:
+    // o * lerp(d, m, f) = lerp(d * o, m * o, f).
+    if terrain_clipmap_source < 2.0 && (tm.macro_mode & MACRO_FADES) != 0u {
+        let local_xz = world_xz - tm.terrain_origin;
+        let macro_c = terrain_macro_sample(
+            tm, local_xz * tm.inv_world_size, world_ddx * tm.inv_world_size, world_ddy * tm.inv_world_size);
+        let fade = terrain_macro_weight(tm, macro_c.a, world_pos);
+        if fade > 0.0 {
+            let darken = mix(1.0, tm.wetness_darken, tap.wetness);
+            let octaves = terrain_macro_octaves(local_xz, tm.macro_octave_strength.xyz);
+            let detail = sqrt(albedo / max(darken, 1e-3));
+            let blended = terrain_macro_blend(detail, macro_c.rgb * octaves, terrain_macro_mode(tm), fade);
+            albedo = blended * blended * darken;
+        }
+    }
     var roughness = tap.roughness;
     var occlusion = tap.occlusion;
     let nxy = tap.nxy;
@@ -327,13 +344,33 @@ fn evaluate_clipmap_material(
 
     if cliff_blend > 0.0 {
         let local_pos = world_pos - vec3(tm.terrain_origin.x, 0.0, tm.terrain_origin.y);
+        // The wall's own bed where the set names rock layers: the splat read here, on steep pixels only, since the
+        // cache keeps colour but not which layer it came from.
+        var wall_layer = tm.cliff_layer;
+        if tm.cliff_band.z + tm.cliff_band.w > 0.0 {
+            let local_xz = world_xz - tm.terrain_origin;
+            var weight = terrain_unpack_splats_painted(
+                terrain_fetch_splats(
+                    tm, terrain_index, local_xz * tm.inv_world_size,
+                    world_ddx * tm.inv_world_size, world_ddy * tm.inv_world_size),
+                tm, local_xz);
+            let selected = terrain_strongest_four(&weight);
+            var strongest = selected[0];
+            for (var s = 1u; s < 4u; s = s + 1u) {
+                if weight[selected[s]] > weight[strongest] {
+                    strongest = selected[s];
+                }
+            }
+            wall_layer = terrain_wall_layer(tm, strongest);
+            taps += 4u;
+        }
         let cliff = terrain_projected_pbr(
             tm,
             terrain_index,
-            tm.cliff_layer,
+            wall_layer,
             local_pos,
             geo_normal,
-            terrain_layer_tiling(tm, terrain_index, tm.cliff_layer),
+            terrain_layer_tiling(tm, terrain_index, wall_layer),
             world_ddx,
             world_ddy,
         );
