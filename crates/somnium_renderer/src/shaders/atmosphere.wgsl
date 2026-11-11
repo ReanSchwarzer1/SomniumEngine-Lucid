@@ -235,6 +235,103 @@ fn raymarch_sky(
     return luminance;
 }
 
+/// The multiscatter table read for a sun near or under the horizon. The table is 32 columns over the sun's whole
+/// cosine, 3.6 degrees a column there, and across the horizon its light falls tens of times a column: read linearly,
+/// civil dusk came out three to five times too bright. Between its two nearest columns it is read exponentially
+/// (log-linear), as the light falls; up the sky the two readings agree.
+fn sample_multiscatter_twilight(lut: texture_2d<f32>, samp: sampler, r: f32, mu_sun: f32) -> vec3<f32> {
+    let columns = f32(textureDimensions(lut).x);
+    let uv = multiscatter_uv(r, mu_sun);
+    let x = clamp(uv.x * columns - 0.5, 0.0, columns - 1.0);
+    let x0 = min(floor(x), columns - 2.0);
+    let a = textureSampleLevel(lut, samp, vec2<f32>((x0 + 0.5) / columns, uv.y), 0.0).rgb;
+    let b = textureSampleLevel(lut, samp, vec2<f32>((x0 + 1.5) / columns, uv.y), 0.0).rgb;
+    let floor_light = vec3<f32>(1e-12);
+    return exp(mix(log(max(a, floor_light)), log(max(b, floor_light)), x - x0));
+}
+
+/// `raymarch_sky` for a sun that sets and rises (a running day clock, Sunscar): radiance per unit of the sun's
+/// illuminance ABOVE the air, which is what this march's own transmittance and planet shadow expect. Two things differ.
+/// The samples crowd near the eye (t grows as the square of the step), where a level ray makes its light: uniform
+/// steps put a twilight's lit air between samples 35 km apart. And the planet's shadow on the air is soft across the
+/// sun's disc and its refraction (a sample's sun eases out over half a degree of its own horizon), so the Earth's
+/// shadow, the twilight arch and the last light on the zenith are smooth across the sky and as the sun moves.
+fn raymarch_sky_twilight(
+    transmittance_lut: texture_2d<f32>,
+    multiscatter_lut:  texture_2d<f32>,
+    samp:              sampler,
+    ray_origin:        vec3<f32>,
+    ray_dir:           vec3<f32>,
+    sun_dir:           vec3<f32>,
+    steps:             i32,
+) -> vec3<f32> {
+    let r  = length(ray_origin);
+    let mu = dot(ray_origin, ray_dir) / r;
+    var march_len = distance_to_atmosphere_top(r, mu);
+    if ray_hits_ground(r, mu) {
+        march_len = distance_to_ground(r, mu);
+    }
+    if march_len <= 0.0 {
+        return vec3<f32>(0.0);
+    }
+    let cos_theta = dot(ray_dir, sun_dir);
+    let phase_r = rayleigh_phase(cos_theta);
+    let phase_m = mie_phase(cos_theta);
+
+    var luminance     = vec3<f32>(0.0);
+    var transmittance = vec3<f32>(1.0);
+    var t_prev = 0.0;
+    for (var i = 0; i < steps; i = i + 1) {
+        let s = (f32(i) + 1.0) / f32(steps);
+        let t_next = march_len * s * s;
+        let dt = t_next - t_prev;
+        let pos = ray_origin + ray_dir * (0.5 * (t_prev + t_next));
+        t_prev = t_next;
+        let ri  = length(pos);
+        let alt = ri - GROUND_RADIUS;
+
+        let density    = atmosphere_density(alt);
+        let extinction = atmosphere_extinction(alt);
+        let scatter_r  = RAYLEIGH_SCATTERING * density.x;
+        let scatter_m  = MIE_SCATTERING * density.y;
+
+        // The sun against this point's own horizon (the planet dips below its level by acos(R / r)).
+        let mu_sun = dot(pos, sun_dir) / ri;
+        let horizon = -sqrt(max(1.0 - (GROUND_RADIUS / ri) * (GROUND_RADIUS / ri), 0.0));
+        let sun_visibility = smoothstep(horizon - 0.0047, horizon + 0.0047, mu_sun);
+        let sun_transmittance =
+            sample_transmittance(transmittance_lut, samp, ri, max(mu_sun, horizon)) * sun_visibility;
+
+        let in_scatter_single = sun_transmittance
+            * (scatter_r * phase_r + vec3<f32>(scatter_m * phase_m));
+        // The multiscatter table already carries the planet's shadow, for a sun under the horizon too.
+        let ms = sample_multiscatter_twilight(multiscatter_lut, samp, ri, mu_sun);
+        let in_scatter = in_scatter_single + ms * (scatter_r + vec3<f32>(scatter_m));
+
+        let step_transmittance = exp(-extinction * dt);
+        let safe_extinction = max(extinction, vec3<f32>(1e-7));
+        luminance += transmittance * (in_scatter - in_scatter * step_transmittance) / safe_extinction;
+        transmittance *= step_transmittance;
+    }
+    return luminance;
+}
+
+/// The air's transmittance along a view ray from near the ground to space, as a luminance: what dims a star
+/// toward the horizon. Kasten and Young's air mass (1989) through a sea-level zenith optical depth of 0.14.
+fn star_extinction(dir_y: f32) -> f32 {
+    let up = max(dir_y, 0.0);
+    let air_mass = 1.0 / (up + 0.50572 * pow(degrees(asin(up)) + 6.07995, -1.6364));
+    return exp(-0.14 * air_mass) * step(0.0, dir_y);
+}
+
+/// The same per channel, through the sea-level zenith optical depths `atmosphere_extinction` integrates (Rayleigh,
+/// Mie and ozone: 0.061, 0.142, 0.271): what dims and reddens a body low on the horizon (the planet's disc).
+fn view_extinction_rgb(dir_y: f32) -> vec3<f32> {
+    let up = max(dir_y, 0.0);
+    let air_mass = 1.0 / (up + 0.50572 * pow(degrees(asin(up)) + 6.07995, -1.6364));
+    return exp(-vec3<f32>(0.0614, 0.1420, 0.2713) * air_mass) * step(0.0, dir_y);
+}
+
 // ── Phase 24D: what is left when the sun goes down ──────────────────────────
 
 /// Cheap 3-D hash, for star placement.
@@ -461,12 +558,16 @@ fn moon_disc_shade(
 /// shading pass already computes the sun's specular highlight from the analytic
 /// light, so a sun disc in the cubemap would be counted a second time through
 /// the IBL specular term.
+///
+/// `star_strength`: how much of the star field shows (`moon_strength` as it always was; under a sky lit above the air,
+/// the air's own transmittance toward the star, `star_extinction`, and the day's sky outshines them).
 fn sky_detail(
     dir: vec3<f32>,
     sun_dir: vec3<f32>,
     sun_illuminance: f32,
     moon_dir: vec3<f32>,
     moon_strength: f32,
+    star_strength: f32,
 ) -> vec3<f32> {
     var result = vec3<f32>(0.0);
 
@@ -484,7 +585,7 @@ fn sky_detail(
     // Phase 25M-2D: phase-correct moon disc with limb darkening.
     result += moon_disc_shade(dir, sun_dir, moon_dir, moon_strength);
 
-    return result + star_field(dir) * moon_strength;
+    return result + star_field(dir) * star_strength;
 }
 
 /// Moon disc and the airglow floor, in cd/m².

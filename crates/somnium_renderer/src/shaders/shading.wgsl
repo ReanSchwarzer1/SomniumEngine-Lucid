@@ -6,6 +6,8 @@
 // resolver (`somnium_shader`) emits each module once, in this order, and
 // hoists every `enable` above everything.
 //!include "sky_eye.wgsl"
+//!include "sky_planet.wgsl"
+//!include "sky_sun.wgsl"
 //!include "global_pool.wgsl"
 //!include "brdf.wgsl"
 //!include "sampling.wgsl"
@@ -2398,13 +2400,49 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // orbital model in sun.rs, not the old `-sun_dir` full-moon hack.
         let moon_dir = normalize(light.moon_direction);
         let moon_strength = saturate(1.0 - sun_illuminance / 10.0);
-        let detail = sky_detail(ray_dir, sun_dir, sun_illuminance, moon_dir, moon_strength);
+        // Under a sky lit above the air (a running day clock) the stars are always there, dimmed only by the air toward
+        // the horizon: the day's sky outshines them, and they come out as the twilight fades, not at the sun's last ray.
+        let star_strength = select(moon_strength, star_extinction(ray_dir.y), light.sky_above_air > 0.5);
+        // The sun seen through the Lid's wreck (`sun_form.y`): in place of the whole disc, the form's disc cut by the
+        // wreck's lanes, with their dust beside it (`sky_sun.wgsl`). The disc keeps sky_detail's brightness in the colour
+        // the air left it; what lies beside it is in space, lit by the sun above the air and dimmed by the air along this
+        // ray, so it stays lit after the ground's sunset.
+        let wreck = light.sun_form.y > 0.5;
+        var detail = sky_detail(ray_dir, sun_dir, select(sun_illuminance, 0.0, wreck), moon_dir, moon_strength, star_strength);
+        // The debris ring orbits far nearer than the planet, so it lies in front of it; the stars and the sun behind.
+        var ring = vec3<f32>(0.0);
+        if wreck {
+            // The celestial pole: the clock's true north (turned by its north offset, `sun_form.z`), raised by the
+            // latitude.
+            let latitude = radians(light.sun_above.w);
+            let north = light.sun_form.z;
+            let pole = vec3<f32>(sin(north) * cos(latitude), sin(latitude), cos(north) * cos(latitude));
+            let beside = light.sun_above.rgb * view_extinction_rgb(ray_dir.y);
+            detail += fragmented_sun(ray_dir, sun_dir, light.sun_angular_radius, light.color, beside, pole,
+                view.time, i32(light.sun_form.x));
+            // The wreck's debris ring across the sky: lit by the sun from below the horizon at dusk, cut by the
+            // world's shadow by night, outshone by day.
+            ring = debris_ring(ray_dir, sun_dir, pole, beside, view.time);
+        }
         // The eye in the sky (somnium.SkyEye): drawn here, behind the cloud
         // composite, where fog does not reach.
         let eye = sky_eye(ray_dir, normalize(light.eye_direction), light.eye_tan_half_width, light.eye_color,
                           light.eye_intensity, light.eye_shape, view.time);
+        // The planet over the horizon (somnium.SkyPlanet): behind the air, which dims and reddens it and lays the
+        // day's blue in front of it; in front of the stars and the sun's disc, which it hides.
+        var planet = vec4<f32>(0.0);
+        if light.planet_direction.w > 0.0 {
+            planet = sky_planet(ray_dir, normalize(light.planet_direction.xyz), light.planet_direction.w, sun_dir,
+                                light.planet_sun.x, light.planet_light.w, light.planet_surface);
+            // An eye adapted to the night ground still sees the planet's face, as one sees the Moon's seas; a camera
+            // exposed for that ground would show a white disc some eleven stops over it. So as the sun goes down the
+            // disc is drawn up to 7.5 stops under its radiance (a fifth of it with the sun 3 degrees down, 1/180 from 8
+            // on). Its light on the world (`planet_light`) is not changed.
+            let night_eye = exp2(-7.5 * (1.0 - smoothstep(-0.139, 0.0, sun_dir.y)));
+            planet = vec4<f32>(planet.rgb * view_extinction_rgb(ray_dir.y) * night_eye, planet.a);
+        }
 
-        var background = (sky + detail) * (1.0 - eye.a) + eye.rgb;
+        var background = (sky + detail * (1.0 - planet.a) + planet.rgb + ring) * (1.0 - eye.a) + eye.rgb;
         // Valley fog (a fog with a flat top) lies between the eye and the sky as it lies between the eye and a ridge:
         // from inside it the sky is gone, and comes back as the eye looks up through less of it. The sky's own march
         // has the air in it and not this fog; without this the sky stood clear and blue over a wall of fog (w9
@@ -3583,7 +3621,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let sun_illuminance = dot(light.color, vec3<f32>(0.2126, 0.7152, 0.0722));
         let moon_strength = saturate(1.0 - sun_illuminance / 10.0);
 
-        if moon_strength > 0.0 && light.moon_intensity > 0.0 {
+        if light.planet_direction.w > 0.0 {
+            // The planet over the horizon takes the moon's slot: its own light through the air, in its own colour,
+            // by day as by night (outshone by day), and a disc degrees wide, not half of one.
+            moonlight = evaluate_brdf_area(surface, normalize(light.moon_direction), light.planet_direction.w)
+                * light.planet_light.rgb;
+            // By night the clouds' shadow on the land is cast toward the planet (`planet_sun.y`): a deck dims it.
+            if light.planet_sun.y > 0.5 {
+                moonlight *= cloud_shadow_at(hit_point);
+            }
+        } else if moon_strength > 0.0 && light.moon_intensity > 0.0 {
             let moon_dir = normalize(light.moon_direction);
             let moon_color = vec3<f32>(0.55, 0.72, 1.0) * light.moon_intensity * moon_strength;
 

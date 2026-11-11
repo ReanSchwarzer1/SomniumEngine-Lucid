@@ -1169,7 +1169,9 @@ fn the_sky_eye_is_drawn_on_sky_pixels() {
     let atmosphere = include_str!("../src/shaders/sky_eye.wgsl");
     let pool = include_str!("../src/shaders/global_pool.wgsl");
     assert!(atmosphere.contains("fn sky_eye("), "the eye is an analytic sky term");
-    assert!(shading.contains("(sky + detail) * (1.0 - eye.a) + eye.rgb"), "the eye covers the sky it sits in");
+    assert!(shading.contains("(sky + detail * (1.0 - planet.a) + planet.rgb + ring) * (1.0 - eye.a) + eye.rgb"),
+        "the eye covers the sky it sits in, the planet over the horizon (behind the air, in front of the stars and the sun) with it");
+    assert!(shading.contains("planet.rgb * view_extinction_rgb(ray_dir.y)"), "the air dims and reddens the planet");
     assert!(pool.contains("eye_shape:"), "the light uniform carries the eye");
     let composite = include_str!("../src/shaders/clouds_composite.wgsl");
     assert!(composite.contains("sky_eye(dir"), "the eye burns through the cloud deck");

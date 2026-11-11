@@ -60,6 +60,10 @@ pub struct TimeOfDayComponent {
     /// Degrees east. Negative is west. The time zone is derived from this
     /// rather than authored, so a longitude change moves noon where it should.
     pub longitude: f32,
+    /// Degrees added to every azimuth the solar clock gives, in [`sun_rotation`]'s convention: where the clock's
+    /// true north stands in the world. Zero puts it toward +Z. A world whose noon sun must stand where an old fixed
+    /// sun stood turns its north by this.
+    pub north_offset: f32,
     /// Game hours advanced per real second while Play is running. Zero freezes
     /// the clock, which is the default: a scene should not start moving the
     /// moment somebody presses Play unless that was asked for.
@@ -91,6 +95,10 @@ pub struct TimeOfDayComponent {
     pub fixed_sun: bool,
     /// Degrees in [`sun_rotation`]'s convention (0 toward +Z, 90 toward +X);
     /// [`azimuth_elevation_from_direction`] converts a direction.
+    ///
+    /// With `fixed_sun` off these two still mean something: the climate's sun
+    /// ([`Self::climate_sun`]), which snow turns from instead of the sun of the
+    /// hour.
     pub fixed_azimuth: f32,
     /// Degrees above the horizon. Below zero the sun has set and
     /// `sun::transmittance` takes the light to nothing, as for the Earth model.
@@ -112,6 +120,10 @@ pub struct TimeOfDayComponent {
     pub night_halo_road: f32,
     /// The Thread (a line of light from the horizon below the sun toward it), 0..1.
     pub night_thread: f32,
+    /// The sun seen through the Lid's wreck (Sunscar): -1 the whole disc (the default); 0 the cut sun (a degree wide,
+    /// cut into three or four pieces by drifting lanes); 1 five shards; 2 the true-size sun crossed by two bars, which
+    /// take 30% of its light. Its debris ring lights the night. `SOMNIUM_SUN_FORM` overrides it.
+    pub sun_wreck: i32,
 }
 
 impl Component for TimeOfDayComponent {}
@@ -124,6 +136,7 @@ impl Default for TimeOfDayComponent {
             day_of_year: 172, // the June solstice: the longest day to look at
             latitude: 45.0,
             longitude: 0.0,
+            north_offset: 0.0,
             timescale: 0.0,
             sun_color: default_sun_color(),
             sun_intensity: default_sun_intensity(),
@@ -140,6 +153,7 @@ impl Default for TimeOfDayComponent {
             night_aurora: 0.0,
             night_halo_road: 0.0,
             night_thread: 0.0,
+            sun_wreck: -1,
         }
     }
 }
@@ -242,8 +256,14 @@ pub fn solar_position(day_of_year: i32, hour: f32, latitude: f32, longitude: f32
     let timezone = (longitude / 15.0).round();
     let true_solar_minutes = hour * 60.0 + eqtime + 4.0 * longitude - 60.0 * timezone;
     let hour_angle_deg = true_solar_minutes / 4.0 - 180.0;
-    let ha = hour_angle_deg.to_radians();
+    sky_position(latitude, decl, hour_angle_deg)
+}
 
+/// Where a body on the sky stands for an observer at `latitude` (degrees north): `(azimuth, elevation)` in degrees,
+/// as [`solar_position`] gives them, from its declination (radians) and hour angle (degrees, west of the meridian).
+#[must_use]
+pub fn sky_position(latitude: f32, decl: f32, hour_angle_deg: f32) -> (f32, f32) {
+    let ha = hour_angle_deg.to_radians();
     let lat = latitude.clamp(-89.9, 89.9).to_radians();
     let cos_zenith = (lat.sin() * decl.sin() + lat.cos() * decl.cos() * ha.cos()).clamp(-1.0, 1.0);
     let zenith = cos_zenith.acos();
@@ -257,7 +277,7 @@ pub fn solar_position(day_of_year: i32, hour: f32, latitude: f32, longitude: f32
     } else {
         let cos_az = ((lat.sin() * cos_zenith - decl.sin()) / denom).clamp(-1.0, 1.0);
         let az = 180.0 - cos_az.acos().to_degrees();
-        if hour_angle_deg > 0.0 { 360.0 - az } else { az }
+        if hour_angle_deg.rem_euclid(360.0) < 180.0 && hour_angle_deg.rem_euclid(360.0) > 0.0 { 360.0 - az } else { az }
     };
 
     (azimuth.rem_euclid(360.0), elevation)
@@ -333,7 +353,8 @@ impl TimeOfDayComponent {
         let (azimuth_deg, elevation_deg) = if self.fixed_sun {
             (self.fixed_azimuth.rem_euclid(360.0), self.fixed_elevation.clamp(-90.0, 90.0))
         } else {
-            solar_position(self.day_of_year, hour, self.latitude, self.longitude)
+            let (azimuth, elevation) = solar_position(self.day_of_year, hour, self.latitude, self.longitude);
+            ((azimuth + self.north_offset).rem_euclid(360.0), elevation)
         };
         // A fixed sun keeps the noon tint: its colour at a low elevation comes
         // from the transmittance physics, not from a clock it does not have.
@@ -376,6 +397,15 @@ impl TimeOfDayComponent {
             cloud_coverage: (!self.cloud_coverage.is_empty())
                 .then(|| self.cloud_coverage.evaluate(hour).clamp(0.0, 1.0)),
         }
+    }
+
+    /// The climate's sun, toward it: the fixed-sun fields' direction. While the
+    /// sun is on the solar clock (`fixed_sun` off) the snow turns from this one,
+    /// so it lies where a year of suns leaves it instead of creeping round the
+    /// slopes by the hour. Sunscar keeps its old fixed sun here.
+    #[must_use]
+    pub fn climate_sun(&self) -> glam::Vec3 {
+        -(sun_rotation(self.fixed_azimuth, self.fixed_elevation) * glam::Vec3::NEG_Z)
     }
 
     /// Format the clock as `HH:MM`, for the context bar and the status line.
@@ -583,6 +613,37 @@ mod tests {
             assert!((state.intensity - 60_000.0).abs() < 1e-2);
             assert_eq!(state.fog_density, Some(0.001));
         }
+    }
+
+    /// Sunscar's clock (day 307, latitude 40.17, longitude -4.091, north turned by -66): noon stands exactly where
+    /// its old fixed sun stood (azimuth 114, elevation 35), so every look made under that sun is true at 12:00. The
+    /// sun rises at about 06:47 and sets at about 17:13.
+    #[test]
+    fn sunscars_noon_is_its_old_fixed_sun() {
+        let (az, el) = solar_position(307, 12.0, 40.17, -4.091);
+        assert!((az - 180.0).abs() < 0.05 && (el - 35.0).abs() < 0.05, "12:00 is ({az}, {el})");
+        let clock = TimeOfDayComponent {
+            fixed_sun: false,
+            hour: 12.0,
+            day_of_year: 307,
+            latitude: 40.17,
+            longitude: -4.091,
+            north_offset: -66.0,
+            fixed_azimuth: 114.0,
+            fixed_elevation: 35.0,
+            ..TimeOfDayComponent::default()
+        };
+        let moving = clock.evaluate().rotation * glam::Vec3::NEG_Z;
+        let fixed = TimeOfDayComponent { fixed_sun: true, ..clock.clone() }.evaluate().rotation * glam::Vec3::NEG_Z;
+        assert!(moving.dot(fixed) > 0.999_999, "{moving} against {fixed}");
+        // The snow's sun is that one too, whatever the hour.
+        assert!(clock.climate_sun().dot(-fixed) > 0.999_999);
+        let up = |hour: f32| solar_position(307, hour, 40.17, -4.091).1 > -0.83;
+        assert!(!up(6.7) && up(6.85), "sunrise");
+        assert!(up(17.15) && !up(17.3), "sunset");
+        // The offset turns the whole day: the morning sun still climbs on the side the noon sun stands.
+        let morning = TimeOfDayComponent { hour: 9.0, ..clock.clone() }.evaluate();
+        assert!((morning.azimuth_deg - (solar_position(307, 9.0, 40.17, -4.091).0 - 66.0)).abs() < 1e-3);
     }
 
     /// Covering the sun scales its light in either model, and an Earth sun

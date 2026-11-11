@@ -385,8 +385,22 @@ pub struct SomniumRenderer {
     /// Tone-mapping curve index; matches `Tonemapper::as_index`.
     pub tonemapper: u32,
     /// Snow lying on surfaces (snow.wgsl's uniform, shading group 1 binding 34); all zero is none.
-    /// Its third vector (toward the sun) is filled from the light each frame.
+    /// Its third vector (toward the sun) is filled from the light each frame, or from `snow_sun`.
     pub snow: [f32; 16],
+    /// The sun the snow turns from (its facing bias), toward the sun; `None` is the light's. A day clock sets the
+    /// climate's sun here, so snow lies where a year of suns leaves it and does not creep round the slopes by the hour.
+    pub snow_sun: Option<glam::Vec3>,
+    /// A day clock is running: the sun moves a little every frame. The sky light (`IblPass`) is then rebuilt a few
+    /// faces a frame and crossfaded, and the clouds' sky capture re-marched when the sun has turned a quarter degree,
+    /// instead of both being rebuilt whole on every change. False, the default, rebuilds on change as always.
+    pub sun_moving: bool,
+    /// The sky, the clouds and the fog take the sun above the air (`sun_above_air`) and do their own transmittance
+    /// and planet shadow, so the sky keeps its light after sunset and twilight exists; stars are always there, outshone
+    /// by day. A day clock sets it. False, the default: they take the light on the ground (`light_color`), as always.
+    pub sky_above_air: bool,
+    /// The sun's light above the air (the directional light's own colour times its lux, before `sun::transmittance`),
+    /// set by the game layer with the light; read only under `sky_above_air`.
+    pub sun_above_air: glam::Vec3,
     /// The snowline map's placement for snow.wgsl (x0, z0, 1 / cell, on; width, height, -, -), set by `set_snow_map`
     /// (all zero is none), and its project path as last asked for.
     pub snow_map_params: [f32; 8],
@@ -605,6 +619,14 @@ pub struct SomniumRenderer {
     /// The eye drawn in the sky this frame (`intensity` 0: none). Set by the
     /// app from `somnium.SkyEye` every frame.
     pub sky_eye: crate::SkyEyeParams,
+    /// The planet over the horizon this frame (`radius` 0: none), set by the app from `somnium.SkyPlanet`. When there
+    /// is one it takes the moon's slot: its direction, its light, its disc's size.
+    pub planet: crate::PlanetParams,
+    /// The sun seen through the Lid's wreck (Sunscar): `Some((form, latitude, north_offset))` draws it in place of the
+    /// whole disc (0 the cut sun, 1 five shards, 2 the true-size sun with bars: `sky_sun.wgsl`) with the debris ring;
+    /// `None`, the default, draws the disc as always. The clock's latitude and north offset (degrees) place the
+    /// celestial pole.
+    pub sun_wreck: Option<(u32, f32, f32)>,
     /// Phase CONTROL-O: deferred decals, binned through the same froxel grid
     /// as the local lights.
     pub decal_grid: crate::pass::decal::DecalGrid,
@@ -1705,6 +1727,10 @@ impl SomniumRenderer {
             render_height: ctx.config.height,
             tonemapper: 0,
             snow: [0.0; 16],
+            snow_sun: None,
+            sun_moving: false,
+            sky_above_air: false,
+            sun_above_air: glam::Vec3::ZERO,
             snow_map_params: [0.0; 8],
             snow_map_source: String::new(),
             surfaces_ab_was_off: false,
@@ -1772,6 +1798,8 @@ impl SomniumRenderer {
             lightning_pass,
             precipitation_pass,
             sky_eye: crate::SkyEyeParams::default(),
+            planet: crate::PlanetParams::default(),
+            sun_wreck: None,
             decal_grid,
             decals: Vec::new(),
             hiz_pass,
@@ -2810,7 +2838,7 @@ impl SomniumRenderer {
         let mut snow = [0.0f32; 24];
         snow[..16].copy_from_slice(&self.snow);
         snow[16..].copy_from_slice(&self.snow_map_params);
-        snow[8..11].copy_from_slice(&self.light_direction.normalize_or_zero().to_array());
+        snow[8..11].copy_from_slice(&self.snow_sun.unwrap_or(self.light_direction).normalize_or_zero().to_array());
         // Metres per pixel per metre of distance: the snow's finer patterns fade where a pixel cannot hold them.
         snow[11] = 2.0 / (self.proj_matrix.y_axis.y.abs().max(1e-6) * self.render_height.max(1) as f32);
         // SOMNIUM_SNOW_AB=1 (measuring its cost): the layer is off for alternate 120-frame stretches, offset by 60, so a
@@ -2899,6 +2927,26 @@ impl SomniumRenderer {
             b: f64::from(sky.z),
             a: 1.0,
         }
+    }
+
+    /// The planet as the clouds and the fog take it: toward it, w 1 by night (the sun six degrees down, too far to
+    /// light any cloud: the clouds' light march and their shadow on the land go toward the planet instead); its light
+    /// above the air, w 1 when there is one. All zero: none.
+    fn planet_march_params(&self) -> [[f32; 4]; 2] {
+        if self.planet.radius <= 0.0 {
+            return [[0.0; 4]; 2];
+        }
+        let night = self.light_direction.y < -0.1045;
+        [
+            self.planet.direction.normalize_or(glam::Vec3::Y).extend(f32::from(u8::from(night))).to_array(),
+            self.planet.light_above_air.extend(1.0).to_array(),
+        ]
+    }
+
+    /// The sun the sky, the clouds and the fog are lit by: above the air under `sky_above_air` (they do their own
+    /// transmittance), else the light on the ground, as always.
+    fn sky_sun(&self) -> glam::Vec3 {
+        if self.sky_above_air { self.sun_above_air } else { self.light_color }
     }
 
     /// Set the directional light parameters for this frame.
@@ -5386,9 +5434,12 @@ impl SomniumRenderer {
             &ctx.device,
             &ctx.queue,
             self.light_direction,
-            self.light_color,
+            self.sky_sun(),
             overcast,
             self.cloud_pass.sky_light_clouds(),
+            self.sun_moving,
+            self.sky_above_air.then_some(self.light_color),
+            crate::pass::ibl::planet_params(&self.planet),
         );
 
         // ── 1. Compute cascades and upload light buffer ───────────────────────
@@ -5426,11 +5477,20 @@ impl SomniumRenderer {
         };
         self.cascade_split_depths = std::array::from_fn(|i| cascades[i].split_depth);
         self.cascade_texels = std::array::from_fn(|i| cascades[i].texel_size);
+        // SOMNIUM_SKY_AB=1 (measuring the sky's cost): the planet and the broken sun are off for alternate 120-frame
+        // stretches, offset by 60, so a run with SOMNIUM_PROFILE_EVERY=120 logs blocks without them (frame=120, 360, ...)
+        // and with them (240, 480, ...) under the same clocks (as SOMNIUM_SNOW_AB does for the snow).
+        static SKY_AB: std::sync::LazyLock<bool> =
+            std::sync::LazyLock::new(|| std::env::var("SOMNIUM_SKY_AB").as_deref() == Ok("1"));
+        if *SKY_AB && (self.profiler.frame_index() + 60) / 120 % 2 == 1 {
+            self.planet = crate::PlanetParams::default();
+            self.sun_wreck = None;
+        }
         let gpu_light = GpuDirectionalLight {
             direction: self.light_direction.to_array(),
             _pad0: 0.0,
             color: self.light_color.to_array(),
-            _pad1: 0.0,
+            sky_above_air: f32::from(u8::from(self.sky_above_air)),
             view_proj: std::array::from_fn(|i| cascades[i].view_proj.to_cols_array_2d()),
             cascade_splits: [
                 cascades[0].split_depth,
@@ -5443,18 +5503,39 @@ impl SomniumRenderer {
             sun_angular_radius: self.sun_angular_radius,
             // TEMP: shadow_factor debug visualisation.
             _pad2: shadow_debug,
-            // Phase 25M-2: physical moon direction from simplified orbital model.
-            moon_direction: crate::shadow::moon_direction(
-                self.light_direction,
-                (self.time as f64) / 86400.0,
-            )
-            .to_array(),
-            moon_intensity: self.moon_intensity,
+            // Phase 25M-2: physical moon direction from simplified orbital model. A planet takes its slot.
+            moon_direction: if self.planet.radius > 0.0 {
+                self.planet.direction.normalize_or(glam::Vec3::Y).to_array()
+            } else {
+                crate::shadow::moon_direction(self.light_direction, (self.time as f64) / 86400.0).to_array()
+            },
+            moon_intensity: if self.planet.radius > 0.0 {
+                self.planet.light_ground.dot(glam::Vec3::new(0.2126, 0.7152, 0.0722))
+            } else {
+                self.moon_intensity
+            },
             eye_direction: self.sky_eye.direction.normalize_or_zero().to_array(),
             eye_tan_half_width: self.sky_eye.tan_half_width,
             eye_color: self.sky_eye.color.to_array(),
             eye_intensity: self.sky_eye.intensity,
             eye_shape: [self.sky_eye.openness, self.sky_eye.pupil, self.sky_eye.pulse_hz, self.sky_eye.glow],
+            planet_direction: self.planet.direction.normalize_or(glam::Vec3::Y).extend(self.planet.radius).to_array(),
+            planet_light: self.planet.light_ground.extend(self.planet.albedo).to_array(),
+            planet_surface: self.planet.surface,
+            // y 1: by night the clouds' shadow field is cast toward the planet (the cloud pass's `planet`).
+            planet_sun: [
+                self.sun_above_air.dot(glam::Vec3::new(0.2126, 0.7152, 0.0722)),
+                f32::from(u8::from(self.planet.radius > 0.0 && self.light_direction.y < -0.1045)),
+                0.0,
+                0.0,
+            ],
+            sun_above: self.sun_above_air.extend(self.sun_wreck.map_or(0.0, |(_, latitude, _)| latitude)).to_array(),
+            sun_form: [
+                self.sun_wreck.map_or(0.0, |(form, ..)| form.min(2) as f32),
+                f32::from(u8::from(self.sun_wreck.is_some())),
+                self.sun_wreck.map_or(0.0, |(_, _, north)| north.to_radians()),
+                0.0,
+            ],
         };
         ctx.queue.write_buffer(
             &self.global_pool.light_buffer,
@@ -6622,6 +6703,8 @@ impl SomniumRenderer {
         );
         self.profiler.end(&mut encoder);
         self.profiler.begin(&mut encoder, "Volumetrics");
+        self.volumetric_pass.above_air = self.sky_above_air;
+        self.volumetric_pass.planet = self.planet_march_params();
         self.volumetric_pass.record(
             &mut encoder,
             &ctx.queue,
@@ -6630,7 +6713,7 @@ impl SomniumRenderer {
             self.view_matrix,
             self.camera_pos,
             self.light_direction,
-            self.light_color,
+            self.sky_sun(),
             self.cloud_pass.sky_light_clouds().is_some(),
         );
         self.profiler.end(&mut encoder);
@@ -6662,13 +6745,16 @@ impl SomniumRenderer {
         );
         self.cloud_pass.sky_eye = self.sky_eye;
         self.cloud_pass.time = self.time;
+        self.cloud_pass.sun_moving = self.sun_moving;
+        self.cloud_pass.above_air = self.sky_above_air;
+        self.cloud_pass.planet = self.planet_march_params();
         self.cloud_pass.record(
             &mut encoder,
             &ctx.queue,
             self.view_proj_unjittered_rel.inverse(),
             self.camera_pos,
             self.light_direction,
-            self.light_color,
+            self.sky_sun(),
             self.volumetric_pass.max_distance(),
         );
         self.profiler.end(&mut encoder);

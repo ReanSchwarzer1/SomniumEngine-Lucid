@@ -2646,12 +2646,16 @@ impl GameApp for HelloGame {
                                     to_light.y,
                                     transform.translation.y * 0.001,
                                 );
+                                // The true-size sun seen behind the wreck's bars (Sunscar's form 2) gives the
+                                // bars' share less: 56,000 of 80,000 lux. Every other form and scene, all of it.
+                                let photometric = light.photometric_color()
+                                    * if matches!(renderer.sun_wreck, Some((2, ..))) { 0.7 } else { 1.0 };
                                 renderer.set_directional_light(
                                     to_light,
-                                    light.photometric_color() * survives,
+                                    photometric * survives,
                                 );
                                 // The living's lamps are lit by what the open sky gives.
-                                let sun = light.photometric_color();
+                                let sun = photometric;
                                 let lux = glam::Vec3::new(0.2126, 0.7152, 0.0722);
                                 self.lamps.step(
                                     self.sky_dim
@@ -2662,6 +2666,9 @@ impl GameApp for HelloGame {
                                         ),
                                     ctx.time.elapsed().as_secs_f32(),
                                 );
+                                // The same light above the air: under a day clock the sky, the clouds and the fog
+                                // take this and do their own transmittance (`sky_above_air`), so dusk exists.
+                                renderer.sun_above_air = photometric;
                                 renderer.set_directional_shadow_policy(
                                     somnium_renderer::shadow::virtual_map::ShadowLightPolicy {
                                         light_id: 0,

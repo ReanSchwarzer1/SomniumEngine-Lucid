@@ -55,7 +55,7 @@ pub const CASCADE_UV_OFFSETS: [(f32, f32); 4] = [(0.0, 0.0), (0.5, 0.0), (0.0, 0
 /// offset   0 :  direction     vec3<f32>          (12 bytes)
 /// offset  12 :  _pad0         f32                ( 4 bytes)
 /// offset  16 :  color         vec3<f32>          (12 bytes)  pre-multiplied by intensity
-/// offset  28 :  _pad1         f32                ( 4 bytes)
+/// offset  28 :  sky_above_air f32                ( 4 bytes)  1: sky lit above the air
 /// offset  32 :  view_proj     array<mat4x4, 4>   (256 bytes) one VP per cascade
 /// offset 288 :  cascade_splits vec4<f32>         (16 bytes)  view-space far Z per cascade
 /// offset 304 :  shadow_map_size f32              ( 4 bytes)  total atlas size in texels
@@ -67,7 +67,9 @@ pub const CASCADE_UV_OFFSETS: [(f32, f32); 4] = [(0.0, 0.0), (0.5, 0.0), (0.0, 0
 /// offset 336 :  eye_direction vec3<f32>, eye_tan_half_width f32   (16) sky eye
 /// offset 352 :  eye_color     vec3<f32>, eye_intensity f32        (16)
 /// offset 368 :  eye_shape     vec4<f32> openness, pupil, pulse_hz, glow (16)
-///              total                             384 bytes
+/// offset 384 :  planet_direction, planet_light, planet_surface, planet_sun   (4 x 16) the planet
+/// offset 448 :  sun_above, sun_form                                         (2 x 16) the broken sun
+///              total                             480 bytes
 /// ```
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -75,7 +77,9 @@ pub struct GpuDirectionalLight {
     pub direction: [f32; 3],
     pub _pad0: f32,
     pub color: [f32; 3],
-    pub _pad1: f32,
+    /// 1 when the sky, clouds and fog are lit above the air (`Renderer::sky_above_air`): the shading pass's sky then
+    /// draws the stars dimmed only by the air, outshone by day. Was padding; every other pass still reads it as such.
+    pub sky_above_air: f32,
     /// Four cascade view-projection matrices, each column-major.
     pub view_proj: [[[f32; 4]; 4]; 4],
     pub cascade_splits: [f32; 4],
@@ -104,6 +108,17 @@ pub struct GpuDirectionalLight {
     pub eye_color: [f32; 3],
     pub eye_intensity: f32,
     pub eye_shape: [f32; 4],
+    /// The planet over the horizon (`PlanetParams`; Sunscar), declared by the shading pass alone: toward it and its
+    /// angular radius (0: none); its light on the ground (lux per channel) and its geometric albedo; its surface; the
+    /// sun's light above the air (luminance), which lights its disc.
+    pub planet_direction: [f32; 4],
+    pub planet_light: [f32; 4],
+    pub planet_surface: [f32; 4],
+    pub planet_sun: [f32; 4],
+    /// The sun seen through the Lid's wreck (`Renderer::sun_wreck`; Sunscar): its light above the air (rgb lux) and
+    /// the latitude (degrees, for the celestial pole the wreck's axes keep to); its form (0..2) and 1 when drawn.
+    pub sun_above: [f32; 4],
+    pub sun_form: [f32; 4],
 }
 
 impl Default for GpuDirectionalLight {
@@ -118,7 +133,7 @@ impl Default for GpuDirectionalLight {
             direction: [0.447, 0.894, -0.0],
             _pad0: 0.0,
             color: [5.0, 5.0, 5.0],
-            _pad1: 0.0,
+            sky_above_air: 0.0,
             view_proj: [identity; 4],
             cascade_splits: [5.0, 20.0, 50.0, 100.0],
             shadow_map_size: ATLAS_SIZE as f32,
@@ -133,6 +148,12 @@ impl Default for GpuDirectionalLight {
             eye_color: [0.0; 3],
             eye_intensity: 0.0,
             eye_shape: [0.42, 0.14, 0.0, 0.0],
+            planet_direction: [0.0; 4],
+            planet_light: [0.0; 4],
+            planet_surface: [0.0; 4],
+            planet_sun: [0.0; 4],
+            sun_above: [0.0; 4],
+            sun_form: [0.0; 4],
         }
     }
 }

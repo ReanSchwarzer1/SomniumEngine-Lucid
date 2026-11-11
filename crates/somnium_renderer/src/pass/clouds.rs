@@ -47,6 +47,9 @@ const WEATHER_SIZE: u32 = 512;
 const ENV_SIZE: u32 = 64;
 /// Seconds between sky-light cloud captures while nothing about the sky changes (the deck drifts with the wind).
 const ENV_REFRESH_SECONDS: f32 = 4.0;
+/// While a day clock runs (`sun_moving`), the sky-light capture is marched again once the sun has turned this far
+/// from the one it was marched under (cos 0.25 degrees): every 2.5 s at a day an hour, not every frame.
+const ENV_MOVING_SUN_COS: f32 = 0.999_990_5;
 /// World-XZ cloud shadow resolution.
 const SHADOW_SIZE: u32 = 512;
 /// Default fraction of the scene resolution the march runs at.
@@ -214,7 +217,11 @@ struct CloudParams {
     heap: f32,
     far_step: f32,
     far_fade: f32,
-    _pad4: f32,
+    /// 1: `sun_illuminance` is the sun above the air (`CloudPass::above_air`).
+    above_air: f32,
+    /// The planet over the horizon (`CloudPass::planet`).
+    planet_direction: [f32; 4],
+    planet_light: [f32; 4],
 }
 
 #[repr(C)]
@@ -269,6 +276,15 @@ pub struct CloudPass {
     /// renderer each frame), and the clock its flames run on.
     pub sky_eye: crate::SkyEyeParams,
     pub time: f32,
+    /// A day clock is running (`Renderer::sun_moving`): the sky-light capture follows the sun by quarter degrees
+    /// (`ENV_MOVING_SUN_COS`) rather than on every change of it.
+    pub sun_moving: bool,
+    /// `sun_illuminance` is the sun above the air (`Renderer::sky_above_air`): each sample takes its own sun through
+    /// the air and the planet's shadow, and the sky's fill follows the twilight (clouds.wgsl `above_air`).
+    pub above_air: bool,
+    /// The planet over the horizon, as the march takes it: toward it, w 1 by night (its light march, not the sun's);
+    /// its light above the air (rgb), w 1 when there is one. All zero: none (the renderer sets it each frame).
+    pub planet: [[f32; 4]; 2],
     // ── Authoring ────────────────────────────────────────────────────────────
     /// Off until the `.somtime` row exists. See the module header.
     ///
@@ -985,6 +1001,9 @@ impl CloudPass {
             env_generation: 0,
             env_at: 0.0,
             env_key: None,
+            sun_moving: false,
+            above_air: false,
+            planet: [[0.0; 4]; 2],
             shadow_pipeline,
             composite_layout,
             composite_bind_groups: [None, None],
@@ -1521,7 +1540,9 @@ impl CloudPass {
                 heap: self.heap.clamp(0.0, 1.0),
                 far_step: self.far_step.clamp(0.0, 0.2),
                 far_fade: self.far_fade.max(0.0),
-                _pad4: 0.0,
+                above_air: f32::from(u8::from(self.above_air)),
+                planet_direction: self.planet[0],
+                planet_light: self.planet[1],
             }),
         );
         #[allow(clippy::cast_precision_loss)]
@@ -1593,7 +1614,14 @@ impl CloudPass {
         });
         // The sky light's clouds: when the sky changed, and every few seconds as the deck drifts. The IBL reads the
         // cube next frame, once this encoder has run (`sky_light_clouds`).
-        let env_key = Some((self.settings, sun_direction.normalize_or_zero().to_array()));
+        // A running clock moves the sun every frame: the capture keeps the sun it was marched under until it has
+        // turned a quarter degree, so the key changes then and not on every frame.
+        let sun_now = sun_direction.normalize_or_zero();
+        let sun_key = match self.env_key {
+            Some((_, marched)) if self.sun_moving && glam::Vec3::from(marched).dot(sun_now) >= ENV_MOVING_SUN_COS => marched,
+            _ => sun_now.to_array(),
+        };
+        let env_key = Some((self.settings, sun_key));
         if let Some(env) = self.env_bind_group.as_ref()
             && (self.env_key != env_key || self.env_generation == 0 || !(0.0..ENV_REFRESH_SECONDS).contains(&(self.time - self.env_at)))
         {

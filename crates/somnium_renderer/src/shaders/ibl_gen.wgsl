@@ -38,6 +38,15 @@ struct GenParams {
     /// x: 1 lays the sky light's cloud cube over the sky (and `overcast` is 0). y: how far the air under the clouds
     /// takes the light they let through (`light_under_clouds`); zw unused.
     clouds: vec4<f32>,
+    /// w 1: `sun_color` is the sun above the air (a running day clock, `Renderer::sky_above_air`) and the sky marches
+    /// its own transmittance and the planet's shadow, so twilight exists; rgb is then the sun on the ground, for the
+    /// land below the horizon. w 0: `sun_color` is the sun on the ground, as it always was.
+    sun_ground: vec4<f32>,
+    /// The planet over the horizon (`PlanetParams`): toward it, w 1 when there is one; its light above the air (rgb,
+    /// lux), which lights the air as a second sun does; its light on the ground (rgb), on the land below the horizon.
+    planet: vec4<f32>,
+    planet_light: vec4<f32>,
+    planet_ground: vec4<f32>,
 }
 
 /// The Undersun's night (`NightSky`, Rimeborn): no moon. A glow over the dome, brighter overhead and toward the hidden
@@ -144,11 +153,31 @@ fn sky(ray_dir: vec3<f32>) -> vec3<f32> {
     // Transmittance fades smoothly across twilight (via HORIZON_FADE in sun.rs), causing the sky to
     // transition naturally from daylight (8000 cd/m²) -> sunset (500 cd/m²) -> night airglow floor.
     let sun_illuminance = params.sun_color.w;
+    // A running day clock (`sun_ground.w`): the sun above the air, through the twilight march. Lit by the sun on the
+    // ground instead, the march's own transmittance counted the air twice and the sky went out with the sun's last
+    // ray: no dusk, the stars on at once.
+    let above_air = params.sun_ground.w > 0.5;
 
-    var radiance = raymarch_sky(
-        transmittance_lut, multiscatter_lut, atmos_sampler,
-        view_pos, ray_dir, sun_dir, 32,
-    ) * sun_illuminance;
+    var radiance: vec3<f32>;
+    if above_air {
+        radiance = raymarch_sky_twilight(
+            transmittance_lut, multiscatter_lut, atmos_sampler,
+            view_pos, ray_dir, sun_dir, 40,
+        ) * sun_illuminance;
+    } else {
+        radiance = raymarch_sky(
+            transmittance_lut, multiscatter_lut, atmos_sampler,
+            view_pos, ray_dir, sun_dir, 32,
+        ) * sun_illuminance;
+    }
+    // The planet lights the air too: by night its glow is the sky round it, blue-grey and brightest near it.
+    let planet_on = params.planet.w > 0.5;
+    if planet_on {
+        radiance += raymarch_sky_twilight(
+            transmittance_lut, multiscatter_lut, atmos_sampler,
+            view_pos, ray_dir, normalize(params.planet.xyz), 24,
+        ) * params.planet_light.rgb;
+    }
 
     // A cloud deck replaces the blue dome with the CIE overcast sky: neutral,
     // no sun disc, three times as bright at the zenith as at the horizon, and
@@ -157,17 +186,33 @@ fn sky(ray_dir: vec3<f32>) -> vec3<f32> {
     // tied to the clear zenith, so exposure holds as the deck closes.
     let cover = smoothstep(0.35, 0.95, params.overcast);
     if cover > 0.0 {
-        let zenith = raymarch_sky(
-            transmittance_lut, multiscatter_lut, atmos_sampler,
-            view_pos, vec3<f32>(0.0, 1.0, 0.0), sun_dir, 16,
-        ) * sun_illuminance;
+        var zenith: vec3<f32>;
+        if above_air {
+            zenith = raymarch_sky_twilight(
+                transmittance_lut, multiscatter_lut, atmos_sampler,
+                view_pos, vec3<f32>(0.0, 1.0, 0.0), sun_dir, 16,
+            ) * sun_illuminance;
+        } else {
+            zenith = raymarch_sky(
+                transmittance_lut, multiscatter_lut, atmos_sampler,
+                view_pos, vec3<f32>(0.0, 1.0, 0.0), sun_dir, 16,
+            ) * sun_illuminance;
+        }
+        if planet_on {
+            zenith += raymarch_sky_twilight(
+                transmittance_lut, multiscatter_lut, atmos_sampler,
+                view_pos, vec3<f32>(0.0, 1.0, 0.0), normalize(params.planet.xyz), 12,
+            ) * params.planet_light.rgb;
+        }
         let lz = dot(zenith, vec3<f32>(0.2126, 0.7152, 0.0722)) * 1.6;
         let dome = select(0.2, (1.0 + 2.0 * ray_dir.y) / 3.0, ray_dir.y >= 0.0);
         radiance = mix(radiance, vec3<f32>(0.97, 1.0, 1.03) * lz * dome, cover);
     }
 
     let moon_dir = -sun_dir;
-    let moon_strength = saturate(1.0 - sun_illuminance / 10.0);
+    // Above the air the sun never dims, so it cannot say night has come: the airglow is simply there, and the day's
+    // sky outshines it by ten million.
+    let moon_strength = select(saturate(1.0 - sun_illuminance / 10.0), 1.0, above_air);
     radiance += night_sky_ambient(ray_dir, moon_dir, moon_strength);
     radiance += undersun_night(ray_dir, sun_dir);
 
@@ -209,8 +254,19 @@ fn ground_radiance() -> vec3<f32> {
         sun_through = textureSampleLevel(cloud_capture, src_samp, sun, 0.0).a;
     }
     // The sky's irradiance on level ground is about pi times its zenith radiance times 0.85 (the CIE overcast's
-    // cosine-weighted mean against its zenith; a clear sky's brighter horizon makes up its lower zenith).
-    let e = params.sun_color.rgb * max(sun.y, 0.0) * sun_through + 0.85 * PI * sky_up;
+    // cosine-weighted mean against its zenith; a clear sky's brighter horizon makes up its lower zenith). The sun on
+    // the land is the one on the ground, whichever the sky was lit by.
+    let sun_on_land = select(params.sun_color.rgb, params.sun_ground.rgb, params.sun_ground.w > 0.5);
+    var e = sun_on_land * max(sun.y, 0.0) * sun_through + 0.85 * PI * sky_up;
+    if params.planet.w > 0.5 {
+        // The planet's light on the land, through the clouds' capture in its direction.
+        let planet_dir = normalize(params.planet.xyz);
+        var planet_through = 1.0;
+        if params.clouds.x > 0.5 {
+            planet_through = textureSampleLevel(cloud_capture, src_samp, planet_dir, 0.0).a;
+        }
+        e += params.planet_ground.rgb * max(planet_dir.y, 0.0) * planet_through;
+    }
     return GROUND_ALBEDO / PI * e * (1.0 - smoothstep(0.35, 0.95, params.overcast));
 }
 
@@ -319,4 +375,16 @@ fn fs_prefilter(in: VOut) -> @location(0) vec4<f32> {
         }
     }
     return vec4(total / max(weight, 1e-4), 1.0);
+}
+
+// ─── Crossfade (a running day clock, `IblPass::step_moving`) ─────────────────
+
+// One face and mip of the cube built for the newest sun, read texel for texel; the pipeline blends it over the same
+// face and mip of the cube everything reads by a constant share, so the sky light walks to the new sky in straight
+// steps too small to see instead of jumping to it.
+@group(0) @binding(7) var blend_src: texture_2d<f32>;
+
+@fragment
+fn fs_blend(in: VOut) -> @location(0) vec4<f32> {
+    return textureLoad(blend_src, vec2<i32>(in.clip.xy), 0);
 }

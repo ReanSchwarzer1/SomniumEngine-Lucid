@@ -2558,8 +2558,9 @@ impl<G: GameApp> Engine<G> {
     /// `SOMNIUM_EDITOR_SCRIPT`: scripted editor input for proof captures in a background window, inert unless set.
     /// Steps are `<frame>:<action>`, separated by `;`: `pick=<x>,<y>` (a click at that fraction of the window),
     /// `select=<name part>` (the first entity whose name contains it), `cmd=<command id>`, `save`, `close`, `splash`,
-    /// `gpu_error`, `panic` (a crash on the main thread), `native_crash` (an access violation), and
-    /// `eye=<x>,<z>,<yaw>,<pitch>` (the editor camera 1.7 m over the loaded ground at scene x, z).
+    /// `gpu_error`, `panic` (a crash on the main thread), `native_crash` (an access violation),
+    /// `eye=<x>,<z>,<yaw>,<pitch>` (the editor camera 1.7 m over the loaded ground at scene x, z), and `hour=<h>` (the
+    /// scene's Time of Day set to that hour: the editor's clock stands still, so one launch can shoot a day).
     pub(super) fn run_editor_script(&mut self) {
         static SCRIPT: std::sync::LazyLock<Vec<(u64, String)>> = std::sync::LazyLock::new(|| {
             std::env::var("SOMNIUM_EDITOR_SCRIPT")
@@ -2627,6 +2628,30 @@ impl<G: GameApp> Engine<G> {
                         None => warn!(x, z, "editor script: no ground loaded under the eye"),
                     }
                 }
+                Some(("hour", h)) => match h.trim().parse::<f32>() {
+                    Ok(hour) => {
+                        let clocks: Vec<_> = self.world.entities_with::<crate::time_of_day::TimeOfDayComponent>().collect();
+                        for e in clocks {
+                            if let Some(t) = self.world.get_mut::<crate::time_of_day::TimeOfDayComponent>(e) {
+                                t.hour = hour.rem_euclid(24.0);
+                            }
+                        }
+                    }
+                    Err(_) => warn!(action = %action, "editor script: hour wants a number"),
+                },
+                // The broken sun's form (`TimeOfDay.sun_wreck`: -1 whole, 0 cut, 1 shards, 2 bars), so one launch can
+                // show them all. `SOMNIUM_SUN_FORM` still wins.
+                Some(("form", f)) => match f.trim().parse::<i32>() {
+                    Ok(form) => {
+                        let clocks: Vec<_> = self.world.entities_with::<crate::time_of_day::TimeOfDayComponent>().collect();
+                        for e in clocks {
+                            if let Some(t) = self.world.get_mut::<crate::time_of_day::TimeOfDayComponent>(e) {
+                                t.sun_wreck = form.clamp(-1, 2);
+                            }
+                        }
+                    }
+                    Err(_) => warn!(action = %action, "editor script: form wants a number"),
+                },
                 // A picture of the scene alone (no editor) at this frame, so one launch can take several. With
                 // `SOMNIUM_CAPTURE_STILL_HDR=1` each also leaves its linear `.somcap`.
                 Some(("shot", path)) => {

@@ -178,11 +178,13 @@ fn gauss2(pixel: vec2<u32>, frame: u32, stream: u32) -> vec2<f32> {
 
 /// Sensor noise on the exposed light (middle grey 0.18), as a camera makes it: photon noise, the square root of the
 /// light gathered, and 3 electrons of read noise. The camera holds ISO 100 down to EV 10 and raises it a stop for
-/// each stop less light, so a bright day is clean and a dim wood or a night grows grain. At ISO 100 middle grey
-/// gathers about 5,000 electrons, as a full-frame sensor's photosite does; `strength` 1 is that sensor. The noise
-/// is mostly luminance, with a third as much colour, as after a camera's own noise reduction.
+/// each stop less light, so a bright day is clean and a dim wood grows grain. Its auto ISO tops out at 6400 (EV 4):
+/// in less light it keeps the shutter open longer, so a night is dark with a fine grain, not a field of noise (at
+/// ISO 100,000 the read noise alone lit a black night to about 20 of 255; sunscar-photoreal, 12 Nov). At ISO 100
+/// middle grey gathers about 5,000 electrons, as a full-frame sensor's photosite does; `strength` 1 is that sensor.
+/// The noise is mostly luminance, with a third as much colour, as after a camera's own noise reduction.
 fn sensor_noise(x: vec3<f32>, pixel: vec2<u32>, strength: f32, ev: f32) -> vec3<f32> {
-    let electrons = 27800.0 / exp2(clamp(10.0 - ev, 0.0, 14.0));
+    let electrons = 27800.0 / exp2(clamp(10.0 - ev, 0.0, 6.0));
     let luma = max(dot(x, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0);
     let sigma = sqrt(luma * electrons + 9.0) / electrons;
     // A new draw every 60th of a second: noise moves with time, as a sensor's does, and never sits as a pattern.

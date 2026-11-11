@@ -100,9 +100,15 @@ struct VolumetricParams {
     /// 1 when the clouds' sky-light capture (`cloud_sky_tex`) holds a marched deck: the sky light the air and the fog
     /// scatter then comes through it. 0 leaves the clear sky's (the multiscatter LUT) as it was.
     cloud_sky: f32,
-    _cloud_pad0: f32,
+    /// 1: `sun_illuminance` is the sun above the air (a running day clock): the multiscatter table is read for a set
+    /// sun as its light falls (`sample_multiscatter_twilight`).
+    above_air: f32,
     _cloud_pad1: f32,
     _cloud_pad2: f32,
+    /// The planet over the horizon: toward it, w 1 by night (the clouds' shadow field is then cast toward it); its
+    /// light above the air (rgb, lux), w 1 when there is one.
+    planet_direction: vec4<f32>,
+    planet_light: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> vol: VolumetricParams;
@@ -402,12 +408,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // out — so every froxel went on being lit by the reddest possible
             // sunlight instead of by none. That is the red frame.
             var sun_transmittance = vec3<f32>(0.0);
-            var multiscatter = vec3<f32>(0.0);
             if !ray_hits_ground(sample_r, mu_sun) {
                 sun_transmittance = sample_transmittance(
                     transmittance_lut, lut_sampler, sample_r, mu_sun);
-                multiscatter = sample_multiscatter(
-                    multiscatter_lut, lut_sampler, sample_r, mu_sun);
+            }
+            // The multiply scattered sky stays after sunset: its table carries the planet's shadow itself, so a sun
+            // under the horizon reads the twilight's light, not the reddest grazing row. Under the light on the ground
+            // (no day clock) a set sun's light is zero and this is nothing, as before.
+            var multiscatter = sample_multiscatter(multiscatter_lut, lut_sampler, sample_r, mu_sun);
+            if vol.above_air > 0.5 {
+                multiscatter = sample_multiscatter_twilight(multiscatter_lut, lut_sampler, sample_r, mu_sun);
             }
 
             var sun_vis = 1.0;
@@ -484,7 +494,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 / max(extinction, vec3<f32>(VOL_MIN_EXTINCTION));
             let integrated_local = (local_scatter - local_scatter * step_transmittance)
                 / max(extinction, vec3<f32>(VOL_MIN_EXTINCTION));
-            inscatter += throughput * (integrated * vol.sun_illuminance + integrated_local);
+            // The planet over the horizon lights the air and the fog as a second sun does: its light through the air
+            // above the sample, its glow on the air, and by night the clouds' shadow cast toward it. No shafts.
+            var integrated_planet = vec3<f32>(0.0);
+            if vol.planet_light.w > 0.5 {
+                let planet_dir = normalize(vol.planet_direction.xyz + vec3<f32>(0.0, 1e-6, 0.0));
+                var through_air = vec3<f32>(0.0);
+                if !ray_hits_ground(sample_r, planet_dir.y) {
+                    through_air = sample_transmittance(transmittance_lut, lut_sampler, sample_r, planet_dir.y);
+                }
+                if vol.planet_direction.w > 0.5 {
+                    through_air *= cloud_sun_at(world_pos);
+                }
+                let glow = sample_multiscatter_twilight(multiscatter_lut, lut_sampler, sample_r, planet_dir.y) * sky_through;
+                let cos_p = dot(ray_dir, planet_dir);
+                var planet_scatter = (scatter_rayleigh * rayleigh_phase(cos_p) + scatter_mie * mie_phase(cos_p)) * through_air
+                    + (scatter_rayleigh + scatter_mie) * glow;
+                if fog > 0.0 {
+                    planet_scatter += vec3<f32>(fog * hg_phase(cos_p, vol.fog_asymmetry)) * through_air
+                        + vec3<f32>(fog) * glow * sky_vis * vol.fog_skylight;
+                }
+                planet_scatter *= vol.planet_light.rgb;
+                integrated_planet = (planet_scatter - planet_scatter * step_transmittance)
+                    / max(extinction, vec3<f32>(VOL_MIN_EXTINCTION));
+            }
+            inscatter += throughput * (integrated * vol.sun_illuminance + integrated_local + integrated_planet);
             throughput *= step_transmittance;
         }
 
