@@ -85,6 +85,31 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     } else {
         ground = evaluate_terrain_material(tm_idx, ground_pos, terrain_xz, ground_n, splat_uv, ddx, ddy);
     }
+    // Steep faces take the ground's strongest layer projected along their own normal, as the terrain's cliffs do: the
+    // ground's texels sampled at x, z would stand in vertical streaks up a wall or a boulder's flank.
+    let side = smoothstep(0.3, 0.7, 1.0 - abs(geo_n.y));
+    if side > 0.0 {
+        var weight = terrain_unpack_splats_painted(
+            terrain_fetch_splats(tm, tm_idx, splat_uv, ddx * tm.inv_world_size, ddy * tm.inv_world_size),
+            tm, terrain_xz);
+        let selected = terrain_strongest_four(&weight);
+        var strongest = selected[0];
+        for (var k = 1u; k < 4u; k = k + 1u) {
+            if weight[selected[k]] > weight[strongest] {
+                strongest = selected[k];
+            }
+        }
+        let local_pos = world - vec3<f32>(tm.terrain_origin.x, 0.0, tm.terrain_origin.y);
+        let proj = terrain_projected_pbr(
+            tm, tm_idx, strongest, local_pos, geo_n, terrain_layer_tiling(tm, tm_idx, strongest), ddx, ddy);
+        let tangent = terrain_stable_tangent(geo_n);
+        let proj_n = resolve_surfgrad(
+            geo_n, ts_to_surfgrad(normalize(proj.normal_ts), tangent, cross(geo_n, tangent)));
+        ground.albedo = mix(ground.albedo, proj.albedo, side);
+        ground.roughness = mix(ground.roughness, proj.roughness, side);
+        ground.occlusion = mix(ground.occlusion, proj.occlusion, side);
+        ground.normal = normalize(mix(ground.normal, proj_n, side));
+    }
     s.albedo = mix(s.albedo, ground.albedo, w);
     s.roughness = mix(s.roughness, ground.roughness, w);
     s.metallic = mix(s.metallic, 0.0, w);
