@@ -108,6 +108,9 @@ fn every_composed_root_validates() {
         "scene_capture.wgsl",
         // The editor's preview studio (a material's turning sphere, an asset's thumbnail).
         "preview_studio.wgsl",
+        // Lamps under a pixel as points of light (sunscar-photoreal): built at start-up, so a refused shader stops
+        // every launch.
+        "light_glints.wgsl",
     ] {
         check(root, &shaders.source_or_panic(root));
     }
