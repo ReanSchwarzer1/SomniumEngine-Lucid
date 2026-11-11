@@ -1618,10 +1618,14 @@ impl TerrainData {
     /// Select per-chunk LODs from the camera position (terrain-local), retain
     /// full detail where a water surface crosses the terrain, clamp neighbor
     /// differences to ≤ 1 level, and derive edge stitch masks.
+    ///
+    /// `by_box`: measure to a chunk's box as well as its centre ([`lod_distance`]); false is the centre alone, as it
+    /// was (debug view 40, for a before and after in one launch).
     pub fn select_lods(
         &mut self,
         local_camera_pos: glam::Vec3,
         shoreline_regions: &[crate::water_body::WaterBodyDescriptor],
+        by_box: bool,
     ) {
         let [gx, gz] = self.desc.grid_size;
         let chunk_world = self.desc.chunk_cells as f32 * self.desc.cell_size;
@@ -1631,12 +1635,17 @@ impl TerrainData {
         // beats a serial loop. Default 16×16 stays serial (CR-A: GPU-bound).
         let lod_base = self.desc.lod_base_range;
         crate::jobs::for_each_mut(&mut self.chunks, |chunk| {
-            let center = glam::Vec3::new(
-                (chunk.grid_pos[0] as f32 + 0.5) * chunk_world,
-                (chunk.aabb_min.y + chunk.aabb_max.y) * 0.5,
-                (chunk.grid_pos[1] as f32 + 0.5) * chunk_world,
+            let lo = glam::Vec3::new(
+                chunk.grid_pos[0] as f32 * chunk_world,
+                chunk.aabb_min.y,
+                chunk.grid_pos[1] as f32 * chunk_world,
             );
-            let dist = local_camera_pos.distance(center).max(0.01);
+            let hi = glam::Vec3::new(lo.x + chunk_world, chunk.aabb_max.y, lo.z + chunk_world);
+            let dist = if by_box {
+                lod_distance(local_camera_pos, lo, hi)
+            } else {
+                local_camera_pos.distance((lo + hi) * 0.5).max(0.01)
+            };
             let lod_f = (dist / lod_base).log2().floor();
             chunk.lod = lod_f.clamp(0.0, MAX_TERRAIN_LOD as f32) as u8;
 
@@ -2224,9 +2233,32 @@ fn read_canopy(path: &str) -> Option<horizon::Canopy> {
     Some(horizon::Canopy { top, size, metres: 1000.0 / size as f32 })
 }
 
+/// The distance a chunk's level of detail is picked by: to its centre, or to its box plus half a chunk, whichever is
+/// less. On level ground the two agree, so nothing there changes. A chunk with a cliff in it has a box as tall as
+/// the cliff and a centre halfway down, so an eye on its rim stood far from it and the ground underfoot was drawn
+/// at the next level: the Vela Canyon's rim patch at 4 m cells, a 1-2 m step beside the eye (Sunscar, 11 Nov 2026).
+fn lod_distance(camera: glam::Vec3, lo: glam::Vec3, hi: glam::Vec3) -> f32 {
+    let outside = (lo - camera).max(camera - hi).max(glam::Vec3::ZERO).length();
+    let half = (hi.x - lo.x).max(hi.z - lo.z) * 0.5;
+    camera.distance((lo + hi) * 0.5).min(outside + half).max(0.01)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Vela Canyon's rim chunk (heights 425..828 m, 128 m wide) from an eye on its edge at 829 m, and a level
+    /// chunk from 200 m off.
+    #[test]
+    fn a_chunk_with_a_cliff_in_it_is_near_to_an_eye_on_its_rim() {
+        let (lo, hi) = (glam::Vec3::new(640.0, 425.0, 256.0), glam::Vec3::new(768.0, 828.0, 384.0));
+        let eye = glam::Vec3::new(640.0, 829.1, 280.0);
+        assert!(eye.distance((lo + hi) * 0.5) > 192.0, "by its centre it is at the second level (base 96)");
+        assert!(lod_distance(eye, lo, hi) < 70.0, "by its box it is underfoot");
+        let (lo, hi) = (glam::Vec3::new(0.0, 10.0, 0.0), glam::Vec3::new(128.0, 10.0, 128.0));
+        let eye = glam::Vec3::new(-200.0, 10.0, 64.0);
+        assert_eq!(lod_distance(eye, lo, hi), eye.distance((lo + hi) * 0.5), "level ground: as before");
+    }
 
     fn test_desc() -> TerrainDescriptor {
         TerrainDescriptor {

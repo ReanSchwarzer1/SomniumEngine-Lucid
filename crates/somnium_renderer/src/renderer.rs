@@ -5450,7 +5450,8 @@ impl SomniumRenderer {
                 set_splat_resident(terrain, &mut self.texture_pool, &mut self.global_pool, &ctx.device, resident);
                 self.profiler.cpu_end();
             }
-            terrain.select_lods(local_cam, &shoreline_regions);
+            // Debug view 40 is the lit picture with the ground's levels picked by a chunk's centre alone, as they were.
+            terrain.select_lods(local_cam, &shoreline_regions, self.shading_debug != 40.0);
             self.rebuilt_chunks.clear();
             self.profiler.cpu_begin("Terrain chunk rebuild");
             terrain.rebuild_dirty_chunks(&ctx.queue, &mut self.geometry, &mut self.rebuilt_chunks);
