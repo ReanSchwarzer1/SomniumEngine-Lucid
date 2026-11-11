@@ -98,7 +98,8 @@ struct View {
     // popped in and out with the jitter (18 Oct 2026).
     lod_scale:     f32,
     _time_pad1:    f32,
-    _time_pad2:    f32,
+    // A pixel's angle times the thinnest a foliage strip is drawn, in pixels (`thin_strip.wgsl`; 0 = off).
+    strip_pixel:   f32,
     // Foliage wind (`wind.rs`): xy m/s over the ground, z strength, w fade metres.
     wind:          vec4<f32>,     // offset 224
     // x: the wind clock this frame, y: last frame (for motion vectors).

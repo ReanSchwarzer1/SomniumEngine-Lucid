@@ -188,6 +188,7 @@ impl Shaders {
             "water_reflection.wgsl",
             "water_spectrum.wgsl",
             "wind.wgsl",
+            "thin_strip.wgsl",
             "preview_studio.wgsl",
         );
         // SAFETY: this is a checked-in Somnium-authored artifact produced by
@@ -425,6 +426,7 @@ mod tests {
             "terrain_splat_core.wgsl",
             "clipmap_shade.wgsl",
             "wind.wgsl",
+            "thin_strip.wgsl",
             "sky_eye.wgsl",
             "shading.wgsl",
             "terrain_morph.wgsl",

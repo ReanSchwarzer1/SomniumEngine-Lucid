@@ -16,6 +16,7 @@
 //!include "froxel_depth.wgsl"
 //!include "clipmap_shade.wgsl"
 //!include "wind.wgsl"
+//!include "thin_strip.wgsl"
 //!if LOCAL_SHADOWS
 enable wgpu_ray_query;
 @group(1) @binding(29) var local_shadow_accel: acceleration_structure;
@@ -2473,6 +2474,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         p0 += wind_offset(p0, pivot, material.wind_bend, material.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
         p1 += wind_offset(p1, pivot, material.wind_bend, material.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
         p2 += wind_offset(p2, pivot, material.wind_bend, material.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
+        // A thin strip widened as the visibility pass drew it (thin_strip.wgsl), from the same rest pose.
+        if thin_strip_applies(view.strip_pixel, material.wind_bend, material.wind_flutter) {
+            let ts = thin_strip((instance.model * vec4<f32>(m0, 1.0)).xyz, (instance.model * vec4<f32>(m1, 1.0)).xyz,
+                                (instance.model * vec4<f32>(m2, 1.0)).xyz, vec2<f32>(v0.u, v0.v),
+                                vec2<f32>(v1.u, v1.v), vec2<f32>(v2.u, v2.v), view.camera_pos, view.strip_pixel);
+            p0 += ts.o0;
+            p1 += ts.o1;
+            p2 += ts.o2;
+        }
     }
 
     // Camera-relative, as the visibility pass rasterised them (depth_tie.wgsl `depth_tie_clip`): a world position
