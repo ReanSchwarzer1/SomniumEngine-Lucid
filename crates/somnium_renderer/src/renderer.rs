@@ -6556,6 +6556,7 @@ impl SomniumRenderer {
                 self.volumetric_pass.fog.height_falloff,
                 self.volumetric_pass.fog.base_height,
             );
+        self.shading_pass.set_fog_top(&ctx.queue, self.volumetric_pass.fog.top_height, self.volumetric_pass.fog.top_softness);
 
         // ── 6.9 Volumetric clouds (Phase CONTROL-M) ──────────────────────────
         //

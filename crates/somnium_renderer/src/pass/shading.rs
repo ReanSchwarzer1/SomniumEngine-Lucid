@@ -671,11 +671,12 @@ impl ShadingPass {
             ..Default::default()
         });
 
-        // 16 bytes: `vec4` is the smallest uniform WGSL will align, and only x
-        // is used — the volume's range in metres, 0 when it is switched off.
+        // Two vec4: the volume's range in metres (0 when it is switched off) with the height fog's density, falloff
+        // and base; then the fog's flat top and its softness (`set_fog_top`; zero is no top). Water and the clouds
+        // bind the same buffer and read the first vec4 only.
         let volumetric_range = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Volumetric Range"),
-            size: 16,
+            size: 32,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -1887,6 +1888,13 @@ impl ShadingPass {
             0,
             bytemuck::bytes_of(&[range, density, falloff, base]),
         );
+    }
+
+    /// The height fog's flat top (valley fog) and the metres it fades over, for the fog `shading.wgsl` carries past
+    /// the volume's range and lays over the sky. At or under the fog's base (zero, the default) there is no top, and
+    /// the sky and the far land are fogged as they always were: the sky not at all.
+    pub fn set_fog_top(&self, queue: &wgpu::Queue, top: f32, softness: f32) {
+        queue.write_buffer(&self.volumetric_range, 16, bytemuck::bytes_of(&[top, softness, 0.0, 0.0]));
     }
 
     pub fn set_lighting_extra(&self, queue: &wgpu::Queue, params: [f32; 4]) {
