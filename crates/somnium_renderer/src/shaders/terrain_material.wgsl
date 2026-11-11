@@ -1037,6 +1037,84 @@ fn terrain_wall_layer(tm: TerrainMaterial, strongest: u32) -> u32 {
     return select(tm.cliff_layer, strongest, ((mask >> strongest) & 1u) != 0u);
 }
 
+/// The strata datum's grid side (`terrain::STRATA_SIZE`).
+const TERRAIN_STRATA_SIZE: f32 = 65.0;
+
+/// A steep pixel's two beds by its own height, where its tile has a strata datum (`TerrainMaterial::strata`): the
+/// stack's base under the pixel (terrain's bake, metres above the terrain's origin) and each bed's bottom above that
+/// base (`layer_albedo[layer].a`, the set's layer_strata.json), so contacts run level along a wall and a bed is as thick
+/// on a cliff as on a slope. The 2 m splat could not change with height on a steep face: each contact dripped 8 m down
+/// it (the Vela, 11 Nov 2026). Returns `terrain_wall_pbr`'s (a, wa, b, wb), the nearer contact softened over a metre
+/// and wandering a metre or two along the wall as real contacts do; wa < 0 where there is no datum.
+fn terrain_strata_beds(
+    tm: TerrainMaterial,
+    terrain_index: u32,
+    local_xz: vec2<f32>,
+    world_xz: vec2<f32>,
+    world_y: f32,
+) -> vec4<f32> {
+    if tm.strata.z < 0.5 || tm.strata.x < 0.0 {
+        return vec4<f32>(0.0, -1.0, 0.0, 0.0);
+    }
+    let uv = clamp(local_xz * tm.inv_world_size, vec2<f32>(0.0), vec2<f32>(1.0));
+    let st = (uv * (TERRAIN_STRATA_SIZE - 1.0) + 0.5) / TERRAIN_STRATA_SIZE;
+    let base = textureSampleLevel(textures[i32(tm.strata.x)], default_sampler, st, 0.0).r;
+    let wander = (terrain_value_noise(world_xz * 0.05) - 0.5) * 3.0 + (terrain_value_noise(world_xz * 0.4) - 0.5) * 0.6;
+    let d = world_y - tm.strata.y - base + wander;
+    // The bed d lies in (the greatest bottom at or under it), the one under that, and the one over it.
+    var bed = 99u;
+    var bed_lo = -1.0e9;
+    var under = 99u;
+    var under_lo = -1.0e9;
+    var over = 99u;
+    var over_lo = 1.0e9;
+    var m = u32(tm.cliff_band.z) | (u32(tm.cliff_band.w) << 16u);
+    loop {
+        if m == 0u {
+            break;
+        }
+        let i = firstTrailingBit(m);
+        m = m & (m - 1u);
+        var lo = tm.layer_albedo[i].a;
+        if terrain_storage_reads {
+            lo = terrain_materials[terrain_index].layer_albedo[i].a;
+        }
+        if lo < -1.0e8 {
+            continue;
+        }
+        if lo <= d {
+            if lo > bed_lo {
+                under = bed;
+                under_lo = bed_lo;
+                bed = i;
+                bed_lo = lo;
+            } else if lo > under_lo {
+                under = i;
+                under_lo = lo;
+            }
+        } else if lo < over_lo {
+            over = i;
+            over_lo = lo;
+        }
+    }
+    if bed == 99u {
+        // Under every bed's bottom: the lowest bed carries on down.
+        return select(vec4<f32>(f32(over), 1.0, f32(over), 0.0), vec4<f32>(0.0, -1.0, 0.0, 0.0), over == 99u);
+    }
+    let soft = 0.8;
+    let up = over_lo - d;
+    let down = d - bed_lo;
+    if over != 99u && up < down {
+        let s = smoothstep(-soft, soft, -up);
+        return vec4<f32>(f32(bed), 1.0 - s, f32(over), s);
+    }
+    if under != 99u {
+        let s = smoothstep(-soft, soft, down);
+        return vec4<f32>(f32(bed), s, f32(under), 1.0 - s);
+    }
+    return vec4<f32>(f32(bed), 1.0, f32(bed), 0.0);
+}
+
 /// A steep pixel's wall from its two strongest splat layers `a` (weight `wa`) and `b` (`wb <= wa`), each worn as
 /// `terrain_wall_layer` says and projected as the cliff layer is. Where both carry weight they are height-blended as
 /// the ground blends its layers: an even mix interleaves by each scan's relief, and the weaker one shows only on its own
@@ -1674,12 +1752,22 @@ fn evaluate_terrain_material(
             ib = s;
         }
     }
-    let wall_layer = terrain_wall_layer(tm, selected[ia]);
+    var wall_layer = terrain_wall_layer(tm, selected[ia]);
     if cliff_blend > 0.0 {
         let local_pos = vec3(terrain_xz.x, world_pos.y, terrain_xz.y);
-        let cliff = terrain_wall_pbr(
-            tm, terrain_index, selected[ia], sel_w[ia], selected[ib], sel_w[ib], local_pos, geo_normal, world_ddx,
-            world_ddy);
+        var a = selected[ia];
+        var wa = sel_w[ia];
+        var b = selected[ib];
+        var wb = sel_w[ib];
+        let beds = terrain_strata_beds(tm, terrain_index, terrain_xz, world_pos.xz, world_pos.y);
+        if beds.y >= 0.0 {
+            a = u32(beds.x);
+            wa = beds.y;
+            b = u32(beds.z);
+            wb = beds.w;
+            wall_layer = terrain_wall_layer(tm, a);
+        }
+        let cliff = terrain_wall_pbr(tm, terrain_index, a, wa, b, wb, local_pos, geo_normal, world_ddx, world_ddy);
         taps += select(4u, 6u, tm.projection_mode != 0u);
         albedo = mix(albedo, cliff.albedo, cliff_blend);
         roughness = mix(roughness, cliff.roughness, cliff_blend);

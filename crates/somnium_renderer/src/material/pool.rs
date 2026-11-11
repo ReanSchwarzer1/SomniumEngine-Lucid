@@ -507,7 +507,7 @@ mod material_flag_tests {
         // TSUSHIMA-G spent the pad that left, and TSUSHIMA-H's octave vec4
         // takes it to 2080. The cliff band (Sunscar, 6 Nov 2026) takes it to 2096.
         use crate::terrain::GpuTerrainMaterial;
-        assert_eq!(std::mem::size_of::<GpuTerrainMaterial>(), 2096);
+        assert_eq!(std::mem::size_of::<GpuTerrainMaterial>(), 2112);
         assert_eq!(std::mem::size_of::<GpuTerrainMaterial>() % 16, 0);
 
         let m = GpuTerrainMaterial::zeroed();
