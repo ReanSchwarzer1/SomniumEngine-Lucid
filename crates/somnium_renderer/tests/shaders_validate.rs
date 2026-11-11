@@ -992,10 +992,24 @@ fn macro_octaves_land_between_the_macro_blend_and_the_squaring() {
         );
         found += 1;
     }
+    assert_eq!(found, 1, "the live path blends the macro map in place, before its octaves and squaring");
+    // The clipmap path (11 Nov 2026): the generator caches the detail with its octaves and no macro lerp, because the
+    // lerp fades with the eye's distance; shading lerps the octave-tinted detail toward the octave-tinted far colour,
+    // which is the live path's result exactly for Lerp and Multiply. Both fade the same way.
+    let generate = &source[source.find("fn terrain_generate_texel(").expect("the clipmap generator")..];
+    let generate = &generate[..generate.find("\n}").expect("its end")];
+    assert!(!generate.contains("terrain_macro_blend("), "a cached texel cannot know the eye's distance");
+    let shade = &source[source.find("fn evaluate_clipmap_material(").expect("clipmap shading")..];
+    let shade = &shade[..shade.find("\n}").expect("its end")];
+    assert!(
+        shade.contains("terrain_macro_blend(detail, macro_c.rgb * octaves, tm.macro_mode, fade)")
+            && shade.contains("terrain_macro_fade(world_pos)"),
+        "clipmap shading lerps the octave-tinted detail toward the octave-tinted far colour, faded with distance"
+    );
     assert_eq!(
-        found, 2,
-        "the live and clipmap-generate paths each blend a macro map; \
-         a terrain shades through whichever the distance picks and they must agree"
+        source.matches("terrain_macro_fade(world_pos)").count(),
+        2,
+        "the live and clipmap paths fade the macro tier the same way"
     );
 }
 

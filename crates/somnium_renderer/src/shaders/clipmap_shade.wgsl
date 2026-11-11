@@ -318,6 +318,22 @@ fn evaluate_clipmap_material(
         tap.valid = true;
     }
     var albedo = tap.albedo;
+    // The macro tier, faded with the eye's distance as on the live path. The cache holds (detail x octaves)^2 x
+    // wet darkening; the lerp goes between the octave-tinted detail and the octave-tinted far colour in the same
+    // perceptual space, so the result is the live path's: o * lerp(d, m, f) = lerp(d * o, m * o, f).
+    if terrain_clipmap_source < 2.0 {
+        let local_xz = world_xz - tm.terrain_origin;
+        let macro_c = terrain_macro_sample(
+            tm, local_xz * tm.inv_world_size, world_ddx * tm.inv_world_size, world_ddy * tm.inv_world_size);
+        let fade = macro_c.a * terrain_macro_fade(world_pos);
+        if fade > 0.0 {
+            let darken = mix(1.0, tm.wetness_darken, tap.wetness);
+            let octaves = terrain_macro_octaves(local_xz, tm.macro_octave_strength.xyz);
+            let detail = sqrt(albedo / max(darken, 1e-3));
+            let blended = terrain_macro_blend(detail, macro_c.rgb * octaves, tm.macro_mode, fade);
+            albedo = blended * blended * darken;
+        }
+    }
     var roughness = tap.roughness;
     var occlusion = tap.occlusion;
     let nxy = tap.nxy;

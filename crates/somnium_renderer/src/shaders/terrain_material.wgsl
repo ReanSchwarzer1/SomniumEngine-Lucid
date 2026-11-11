@@ -1027,6 +1027,16 @@ fn terrain_macro_blend(
     return mix(detail, blended, factor);
 }
 
+/// Where the macro tier's lerp toward each layer's far colour comes in (sunscar-look's ask, 11 Nov 2026): scanned
+/// ground keeps its own texels within TERRAIN_MACRO_NEAR of the eye and takes the far colour in full by
+/// TERRAIN_MACRO_FAR. At every distance, as it was, it flattened the scans from a few metres out.
+const TERRAIN_MACRO_NEAR: f32 = 40.0;
+const TERRAIN_MACRO_FAR: f32 = 400.0;
+
+fn terrain_macro_fade(world_pos: vec3<f32>) -> f32 {
+    return smoothstep(TERRAIN_MACRO_NEAR, TERRAIN_MACRO_FAR, distance(world_pos, view.camera_pos));
+}
+
 /// Sample the macro map at a terrain-global UV, returning colour and the
 /// per-texel strength its alpha carries.
 ///
@@ -1382,8 +1392,10 @@ fn terrain_generate_texel(
         height += samples[s].height * b;
         moisture += terrain_layer_moisture(tm, terrain_index, selected[s]) * b;
     }
-    let macro_c = terrain_macro_sample(tm, splat_uv, splat_ddx, splat_ddy);
-    albedo = terrain_macro_blend(albedo, macro_c.rgb, tm.macro_mode, macro_c.a);
+    // No macro lerp here: it fades with the eye's distance, which a cached texel cannot know, so
+    // `evaluate_clipmap_material` applies it at shading time over these octaves (exact for Lerp and Multiply).
+    _ = splat_ddx;
+    _ = splat_ddy;
     // Same octaves, same world frame, same place in the chain as the live path.
     // A terrain shades through whichever of the two the distance picks, and a
     // clipmap ring that disagreed with live terrain about the tint would put a
@@ -1566,7 +1578,7 @@ fn evaluate_terrain_material(
     }
 
     let macro_c = terrain_macro_sample(tm, splat_uv, splat_ddx, splat_ddy);
-    albedo = terrain_macro_blend(albedo, macro_c.rgb, tm.macro_mode, macro_c.a);
+    albedo = terrain_macro_blend(albedo, macro_c.rgb, tm.macro_mode, macro_c.a * terrain_macro_fade(world_pos));
     // TSUSHIMA-H, in the same approximately-perceptual space the macro blend
     // above already works in — between the `sqrt` and the squaring, not after.
     // Applied later it would be a second, independent gain on linear radiance
