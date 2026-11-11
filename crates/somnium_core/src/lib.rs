@@ -1510,6 +1510,10 @@ pub struct PostProcessComponent {
     /// A local snowline map, project-relative (`SNOWLN01`, see `somnium_renderer::snow_map`): where it covers, its
     /// snowline replaces `snowline_m` and already carries the sun's shade. Empty for none.
     pub snow_map: String,
+    /// Meshes blend into the terrain under them within this many metres (ground_blend.wgsl): their colour, roughness
+    /// and normal cross-fade to the ground's on a ragged line. Materials that set `somnium_ground_blend` use their own
+    /// (negative: never); scaled by each instance's size. 0 (default) is off.
+    pub ground_blend_m: f32,
 }
 
 impl Default for PostProcessComponent {
@@ -1703,6 +1707,7 @@ impl Default for PostProcessComponent {
             snow_scour: 0.3,
             snow_bare_slope_deg: 65.0,
             snow_map: String::new(),
+            ground_blend_m: 0.0,
         }
     }
 }

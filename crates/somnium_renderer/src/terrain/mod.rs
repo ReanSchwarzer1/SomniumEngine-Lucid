@@ -90,6 +90,51 @@ impl Default for TerrainDescriptor {
     }
 }
 
+/// [`Terrain::height_gpu`]: one R32Float texel per vertex, metres above the origin, where the device filters it.
+fn upload_heights(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    heights: &[f32],
+    tx: u32,
+    tz: u32,
+    height_scale: f32,
+) -> Option<(wgpu::Texture, wgpu::TextureView)> {
+    if !device.features().contains(wgpu::Features::FLOAT32_FILTERABLE) || heights.len() != (tx * tz) as usize {
+        return None;
+    }
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Terrain Heights"),
+        size: wgpu::Extent3d { width: tx, height: tz, depth_or_array_layers: 1 },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let desc = TerrainDescriptor { height_scale, ..TerrainDescriptor::default() };
+    write_height_texels(queue, &texture, heights, tx, tz, desc.height_scale);
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    Some((texture, view))
+}
+
+fn write_heights(queue: &wgpu::Queue, texture: &wgpu::Texture, heights: &[f32], desc: &TerrainDescriptor) {
+    let (tx, tz) = (desc.total_vertices_x(), desc.total_vertices_z());
+    if heights.len() == (tx * tz) as usize && texture.width() == tx && texture.height() == tz {
+        write_height_texels(queue, texture, heights, tx, tz, desc.height_scale);
+    }
+}
+
+fn write_height_texels(queue: &wgpu::Queue, texture: &wgpu::Texture, heights: &[f32], tx: u32, tz: u32, scale: f32) {
+    let metres: Vec<f32> = heights.iter().map(|h| h * scale).collect();
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo { texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+        bytemuck::cast_slice(&metres),
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(tx * 4), rows_per_image: Some(tz) },
+        wgpu::Extent3d { width: tx, height: tz, depth_or_array_layers: 1 },
+    );
+}
+
 impl TerrainDescriptor {
     /// Total vertices along X (`grid_size[0] * chunk_cells + 1`).
     pub fn total_vertices_x(&self) -> u32 {
@@ -359,6 +404,8 @@ pub struct TerrainTextureIds {
     pub relief_normal: i32,
     /// The stack's base under the tile (`TerrainData::strata_gpu`), for strata by height; -1 when there is none.
     pub strata: i32,
+    /// Metres above the origin at every vertex (`Terrain::height_gpu`), for mesh blending; -1 when there is none.
+    pub height: i32,
 }
 
 impl Default for TerrainTextureIds {
@@ -373,6 +420,7 @@ impl Default for TerrainTextureIds {
             sky_visibility: -1,
             relief_normal: -1,
             strata: -1,
+            height: -1,
         }
     }
 }
@@ -443,6 +491,10 @@ pub struct TerrainData {
     /// horizon bake, on the same `horizon_dirty` flag — both read the
     /// heightfield and both go stale for exactly the same reasons.
     pub relief_gpu: relief::ReliefGpu,
+    /// Metres above the terrain's origin at every vertex, for meshes blending into the ground (`ground_blend.wgsl`):
+    /// R32Float, so `None` where the device cannot filter 32-bit floats, and then nothing blends. Rewritten with the
+    /// relief map, on the same `horizon_dirty` flag.
+    pub height_gpu: Option<(wgpu::Texture, wgpu::TextureView)>,
     /// Phase TSUSHIMA-E. `SOMNIUM_TERRAIN_RELIEF=0` is the A/B rail.
     pub relief_normal: bool,
     /// Metres at which the baked relief normal has fully taken over from the
@@ -909,6 +961,14 @@ impl TerrainData {
             ),
         );
 
+        let height_gpu = upload_heights(
+            device,
+            queue,
+            &heightmap,
+            desc.total_vertices_x(),
+            desc.total_vertices_z(),
+            desc.height_scale,
+        );
         let relief_gpu = relief::upload(
             device,
             queue,
@@ -926,6 +986,7 @@ impl TerrainData {
             macro_texture,
             macro_view,
             relief_gpu,
+            height_gpu,
             relief_normal: std::env::var("SOMNIUM_TERRAIN_RELIEF").as_deref() != Ok("0"),
             // The last cascade's far edge, matching TSUSHIMA-B's cross-fade.
             // Inside it the mesh is at a fine LOD and its own normals are
@@ -1564,6 +1625,13 @@ impl TerrainData {
         self.strata_beds.iter().fold(self.rock_mask, |m, &(slot, _)| m | (1 << slot))
     }
 
+    /// Put the heights back on the GPU after they change (`height_gpu`).
+    fn rewrite_heights(&self, queue: &wgpu::Queue) {
+        if let Some((texture, _)) = &self.height_gpu {
+            write_heights(queue, texture, &self.heightmap, &self.desc);
+        }
+    }
+
     /// Fill the heightmap with procedural FBM relief (Phase 25L).
     pub fn generate_relief(&mut self, seed: u32, amplitude: f32) {
         let (tx, tz) = (self.desc.total_vertices_x(), self.desc.total_vertices_z());
@@ -1853,6 +1921,7 @@ impl TerrainData {
                     relief::RELIEF_SIZE,
                 ),
             );
+            self.rewrite_heights(queue);
             // The distribution, not just the timing. "Sky visibility is on"
             // and "sky visibility varies across this terrain" are different
             // claims, and only the second one can change a picture.
@@ -2163,6 +2232,7 @@ impl TerrainData {
             {
                 horizon::rewrite(queue, &self.horizon_gpu, &horizon_maps);
                 relief::rewrite(queue, &self.relief_gpu, &relief_maps);
+                self.rewrite_heights(queue);
                 self.horizon_dirty = false;
             }
             _ => self.horizon_dirty = true,
