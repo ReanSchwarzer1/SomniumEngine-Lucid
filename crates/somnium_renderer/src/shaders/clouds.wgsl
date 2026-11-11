@@ -78,7 +78,13 @@ struct CloudParams {
     volumetric_range: f32,
     /// Scale on the scattered light (`CloudSettings::brightness`).
     brightness: f32,
-    _pad1: f32,
+    /// How far a closed deck is carried down to the horizon, 0..1 (`CloudPass::horizon_closure`; `closed_dir`).
+    horizon_closure: f32,
+    /// How far a cloud is heaped, 0..1 (`CloudPass::heap`; `slab_density`).
+    heap: f32,
+    _pad2: f32,
+    _pad3: f32,
+    _pad4: f32,
 }
 
 @group(0) @binding(0) var<uniform> cp: CloudParams;
@@ -146,6 +152,14 @@ fn slab_density(world_pos: vec3<f32>, cheap: bool) -> f32 {
     if coverage <= 0.001 {
         return 0.0;
     }
+    // Cumulus heaps (`CloudPass::heap`; off by default). The height profile below is the same in every column, so
+    // every cloud of a field ended at one height: white bricks with level tops, seen from the side (the lead,
+    // 11 Nov 2026). A real one stands on a flat base, is tallest over its middle and falls away to its edge. The
+    // column's profile is read as if the layer were thinner where the cloud's cover is thin: a third at its edge.
+    var profile_height = height;
+    if cp.heap > 0.0 {
+        profile_height = height / mix(1.0, mix(0.3, 1.0, smoothstep(0.0, 0.55, coverage)), cp.heap);
+    }
 
     // The wind carries the *shape* as well as the weather field, and the two
     // move at slightly different rates so the sky does not read as one rigid
@@ -160,7 +174,7 @@ fn slab_density(world_pos: vec3<f32>, cheap: bool) -> f32 {
     // rather than like a density multiply.
     let worley_fbm = base.g * 0.625 + base.b * 0.25 + base.a * 0.125;
     var shape = clamp(cloud_remap(base.r, worley_fbm - 1.0, 1.0, 0.0, 1.0), 0.0, 1.0);
-    shape *= height_gradient(height, weather.g);
+    shape *= height_gradient(profile_height, weather.g);
     var density = clamp(cloud_remap(shape, 1.0 - coverage, 1.0, 0.0, 1.0), 0.0, 1.0) * coverage;
 
     if density <= 0.0 {
@@ -177,7 +191,7 @@ fn slab_density(world_pos: vec3<f32>, cheap: bool) -> f32 {
         / max(cp.shape_scale * 0.11, 1.0);
     let detail = textureSampleLevel(detail_noise_tex, cloud_sampler, detail_uvw, 0.0);
     let detail_fbm = detail.r * 0.625 + detail.g * 0.25 + detail.b * 0.125;
-    let modifier = mix(detail_fbm, 1.0 - detail_fbm, clamp(height * 5.0, 0.0, 1.0));
+    let modifier = mix(detail_fbm, 1.0 - detail_fbm, clamp(profile_height * 5.0, 0.0, 1.0));
     density = cloud_remap(
         density,
         modifier * cp.detail_strength * 0.35,
@@ -778,6 +792,25 @@ fn cloud_aerial(view_uv: vec2<f32>, distance: f32) -> vec4<f32> {
 // The march
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+/// Sine of the elevation a closed deck is carried down from (2.6 degrees): above it a ray still meets the layer
+/// inside the march's reach.
+const HORIZON_FLOOR: f32 = 0.045;
+
+/// The direction to march for a ray that looks at the sky: its own, or, under a closed deck and within a few degrees
+/// of the horizon, the same bearing at 2.6 degrees. The layer is a flat slab and the march gives up at its reach, so
+/// under about two and a half degrees no ray meets a deck that in truth runs to the horizon and beyond; and a ray
+/// level with the deck's base or under it looks out below the deck for ever. A strip of the bare bright sky stood
+/// there (the open-land stills, 11 Nov 2026). What is there is the deck's far underside: the same grey, drawn down.
+/// Rays well below the horizon are the ground's and keep their own way.
+fn closed_dir(dir: vec3<f32>) -> vec3<f32> {
+    let level = length(dir.xz);
+    if cp.horizon_closure <= 0.0 || dir.y >= HORIZON_FLOOR || dir.y < -0.02 || level < 1e-4 {
+        return dir;
+    }
+    let reach = sqrt(1.0 - HORIZON_FLOOR * HORIZON_FLOOR) / level;
+    return normalize(mix(dir, vec3<f32>(dir.x * reach, HORIZON_FLOOR, dir.z * reach), cp.horizon_closure));
+}
+
 /// One ray through the layer from the camera: in-scattered light, transmittance and the transmittance-weighted
 /// depth. `jitter` (0..1) moves the first sample within a long step. Shared by the screen march and the sky
 /// light's capture (`cloud_env`).
@@ -1008,7 +1041,10 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
     // w = 0 and its xyz is the ray's direction (taken undivided, an orthographic view's far plane less its near).
     let near = cp.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
     let far = cp.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-    let ray_dir = normalize(far.xyz - near.xyz / near.w * far.w);
+    let own_dir = normalize(far.xyz - near.xyz / near.w * far.w);
+    // Under a closed deck a texel that sees sky follows the deck to the horizon (`closed_dir`). Whether it sees sky is
+    // known once its depth taps are read, below; a texel that is all ground goes back to its own way there.
+    var ray_dir = closed_dir(own_dir);
 
     var interval = cloud_interval(cp.camera_pos, ray_dir);
     if interval.y <= interval.x {
@@ -1044,6 +1080,10 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
         farthest = max(farthest, length(occ_clip.xyz / occ_clip.w));
     }
     if !sky_seen {
+        if cp.horizon_closure > 0.0 {
+            ray_dir = own_dir;
+            interval = cloud_interval(cp.camera_pos, ray_dir);
+        }
         interval.y = min(interval.y, farthest);
         if interval.y <= interval.x {
             textureStore(scatter_out, vec2<i32>(gid.xy), vec4<f32>(0.0, 0.0, 0.0, 1.0));
@@ -1104,7 +1144,8 @@ fn cloud_env(@builtin(global_invocation_id) gid: vec3<u32>) {
     if gid.x >= dims.x || gid.y >= dims.y {
         return;
     }
-    let dir = env_cube_dir(gid.z, (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims));
+    // The capture closes a deck to the horizon as the picture does: the far land and sea fade toward what it holds.
+    let dir = closed_dir(env_cube_dir(gid.z, (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims)));
     var out = vec4<f32>(0.0, 0.0, 0.0, 1.0);
     let interval = cloud_interval(cp.camera_pos, dir);
     if (cp.density > 0.0 || storm.counts.x > 0u) && interval.y > interval.x {

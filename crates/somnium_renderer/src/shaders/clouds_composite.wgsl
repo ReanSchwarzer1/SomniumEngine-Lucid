@@ -41,8 +41,7 @@ struct CompositeParams {
     depth_sigma: f32,
     /// Cloud layer top, metres.
     layer_top: f32,
-    /// How far a closed deck is carried down to the horizon, 0..1 (`CloudPass::horizon_closure`).
-    horizon_closure: f32,
+    _pad0: f32,
     _pad1: f32,
     // The sky eye, which burns through the deck: `eye_through` of it survives
     // where the cloud is opaque (the shading pass drew it under the cloud).
@@ -143,54 +142,13 @@ fn sky_cloud(uv: vec2<f32>, depth_dims: vec2<u32>) -> vec4<f32> {
     return colour / max(weight_sum, 1e-6);
 }
 
-/// The direction a sky pixel looks. Reversed-Z: depth 1 is the near plane and 0 infinity, where a perspective's
-/// point has w = 0 and its xyz is the ray's direction.
-fn sky_ray(uv: vec2<f32>) -> vec3<f32> {
-    let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    let near_p = comp.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
-    let far_p = comp.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-    return normalize(far_p.xyz - near_p.xyz / near_p.w * far_p.w);
-}
-
-/// Sine of the elevation under which a closed deck is carried to the horizon (2.6 degrees): above it the march
-/// still meets the layer inside its reach.
-const HORIZON_FLOOR: f32 = 0.045;
-
-/// A closed deck reaches the horizon. The layer is a flat slab and the march gives up at its reach, so under about
-/// two and a half degrees a ray never meets it, and looking out from under (or from the level of) an overcast a strip
-/// of the bare bright sky stood between the deck and the horizon (the open-land stills, 11 Nov 2026). There the
-/// deck is shown as it is in the same column at two and a half degrees, which is what a deck's far underside is: the
-/// same grey, drawn down to the horizon. Where something stands in that column the read is tried once more, higher.
-fn close_horizon(cloud: vec4<f32>, uv: vec2<f32>, depth_dims: vec2<u32>) -> vec4<f32> {
-    let dir = sky_ray(uv);
-    if dir.y >= HORIZON_FLOOR {
-        return cloud;
-    }
-    // How fast the elevation's sine climbs up the picture, from a second ray a fiftieth of its height higher.
-    let rise = (sky_ray(uv - vec2<f32>(0.0, 0.02)).y - dir.y) / 0.02;
-    if rise <= 1e-4 {
-        return cloud;
-    }
-    var above = sky_cloud(vec2<f32>(uv.x, clamp(uv.y - (HORIZON_FLOOR - dir.y) / rise, 0.0, 1.0)), depth_dims);
-    if above.a > 0.5 {
-        above = sky_cloud(vec2<f32>(uv.x, clamp(uv.y - (HORIZON_FLOOR * 2.5 - dir.y) / rise, 0.0, 1.0)), depth_dims);
-    }
-    if above.a > 0.5 {
-        return cloud;
-    }
-    return mix(cloud, above, comp.horizon_closure);
-}
-
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let depth_dims = textureDimensions(comp_depth);
     let here = textureLoad(comp_depth, vec2<i32>(in.uv * vec2<f32>(depth_dims)), 0);
     // Sky: the cloud is behind nothing, so a bilinear read of the texels that were marched (`sky_cloud`).
     if here <= 0.0 || here >= 1.0 {
-        var cloud = sky_cloud(in.uv, depth_dims);
-        if comp.horizon_closure > 0.0 {
-            cloud = close_horizon(cloud, in.uv, depth_dims);
-        }
+        let cloud = sky_cloud(in.uv, depth_dims);
         if comp.eye_intensity <= 0.0 {
             return cloud;
         }
