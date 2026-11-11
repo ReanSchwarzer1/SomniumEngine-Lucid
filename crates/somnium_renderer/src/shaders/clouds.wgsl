@@ -252,7 +252,11 @@ fn storm_cell(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
     // Bands round the tower where the updraft turns (a supercell's striations).
     let band = 1.0 + v.b.y * 0.07 * sin(h * 52.0 + atan2(d.y, d.x) * 2.0 - v.albedo.w);
     let bell = (0.18 + 0.3 * v.b.y) * (1.0 - smoothstep(0.0, 0.22, h));
-    let rt = radius * (0.82 + bell + 0.7 * smoothstep(0.5, 0.95, h)) * band;
+    // A tower that has reached its anvil flares into it (`b.z` 1). One that has not (a flanking line's, a young
+    // storm's) is a cumulus still: it draws in to a rounded head. (Flared and cut level, each stood as a drum with a
+    // collar: the windowless pictures, 12 Nov.)
+    let head = sqrt(max(1.0 - pow(smoothstep(0.4, 1.0, h), 2.0), 0.0));
+    let rt = radius * mix((0.82 + bell) * head, 0.82 + bell + 0.7 * smoothstep(0.5, 0.95, h), v.b.z) * band;
     let dome = 0.97 + over * (1.0 - smoothstep(0.0, radius * 0.9, rho));
     // A convective tower's edge is hard: the shape fills over a sixth of its radius, and the noise frays only that.
     let tower = (1.0 - smoothstep(rt * 0.84, rt, rho)) * (1.0 - smoothstep(dome - 0.05, dome, h)) * smoothstep(0.0, 0.012, h);
@@ -293,7 +297,8 @@ fn storm_anvil(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
             fray = 0.15;
         }
     }
-    return vec2<f32>(anvil, fray);
+    // Ice: its rim thins away in fibres, it does not break into puffs.
+    return vec2<f32>(anvil, fray * 0.08);
 }
 
 /// A storm's base: a level deck, an ellipse drawn out downwind, thick at the storm and thinning to a rim that the

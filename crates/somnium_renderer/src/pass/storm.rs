@@ -83,7 +83,8 @@ impl StormVolume {
         let dir = downwind.normalize_or(glam::Vec2::X);
         let mut v = Self::new(CELL, base, radius, height, 1.0, (radius * 2.2).clamp(600.0, 6000.0));
         v.a = [dir.x, dir.y, 0.0, 0.0];
-        v.b = [lean, striation.clamp(0.0, 1.0), 0.0, overshoot.max(0.0)];
+        // b.z: it flares into an anvil at its top (1, the default); a game sets 0 for a tower with none.
+        v.b = [lean, striation.clamp(0.0, 1.0), 1.0, overshoot.max(0.0)];
         // Its widest (the flare under the anvil, 1.63 radii with its bands) pushed out by all the noise may (1.35).
         let centre = glam::Vec2::new(base.x, base.z) + dir * (lean * 0.5);
         v.bound = [centre.x, centre.y, radius * 2.2 + lean.abs() * 0.5, (radius * 0.08).max(30.0)];
