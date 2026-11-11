@@ -4914,6 +4914,28 @@ impl SomniumRenderer {
         } else {
             0
         };
+        // The GPU memory held, for the profile table: the report walks every allocation, so twice a second.
+        if self.profiler.enabled()
+            && self.profiler.frame_index() % 30 == 0
+            && let Some(report) = ctx.device.generate_allocator_report()
+        {
+            self.profiler.gpu_memory_mib = [report.total_allocated_bytes >> 20, report.total_reserved_bytes >> 20];
+            // `SOMNIUM_GPU_MEMORY_TOP=1`: every ten seconds or so, what holds it, by the label each resource was made
+            // with.
+            if self.profiler.frame_index() % 600 == 0 && std::env::var("SOMNIUM_GPU_MEMORY_TOP").as_deref() == Ok("1") {
+                let mut held: std::collections::HashMap<&str, (u64, u32)> = std::collections::HashMap::new();
+                for allocation in &report.allocations {
+                    let entry = held.entry(allocation.name.as_str()).or_default();
+                    entry.0 += allocation.size;
+                    entry.1 += 1;
+                }
+                let mut held: Vec<_> = held.into_iter().collect();
+                held.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+                for (name, (bytes, count)) in held.into_iter().take(16) {
+                    tracing::info!("GPU memory: {:>6} MiB in {count:>5} of {name}", bytes >> 20);
+                }
+            }
+        }
         self.profiler.end(&mut encoder); // Frame
         self.profiler.end_frame(&mut encoder);
         let submit_started = std::time::Instant::now();
@@ -5625,6 +5647,12 @@ impl SomniumRenderer {
                 mat.macro_mode &= !crate::terrain::MACRO_FADES;
                 mat.cliff_band[2] = 0.0;
                 mat.cliff_band[3] = 0.0;
+            }
+            // Debug view 43 is the lit picture without the baked horizon's sun shadow (the sky's share stays): what the
+            // traced sun alone gives the far ground.
+            if self.shading_debug == 43.0 {
+                mat.horizon_map_a = -1;
+                mat.horizon_map_b = -1;
             }
             let terrain_index = terrain.terrain_index;
             let edit_revision = terrain.edit_revision;

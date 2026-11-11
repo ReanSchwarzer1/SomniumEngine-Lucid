@@ -458,6 +458,10 @@ pub struct GpuProfiler {
     scratch: Arc<Mutex<Vec<u64>>>,
     /// Frames between headless log dumps, 0 for never (`SOMNIUM_PROFILE_EVERY`).
     log_every: u64,
+    /// GPU memory this device has in use and has reserved, MiB, as the renderer last read it (twice a second while
+    /// profiling). A walk into a canyon of 13,000 rock pieces lost the device and nothing in the log said how full
+    /// the card was (Sunscar, 11 Nov 2026).
+    pub gpu_memory_mib: [u64; 2],
 }
 
 impl GpuProfiler {
@@ -575,6 +579,7 @@ impl GpuProfiler {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(120),
+            gpu_memory_mib: [0; 2],
         }
     }
 
@@ -1036,6 +1041,10 @@ impl GpuProfiler {
         out.push(format!(
             "{:<26} {} rendered / {} resident",
             "virtual shadow pages", c.virtual_shadow_pages, c.virtual_shadow_resident
+        ));
+        out.push(format!(
+            "{:<26} {} MiB in use / {} MiB reserved",
+            "gpu memory", self.gpu_memory_mib[0], self.gpu_memory_mib[1]
         ));
         out
     }
