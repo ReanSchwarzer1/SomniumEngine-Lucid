@@ -155,7 +155,9 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) drop: u3
             let to_flash = pp.flash_pos[i].xyz - (here + pp.camera_pos);
             let lux = pp.flash_color[i].rgb / (dot(to_flash, to_flash) + 25.0);
             if pp.kind < 0.5 {
-                radiance += lux * hg(dot(toward, normalize(to_flash)), 0.8);
+                // A drop throws a flash's light forward in a narrow lobe: the rain blazes round the bolt, not all
+                // over the picture.
+                radiance += lux * hg(dot(toward, normalize(to_flash)), 0.92);
             } else {
                 radiance += 0.85 * lux / PRECIP_PI;
             }

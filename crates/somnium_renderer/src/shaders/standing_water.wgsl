@@ -99,10 +99,14 @@ fn apply_standing_water(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>,
         up = normalize(vec3<f32>(tilt.x, 1.0, tilt.y));
     }
     // Shallow, a little cloudy water over wet soil: the bed shows darker through it, and the surface is water's own
-    // mirror (a dielectric of index 1.33).
+    // (a dielectric of index 1.33).
+    // ponytail: not a true mirror. The sky light's sharpest level holds the clear sky alone (the cloud deck is laid
+    // into its blurred levels only), so a mirror here shows blue sky under an overcast: first stills, 11 Nov. At
+    // this roughness the pool shows the deck, a little soft; rain roughens it further. A mirror needs the deck in
+    // what reflections see.
     s.albedo = mix(s.albedo, s.albedo * 0.5, water);
     s.normal = normalize(mix(s.normal, up, water));
-    s.roughness = mix(s.roughness, 0.035, water);
+    s.roughness = mix(s.roughness, mix(0.16, 0.22, saturate(rain * 2.0)), water);
     s.metallic = mix(s.metallic, 0.0, water);
     s.f0 = mix(s.f0, vec3<f32>(0.02), water);
     return s;
