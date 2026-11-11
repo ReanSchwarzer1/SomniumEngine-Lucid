@@ -9392,9 +9392,15 @@ impl<G: GameApp> Engine<G> {
                 slow_foliage_step(terrain_id, "painted grid", since);
                 grid.kinds.clone()
             };
-            // Kinds generated round the camera need their meshes as painted ones do.
-            let cover_kinds: Vec<u16> =
-                self.project_foliage.iter().filter(|(_, e)| e.ground_cover.is_some()).map(|(k, _)| *k).collect();
+            // Kinds generated round the camera need their meshes as painted ones do: the ones this terrain's ground
+            // set grows. Every cover kind was loaded for every terrain: Sunscar has 1,142, Monargent's ground grows
+            // 707 of them, and the rest were part of a minute of half-second frames after a start (11 Nov 2026).
+            let cover_kinds: Vec<u16> = self
+                .project_foliage
+                .iter()
+                .filter(|(_, e)| e.ground_cover.as_ref().is_some_and(|cover| cover.grows_on(&layer_set)))
+                .map(|(k, _)| *k)
+                .collect();
             for kind in kinds.iter().chain(&cover_kinds) {
                 self.ensure_palette_mesh(*kind);
             }
