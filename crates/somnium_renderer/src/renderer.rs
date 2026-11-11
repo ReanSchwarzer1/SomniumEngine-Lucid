@@ -5381,6 +5381,7 @@ impl SomniumRenderer {
         } else {
             0.0
         };
+        self.ibl_pass.clouds_under = self.cloud_pass.horizon_closure;
         self.ibl_pass.generate_if_needed(
             &ctx.device,
             &ctx.queue,
@@ -5388,7 +5389,6 @@ impl SomniumRenderer {
             self.light_color,
             overcast,
             self.cloud_pass.sky_light_clouds(),
-            self.cloud_pass.horizon_closure,
         );
 
         // ── 1. Compute cascades and upload light buffer ───────────────────────
