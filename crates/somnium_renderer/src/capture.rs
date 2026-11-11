@@ -34,6 +34,15 @@ static CAPTURE_FINISHED: AtomicBool = AtomicBool::new(false);
 /// did, every time.
 static SURFACE_PENDING: AtomicUsize = AtomicUsize::new(0);
 
+/// Captures written this run. `SOMNIUM_SURFACES_AB=captures` turns photoreal's surface changes off and on by it, so a
+/// proof's before and after come from one launch (one launch per turn at the window lock, Sunscar 11 Nov 2026).
+static CAPTURES_WRITTEN: AtomicUsize = AtomicUsize::new(0);
+
+/// How many captures this run has written.
+pub fn captures_written() -> usize {
+    CAPTURES_WRITTEN.load(Ordering::Relaxed)
+}
+
 /// Say that one more surface is going to be written before the run may end.
 pub fn expect_surface_capture() {
     SURFACE_PENDING.fetch_add(1, Ordering::Relaxed);
@@ -784,6 +793,7 @@ impl FrameCapture {
         self.display_pending = None;
         self.ui_staging = None;
         self.ui_pending = None;
+        CAPTURES_WRITTEN.fetch_add(1, Ordering::Relaxed);
         CAPTURE_FINISHED.store(true, Ordering::Relaxed);
     }
 

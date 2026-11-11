@@ -124,6 +124,25 @@ struct FrameViewState {
     overlays: bool,
 }
 
+/// `SOMNIUM_SURFACES_AB=captures` (proof stills): photoreal's surface changes on the ground, the macro tier fading with
+/// distance and steep ground wearing its own bed's rock, are off until the run's first capture is written, then on,
+/// off, ... by each one written. A walk naming every view twice shoots each pair, before and after, in one launch (one
+/// launch per turn at Sunscar's window lock, 11 Nov 2026). `=1` (cost) turns them off in the frame=120, 360, ... blocks
+/// of a run with SOMNIUM_PROFILE_EVERY=120, as SOMNIUM_SNOW_AB.
+fn surfaces_ab_off(frame: u64) -> bool {
+    static AB: std::sync::LazyLock<u8> =
+        std::sync::LazyLock::new(|| match std::env::var("SOMNIUM_SURFACES_AB").as_deref() {
+            Ok("1") => 1,
+            Ok("captures") => 2,
+            _ => 0,
+        });
+    match *AB {
+        1 => (frame + 60) / 120 % 2 == 1,
+        2 => crate::capture::captures_written() % 2 == 0,
+        _ => false,
+    }
+}
+
 pub struct SomniumRenderer {
     /// Global descriptor pool (bindless arrays, includes light buffer at binding 6).
     pub global_pool: GlobalResourcePool,
@@ -372,6 +391,8 @@ pub struct SomniumRenderer {
     /// (all zero is none), and its project path as last asked for.
     pub snow_map_params: [f32; 8],
     pub snow_map_source: String,
+    /// Last frame's [`surfaces_ab_off`], so a clipmap regenerates when its fade flips.
+    surfaces_ab_was_off: bool,
     /// Radial vignette strength (0 = off, 1 = default, higher = stronger).
     ///
     /// Defaults to **off**: an always-on vignette darkens the viewport edges,
@@ -1678,6 +1699,7 @@ impl SomniumRenderer {
             snow: [0.0; 16],
             snow_map_params: [0.0; 8],
             snow_map_source: String::new(),
+            surfaces_ab_was_off: false,
             vignette_strength: 0.0,
             chromatic_aberration: 0.0,
             fxaa_pass: crate::pass::fxaa::FxaaPass::new(
@@ -5576,15 +5598,31 @@ impl SomniumRenderer {
         self.profiler.counters.terrain_cpu_culled = cpu_culled;
         self.profiler.cpu_end();
 
+        let surfaces_off = surfaces_ab_off(self.profiler.frame_index());
+        let surfaces_flipped = surfaces_off != self.surfaces_ab_was_off;
+        self.surfaces_ab_was_off = surfaces_off;
+        if surfaces_flipped {
+            tracing::info!(frame = self.profiler.frame_index(), on = !surfaces_off, "surfaces A/B");
+        }
         for &(id, model) in &self.terrain_queue {
             let Some(terrain) = self.terrains.get(id as usize) else {
                 continue;
             };
             let local_cam = model.inverse().transform_point3(self.camera_pos);
             let mut mat = terrain.gpu_material_for_camera(local_cam);
+            if surfaces_off {
+                // The macro tier holds at every distance and walls wear the cliff layer, as on lucid/sunscar.
+                mat.macro_mode &= !crate::terrain::MACRO_FADES;
+                mat.cliff_band[2] = 0.0;
+                mat.cliff_band[3] = 0.0;
+            }
             let terrain_index = terrain.terrain_index;
             let edit_revision = terrain.edit_revision;
             if let Some(clipmap) = self.clipmaps.get_mut(id as usize) {
+                // The cache bakes the tier only where it does not fade, so a flip of the fade regenerates it.
+                if surfaces_flipped && terrain.macro_fades {
+                    clipmap.invalidate();
+                }
                 if clipmap.enabled && !crate::terrain::clipmap::TerrainClipmap::env_forced_off() {
                     let forward = self
                         .view_matrix
