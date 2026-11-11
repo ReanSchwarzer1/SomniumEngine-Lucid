@@ -22,8 +22,11 @@ impl<G: GameApp> Engine<G> {
             let compressing =
                 self.render_ctx.as_ref().is_some_and(somnium_renderer::SomniumRenderer::imported_compression);
             somnium_asset::share_decoded_images(crate::cell_streaming::image_share_bytes());
+            let gate = self.cell_streamer.gate.clone();
             let (send, receive) = std::sync::mpsc::sync_channel(1);
             std::thread::spawn(move || {
+                // A turn at the cells' gate: the palette and the cells read as many at once between them.
+                let _turn = gate.take();
                 let read = somnium_asset::load_gltf(&path).map_err(|error| error.to_string()).map(|scene| {
                     let prepared = somnium_renderer::SomniumRenderer::prepare_scene_for(&scene, None, compressing);
                     (scene, prepared)

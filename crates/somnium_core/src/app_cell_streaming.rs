@@ -15,6 +15,9 @@ use std::path::{Path, PathBuf};
 const FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(6);
 /// The longest a first fill may hold the frame before the rest streams in as usual.
 const FIRST_FILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(90);
+/// How often a first fill asks for the palette kinds its tiles draw. The ask walks every kind of every tile in: after
+/// each piece that arrived, it ran thousands of times in a fill.
+const PALETTE_ASK: std::time::Duration = std::time::Duration::from_millis(250);
 /// Retired terrain slots made at the end of a first fill, for tiles that stream in later ([`Engine::warm_terrain_slots`]).
 const SPARE_TERRAIN_SLOTS: usize = 4;
 
@@ -87,14 +90,15 @@ impl<G: GameApp> Engine<G> {
             // The foliage palette is read beside the cells: the tiles that are in ask for their kinds as they land.
             self.cell_streamer.filling = true;
             let mut palette = false;
-            // Where the fill's time goes: this thread's uploads and installs, its waits for the GPU, and its waits
-            // for the readers.
-            let mut spent = [std::time::Duration::ZERO; 3];
+            // Where the fill's time goes: this thread's uploads and installs, its waits for the GPU, its waits for
+            // the readers, and the palette's asks and uploads.
+            let mut spent = [std::time::Duration::ZERO; 4];
+            self.cell_streamer.spent = Default::default();
+            let mut asked: Option<std::time::Instant> = None;
             // Round the readers without a frame budget, so all of them keep decoding while this thread uploads.
             while (!self.cell_streamer.reading.is_empty() || palette) && started.elapsed() < FIRST_FILL_LIMIT {
                 let round = std::time::Instant::now();
                 if self.pump_cell_reads(usize::MAX) {
-                    self.prefetch_foliage_palette();
                     spent[0] += round.elapsed();
                     let flush = std::time::Instant::now();
                     // Uploads stage CPU copies until a submit; a fill is many frames' uploads in one, so it flushes as
@@ -109,13 +113,17 @@ impl<G: GameApp> Engine<G> {
                     spent[2] += round.elapsed();
                 }
                 self.schedule_cells(&settings, focus, cells::fill_readers());
-                // Each read that lands frees a reader for the next kind's source.
-                let before = self.palette_reads.len();
-                palette = self.pump_palette_reads(None);
-                if self.palette_reads.len() < before {
+                // The tiles that are in ask for their kinds, and each read that has landed frees a reader for the
+                // next kind's source: a few times a second, and at once when nothing else is left to wait for.
+                let asking = std::time::Instant::now();
+                self.pump_palette_reads(None);
+                let idle = self.cell_streamer.reading.is_empty() && self.palette_reads.is_empty();
+                if idle || asked.is_none_or(|at| at.elapsed() >= PALETTE_ASK) {
                     self.prefetch_foliage_palette();
-                    palette = !self.palette_reads.is_empty();
+                    asked = Some(std::time::Instant::now());
                 }
+                palette = !self.palette_reads.is_empty();
+                spent[3] += asking.elapsed();
             }
             self.cell_streamer.filling = false;
             info!(
@@ -123,6 +131,9 @@ impl<G: GameApp> Engine<G> {
                 entities = self.cell_streamer.streamed_entities(),
                 seconds = format!("{:.1}", started.elapsed().as_secs_f64()),
                 uploading = format!("{:.1}", spent[0].as_secs_f64()),
+                sources = format!("{:.1}", self.cell_streamer.spent[0].as_secs_f64()),
+                installs = format!("{:.1}", self.cell_streamer.spent[1].as_secs_f64()),
+                palette = format!("{:.1}", spent[3].as_secs_f64()),
                 gpu_wait = format!("{:.1}", spent[1].as_secs_f64()),
                 readers_wait = format!("{:.1}", spent[2].as_secs_f64()),
                 still_reading = self.cell_streamer.reading.len(),
@@ -315,9 +326,11 @@ impl<G: GameApp> Engine<G> {
                 match receive.try_recv() {
                     Ok(Piece::Source { path, parts, scene, prepared }) => {
                         pieces += 1;
+                        let uploading = std::time::Instant::now();
                         self.zone_begin("Cell source upload");
                         self.upload_streamed_source(&path, &parts, &scene, prepared);
                         self.zone_end();
+                        self.cell_streamer.spent[0] += uploading.elapsed();
                     }
                     Ok(Piece::Cell(parsed, terrains)) => {
                         pieces += 1;
@@ -334,9 +347,10 @@ impl<G: GameApp> Engine<G> {
                                 self.cell_streamer.ground_failed(index, error, std::time::Instant::now());
                             }
                             (parsed, _) => {
-                                if let Err(error) =
-                                    parsed.and_then(|document| self.install_cell(index, &document, terrains))
-                                {
+                                let installing = std::time::Instant::now();
+                                let installed = parsed.and_then(|document| self.install_cell(index, &document, terrains));
+                                self.cell_streamer.spent[1] += installing.elapsed();
+                                if let Err(error) = installed {
                                     warn!(%error, cell = index, "streamed cell skipped");
                                     self.cell_streamer.failed.insert(index, error);
                                 } else {

@@ -581,6 +581,8 @@ pub struct CellStreamer {
     pub(crate) ground_retries: HashMap<usize, GroundRetry>,
     /// How many sources and grounds are read at once, over all the cells being read.
     pub(crate) gate: std::sync::Arc<ReadGate>,
+    /// Main-thread time spent uploading sources and installing cells, for the first fill's log line.
+    pub(crate) spent: [std::time::Duration; 2],
 }
 
 /// The readers' turnstile: a cell's sources are read side by side, and this bounds how many are being read at once
@@ -647,14 +649,16 @@ pub(crate) fn fill_readers() -> usize {
 }
 
 /// RGBA8 bytes of decoded images the readers share while anything is being read
-/// (`somnium_asset::share_decoded_images`): 4 GiB, about 250 images of 2K. `SOMNIUM_IMAGE_SHARE_MIB` sets it; 0 is
+/// (`somnium_asset::share_decoded_images`): 2 GiB, about 120 images of 2K. `SOMNIUM_IMAGE_SHARE_MIB` sets it; 0 is
 /// off, and every source decodes its own images again. A Monargent start's first files read in 54 s with none
-/// shared, 38 s with 2 GiB, 26 s with 4 and 28 s with 8 (twelve to fourteen readers, 12 Nov 2026).
+/// shared, 38 s with 2 GiB, 26 s with 4 and 28 s with 8 (twelve to fourteen readers, 12 Nov 2026). With 4 GiB the
+/// game held 8 GB of memory more while it filled than after, on a machine with 12 free; and the fill then waited on
+/// its own uploads more than on its readers, so the smaller share costs little.
 pub(crate) fn image_share_bytes() -> usize {
     static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *BYTES.get_or_init(|| {
         let mib = std::env::var("SOMNIUM_IMAGE_SHARE_MIB").ok().and_then(|mib| mib.trim().parse::<usize>().ok());
-        mib.unwrap_or(4096) << 20
+        mib.unwrap_or(2048) << 20
     })
 }
 
