@@ -2402,7 +2402,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let moon_strength = saturate(1.0 - sun_illuminance / 10.0);
         // Under a sky lit above the air (a running day clock) the stars are always there, dimmed only by the air toward
         // the horizon: the day's sky outshines them, and they come out as the twilight fades, not at the sun's last ray.
-        let star_strength = select(moon_strength, star_extinction(ray_dir.y), light.sky_above_air > 0.5);
+        // There the stars are also twelve times sky_detail's: its brightest were some forty times under a first-
+        // magnitude star's radiance in a pixel, and vanished on a planet-lit sky; the day's sky still hides them all.
+        let star_strength = select(moon_strength, star_extinction(ray_dir.y) * 12.0, light.sky_above_air > 0.5);
         // The sun seen through the Lid's wreck (`sun_form.y`): in place of the whole disc, the form's disc cut by the
         // wreck's lanes, with their dust beside it (`sky_sun.wgsl`). The disc keeps sky_detail's brightness in the colour
         // the air left it; what lies beside it is in space, lit by the sun above the air and dimmed by the air along this
@@ -2439,7 +2441,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             // disc is drawn up to 7.5 stops under its radiance (a fifth of it with the sun 3 degrees down, 1/180 from 8
             // on). Its light on the world (`planet_light`) is not changed.
             let night_eye = exp2(-7.5 * (1.0 - smoothstep(-0.139, 0.0, sun_dir.y)));
-            planet = vec4<f32>(planet.rgb * view_extinction_rgb(ray_dir.y) * night_eye, planet.a);
+            // By day it reads as a daytime moon does, its sunlit face some 40% over the sky round it. Its true radiance
+            // is a few per cent of the day sky's (the albedo the night's light needs: 1 lux after dusk), so by day the
+            // drawn face is lifted to that share of the sky here, its pattern, phase and terminator kept and its dark
+            // part still the sky's colour. As the sky darkens the lift falls to nothing and the true radiance is
+            // drawn. The light it casts is never changed.
+            let luma = vec3<f32>(0.2126, 0.7152, 0.0722);
+            let face = max(light.planet_light.w * light.planet_sun.x / 3.14159265
+                           * dot(view_extinction_rgb(ray_dir.y), luma), 1e-4);
+            let lift = max(0.5 * dot(sky, luma) / face, 1.0);
+            planet = vec4<f32>(planet.rgb * view_extinction_rgb(ray_dir.y) * lift * night_eye, planet.a);
         }
 
         var background = (sky + detail * (1.0 - planet.a) + planet.rgb + ring) * (1.0 - eye.a) + eye.rgb;
