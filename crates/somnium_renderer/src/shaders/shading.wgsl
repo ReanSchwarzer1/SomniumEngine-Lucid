@@ -1772,8 +1772,8 @@ fn evaluate_ibl(surface: Surface, traced_diffuse: TracedLight) -> vec3<f32> {
 //
 // The line the fade follows is ragged on purpose. A height threshold alone is a contour line, as artificial as the
 // edge it replaces. So the threshold moves with two octaves of world-space noise, comes up where the material's own
-// occlusion says there is a crevice, and comes up on faces that look at the sky: soil lies on ledges and in cracks,
-// and leaves the steep faces between them bare.
+// occlusion says there is a crevice, and goes down on faces that look at the sky: soil fills cracks and banks
+// against flanks, and the crown of a stone stays stone.
 
 /// One texel of a terrain's height texture as metres above the terrain's base (terrain/ground.rs `encode`).
 fn ground_decode(texel: vec4<f32>) -> f32 {
@@ -1887,10 +1887,13 @@ fn ground_stand(normal: vec3<f32>, blend: f32, world_pos: vec3<f32>) -> GroundSt
     }
     let coarse = terrain_value_noise(world_pos.xz * 1.9 + vec2<f32>(world_pos.y * 0.7, 3.1));
     let fine = terrain_value_noise(world_pos.xz * 7.7 + vec2<f32>(11.3, world_pos.y * 2.9));
-    // A crevice by the material's own occlusion, and a ledge by its facing: where soil lies.
+    // Soil lies in crevices (the material's own occlusion says where), and banks against what stands up out of the
+    // ground. It does not lie on the top of a stone: a face that looks at the sky this close to the ground is the
+    // crown of a pebble, and it stays stone while its flanks sink in. That is also what keeps the band in scale with
+    // the object without knowing its size: a cobble keeps its top, a boulder only loses its foot.
     let crevice = 1.0 - micro_occlusion;
-    let ledge = max(normal.y, 0.0);
-    let level = above / max(blend, 1.0e-3) + (coarse - 0.5) * 0.7 + (fine - 0.5) * 0.3 - crevice * 0.6 - ledge * 0.25;
+    let crown = max(normal.y, 0.0);
+    let level = above / max(blend, 1.0e-3) + (coarse - 0.5) * 0.7 + (fine - 0.5) * 0.3 - crevice * 0.6 + crown * 0.6;
     stand.t = (1.0 - smoothstep(0.3, 0.8, level)) * reach;
     return stand;
 }
