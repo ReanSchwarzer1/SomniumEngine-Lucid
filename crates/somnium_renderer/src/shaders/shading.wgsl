@@ -1661,8 +1661,9 @@ fn gathered_light(surface: Surface, traced: TracedLight, sky: vec3<f32>) -> vec3
         return untraced;
     }
     let fine = surface.occlusion / (max(screen_occlusion, 0.004) * max(baked_sky_vis, 0.05));
-    gi_sky_seen = mix(1.0, saturate(traced.sky / max(baked_sky_vis, 0.05)), traced.trust);
-    // A blended mesh's band shades as the ground: its share of the sky opens toward the ground's (ground_blend.wgsl).
+    // A blended mesh's band shades as the ground: its share of the sky, for the light it gathers and the sky it
+    // reflects, opens toward the ground's (ground_blend.wgsl).
+    gi_sky_seen = mix(1.0, saturate(mix(traced.sky, 1.0, ground_blend_open) / max(baked_sky_vis, 0.05)), traced.trust);
     var gathered = sky * mix(min(traced.sky, traced.contact), 1.0, ground_blend_open) + traced.bounce;
     if traced.through > 0.0 {
         gathered += textureSampleLevel(env_cube, env_sampler, vec3<f32>(0.0, 1.0, 0.0), ENV_MAX_MIP).rgb
@@ -3707,7 +3708,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         if (extra_flags & 2u) != 0u {
             let aux_uv = (vec2<f32>(pixel_coords) + 0.5) / vec2<f32>(textureDimensions(vis_buffer));
             let spec_gi = textureSampleLevel(lighting_aux, default_sampler, aux_uv, 0.0);
-            let spec_w = spec_gi.a * saturate(1.0 - surface.roughness);
+            // A blended band reflects the sky along its own normal, not the face's traced mirror (ground_blend.wgsl).
+            let spec_w = spec_gi.a * saturate(1.0 - surface.roughness) * (1.0 - ground_blend_w);
             let n_dot_v = max(dot(surface.normal, surface.view_dir), 1e-4);
             let traced_spec = spec_gi.rgb
                 * env_brdf_approx(surface.f0, surface.roughness, n_dot_v)
