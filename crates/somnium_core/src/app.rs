@@ -1236,6 +1236,11 @@ pub struct Engine<G: GameApp> {
     foliage_failed: Vec<bool>,
     project_foliage: std::collections::BTreeMap<u16, crate::foliage_palette::ProjectEntry>,
     project_foliage_sources: std::collections::HashMap<std::path::PathBuf, Vec<FoliagePart>>,
+    /// Palette sources a streamed world is reading off the main thread (`palette_source`), each with whether its
+    /// parts are leaves by their materials (a kind's own mesh) or never (a level of detail, an impostor).
+    palette_reads: std::collections::HashMap<std::path::PathBuf, (std::sync::mpsc::Receiver<PaletteRead>, bool)>,
+    /// Palette sources that did not read: not asked for again.
+    palette_failed: std::collections::HashSet<std::path::PathBuf>,
     /// Phase 17F: the foliage brush.
     foliage_brush: somnium_renderer::terrain::foliage_paint::FoliageBrush,
     /// When true, dragging in the viewport paints foliage instead of sculpting.
@@ -1933,6 +1938,8 @@ impl<G: GameApp + 'static> Engine<G> {
             foliage_failed: vec![false; FOLIAGE_KINDS],
             project_foliage,
             project_foliage_sources: std::collections::HashMap::new(),
+            palette_reads: std::collections::HashMap::new(),
+            palette_failed: std::collections::HashSet::new(),
             foliage_brush: somnium_renderer::terrain::foliage_paint::FoliageBrush::default(),
             foliage_paint_active: false,
             foliage_erase: false,
@@ -4164,6 +4171,8 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 self.render_ctx = Some(render_ctx);
                 self.imported_uploads.clear();
                 self.project_foliage_sources.clear();
+                self.palette_reads.clear();
+                self.palette_failed.clear();
                 self.foliage_meshes.fill(None);
                 self.foliage_lod_meshes.fill(None);
                 self.foliage_impostor_meshes.fill(None);
@@ -9360,6 +9369,8 @@ impl<G: GameApp> Engine<G> {
         if let Some(r) = self.renderer.as_mut() {
             r.profiler.cpu_begin("Foliage");
         }
+        // Palette sources read off the main thread since the last frame go up now, within the streaming budget.
+        self.pump_palette_reads(Some(std::time::Duration::from_millis(6)));
         let batched = crate::foliage_batches::enabled();
         if batched {
             self.foliage_batches.begin_frame();

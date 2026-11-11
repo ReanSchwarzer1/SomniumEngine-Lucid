@@ -1,5 +1,124 @@
+/// A palette source read off the main thread: its glTF decoded, its textures and meshes made ready to upload.
+pub(crate) type PaletteRead = Result<(somnium_asset::LoadedScene, somnium_renderer::PreparedScene), String>;
+
 // Project palette adapter: native terrain instances share one upload per source.
 impl<G: GameApp> Engine<G> {
+    /// Whether a palette source is uploaded (`None`: it failed). One that is not is read off the main thread, as a
+    /// cell's sources are: at most as many at once as cells are read, and a later frame asks again.
+    ///
+    /// A streamed world's first frame loaded every palette source it drew, one after another, on the main thread: at
+    /// Monargent that frame took over a minute after the first fill's ninety seconds, and each tile that came into
+    /// reach afterwards stalled a frame for its new kinds (Sunscar, 12 Nov 2026).
+    fn palette_source(&mut self, source: &std::path::Path, leaves_by_material: bool) -> Option<bool> {
+        if self.project_foliage_sources.contains_key(source) {
+            return Some(true);
+        }
+        if self.palette_failed.contains(source) {
+            return None;
+        }
+        let readers = if self.cell_streamer.filling { crate::cell_streaming::fill_readers() } else { crate::cell_streaming::READERS };
+        if !self.palette_reads.contains_key(source) && self.palette_reads.len() < readers {
+            let path = source.to_path_buf();
+            let compressing =
+                self.render_ctx.as_ref().is_some_and(somnium_renderer::SomniumRenderer::imported_compression);
+            let (send, receive) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let read = somnium_asset::load_gltf(&path).map_err(|error| error.to_string()).map(|scene| {
+                    let prepared = somnium_renderer::SomniumRenderer::prepare_scene_for(&scene, None, compressing);
+                    (scene, prepared)
+                });
+                let _ = send.send(read);
+            });
+            self.palette_reads.insert(source.to_path_buf(), (receive, leaves_by_material));
+        }
+        Some(false)
+    }
+
+    /// Upload the palette sources whose reads have finished: at least one, then until `budget` of main-thread time
+    /// is spent (`None`: all that are ready). True while any is still being read.
+    pub(super) fn pump_palette_reads(&mut self, budget: Option<std::time::Duration>) -> bool {
+        let started = std::time::Instant::now();
+        let sources: Vec<std::path::PathBuf> = self.palette_reads.keys().cloned().collect();
+        let mut uploaded = false;
+        for source in sources {
+            if uploaded && budget.is_some_and(|budget| started.elapsed() >= budget) {
+                break;
+            }
+            let read = match self.palette_reads[&source].0.try_recv() {
+                Ok(read) => read,
+                Err(std::sync::mpsc::TryRecvError::Empty) => continue,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Err("the palette reader stopped".to_string()),
+            };
+            let leaves_by_material = self.palette_reads.remove(&source).is_some_and(|(_, leaves)| leaves);
+            match (read, self.renderer.as_mut().zip(self.render_ctx.as_ref())) {
+                (Ok((scene, prepared)), Some((renderer, ctx))) => {
+                    let parts = renderer
+                        .upload_prepared_scene_for(ctx, &scene, None, prepared)
+                        .iter()
+                        .map(|node| FoliagePart {
+                            vertex_offset: node.vertex_offset,
+                            index_offset: node.index_offset,
+                            index_count: node.index_count,
+                            material_id: node.material_id,
+                            local: node.transform,
+                            is_leaf: leaves_by_material
+                                && scene.materials.get(node.material_index).is_some_and(|material| {
+                                    material.foliage || material.alpha_mode != somnium_asset::AlphaMode::Opaque
+                                }),
+                        })
+                        .collect();
+                    self.project_foliage_sources.insert(source, parts);
+                    uploaded = true;
+                }
+                (Ok(_), None) => {}
+                (Err(error), _) => {
+                    warn!(%error, source = %source.display(), "Project foliage import failed");
+                    self.palette_failed.insert(source);
+                }
+            }
+        }
+        !self.palette_reads.is_empty()
+    }
+
+    /// Ask for the palette meshes the terrains in the world draw (their painted kinds, and the cover their ground set
+    /// grows), as a frame's foliage pass does. Called while a first fill holds the frame, so the palette is read
+    /// beside the cells and the first frame has its trees.
+    pub(super) fn prefetch_foliage_palette(&mut self) {
+        let terrains: Vec<(u32, String)> = self
+            .world
+            .entities_with::<TerrainComponent>()
+            .filter_map(|e| {
+                if crate::is_hidden(&self.world, e) || !self.world.get::<FoliageComponent>(e)?.enabled {
+                    return None;
+                }
+                let layer_set = self
+                    .world
+                    .get::<crate::cell_streaming::TerrainStreamingComponent>(e)
+                    .map(|streaming| streaming.layer_set.clone())
+                    .unwrap_or_default();
+                Some((self.world.get::<TerrainComponent>(e)?.terrain_id, layer_set))
+            })
+            .collect();
+        for (terrain_id, layer_set) in terrains {
+            let mut kinds = {
+                let Some(terrain) = self.renderer.as_ref().and_then(|renderer| renderer.terrain(terrain_id)) else {
+                    continue;
+                };
+                let grid = self.foliage_grids.entry(terrain_id).or_default();
+                grid.refresh(terrain.edit_revision, &terrain.painted_foliage);
+                grid.kinds.clone()
+            };
+            kinds.extend(
+                self.project_foliage
+                    .iter()
+                    .filter(|(_, entry)| entry.ground_cover.as_ref().is_some_and(|cover| cover.grows_on(&layer_set)))
+                    .map(|(kind, _)| *kind),
+            );
+            for kind in kinds {
+                self.ensure_palette_mesh(kind);
+            }
+        }
+    }
     fn foliage_kind_exists(&self, kind: u16) -> bool {
         (kind as usize) < FOLIAGE_PALETTE.len() || self.project_foliage.contains_key(&kind)
     }
@@ -36,6 +155,33 @@ impl<G: GameApp> Engine<G> {
             self.foliage_failed[index] = true;
             return;
         };
+        // A streamed world reads the kind's sources off the main thread (`palette_source`): the kind is drawn once
+        // its own mesh and its far forms are all in. Any other scene loads them here and now, as it always has.
+        if self.cell_streamer.key.is_some() {
+            let mut waiting = false;
+            let wanted = [
+                (Some(&entry.source), true),
+                (entry.lod.as_ref().map(|lod| &lod.source), false),
+                (entry.impostor.as_ref().map(|impostor| &impostor.source), false),
+            ];
+            for (source, own) in wanted {
+                let Some(source) = source else { continue };
+                match self.palette_source(source, own) {
+                    Some(true) => {}
+                    Some(false) => waiting = true,
+                    // Its own mesh did not read: the kind is not drawn. A far form that did not read is left out
+                    // below, with a warning, and the kind keeps its full geometry.
+                    None if own => {
+                        self.foliage_failed[index] = true;
+                        return;
+                    }
+                    None => {}
+                }
+            }
+            if waiting {
+                return;
+            }
+        }
         if !self.project_foliage_sources.contains_key(&entry.source) {
             let Some((renderer, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref()) else {
                 return;

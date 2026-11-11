@@ -562,6 +562,8 @@ pub struct CellStreamer {
     pub(crate) failed: HashMap<usize, String>,
     /// The first fill (the view's cells taken in whole) has happened for this manifest.
     pub(crate) filled: bool,
+    /// A first fill is holding the frame now: readers of every kind may use the other cores (`fill_readers`).
+    pub(crate) filling: bool,
     /// Canonical sources each loaded cell draws, and how many loaded cells draw each source.
     pub(crate) cell_sources: HashMap<usize, Vec<PathBuf>>,
     pub(crate) source_users: HashMap<PathBuf, u32>,

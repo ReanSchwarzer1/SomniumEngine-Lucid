@@ -84,9 +84,13 @@ impl<G: GameApp> Engine<G> {
             // Nothing is in yet (a scene just opened, Play just began): the view's own cells come in whole before the
             // world is shown, as behind a loading screen, rather than popping in a few a frame.
             let started = std::time::Instant::now();
+            // The foliage palette is read beside the cells: the tiles that are in ask for their kinds as they land.
+            self.cell_streamer.filling = true;
+            let mut palette = false;
             // Round the readers without a frame budget, so all of them keep decoding while this thread uploads.
-            while !self.cell_streamer.reading.is_empty() && started.elapsed() < FIRST_FILL_LIMIT {
+            while (!self.cell_streamer.reading.is_empty() || palette) && started.elapsed() < FIRST_FILL_LIMIT {
                 if self.pump_cell_reads(usize::MAX) {
+                    self.prefetch_foliage_palette();
                     // Uploads stage CPU copies until a submit; a fill is many frames' uploads in one, so it flushes as
                     // it goes (a 7-window Tyffir peaked at 15.8 of 16 GB without this).
                     if let Some((renderer, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref()) {
@@ -97,7 +101,15 @@ impl<G: GameApp> Engine<G> {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
                 self.schedule_cells(&settings, focus, cells::fill_readers());
+                // Each read that lands frees a reader for the next kind's source.
+                let before = self.palette_reads.len();
+                palette = self.pump_palette_reads(None);
+                if self.palette_reads.len() < before {
+                    self.prefetch_foliage_palette();
+                    palette = !self.palette_reads.is_empty();
+                }
             }
+            self.cell_streamer.filling = false;
             info!(
                 cells = self.cell_streamer.loaded.len(),
                 entities = self.cell_streamer.streamed_entities(),
