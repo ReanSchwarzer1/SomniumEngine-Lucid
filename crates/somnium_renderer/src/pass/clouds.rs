@@ -223,7 +223,7 @@ struct CompositeParams {
     low_size: [f32; 2],
     depth_sigma: f32,
     layer_top: f32,
-    _pad0: f32,
+    horizon_closure: f32,
     _pad1: f32,
     eye_direction: [f32; 3],
     eye_tan_half_width: f32,
@@ -279,6 +279,11 @@ pub struct CloudPass {
     /// Storm bodies and lightning for this frame (`storm.rs`; Sunscar weather, 11 Nov 2026). A game sets it; empty
     /// is every scene that asks for none.
     pub storm: crate::pass::storm::Storm,
+    /// How far a closed deck is carried down to the horizon, 0..1 (Sunscar weather, 11 Nov 2026). The layer is a flat
+    /// slab and the march gives up at its reach, so from open ground a strip of bare bright sky stood between an
+    /// overcast and the horizon; at 1 the sky under 2.6 degrees shows the deck as it is at 2.6. A game sets it by how
+    /// closed its deck is; 0, the default, is every scene before this.
+    pub horizon_closure: f32,
     /// Toft & Bowles' blue-noise ray-start offset, behind a switch so the
     /// evidence plan's with-and-without row is a run rather than a rebuild.
     pub jitter: bool,
@@ -920,6 +925,7 @@ impl CloudPass {
             },
             settings: CloudSettings::default(),
             storm: crate::pass::storm::Storm::default(),
+            horizon_closure: 0.0,
             storm_params: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Cloud Storm"),
                 size: std::mem::size_of::<crate::pass::storm::StormGpu>() as u64,
@@ -1508,7 +1514,7 @@ impl CloudPass {
                 ],
                 low_size: [self.march_size.0 as f32, self.march_size.1 as f32],
                 depth_sigma: self.upsample_depth_sigma.max(0.0),
-                _pad0: 0.0,
+                horizon_closure: self.horizon_closure.clamp(0.0, 1.0),
                 _pad1: 0.0,
                 eye_direction: self.sky_eye.direction.normalize_or_zero().to_array(),
                 eye_tan_half_width: self.sky_eye.tan_half_width,
