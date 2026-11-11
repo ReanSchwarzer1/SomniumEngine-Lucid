@@ -4,6 +4,7 @@
 // hoists every `enable` above everything.
 //!include "atmosphere.wgsl"
 //!include "froxel_depth.wgsl"
+//!include "storm.wgsl"
 
 // Somnium Engine — Phase CONTROL-M: the volumetric cloud march.
 //
@@ -92,6 +93,8 @@ struct CloudParams {
 @group(0) @binding(9) var shadow_out:  texture_storage_2d<r16float, write>;
 @group(0) @binding(10) var scene_depth: texture_depth_2d;
 @group(0) @binding(11) var cloud_volumetrics: texture_3d<f32>;
+/// Storm bodies and lightning (`storm.wgsl`). No bodies and no lights is every scene that asks for none.
+@group(0) @binding(17) var<uniform> storm: Storm;
 
 const CLOUD_PI: f32 = 3.14159265;
 /// Transmittance below which the march stops. Anything darker is opaque.
@@ -127,16 +130,17 @@ fn sample_weather(world_xz: vec2<f32>) -> vec4<f32> {
     return textureSampleLevel(weather_tex, cloud_sampler, uv, 0.0);
 }
 
-/// Density at a world point. `cheap` skips the detail erosion, which is what
+/// The slab's density at a world point. `cheap` skips the detail erosion, which is what
 /// makes the long-step search affordable.
-fn cloud_density(world_pos: vec3<f32>, cheap: bool) -> f32 {
+fn slab_density(world_pos: vec3<f32>, cheap: bool) -> f32 {
     let height = (world_pos.y - cp.layer_bottom) / max(cp.layer_thickness, 1.0);
     if height < 0.0 || height > 1.0 {
         return 0.0;
     }
 
     let weather = sample_weather(world_pos.xz);
-    let coverage = weather.r;
+    // A storm's holes take coverage, so their rims dissolve as a cloud's edge does.
+    let coverage = weather.r * storm_slab(world_pos.xz);
     if coverage <= 0.001 {
         return 0.0;
     }
@@ -181,6 +185,380 @@ fn cloud_density(world_pos: vec3<f32>, cheap: bool) -> f32 {
     );
 
     return clamp(density, 0.0, 1.0) * cp.density;
+}
+
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+// Storm bodies (Sunscar weather, 11 Nov 2026)
+// ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+//
+// The slab is one tiling field: no storm in it has a place or parts. These do: a tower with its anvil, a wall cloud
+// under it, a shelf on its gust front, a funnel to the ground with its debris, shafts of rain. Each is a shape in
+// world metres that says how full the body is at a point; the cloud's own noise then frays its edge exactly as
+// coverage frays the slab's. Because they are part of `cloud_density`, the screen march, the ground's shadow field
+// and the sky light's capture all see them.
+
+fn storm_rot(p: vec2<f32>, angle: f32) -> vec2<f32> {
+    let c = cos(angle);
+    let s = sin(angle);
+    return vec2<f32>(c * p.x - s * p.y, s * p.x + c * p.y);
+}
+
+/// What the slab keeps of its coverage at a place: 1, less inside a storm's holes.
+fn storm_slab(world_xz: vec2<f32>) -> f32 {
+    var keep = 1.0;
+    for (var i = 0u; i < storm.counts.x; i = i + 1u) {
+        let v = storm.volumes[i];
+        if storm_is_modifier(v) {
+            keep *= smoothstep(v.size.x, v.size.x + v.a.x, length(world_xz - v.pos.xz));
+        }
+    }
+    return keep;
+}
+
+// Each shape returns x: how full the body is at `q` (the point from its foot), 0 outside to 1 in its core, and
+// y: how much its noise may fray it there (0 a smooth, laminar surface, 1 a ragged one).
+
+/// A cumulonimbus: a leaning, banded tower from a flat base, an anvil reaching downwind and thinning to its rim, an
+/// overshooting dome, mammatus under the anvil.
+fn storm_cell(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
+    let h = q.y / v.size.y;
+    let over = v.b.w / v.size.y;
+    if h < 0.0 || h > 1.0 + over {
+        return vec2<f32>(0.0);
+    }
+    let dir = v.a.xy;
+    let radius = v.size.x;
+    let d = q.xz - dir * (v.b.x * h * h);
+    let rho = length(d);
+    // Bands round the tower where the updraft turns (a supercell's striations).
+    let band = 1.0 + v.b.y * 0.07 * sin(h * 52.0 + atan2(d.y, d.x) * 2.0 - v.albedo.w);
+    let rt = radius * (0.9 + 0.3 * h) * band;
+    let dome = 0.97 + over * (1.0 - smoothstep(0.0, radius * 0.9, rho));
+    let tower = (1.0 - smoothstep(rt * 0.6, rt, rho)) * (1.0 - smoothstep(dome - 0.05, dome, h)) * smoothstep(0.0, 0.015, h);
+
+    let reach = v.a.z;
+    var anvil = 0.0;
+    var fray = 1.0;
+    if reach > 0.0 {
+        let along = dot(q.xz, dir);
+        let across = dot(q.xz, vec2<f32>(-dir.y, dir.x));
+        let e = length(vec2<f32>((along - reach * 0.42) / (reach * 0.62 + radius), across / (reach * 0.34 + radius)));
+        // Its underside rises toward the rim: a wedge, thick at the tower.
+        let under = mix(v.a.w, 0.9, smoothstep(0.1, 1.0, e));
+        anvil = (1.0 - smoothstep(0.6, 1.0, e)) * smoothstep(under - 0.02, under + 0.03, h) * (1.0 - smoothstep(0.94, 0.985, h));
+        if v.b.z > 0.0 && h < under + 0.02 && e < 0.95 {
+            // Mammatus: smooth lobes about 350 m across hanging from the underside, away from the tower.
+            let cells = textureSampleLevel(base_noise_tex, cloud_sampler, vec3<f32>(q.x, 0.0, q.z) / 2800.0 + vec3<f32>(0.0, 0.37, 0.0), 0.0).g;
+            let hang = v.b.z * 0.06 * smoothstep(0.45, 0.85, cells) * smoothstep(rt * 1.2, rt * 2.5, rho);
+            let lobe = (1.0 - smoothstep(0.7, 1.0, e)) * smoothstep(under - hang, under - hang * 0.55, h);
+            if lobe > anvil {
+                anvil = lobe;
+                fray = 0.15;
+            }
+        }
+    }
+    if anvil > tower {
+        return vec2<f32>(anvil, fray);
+    }
+    return vec2<f32>(tower, 1.0);
+}
+
+/// A wall cloud: a block lowered under the base, a little wider where it joins it, with a tail cloud reaching toward
+/// the rain at its lower levels.
+fn storm_wall(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
+    let h = q.y / v.size.y;
+    if h < -0.12 || h > 1.12 {
+        return vec2<f32>(0.0);
+    }
+    let r = v.size.x * mix(0.72, 1.15, clamp(h, 0.0, 1.0));
+    var m = (1.0 - smoothstep(r * 0.55, r, length(q.xz))) * smoothstep(-0.1, 0.15, h);
+    let along = dot(q.xz, v.a.xy);
+    if v.a.z > 0.0 && along > 0.0 {
+        let u = along / v.a.z;
+        let across = dot(q.xz, vec2<f32>(-v.a.y, v.a.x));
+        let tube = v.size.x * 0.34 * (1.0 - 0.65 * u);
+        let from_axis = length(vec2<f32>(across, (q.y - v.size.y * (0.3 + 0.4 * u)) * 1.5));
+        m = max(m, (1.0 - smoothstep(tube * 0.45, tube, from_axis)) * (1.0 - smoothstep(0.8, 1.0, u)));
+    }
+    return vec2<f32>(m, mix(0.5, 1.0, v.a.w));
+}
+
+/// A shelf cloud: a wedge along an arc, its nose low at the leading edge, its upper surface smooth and banded and
+/// climbing back to the parent's base, its underside ragged and lifting behind the nose.
+fn storm_shelf(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
+    let height = v.size.y;
+    let nose = v.a.w;
+    if q.y < -0.2 * nose || q.y > height * 1.05 {
+        return vec2<f32>(0.0);
+    }
+    var off = atan2(q.x, q.z) - v.a.x;
+    off = off - 6.2831853 * round(off / 6.2831853);
+    let arc = 1.0 - smoothstep(v.a.y * 0.85, v.a.y, abs(off));
+    let behind = v.size.x - length(q.xz);
+    if arc <= 0.0 || behind < -nose || behind > v.a.z {
+        return vec2<f32>(0.0);
+    }
+    let u = clamp(behind / v.a.z, 0.0, 1.0);
+    let top = nose + (height - nose) * pow(u, 0.75);
+    let under = height * 0.55 * u * u * (3.0 - 2.0 * u);
+    let inside = smoothstep(under - 0.12 * nose, under + 0.25 * nose, q.y) * (1.0 - smoothstep(top - 0.1 * nose, top, q.y));
+    let front = smoothstep(-0.5 * nose, 0.3 * nose, behind) * (1.0 - smoothstep(0.85, 1.0, u));
+    // Laminar bands along the face near the leading edge.
+    let bands = 0.78 + 0.22 * sin(q.y / max(nose, 1.0) * 31.0 + behind * 0.01);
+    let m = arc * front * inside * mix(1.0, bands, 1.0 - smoothstep(0.0, 0.3, u));
+    let ragged = 1.0 - smoothstep(under, under + 0.6 * nose, q.y);
+    return vec2<f32>(m, mix(0.12, 1.0, ragged));
+}
+
+/// Where a funnel's axis stands at a height (0 its foot, 1 its top), from its foot: leaning, and bowed between.
+fn storm_funnel_axis(v: StormVolume, h: f32) -> vec2<f32> {
+    let lean = v.a.xy;
+    let len = length(lean);
+    var side = vec2<f32>(1.0, 0.0);
+    if len > 1.0 {
+        side = vec2<f32>(-lean.y, lean.x) / len;
+    }
+    return lean * h + side * v.b.x * sin(h * 3.14159265);
+}
+
+/// A funnel: a tube from the ground to the cloud, dense at its wall and thin inside, so it reads lighter down its
+/// middle.
+fn storm_funnel(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
+    let h = q.y / v.size.y;
+    if h < -0.02 || h > 1.04 {
+        return vec2<f32>(0.0);
+    }
+    let hc = clamp(h, 0.0, 1.0);
+    let rho = length(q.xz - storm_funnel_axis(v, hc));
+    let r = mix(v.size.x, v.a.z, pow(hc, v.a.w));
+    let wall = 1.0 - smoothstep(r * 0.74, r, rho);
+    let core = 1.0 - smoothstep(r * 0.2, r * 0.6, rho);
+    return vec2<f32>(wall * (1.0 - 0.65 * core), 0.3);
+}
+
+/// The debris cloud and dust skirt at a vortex's foot: widest along the ground, drawn in as it rises, with inflow
+/// bands spiralling in.
+fn storm_bowl(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
+    let h = q.y / v.size.y;
+    if h < -0.05 || h > 1.0 {
+        return vec2<f32>(0.0);
+    }
+    let hc = clamp(h, 0.0, 1.0);
+    let rho = length(q.xz);
+    let r = v.size.x * mix(1.0 + v.a.y, 0.4, pow(hc, 0.6));
+    var m = (1.0 - smoothstep(r * 0.4, r, rho)) * (1.0 - smoothstep(0.5, 1.0, hc)) * smoothstep(-0.05, 0.02, h);
+    let spiral = 0.5 + 0.5 * sin(atan2(q.z, q.x) * 3.0 + log(max(rho, 1.0)) * 5.0 + v.albedo.w * 2.0);
+    m *= mix(1.0, 0.45 + 0.55 * spiral, (1.0 - hc) * smoothstep(v.size.x * 0.5, v.size.x, rho));
+    m *= mix(0.35, 1.0, smoothstep(v.a.x * 0.6, v.a.x * 1.4, rho));
+    return vec2<f32>(m, 1.0);
+}
+
+/// A shaft of rain or hail under a base: its foot lags its top (the drops fall into slower air), a little wider at
+/// the ground; virga ends part of the way down.
+fn storm_shaft(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
+    let h = q.y / v.size.y;
+    if h < 0.0 || h > 1.03 {
+        return vec2<f32>(0.0);
+    }
+    let lag = 1.0 - (1.0 - h) * (1.0 - h);
+    let r = v.size.x * (1.0 + 0.2 * (1.0 - h));
+    var m = 1.0 - smoothstep(r * 0.35, r, length(q.xz + v.a.xy * lag));
+    if v.a.z > 0.001 {
+        m *= smoothstep(v.a.z - 0.12, v.a.z + 0.12, h);
+    }
+    return vec2<f32>(m, 1.0);
+}
+
+/// A ring of storm: a wall round a clear eye that leans outward as it climbs (from inside, a stadium), smooth on its
+/// inner face and ragged outside, an anvil spreading outward from its top, and a curtain of rain under it.
+fn storm_ring(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
+    let h = q.y / v.size.y;
+    let rho = length(q.xz);
+    if h > 1.02 {
+        return vec2<f32>(0.0);
+    }
+    if h < 0.0 {
+        if -q.y > v.b.y || v.b.x <= 0.0 {
+            return vec2<f32>(0.0);
+        }
+        return vec2<f32>(1.0 - smoothstep(0.5, 1.0, abs(rho - v.size.x) / (v.a.x * 1.3)), 1.0);
+    }
+    let mid = v.size.x + v.a.y * h * h;
+    let s = (rho - mid) / (v.a.x * (1.0 + 0.5 * h));
+    var wall = (1.0 - smoothstep(0.75, 1.0, abs(s))) * (1.0 - smoothstep(0.93, 1.0, h)) * smoothstep(0.0, 0.02, h);
+    var fray = mix(0.25, 1.0, smoothstep(-0.5, 0.5, s));
+    if v.a.z > 0.0 && rho > mid {
+        let e = (rho - mid) / v.a.z;
+        let under = mix(v.a.w, 0.92, smoothstep(0.1, 1.0, e));
+        let anvil = (1.0 - smoothstep(0.6, 1.0, e)) * smoothstep(under - 0.02, under + 0.03, h) * (1.0 - smoothstep(0.95, 0.99, h));
+        if anvil > wall {
+            wall = anvil;
+            fray = 1.0;
+        }
+    }
+    return vec2<f32>(wall, fray);
+}
+
+/// One body's density at a world point (not a hole's: `storm_slab`).
+fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
+    let q = p - v.pos.xyz;
+    let turn = v.albedo.w;
+    var m = vec2<f32>(0.0);
+    // Where its noise is read: turned with it, and for a shaft drawn out along its fall.
+    var np = q;
+    switch i32(v.pos.w + 0.5) {
+        case 1 {
+            m = storm_cell(v, q);
+            let r = storm_rot(q.xz, turn * (1.0 - 0.5 * clamp(q.y / v.size.y, 0.0, 1.0)));
+            np = vec3<f32>(r.x, q.y, r.y);
+        }
+        case 2 {
+            m = storm_wall(v, q);
+            let r = storm_rot(q.xz, turn);
+            np = vec3<f32>(r.x, q.y, r.y);
+        }
+        case 3 {
+            m = storm_shelf(v, q);
+            np = vec3<f32>(q.x, q.y * 2.0, q.z);
+        }
+        case 4 {
+            m = storm_funnel(v, q);
+            let hc = clamp(q.y / v.size.y, 0.0, 1.0);
+            // The wall turns, faster low down, and its streaks climb.
+            let r = storm_rot(q.xz - storm_funnel_axis(v, hc), turn * (1.5 - 0.5 * hc));
+            np = vec3<f32>(r.x, q.y - turn * v.size.x * 0.6, r.y);
+        }
+        case 5 {
+            m = storm_bowl(v, q);
+            let r = storm_rot(q.xz, turn * mix(1.6, 0.8, clamp(length(q.xz) / v.size.x, 0.0, 1.0)));
+            np = vec3<f32>(r.x, q.y - turn * 12.0, r.y);
+        }
+        case 7 {
+            m = storm_shaft(v, q);
+            np = vec3<f32>(q.x, q.y * 0.07 + turn, q.z);
+        }
+        case 8 {
+            m = storm_ring(v, q);
+            if q.y < 0.0 {
+                // Its rain, drawn out along its fall.
+                np = vec3<f32>(q.x, q.y * 0.07 + turn * 30.0, q.z);
+            } else {
+                let r = storm_rot(q.xz, turn * (1.0 - 0.5 * clamp(q.y / v.size.y, 0.0, 1.0)));
+                np = vec3<f32>(r.x, q.y, r.y);
+            }
+        }
+        default {}
+    }
+    if m.x <= 0.0 {
+        return 0.0;
+    }
+    let n = textureSampleLevel(base_noise_tex, cloud_sampler, np / v.size.w, 0.0);
+    let worley = n.g * 0.625 + n.b * 0.25 + n.a * 0.125;
+    let shape = clamp(cloud_remap(n.r, worley - 1.0, 1.0, 0.0, 1.0), 0.0, 1.0);
+    // Frayed as coverage frays the slab; where the surface is laminar the shape alone holds.
+    let frayed = clamp(cloud_remap(shape, 1.0 - m.x, 1.0, 0.0, 1.0), 0.0, 1.0) * m.x;
+    var density = mix(m.x * 0.6, frayed, m.y);
+    if !cheap && density > 0.0 {
+        let detail = textureSampleLevel(detail_noise_tex, cloud_sampler, np / (v.size.w * 0.13), 0.0);
+        let fbm = detail.r * 0.625 + detail.g * 0.25 + detail.b * 0.125;
+        density = clamp(cloud_remap(density, fbm * 0.3 * m.y, 1.0, 0.0, 1.0), 0.0, 1.0);
+    }
+    // A ring's rain is thin beside its cloud.
+    if v.pos.w > 7.5 && q.y < 0.0 {
+        density *= v.b.x;
+    }
+    return density * v.size.z;
+}
+
+/// The bodies at a point: their density, what they scatter of the light they meet (weighted by density), and the
+/// finest step any of them asks of a march there.
+struct StormSample {
+    density: f32,
+    albedo: vec3<f32>,
+    step: f32,
+}
+
+fn storm_sample(p: vec3<f32>, cheap: bool) -> StormSample {
+    var s = StormSample(0.0, vec3<f32>(0.0), 1e9);
+    for (var i = 0u; i < storm.counts.x; i = i + 1u) {
+        let v = storm.volumes[i];
+        let o = p.xz - v.bound.xy;
+        if storm_is_modifier(v) || p.y < v.bound_y.x || p.y > v.bound_y.y || dot(o, o) > v.bound.z * v.bound.z {
+            continue;
+        }
+        let d = storm_body(v, p, cheap);
+        if d > 0.0 {
+            s.density += d;
+            s.albedo += v.albedo.rgb * d;
+            s.step = min(s.step, v.bound.w);
+        }
+    }
+    if s.density > 0.0 {
+        s.albedo = s.albedo / s.density;
+    }
+    return s;
+}
+
+/// Density at a world point: the slab and every storm body.
+fn cloud_density(world_pos: vec3<f32>, cheap: bool) -> f32 {
+    var density = slab_density(world_pos, cheap);
+    if storm.counts.x > 0u {
+        density += storm_sample(world_pos, cheap).density;
+    }
+    return density;
+}
+
+/// Where a ray is in cloud: the slab's interval widened to every storm body's cylinder it crosses.
+fn cloud_interval(origin: vec3<f32>, dir: vec3<f32>) -> vec2<f32> {
+    var interval = slab_interval(origin, dir);
+    for (var i = 0u; i < storm.counts.x; i = i + 1u) {
+        let v = storm.volumes[i];
+        if storm_is_modifier(v) {
+            continue;
+        }
+        let c = storm_cylinder(v, origin, dir);
+        let exit = min(c.y, cp.max_distance);
+        if exit > c.x {
+            if interval.y <= interval.x {
+                interval = vec2<f32>(c.x, exit);
+            } else {
+                interval = vec2<f32>(min(interval.x, c.x), max(interval.y, exit));
+            }
+        }
+    }
+    return interval;
+}
+
+/// Optical depth toward the sun from inside a storm body, in `light_march`'s units: seven taps that double in reach
+/// from the body's own finest step, so a funnel a hundred metres wide shades itself and still sees the storm two
+/// kilometres above it. The slab's march steps by the layer's thickness, which would miss both.
+fn storm_light_march(origin: vec3<f32>, sun: vec3<f32>, finest: f32) -> f32 {
+    var optical_depth = 0.0;
+    var width = finest;
+    var near = 0.0;
+    for (var i = 0; i < 7; i = i + 1) {
+        optical_depth += cloud_density(origin + sun * (near + width * 0.5), true) * width * 0.01;
+        near += width;
+        width *= 2.0;
+    }
+    return optical_depth;
+}
+
+/// Lightning's light on the cloud at a point: each flash by the inverse square, through the cloud between (what is
+/// here and what is halfway there, as an optical depth). Direct light dies in a few free paths; the light the cloud
+/// scatters carries on as a glow, which is why a whole tower lights from one channel.
+fn storm_flashes(p: vec3<f32>, density: f32) -> vec3<f32> {
+    var light = vec3<f32>(0.0);
+    for (var i = 0u; i < storm.counts.y; i = i + 1u) {
+        let f = storm.flashes[i];
+        let to = f.pos.xyz - p;
+        let d2 = dot(to, to);
+        let tau = (density + cloud_density(p + to * 0.5, true)) * 0.5 * sqrt(d2) * 0.05;
+        let through = 0.4 * exp(-tau) + 0.6 / (1.0 + 0.15 * tau);
+        light += f.color.rgb * through / (d2 + f.pos.w * f.pos.w);
+    }
+    // Scattered evenly: deep in cloud the light has no direction left.
+    return light / (4.0 * CLOUD_PI);
 }
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -349,9 +727,29 @@ struct CloudRay {
     depth: f32,
 }
 
-fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32) -> CloudRay {
+fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool) -> CloudRay {
     let span = interval.y - interval.x;
     let steps = max(i32(cp.max_steps), 8);
+
+    // The storm bodies this ray crosses: where, and the finest step each asks for. Inside one the march steps by the
+    // body's own size, not the slab's: a funnel is a hundred metres wide and the slab's long step is two hundred.
+    var hits = 0;
+    var hit_enter: array<f32, 16>;
+    var hit_exit: array<f32, 16>;
+    var hit_step: array<f32, 16>;
+    for (var i = 0u; i < storm.counts.x; i = i + 1u) {
+        let v = storm.volumes[i];
+        if storm_is_modifier(v) {
+            continue;
+        }
+        let c = storm_cylinder(v, cp.camera_pos, ray_dir);
+        if c.y > c.x {
+            hit_enter[hits] = c.x;
+            hit_exit[hits] = c.y;
+            hit_step[hits] = v.bound.w;
+            hits = hits + 1;
+        }
+    }
 
     // **The step is a distance in metres, derived from the layer's own
     // thickness — not `span / steps`.**
@@ -371,8 +769,8 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32) -> CloudRay {
     let long_step = max(cp.layer_thickness / f32(steps) * 3.0, 1.0);
     let short_step = long_step * 0.35;
     // Enough iterations to cross the layer several times at the fine step,
-    // capped so a grazing ray cannot run away.
-    let iteration_cap = steps * 6;
+    // capped so a grazing ray cannot run away. Each storm body crossed gets its own share.
+    let iteration_cap = steps * 6 + hits * 48;
 
     // Toft & Bowles' jitter. Their measurement is that this can cost
     // 2.3 → 7.5 ms through texture-cache incoherence, so whether it pays is a
@@ -420,24 +818,34 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32) -> CloudRay {
         if t >= interval.y || transmittance < CLOUD_MIN_TRANSMITTANCE {
             break;
         }
-        let step_len = select(long_step, short_step, inside);
+        var step_len = select(long_step, short_step, inside);
+        for (var k = 0; k < hits; k = k + 1) {
+            if t + step_len >= hit_enter[k] && t <= hit_exit[k] {
+                step_len = min(step_len, hit_step[k] * select(2.5, 1.0, inside));
+            }
+        }
         let p = cp.camera_pos + ray_dir * (t + step_len * 0.5);
 
         if !inside {
             // Searching: cheap density only, long steps.
             if cloud_density(p, true) > 0.0 {
-                // Step back one long step and switch to fine sampling, or the
+                // Step back one step and switch to fine sampling, or the
                 // cloud's leading edge is cut off flat.
                 inside = true;
                 empty_runs = 0;
-                t = max(t - long_step, interval.x);
+                t = max(t - step_len, interval.x);
                 continue;
             }
             t += step_len;
             continue;
         }
 
-        let density = cloud_density(p, false);
+        let slab = slab_density(p, false);
+        var body = StormSample(0.0, vec3<f32>(0.0), 1e9);
+        if hits > 0 {
+            body = storm_sample(p, false);
+        }
+        let density = slab + body.density;
         if density <= 0.0 {
             empty_runs += 1;
             if empty_runs >= CLOUD_EMPTY_BEFORE_ESCAPE {
@@ -451,8 +859,14 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32) -> CloudRay {
         // Precipitating columns absorb more, which is what makes the base of a
         // rain cloud read as dark rather than merely thick.
         let weather = sample_weather(p.xz);
-        let extinction = density * (1.0 + weather.b * cp.precipitation * 2.0) * 0.05;
-        let optical_depth = light_march(p, sun) * 4.0;
+        let extinction = (slab * (1.0 + weather.b * cp.precipitation * 2.0) + body.density) * 0.05;
+        // Inside a storm body the light is marched at the body's own scale.
+        var optical_depth = 0.0;
+        if body.density > 0.0 {
+            optical_depth = storm_light_march(p, sun, body.step) * 4.0;
+        } else {
+            optical_depth = light_march(p, sun) * 4.0;
+        }
         let sun_energy = sun_octaves(optical_depth, cos_theta);
 
         // Radiance arriving at the sample: the sun through its octaves, the sun again as diffused light (Lambertian,
@@ -460,13 +874,18 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32) -> CloudRay {
         // the sky's fill, which reaches inside as diffused light does.
         let diffusion = cloud_diffusion(optical_depth);
         let thick = 1.0 - exp(-4.0 * density);
-        let luminance = sun_e * (sun_energy + CLOUD_DIFFUSE * thick * diffusion * 0.5 / CLOUD_PI)
+        var luminance = sun_e * (sun_energy + CLOUD_DIFFUSE * thick * diffusion * 0.5 / CLOUD_PI)
             + sky_fill * cp.ambient * diffusion;
+        if flashes && storm.counts.y > 0u {
+            luminance += storm_flashes(p, density);
+        }
 
         let step_transmittance = exp(-extinction * step_len);
         // Analytic segment integration with the scattering coefficient in (sigma_s = albedo sigma_t): what the
-        // segment scatters toward the eye is albedo x radiance x its opacity.
-        let integrated = CLOUD_ALBEDO * luminance * (1.0 - step_transmittance);
+        // segment scatters toward the eye is albedo x radiance x its opacity. Water scatters nearly all it meets;
+        // a storm body may scatter less, and by colour (dust).
+        let albedo = (vec3<f32>(CLOUD_ALBEDO) * slab + body.albedo * body.density) / density;
+        let integrated = albedo * luminance * (1.0 - step_transmittance);
         scatter += transmittance * integrated;
 
         let weight = transmittance * (1.0 - step_transmittance);
@@ -490,7 +909,7 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
 
     // A clear sky costs one store per quarter-res pixel and nothing else.
-    if cp.density <= 0.0 {
+    if cp.density <= 0.0 && storm.counts.x == 0u {
         textureStore(scatter_out, vec2<i32>(gid.xy), vec4<f32>(0.0, 0.0, 0.0, 1.0));
         return;
     }
@@ -502,7 +921,7 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
     let far = cp.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
     let ray_dir = normalize(far.xyz - near.xyz / near.w * far.w);
 
-    var interval = slab_interval(cp.camera_pos, ray_dir);
+    var interval = cloud_interval(cp.camera_pos, ray_dir);
     if interval.y <= interval.x {
         textureStore(scatter_out, vec2<i32>(gid.xy), vec4<f32>(0.0, 0.0, 0.0, 1.0));
         return;
@@ -547,7 +966,7 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
     if cp.jitter_enabled > 0.5 {
         jitter = ign(vec2<f32>(gid.xy), cp.frame);
     }
-    let cloud = march_ray(ray_dir, interval, jitter);
+    let cloud = march_ray(ray_dir, interval, jitter, true);
     var scatter = cloud.scatter;
     let transmittance = cloud.transmittance;
 
@@ -555,6 +974,9 @@ fn march(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cloud_distance = cloud.depth;
     let aerial = cloud_aerial(uv, cloud_distance);
     scatter = scatter * aerial.a + aerial.rgb * (1.0 - transmittance);
+    // The target is 16-bit float: cloud beside a flash can pass its ceiling, and an infinity there becomes a NaN in
+    // the history's variance and black in the picture.
+    scatter = min(scatter, vec3<f32>(6.0e4));
 
     textureStore(
         scatter_out,
@@ -595,9 +1017,11 @@ fn cloud_env(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let dir = env_cube_dir(gid.z, (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims));
     var out = vec4<f32>(0.0, 0.0, 0.0, 1.0);
-    let interval = slab_interval(cp.camera_pos, dir);
-    if cp.density > 0.0 && interval.y > interval.x {
-        let cloud = march_ray(dir, interval, 0.5);
+    let interval = cloud_interval(cp.camera_pos, dir);
+    if (cp.density > 0.0 || storm.counts.x > 0u) && interval.y > interval.x {
+        // Without the flashes: the sky light gathers over seconds, and lightning lasts a few frames (the land takes
+        // it as a light of its own).
+        let cloud = march_ray(dir, interval, 0.5, false);
         out = vec4<f32>(cloud.scatter, clamp(cloud.transmittance, 0.0, 1.0));
     }
     textureStore(env_out, vec2<i32>(gid.xy), i32(gid.z), out);
@@ -620,7 +1044,7 @@ fn cloud_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
     if gid.x >= dims.x || gid.y >= dims.y {
         return;
     }
-    if cp.density <= 0.0 || cp.shadow_strength <= 0.0 {
+    if (cp.density <= 0.0 && storm.counts.x == 0u) || cp.shadow_strength <= 0.0 {
         textureStore(shadow_out, vec2<i32>(gid.xy), vec4<f32>(1.0));
         return;
     }
@@ -647,7 +1071,27 @@ fn cloud_shadow(@builtin(global_invocation_id) gid: vec3<u32>) {
     var optical_depth = 0.0;
     for (var i = 0; i < steps; i = i + 1) {
         let t = enter + (f32(i) + 0.5) * step_len;
-        optical_depth += cloud_density(origin + sun * t, true) * step_len * 0.05;
+        optical_depth += slab_density(origin + sun * t, true) * step_len * 0.05;
+    }
+    // The storm bodies between this ground and the sun, over their own reach (they stand under and over the slab).
+    var near = 1e30;
+    var far = -1e30;
+    for (var i = 0u; i < storm.counts.x; i = i + 1u) {
+        let v = storm.volumes[i];
+        if storm_is_modifier(v) {
+            continue;
+        }
+        let c = storm_cylinder(v, origin, sun);
+        if c.y > c.x {
+            near = min(near, c.x);
+            far = max(far, c.y);
+        }
+    }
+    if far > near {
+        let body_step = (far - near) / 12.0;
+        for (var i = 0; i < 12; i = i + 1) {
+            optical_depth += storm_sample(origin + sun * (near + (f32(i) + 0.5) * body_step), true).density * body_step * 0.05;
+        }
     }
     let transmittance = mix(1.0, exp(-optical_depth), clamp(cp.shadow_strength, 0.0, 1.0));
     textureStore(shadow_out, vec2<i32>(gid.xy), vec4<f32>(transmittance));

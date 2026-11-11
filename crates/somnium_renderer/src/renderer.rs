@@ -598,6 +598,10 @@ pub struct SomniumRenderer {
     /// Phase CONTROL-M: volumetric clouds. Public because the editor drives
     /// every one of its parameters from `SkyComponent`.
     pub cloud_pass: crate::pass::clouds::CloudPass,
+    /// Lightning's channels (`pass/lightning.rs`): a game sets `bolts` each frame.
+    pub lightning_pass: crate::pass::lightning::LightningPass,
+    /// Rain, snow and hail near the eye (`pass/precipitation.rs`): a game sets `settings`.
+    pub precipitation_pass: crate::pass::precipitation::PrecipitationPass,
     /// The eye drawn in the sky this frame (`intensity` 0: none). Set by the
     /// app from `somnium.SkyEye` every frame.
     pub sky_eye: crate::SkyEyeParams,
@@ -1439,6 +1443,10 @@ impl SomniumRenderer {
             ctx.config.width,
             ctx.config.height,
         );
+        // Rain, snow and hail near the eye (Sunscar weather, 11 Nov 2026): nothing unless a game asks for drops.
+        let precipitation_pass = crate::pass::precipitation::PrecipitationPass::new(&ctx.device, &shaders);
+        // Lightning's channels, drawn over the clouds (Sunscar weather, 11 Nov 2026): nothing unless a game hands it bolts.
+        let lightning_pass = crate::pass::lightning::LightningPass::new(&ctx.device, &shaders, HDR_FORMAT);
         // The sky light sees the clouds the camera does (Sunscar, 5 Nov 2026).
         ibl_pass.set_cloud_capture(&ctx.device, cloud_pass.sky_light_view());
         // What GI's escaped rays see: the sky reaches a surface only through what its rays find open.
@@ -1761,6 +1769,8 @@ impl SomniumRenderer {
             ibl_pass,
             volumetric_pass,
             cloud_pass,
+            lightning_pass,
+            precipitation_pass,
             sky_eye: crate::SkyEyeParams::default(),
             decal_grid,
             decals: Vec::new(),
@@ -7087,6 +7097,16 @@ impl SomniumRenderer {
         self.profiler.begin(&mut encoder, "Cloud composite");
         self.cloud_pass
             .composite(&mut encoder, &self.postprocess_pass.hdr_view);
+        // Lightning's channels, over the clouds they hang under.
+        self.lightning_pass.prepare(
+            &ctx.device,
+            &ctx.queue,
+            &self.vis_pass.depth_view,
+            self.scene_extent(),
+            self.view_proj_unjittered_rel,
+            self.camera_pos,
+        );
+        self.lightning_pass.draw(&mut encoder, &self.postprocess_pass.hdr_view);
         self.profiler.end(&mut encoder);
 
         self.profiler.cpu_end();
@@ -7362,6 +7382,39 @@ impl SomniumRenderer {
             &self.pending_particles,
         );
         self.profiler.end(&mut encoder);
+
+        // Rain, snow and hail near the eye, over the sprites and into the same reactive mask.
+        if self.precipitation_pass.settings.count > 0
+            && let Some(reactive) = self.particle_pass.reactive_view(slot as usize)
+        {
+            self.profiler.begin(&mut encoder, "Precipitation");
+            self.precipitation_pass.ensure_bind_group(
+                &ctx.device,
+                &self.ibl_pass.cube_view,
+                &self.ibl_pass.sampler,
+                &self.cloud_pass.shadow_view,
+                &self.cloud_pass.shadow_params,
+            );
+            // The way the eye looks: the middle of the picture, unprojected (reversed depth: 1 near, 0 infinity).
+            let inverse = self.view_proj_unjittered_rel.inverse();
+            let (near, far) = (inverse * glam::Vec4::new(0.0, 0.0, 1.0, 1.0), inverse * glam::Vec4::new(0.0, 0.0, 0.0, 1.0));
+            let look = (far.truncate() - near.truncate() / near.w * far.w).normalize_or_zero();
+            self.precipitation_pass.record(
+                &ctx.queue,
+                &mut encoder,
+                &self.postprocess_pass.hdr_view,
+                reactive,
+                &self.vis_pass.depth_view,
+                self.scene_extent(),
+                self.view_proj_unjittered_rel,
+                self.camera_pos,
+                look,
+                self.light_direction,
+                self.light_color,
+                self.time,
+            );
+            self.profiler.end(&mut encoder);
+        }
 
         // Phase IV-G: choose the finite body under the camera from the same
         // CPU query contract used by gameplay. Mesh-local XZ is centred, while
