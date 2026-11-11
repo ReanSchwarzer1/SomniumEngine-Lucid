@@ -650,7 +650,7 @@ impl VoxelTerrain {
                 detile: 0.0,
                 wind: [0.0; 2],
                 subsurface: 0.0,
-                ground_blend: 0.0,
+                reserved: 0.0,
             },
         );
 
@@ -2709,7 +2709,7 @@ impl GameApp for HelloGame {
                         detile: 0.0,
                         wind: [0.0; 2],
                         subsurface: 0.0,
-                        ground_blend: 0.0,
+                        reserved: 0.0,
                     },
                 );
 
@@ -3500,7 +3500,7 @@ fn spawn_procedural_scene(
             detile: 0.0,
             wind: [0.0; 2],
             subsurface: 0.0,
-            ground_blend: 0.0,
+            reserved: 0.0,
         },
     );
     let mat_red = renderer.materials_pool.add_material(
@@ -3527,7 +3527,7 @@ fn spawn_procedural_scene(
             detile: 0.0,
             wind: [0.0; 2],
             subsurface: 0.0,
-            ground_blend: 0.0,
+            reserved: 0.0,
         },
     );
 
@@ -3619,7 +3619,7 @@ fn spawn_procedural_scene(
                 detile: 0.0,
                 wind: [0.0; 2],
                 subsurface: 0.0,
-                ground_blend: 0.0,
+                reserved: 0.0,
             },
         )
     };

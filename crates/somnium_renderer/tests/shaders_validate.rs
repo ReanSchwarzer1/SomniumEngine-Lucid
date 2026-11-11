@@ -1003,11 +1003,11 @@ fn macro_octaves_land_between_the_macro_blend_and_the_squaring() {
     let shade = &shade[..shade.find("\n}").expect("its end")];
     assert!(
         shade.contains("terrain_macro_blend(detail, macro_c.rgb * octaves, tm.macro_mode, fade)")
-            && shade.contains("terrain_macro_fade(world_pos)"),
+            && shade.contains("terrain_macro_weight(tm, macro_c.a, world_pos)"),
         "clipmap shading lerps the octave-tinted detail toward the octave-tinted far colour, faded with distance"
     );
     assert_eq!(
-        source.matches("terrain_macro_fade(world_pos)").count(),
+        source.matches("terrain_macro_weight(tm, macro_c.a, world_pos)").count(),
         2,
         "the live and clipmap paths fade the macro tier the same way"
     );

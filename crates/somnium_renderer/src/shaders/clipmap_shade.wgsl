@@ -325,7 +325,7 @@ fn evaluate_clipmap_material(
         let local_xz = world_xz - tm.terrain_origin;
         let macro_c = terrain_macro_sample(
             tm, local_xz * tm.inv_world_size, world_ddx * tm.inv_world_size, world_ddy * tm.inv_world_size);
-        let fade = macro_c.a * terrain_macro_fade(world_pos);
+        let fade = terrain_macro_weight(tm, macro_c.a, world_pos);
         if fade > 0.0 {
             let darken = mix(1.0, tm.wetness_darken, tap.wetness);
             let octaves = terrain_macro_octaves(local_xz, tm.macro_octave_strength.xyz);

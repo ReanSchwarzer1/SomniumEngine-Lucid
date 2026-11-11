@@ -80,7 +80,7 @@ fn material(renderer: &mut Renderer, queue: &wgpu::Queue, rgb: [f32; 3]) -> u32 
             detile: 0.0,
             wind: [0.0; 2],
             subsurface: 0.0,
-            ground_blend: 0.0,
+            reserved: 0.0,
         },
     )
 }

@@ -1037,11 +1037,21 @@ fn terrain_wall_layer(tm: TerrainMaterial, strongest: u32) -> u32 {
     return select(tm.cliff_layer, strongest, ((mask >> strongest) & 1u) != 0u);
 }
 
-const TERRAIN_MACRO_NEAR: f32 = 40.0;
-const TERRAIN_MACRO_FAR: f32 = 400.0;
+// sunscar-look (11 Nov): untouched within 25 m, where the plants' near kinds still cover the ground; all of the far
+// colour by 200 m, where the far stand-ins (baked from the same layer_far_colour.json) take over without a seam.
+const TERRAIN_MACRO_NEAR: f32 = 25.0;
+const TERRAIN_MACRO_FAR: f32 = 200.0;
+const TERRAIN_MACRO_FAR_WEIGHT: f32 = 1.0;
 
 fn terrain_macro_fade(world_pos: vec3<f32>) -> f32 {
     return smoothstep(TERRAIN_MACRO_NEAR, TERRAIN_MACRO_FAR, distance(world_pos, view.camera_pos));
+}
+
+/// The macro tier's weight at a point: the macro map's own alpha, faded in with distance, up to the far weight in
+/// Lerp mode and the terrain's macro strength in the others; 0 strength stays the off switch (SOMNIUM_TERRAIN_MACRO).
+fn terrain_macro_weight(tm: TerrainMaterial, alpha: f32, world_pos: vec3<f32>) -> f32 {
+    let top = select(tm.macro_strength, TERRAIN_MACRO_FAR_WEIGHT, tm.macro_mode == MACRO_LERP && tm.macro_strength > 0.0);
+    return alpha * top * terrain_macro_fade(world_pos);
 }
 
 /// Sample the macro map at a terrain-global UV, returning colour and the
@@ -1058,9 +1068,8 @@ fn terrain_macro_sample(
     if tm.macro_map < 0 {
         return vec4<f32>(0.5, 0.5, 0.5, 0.0);
     }
-    let m = textureSampleGrad(
-        textures[tm.macro_map], default_sampler, splat_uv, splat_ddx, splat_ddy);
-    return vec4<f32>(m.rgb, m.a * tm.macro_strength);
+    // The texel's own alpha: callers weigh it (`terrain_macro_weight`).
+    return textureSampleGrad(textures[tm.macro_map], default_sampler, splat_uv, splat_ddx, splat_ddy);
 }
 
 /// Low-frequency value variance at the scales between the tile and the terrain
@@ -1585,7 +1594,7 @@ fn evaluate_terrain_material(
     }
 
     let macro_c = terrain_macro_sample(tm, splat_uv, splat_ddx, splat_ddy);
-    albedo = terrain_macro_blend(albedo, macro_c.rgb, tm.macro_mode, macro_c.a * terrain_macro_fade(world_pos));
+    albedo = terrain_macro_blend(albedo, macro_c.rgb, tm.macro_mode, terrain_macro_weight(tm, macro_c.a, world_pos));
     // TSUSHIMA-H, in the same approximately-perceptual space the macro blend
     // above already works in — between the `sqrt` and the squaring, not after.
     // Applied later it would be a second, independent gain on linear radiance
