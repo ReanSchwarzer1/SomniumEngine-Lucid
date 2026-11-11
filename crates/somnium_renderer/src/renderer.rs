@@ -429,6 +429,9 @@ pub struct SomniumRenderer {
     /// Point and spot lamps drawn as their own light where they fall under a pixel (PostProcess `light_glints`, 1 the
     /// physical amount); 0 (default) is off.
     pub light_glints: f32,
+    /// The local lights the cluster grid took this frame, for the lamp points: `local_lights` is cleared after that
+    /// upload, long before the points draw.
+    glint_lights: u32,
     /// Last frame's [`surfaces_ab_off`], so a clipmap regenerates when its fade flips.
     surfaces_ab_was_off: bool,
     /// Radial vignette strength (0 = off, 1 = default, higher = stronger).
@@ -1749,6 +1752,7 @@ impl SomniumRenderer {
             snow_map_source: String::new(),
             ground_blend_default: 0.0,
             light_glints: 0.0,
+            glint_lights: 0,
             surfaces_ab_was_off: false,
             vignette_strength: 0.0,
             chromatic_aberration: 0.0,
@@ -5355,6 +5359,7 @@ impl SomniumRenderer {
             shading_mode,
         );
         self.restir_gi_pass.update_local_lights(&self.local_lights);
+        self.glint_lights = self.local_lights.len().min(crate::cluster::MAX_LOCAL_LIGHTS) as u32;
         self.local_lights.clear();
 
         // Phase CONTROL-O: the same grid geometry, the same matrices, the same
@@ -7642,7 +7647,7 @@ impl SomniumRenderer {
                 &self.postprocess_pass.hdr_view,
                 &self.vis_pass.depth_view,
                 &self.global_pool.cluster_grid.light_buffer,
-                self.local_lights.len().min(crate::cluster::MAX_LOCAL_LIGHTS) as u32,
+                self.glint_lights,
                 self.view_matrix,
                 self.proj_matrix,
                 self.camera_pos,
