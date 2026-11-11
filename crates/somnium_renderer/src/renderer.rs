@@ -128,6 +128,14 @@ struct FrameViewState {
 /// `ground_blend_open`).
 const GROUND_BLEND_OPEN: f32 = 0.5;
 
+/// `SOMNIUM_SHADING_DEBUG_CYCLE=0,2,3`: the shading debug view for this pair of captures (proof stills, as
+/// SOMNIUM_GROUND_BLEND_OPENS), the list wrapping round; `None` when it is unset.
+fn debug_cycle_view() -> Option<f32> {
+    static DEBUGS: std::sync::LazyLock<Option<Vec<f32>>> =
+        std::sync::LazyLock::new(|| env_floats("SOMNIUM_SHADING_DEBUG_CYCLE"));
+    DEBUGS.as_ref().map(|views| views[(crate::capture::captures_written() / 2) % views.len()])
+}
+
 /// A comma list of numbers from the environment, or `None` when it is unset or holds none.
 fn env_floats(name: &str) -> Option<Vec<f32>> {
     let list: Vec<f32> = std::env::var(name).ok()?.split(',').filter_map(|s| s.trim().parse().ok()).collect();
@@ -5175,6 +5183,10 @@ impl SomniumRenderer {
         if let Some(debug_view) = view.debug_view {
             self.shading_debug = debug_view as f32;
         }
+        // After the view's own, which would put it back every frame.
+        if let Some(debug_view) = debug_cycle_view() {
+            self.shading_debug = debug_view;
+        }
         self.editor_overlays_enabled = self.frame_view_state.overlays && view.overlays;
     }
 
@@ -5717,13 +5729,8 @@ impl SomniumRenderer {
         static OPENS: std::sync::LazyLock<Vec<f32>> = std::sync::LazyLock::new(|| {
             env_floats("SOMNIUM_GROUND_BLEND_OPENS").unwrap_or_else(|| vec![GROUND_BLEND_OPEN])
         });
-        static DEBUGS: std::sync::LazyLock<Option<Vec<f32>>> =
-            std::sync::LazyLock::new(|| env_floats("SOMNIUM_SHADING_DEBUG_CYCLE"));
         let pair = crate::capture::captures_written() / 2;
         ground[3] = OPENS[pair % OPENS.len()];
-        if let Some(views) = DEBUGS.as_ref() {
-            self.shading_debug = views[pair % views.len()];
-        }
         self.shading_pass.set_ground_blend(&ctx.queue, &ground);
 
         self.profiler.cpu_end();
