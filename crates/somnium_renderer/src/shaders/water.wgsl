@@ -996,10 +996,14 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> Sh
             backdrop_distance),
         base_has_backdrop,
     );
+    // Foam at a shore is water thrown about, so it takes waves: a body's swell under 5 cm scales it away. Without
+    // this the contact term whitened every pixel of water shallower than a third of a metre, moving or not, and a
+    // shallow river lay white as snow from bank to bank (the Vela Canyon's river, Sunscar, 11 Nov 2026).
+    let agitation = saturate(material.surface_params.z / 0.05);
     let shore_foam = max(
         shore_band * clamp(0.28 + breaker * 0.82 + foam_noise * 0.38, 0.0, 1.0),
         depth_contact * (0.62 + foam_noise * 0.28),
-    );
+    ) * agitation;
     // Whitecap coverage. The 0.75 scale and the distance fade are the
     // reference's: foam is a thin film that stops resolving long before the
     // waves carrying it do, so it has to disappear faster than the geometry.
@@ -1234,10 +1238,11 @@ fn fs_prepass(input: VertexOutput, @builtin(front_facing) front_facing: bool) ->
             backdrop_distance),
         base_has_backdrop,
     );
+    // As in the surface's shading above: no swell, no shore foam.
     let shore_foam = max(
         shore_band * clamp(0.28 + breaker * 0.82 + foam_noise * 0.38, 0.0, 1.0),
         depth_contact * (0.62 + foam_noise * 0.28),
-    );
+    ) * saturate(material.surface_params.z / 0.05);
     let crest_foam = smoothstep(0.0, 1.0, spectrum.a * 0.75)
         * exp(-water_view_depth * 0.0075)
         * smoothstep(0.5, 2.0, authored_depth);
