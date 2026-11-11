@@ -95,11 +95,17 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     // The face unfolded onto the ground: a point some way up it reads the ground as far out from its foot as it stands
     // along the face. So the band wears the terrain's own surface as the terrain shows it beside the foot (its layers,
     // far colour, octaves and wetness, at its own scale), meets it on the same texel at the foot, and carries no
-    // vertical streaks, which the ground sampled straight down drew up every wall (11 Nov). Up the face by `above`
-    // is out along its horizontal normal by above / |n.xz|, less the face's own run: k = n.xz (1 + n.y) / |n.xz|^2,
-    // clamped where the face lies nearly flat, which the line above has faded out already. The footprint follows by
-    // the chain rule, the ground's height moving with the slope.
-    let k = geo_n.xz * (1.0 + geo_n.y) / max(dot(geo_n.xz, geo_n.xz), 0.06);
+    // vertical streaks, which the ground sampled straight down drew up every wall (11 Nov). The unfolding runs in the
+    // ground's own plane: up the face by the height over the ground is out along the face's normal as it lies in that
+    // plane, less the face's own run, k = n_t (1 + n.g) / |n_t|^2 with n_t the normal less its part along the ground's,
+    // clamped where the face lies nearly along the ground, which the line above has faded out already. On level ground
+    // that is out along the face's horizontal normal; on a wall it stays on the wall, where folding out level reached
+    // the canyon's floor or bench and fringed a rock shell with their colour (12 Nov). The footprint follows by the
+    // chain rule, the ground's height moving with the slope.
+    let along = dot(geo_n, ground_n);
+    let n_t = geo_n - ground_n * along;
+    let k3 = n_t * (1.0 + along) / max(dot(n_t, n_t), 0.06);
+    let k = k3.xz * ground_n.y;
     let fold = world.xz + k * max(above, 0.0);
     let fold_dx = dwx.xz + k * (dwx.y - dot(slope, dwx.xz));
     let fold_dy = dwy.xz + k * (dwy.y - dot(slope, dwy.xz));
