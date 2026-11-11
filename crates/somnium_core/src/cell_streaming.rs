@@ -667,6 +667,7 @@ pub(crate) fn terrain_descriptor(
         grid_size: [component.grid_x, component.grid_z],
         cell_size: component.cell_size,
         height_scale: component.height_scale,
+        lod_base_range: lod_base_range(component.cell_size),
         virtual_texturing: component.virtual_texturing,
         ..Default::default()
     };
@@ -683,6 +684,14 @@ pub(crate) fn terrain_descriptor(
         && desc.height_scale > 0.0
         && desc.total_vertices_x().checked_mul(desc.total_vertices_z()).is_some();
     valid.then_some(desc)
+}
+
+/// How far a saved terrain's finest level reaches, metres: as many cells as on 1 m ground, so each level's cells are
+/// the same size on screen whatever the cell size. At the 96 m of 1 m ground a 2 m tile was drawn in 4 m cells from
+/// 192 m and in 16 m cells from 768 m: cliffs and ridgelines a kilometre off stood in 16 m teeth, coarser than the 8 m
+/// far stand-ins beyond them (Sunscar, 11 Nov 2026). Ground finer than a metre keeps the range it had.
+fn lod_base_range(cell_size: f32) -> f32 {
+    somnium_renderer::terrain::TerrainDescriptor::default().lod_base_range * cell_size.max(1.0)
 }
 
 impl CellStreamer {
@@ -921,6 +930,11 @@ mod tests {
         // A window naming one wears the project's layers instead, rather than reading from anywhere.
         let window = TerrainStreamingComponent { layer_set: "../../../elsewhere".into(), ..Default::default() };
         assert_eq!(window.layer_dir(root), root);
+    }
+
+    #[test]
+    fn the_finest_level_reaches_as_many_cells_on_coarser_ground_and_no_less_on_finer() {
+        assert_eq!((lod_base_range(1.0), lod_base_range(2.0), lod_base_range(0.5)), (96.0, 192.0, 96.0));
     }
 
     #[test]
