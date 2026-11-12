@@ -47,6 +47,17 @@ const TREE_WORDS: [&str; 22] = [
     "poplar", "plane", "holm", "juniper", "carob", "hornbeam", "shrub", "bush", "palm", "laurel",
 ];
 
+/// The warning for a scene the world is composed from: Sunscar's `places_*` scenes are read raw by its composer, so
+/// edits saved with one open never reach the world (design/editor/EDIT_ANYTHING.md, D). `None` for the world itself
+/// (the startup scene) and for any other scene.
+fn composed_scene_warning(opened: &Path, startup: Option<&Path>) -> Option<String> {
+    let name = opened.file_name()?.to_str()?;
+    let world = startup?.file_name()?.to_str()?;
+    (name.starts_with("places_") && name != world).then(|| {
+        format!("Edits saved in {name} do not reach the world: the world is composed from it. Open {world} to edit the world")
+    })
+}
+
 /// Whether a model path names a tree: a whole word of it (folders included, plurals too) is a tree word, so
 /// `trees/grown/holm_oak_b.gltf` and `wall_fig.gltf` are and `silver_street_01.gltf` is not.
 fn tree_like(path: &str) -> bool {
@@ -543,7 +554,10 @@ impl<G: GameApp> Engine<G> {
                 self.editing.made_by.insert(project_relative(root.as_deref(), &scene), label);
             }
         }
-        match SceneEdits::read(&scene) {
+        let warning = (!self.config.player_mode)
+            .then(|| composed_scene_warning(&scene, self.config.startup_scene.as_deref()))
+            .flatten();
+        let result = match SceneEdits::read(&scene) {
             Ok(Some(mut layer)) => {
                 let mut edited = document.clone();
                 let applied = scene_edits::apply(&mut edited, &mut layer, Scope::Scene);
@@ -579,7 +593,15 @@ impl<G: GameApp> Engine<G> {
                 self.editing.layer_error = Some(error);
                 None
             }
+        };
+        if let Some(warning) = warning {
+            warn!("{warning}");
+            self.editing.summary = Some(match self.editing.summary.take() {
+                Some(summary) => format!("{warning} ({summary})"),
+                None => warning,
+            });
         }
+        result
     }
 
     /// After the scene spawned: say what its layer did.
@@ -3313,6 +3335,17 @@ fn decal_slab_distance(world: &World, entity: Entity, origin: glam::Vec3, direct
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_places_scene_warns_that_its_edits_never_reach_the_world() {
+        let world = Path::new("F:/game/scenes/sunscar.scene.json");
+        let places = Path::new("F:/game/scenes/places_kept_monargent.scene.json");
+        let warning = composed_scene_warning(places, Some(world)).expect("warned");
+        assert!(warning.contains("places_kept_monargent.scene.json") && warning.contains("Open sunscar.scene.json"));
+        assert_eq!(composed_scene_warning(world, Some(world)), None, "the world itself");
+        assert_eq!(composed_scene_warning(Path::new("scenes/town.scene.json"), Some(world)), None, "any other scene");
+        assert_eq!(composed_scene_warning(places, None), None, "no startup scene: nothing to point at");
+    }
 
     #[test]
     fn tree_like_is_whole_words_of_the_path() {
