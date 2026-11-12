@@ -477,6 +477,9 @@ struct GizmoDragState {
     followers: Vec<GizmoFollower>,
     /// Whether the drag axes follow the object's own rotation.
     local_space: bool,
+    /// The primary's pivot in its own mesh space, when it is not its origin ([`pivot_of_box`]): a part of a merged
+    /// model turns and scales about itself, not about the model's corner.
+    pivot: Option<glam::Vec3>,
 }
 
 /// State captured while a terrain brush stroke is in progress (Phase 14D).
@@ -3419,7 +3422,14 @@ impl<G: GameApp> Engine<G> {
         {
             return;
         }
-        let anchor = gizmo_anchor(&self.world, self.selection.primary);
+        let mut anchor = gizmo_anchor(&self.world, self.selection.primary);
+        // A part of a merged model shows its handle on itself, where it turns (`part_pivot`).
+        if let (Some(entity), Some(renderer), Some(_)) = (self.selection.primary, self.renderer.as_ref(), anchor) {
+            let world = self.world.get::<WorldTransform>(entity).map(|w| w.0);
+            if let (Some(pivot), Some(world)) = (part_pivot(&self.world, renderer, entity), world) {
+                anchor = Some(world.transform_point3(pivot));
+            }
+        }
         if let Some(renderer) = self.renderer.as_mut() {
             match anchor {
                 Some(pos) => {
@@ -13608,6 +13618,8 @@ fn try_start_gizmo_drag(
         // selection and the settings.
         followers: Vec::new(),
         local_space,
+        // Only where the handle is drawn on the pivot (`refresh_gizmo_anchor` needs the world transform too).
+        pivot: world.get::<WorldTransform>(entity).and(part_pivot(world, renderer, entity)),
         axis,
         mode,
         entity_index: entity.index(),
@@ -13821,6 +13833,9 @@ fn apply_gizmo_drag(
                 );
                 result.translation =
                     world_to_local_translation(drag.parent_world_inverse, snapped_world);
+                if let Some(pivot) = drag.pivot {
+                    result.translation = pivot_translation(drag.parent_world_inverse, snapped_world, &result, pivot);
+                }
             }
         }
         GizmoMode::Scale => {
@@ -13859,7 +13874,33 @@ fn apply_gizmo_drag(
             }
         }
     }
+    // Rotate and scale about the part's own pivot, which stays where the gizmo is.
+    if let (Some(pivot), GizmoMode::Rotate | GizmoMode::Scale) = (drag.pivot, drag.mode) {
+        result.translation = pivot_translation(drag.parent_world_inverse, drag.gizmo_pos, &result, pivot);
+    }
     result
+}
+
+/// The local translation that puts mesh-space point `pivot` of a part at world point `pivot_world` under the part's
+/// new rotation and scale: `T = parent⁻¹·p − R·(S·c)`, so a part turns and scales about itself.
+fn pivot_translation(parent_world_inverse: glam::Mat4, pivot_world: glam::Vec3, transform: &Transform, pivot: glam::Vec3) -> glam::Vec3 {
+    world_to_local_translation(parent_world_inverse, pivot_world) - transform.rotation * (transform.scale * pivot)
+}
+
+/// A part's pivot from its mesh box (mesh space): the box's centre when the box does not hold the origin, as for a part
+/// of a merged model whose vertices sit in the model's frame (design/editor/EDIT_ANYTHING.md, A); `None` keeps the
+/// origin, an ordinary prop's own pivot.
+fn pivot_of_box(min: glam::Vec3, max: glam::Vec3) -> Option<glam::Vec3> {
+    let margin = glam::Vec3::splat(0.05);
+    let holds_origin = (min - margin).cmple(glam::Vec3::ZERO).all() && glam::Vec3::ZERO.cmple(max + margin).all();
+    (!holds_origin && min.cmple(max).all()).then(|| (min + max) * 0.5)
+}
+
+/// [`pivot_of_box`] for an entity's own mesh, if it has one.
+fn part_pivot(world: &somnium_ecs::World, renderer: &SomniumRenderer, entity: somnium_ecs::entity::Entity) -> Option<glam::Vec3> {
+    let mesh = world.get::<MeshComponent>(entity)?;
+    let (min, max) = renderer.geometry.mesh_aabb(mesh.vertex_offset)?;
+    pivot_of_box(glam::Vec3::from_array(min), glam::Vec3::from_array(max))
 }
 
 /// Component tags for one entity, used by the Outliner's `type:` filter.
@@ -14555,6 +14596,33 @@ mod viewport_control_tests {
             start_local + delta,
             "adding the world delta directly would only be valid for an identity parent"
         );
+    }
+
+    /// The smelter yard's bench (EDIT_ANYTHING.md, A): its vertices sit in the yard's frame, its box 5.4 m from the
+    /// part's origin, so it must turn and scale about the box, not the yard's corner.
+    #[test]
+    fn a_part_of_a_merged_model_turns_about_its_own_box() {
+        let v = glam::Vec3::new;
+        assert_eq!(super::pivot_of_box(v(-0.5, 0.0, -0.5), v(0.5, 1.0, 0.5)), None, "an ordinary prop keeps its origin");
+        let c = super::pivot_of_box(v(2.0, 0.0, -5.2), v(2.9, 0.96, -4.36)).expect("its box is off its origin");
+        assert!(c.abs_diff_eq(v(2.45, 0.48, -4.78), 1e-4));
+        let parent = glam::Mat4::from_rotation_translation(glam::Quat::from_rotation_y(0.7), v(-15459.7, 60.0, 284.2));
+        let start = Transform::from_translation(glam::Vec3::ZERO);
+        let pivot_world = parent.transform_point3(c);
+        let centre = |t: &Transform| parent.transform_point3(t.translation + t.rotation * (t.scale * c));
+        // Unmoved, the translation is the one it started with: no jump when a drag begins.
+        assert!(super::pivot_translation(parent.inverse(), pivot_world, &start, c).abs_diff_eq(start.translation, 5e-3));
+        // Half a turn and twice the size: the bench stays where it stood, its origin swings round it.
+        let mut turned = start;
+        turned.rotation = glam::Quat::from_rotation_y(std::f32::consts::PI);
+        turned.scale = glam::Vec3::splat(2.0);
+        turned.translation = super::pivot_translation(parent.inverse(), pivot_world, &turned, c);
+        assert!(centre(&turned).abs_diff_eq(pivot_world, 5e-3), "{} vs {pivot_world}", centre(&turned));
+        assert!(turned.translation.length() > 5.0, "the origin moved round the bench");
+        // Moved 1 m along world x: the bench's centre goes 1 m, wherever its origin is.
+        let mut moved = start;
+        moved.translation = super::pivot_translation(parent.inverse(), pivot_world + glam::Vec3::X, &moved, c);
+        assert!(centre(&moved).abs_diff_eq(pivot_world + glam::Vec3::X, 5e-3));
     }
 
     /// Locked and hidden exist to stop the viewport moving something. The
