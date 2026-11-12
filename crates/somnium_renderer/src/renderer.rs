@@ -5442,6 +5442,7 @@ impl SomniumRenderer {
         } else {
             0.0
         };
+        self.ibl_pass.clouds_under = self.cloud_pass.horizon_closure;
         self.ibl_pass.generate_if_needed(
             &ctx.device,
             &ctx.queue,

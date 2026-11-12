@@ -83,7 +83,8 @@ impl StormVolume {
         let dir = downwind.normalize_or(glam::Vec2::X);
         let mut v = Self::new(CELL, base, radius, height, 1.0, (radius * 2.2).clamp(600.0, 6000.0));
         v.a = [dir.x, dir.y, 0.0, 0.0];
-        v.b = [lean, striation.clamp(0.0, 1.0), 0.0, overshoot.max(0.0)];
+        // b.z: it flares into an anvil at its top (1, the default); a game sets 0 for a tower with none.
+        v.b = [lean, striation.clamp(0.0, 1.0), 1.0, overshoot.max(0.0)];
         // Its widest (the flare under the anvil, 1.63 radii with its bands) pushed out by all the noise may (1.35).
         let centre = glam::Vec2::new(base.x, base.z) + dir * (lean * 0.5);
         v.bound = [centre.x, centre.y, radius * 2.2 + lean.abs() * 0.5, (radius * 0.08).max(30.0)];
@@ -105,10 +106,11 @@ impl StormVolume {
         let mut v = Self::new(ANVIL, base, radius, height, 1.0, (radius * 2.2).clamp(600.0, 6000.0));
         v.a = [dir.x, dir.y, reach.max(0.0), under];
         v.b = [0.0, 0.0, mammatus.clamp(0.0, 1.0), 0.0];
-        let centre = glam::Vec2::new(base.x, base.z) + dir * (reach * 0.42);
-        v.bound = [centre.x, centre.y, reach * 0.62 + radius * 2.0, (radius * 0.15).max(60.0)];
+        let centre = glam::Vec2::new(base.x, base.z) + dir * (reach * 0.5);
+        v.bound = [centre.x, centre.y, reach * 0.5 + radius * 2.0, (radius * 0.15).max(60.0)];
         // From its lowest mammatus to its top.
-        v.bound_y = [base.y + height * (under - 0.08), base.y + height, 0.0, 0.0];
+        // From its lowest (round the tower its underside comes down a quarter of the height; mammatus under that).
+        v.bound_y = [base.y + height * (under - 0.32).max(0.22), base.y + height, 0.0, 0.0];
         v
     }
 
@@ -313,11 +315,12 @@ mod tests {
         assert!((at + dir * (600.0 + 800.0 * 1.63)).distance(centre) <= cell.bound[2], "tower's top outside");
         assert!((at - dir * 800.0 * 1.4).distance(centre) <= cell.bound[2], "tower's back outside");
         assert!(cell.bound[2] < 3000.0 && cell.bound_y[1] >= 900.0 + 6000.0 + 400.0);
-        // The anvil's far tip is inside its own, which starts at its underside: the air below it is nobody's.
+        // The anvil's far tip is inside its own, which starts at its underside (it comes down a quarter of the height
+        // round the tower): the air below it is nobody's.
         let anvil = StormVolume::anvil(glam::Vec3::new(1000.0, 900.0, -500.0), 800.0, 6000.0, dir, 9000.0, 0.72, 0.5);
         let centre = glam::Vec2::new(anvil.bound[0], anvil.bound[1]);
         assert!((at + dir * 9000.0 * 1.04).distance(centre) <= anvil.bound[2], "anvil tip outside");
-        assert!(anvil.bound_y[0] > 900.0 + 6000.0 * 0.6 && anvil.bound_y[1] >= 900.0 + 6000.0);
+        assert!(anvil.bound_y[0] > 900.0 + 6000.0 * 0.35 && anvil.bound_y[0] < 900.0 + 6000.0 * 0.45 && anvil.bound_y[1] >= 900.0 + 6000.0);
 
         // A deck's cylinder reaches its downwind end and stops at its own top.
         let deck = StormVolume::deck(glam::Vec3::new(1000.0, 900.0, -500.0), 7000.0, 900.0, dir * 6000.0);

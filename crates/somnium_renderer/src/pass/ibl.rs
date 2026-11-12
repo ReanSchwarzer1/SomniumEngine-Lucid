@@ -85,7 +85,7 @@ struct GenParams {
     night: [f32; 4],
     /// `NightSky::tint`, then padding.
     night_tint: [f32; 4],
-    /// x: 1 lays the clouds' capture over the sky (`set_cloud_capture`).
+    /// x: 1 lays the clouds' capture over the sky (`set_cloud_capture`). y: `IblPass::clouds_under`.
     clouds: [f32; 4],
     /// The sun on the ground and 1 when `sun_color` is the sun above the air (`generate_if_needed`'s `ground_sun`);
     /// all zero is the sky as it always was.
@@ -145,6 +145,13 @@ pub struct IblPass {
     prefilter_bgl: wgpu::BindGroupLayout,
     mip0_view: wgpu::TextureView,
     last_clouds: Option<u64>,
+    /// How far the air under the clouds takes the light they let through and not the open sky's, 0..1: how closed
+    /// the deck is to the horizon (`CloudPass::horizon_closure`; the renderer sets it each frame). Mip 0 holds, below
+    /// the horizon, the clear air's scatter toward the ground lit by an open sun and sky, and the far land fades
+    /// toward it: under an overcast, a haze twice as bright as the deck and blue (Sunscar's summit stills, 12 Nov
+    /// 2026). It rides the cube's next rebuild, which the clouds' own capture brings when the deck changes; 0, the
+    /// default, is every sky but a closed deck.
+    pub clouds_under: f32,
     prefilter_bind_group: wgpu::BindGroup,
     params_buffer: wgpu::Buffer,
 
@@ -459,6 +466,7 @@ impl IblPass {
             prefilter_bgl,
             mip0_view,
             last_clouds: None,
+            clouds_under: 0.0,
             prefilter_bind_group,
             params_buffer,
             last_sun: None,
@@ -790,7 +798,7 @@ impl IblPass {
             ],
             night: [self.night.glow.max(0.0), self.night.aurora, self.night.halo_road, self.night.thread],
             night_tint: [self.night.tint[0], self.night.tint[1], self.night.tint[2], 0.0],
-            clouds: [clouds, 0.0, 0.0, 0.0],
+            clouds: [clouds, self.clouds_under.clamp(0.0, 1.0), 0.0, 0.0],
             sun_ground: ground,
             planet,
         };

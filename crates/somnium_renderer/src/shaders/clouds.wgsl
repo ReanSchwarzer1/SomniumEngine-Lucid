@@ -259,7 +259,11 @@ fn storm_cell(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
     // Bands round the tower where the updraft turns (a supercell's striations).
     let band = 1.0 + v.b.y * 0.07 * sin(h * 52.0 + atan2(d.y, d.x) * 2.0 - v.albedo.w);
     let bell = (0.18 + 0.3 * v.b.y) * (1.0 - smoothstep(0.0, 0.22, h));
-    let rt = radius * (0.82 + bell + 0.7 * smoothstep(0.5, 0.95, h)) * band;
+    // A tower that has reached its anvil flares into it (`b.z` 1). One that has not (a flanking line's, a young
+    // storm's) is a cumulus still: it draws in to a rounded head. (Flared and cut level, each stood as a drum with a
+    // collar: the windowless pictures, 12 Nov.)
+    let head = sqrt(max(1.0 - pow(smoothstep(0.4, 1.0, h), 2.0), 0.0));
+    let rt = radius * mix((0.82 + bell) * head, 0.82 + bell + 0.7 * smoothstep(0.5, 0.95, h), v.b.z) * band;
     let dome = 0.97 + over * (1.0 - smoothstep(0.0, radius * 0.9, rho));
     // A convective tower's edge is hard: the shape fills over a sixth of its radius, and the noise frays only that.
     let tower = (1.0 - smoothstep(rt * 0.84, rt, rho)) * (1.0 - smoothstep(dome - 0.05, dome, h)) * smoothstep(0.0, 0.012, h);
@@ -279,11 +283,16 @@ fn storm_anvil(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
     let radius = v.size.x;
     let along = dot(q.xz, dir);
     let across = dot(q.xz, vec2<f32>(-dir.y, dir.x));
-    let e = length(vec2<f32>((along - reach * 0.42) / (reach * 0.62 + radius), across / (reach * 0.34 + radius)));
+    // Downwind its whole reach; upwind little more than the tower's own width (the back-sheared edge), so a sun
+    // on that side still reaches the tower's flank.
+    let e = length(vec2<f32>((along - reach * 0.5) / (reach * 0.5 + radius * 1.1), across / (reach * 0.34 + radius)));
     if e >= 1.0 {
         return vec2<f32>(0.0);
     }
-    let under = mix(v.a.w, 0.9, smoothstep(0.1, 1.0, e));
+    // Its underside is lowest round the tower, where the updraft spreads into it, and climbs away from there: seen
+    // from the side the two are one mushroom, not a plate laid on a post (the windowless pictures, 12 Nov).
+    let from_tower = length(q.xz);
+    let under = max(mix(v.a.w, 0.9, smoothstep(0.1, 1.0, e)) - 0.24 * (1.0 - smoothstep(radius * 0.9, radius * 4.2, from_tower)), 0.3);
     let top = 0.985 - 0.07 * smoothstep(0.2, 1.0, e);
     var anvil = (1.0 - smoothstep(0.6, 1.0, e)) * smoothstep(under - 0.02, under + 0.03, h) * (1.0 - smoothstep(top - 0.045, top, h));
     var fray = 1.0;
@@ -293,14 +302,17 @@ fn storm_anvil(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
         let hang = v.b.z * 0.06 * smoothstep(0.45, 0.85, cells) * smoothstep(radius * 1.8, radius * 3.2, length(q.xz));
         var lobe = 0.0;
         if hang > 0.0 {
-            lobe = (1.0 - smoothstep(0.7, 1.0, e)) * smoothstep(under - hang, under - hang * 0.55, h);
+            // Under the anvil's body, not out at its rim: there the sun reaches them, and a ring of white puffs
+            // stood round the anvil (the windowless pictures, 12 Nov).
+            lobe = (1.0 - smoothstep(0.45, 0.7, e)) * smoothstep(under - hang, under - hang * 0.55, h);
         }
         if lobe > anvil {
             anvil = lobe;
             fray = 0.15;
         }
     }
-    return vec2<f32>(anvil, fray);
+    // Ice: its rim thins away in fibres, it does not break into puffs.
+    return vec2<f32>(anvil, fray * 0.08);
 }
 
 /// A storm's base: a level deck, an ellipse drawn out downwind, thick at the storm and thinning to a rim that the
@@ -358,8 +370,13 @@ fn storm_shelf(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
         return vec2<f32>(0.0);
     }
     let u = clamp(behind / v.a.z, 0.0, 1.0);
-    let top = nose + (height - nose) * pow(u, 0.75);
-    let under = height * 0.55 * u * u * (3.0 - 2.0 * u);
+    // Its upper face is stacked plates: tiers that step back as it climbs, each a ledge with a shadow under it. Its
+    // underside is torn by the air rolling under it, in lumps as deep as its nose.
+    let along_arc = off * v.size.x;
+    let rough = textureSampleLevel(base_noise_tex, cloud_sampler, vec3<f32>(along_arc, 0.0, behind) / (nose * 6.0) + vec3<f32>(0.23, 0.61, 0.07), 0.0);
+    let tiers = 0.5 + 0.5 * sin(u * 26.0 + (rough.r - 0.5) * 3.0);
+    let top = nose + (height - nose) * pow(u, 0.75) - nose * 0.45 * tiers * smoothstep(0.02, 0.12, u) * (1.0 - smoothstep(0.7, 1.0, u));
+    let under = height * 0.55 * u * u * (3.0 - 2.0 * u) + nose * (1.1 * rough.g - 0.35) * smoothstep(0.0, 0.2, u);
     let inside = smoothstep(under - 0.12 * nose, under + 0.25 * nose, q.y) * (1.0 - smoothstep(top - 0.1 * nose, top, q.y));
     let front = smoothstep(-0.5 * nose, 0.3 * nose, behind) * (1.0 - smoothstep(0.85, 1.0, u));
     // Laminar bands along the face near the leading edge.
@@ -480,6 +497,39 @@ fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
         // Up or down a little too (not at a tower's flat base); a wall cloud's foot hangs in rags.
         let lift = select(0.06 * step(0.05 * v.size.y, q.y), 0.7, kind == 2) * v.size.y;
         qs = vec3<f32>(q.x / swell, q.y + (lump.a - 0.5) * lift, q.z / swell);
+    } else if kind == 10 {
+        // A storm's base is not a ceiling: it is hollowed and domed from below, in lumps a kilometre across and
+        // smaller ones on them, and its rim is torn. (It only ever rises: the body's cylinder starts at its base.)
+        let at = vec3<f32>(q.x, 0.0, q.z);
+        let big = textureSampleLevel(base_noise_tex, cloud_sampler, at / v.size.w + vec3<f32>(0.31, 0.21, 0.17), 0.0);
+        let small = textureSampleLevel(base_noise_tex, cloud_sampler, at / (v.size.w * 0.31) + vec3<f32>(0.11, 0.57, 0.43), 0.0);
+        let swell = clamp(1.0 + (big.g - 0.6) * 0.5 + (small.g - 0.6) * 0.2, 0.75, 1.3);
+        let hollow = min(0.3 * v.size.y, 340.0) * clamp(0.75 * big.g + 0.45 * small.g - 0.25, 0.0, 1.0);
+        qs = vec3<f32>(q.x / swell, q.y - hollow, q.z / swell);
+        if v.a.w > 0.0 {
+            // A deck that stands on the ground is a wall (dust): its face and top billow, lobes some hundreds of
+            // metres across with creases between, cut back into it by up to half a kilometre.
+            let lobe = textureSampleLevel(base_noise_tex, cloud_sampler, q / 1100.0 + vec3<f32>(0.37, 0.11, 0.59), 0.0);
+            let knot = textureSampleLevel(base_noise_tex, cloud_sampler, q / 380.0 + vec3<f32>(0.71, 0.29, 0.13), 0.0);
+            let cut = v.a.w * 520.0 * clamp(1.2 * lobe.g + 0.45 * knot.g - 0.5, 0.0, 1.0);
+            let mid = v.a.xy * v.a.z;
+            let from_mid = q.xz - mid;
+            let out = mid + from_mid * (1.0 + cut / max(length(from_mid), 1.0));
+            qs = vec3<f32>(out.x, q.y + 0.6 * cut, out.y);
+        }
+    } else if kind == 4 {
+        // A funnel's wall is condensing, turning air: it bulges and necks along its length.
+        let hc = clamp(q.y / v.size.y, 0.0, 1.0);
+        let axis = storm_funnel_axis(v, hc);
+        let lump = textureSampleLevel(base_noise_tex, cloud_sampler, vec3<f32>(q.x, q.y * 0.5 - turn * v.size.x, q.z) / v.size.w + vec3<f32>(0.47, 0.0, 0.29), 0.0);
+        let swell = clamp(1.0 + (lump.g - 0.6) * 0.55 + (lump.b - 0.6) * 0.3, 0.72, 1.3);
+        let rel = (q.xz - axis) / swell;
+        qs = vec3<f32>(axis.x + rel.x, q.y, axis.y + rel.y);
+    } else if kind == 7 {
+        // Rain comes down from the parts of a base that rain hardest: a shaft's edge wanders, in and out by a third.
+        let wander = textureSampleLevel(base_noise_tex, cloud_sampler, vec3<f32>(q.x, q.y * 0.15, q.z) / (v.size.x * 2.4) + vec3<f32>(0.13, 0.0, 0.41), 0.0);
+        let swell = clamp(0.62 + 0.75 * wander.g, 0.6, 1.35);
+        qs = vec3<f32>(q.x / swell, q.y, q.z / swell);
     }
     switch kind {
         case 1 {
@@ -497,7 +547,7 @@ fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
             np = vec3<f32>(q.x, q.y * 2.0, q.z);
         }
         case 4 {
-            m = storm_funnel(v, q);
+            m = storm_funnel(v, qs);
             let hc = clamp(q.y / v.size.y, 0.0, 1.0);
             // The wall turns, faster low down, and its streaks climb.
             let r = storm_rot(q.xz - storm_funnel_axis(v, hc), turn * (1.5 - 0.5 * hc));
@@ -514,7 +564,7 @@ fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
             np = vec3<f32>(dot(q.xz, v.a.xy) * 0.3, q.y * 1.5, dot(q.xz, vec2<f32>(-v.a.y, v.a.x)));
         }
         case 7 {
-            m = storm_shaft(v, q);
+            m = storm_shaft(v, qs);
             np = vec3<f32>(q.x, q.y * 0.07 + turn, q.z);
         }
         case 8 {
@@ -528,7 +578,7 @@ fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
             }
         }
         case 10 {
-            m = storm_deck(v, q);
+            m = storm_deck(v, qs);
             np = vec3<f32>(q.x, q.y * 2.0, q.z);
         }
         default {}
@@ -546,6 +596,11 @@ fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
         let detail = textureSampleLevel(detail_noise_tex, cloud_sampler, np / (v.size.w * 0.13), 0.0);
         let fbm = detail.r * 0.625 + detail.g * 0.25 + detail.b * 0.125;
         density = clamp(cloud_remap(density, fbm * 0.3 * m.y, 1.0, 0.0, 1.0), 0.0, 1.0);
+        if kind == 7 {
+            // Combed into fall streaks a hundred metres or so across, drawn out along the fall.
+            let comb = textureSampleLevel(detail_noise_tex, cloud_sampler, vec3<f32>(q.x, q.y * 0.04 + turn, q.z) / 420.0, 0.0);
+            density *= 0.55 + 0.7 * comb.r;
+        }
     }
     // A ring's rain is thin beside its cloud.
     if v.pos.w > 7.5 && q.y < 0.0 {
@@ -624,6 +679,11 @@ fn storm_light_march(origin: vec3<f32>, sun: vec3<f32>, finest: f32) -> f32 {
         optical_depth += cloud_density(origin + sun * (near + width * 0.5), true) * width * 0.01;
         near += width;
         width *= 3.0;
+    }
+    // A small body's four taps end a few hundred metres up: one more, far along the ray, finds the storm over it. A
+    // funnel under a storm's base stood in full sun, white (the windowless pictures, 12 Nov).
+    if near < 4000.0 {
+        optical_depth += cloud_density(origin + sun * 2600.0, true) * 2400.0 * 0.01;
     }
     return optical_depth;
 }
