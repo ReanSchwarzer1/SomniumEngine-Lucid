@@ -31,11 +31,6 @@ var<private> ground_blend_open: f32 = 0.0;
 /// mirror where the band shades as ground, so the band takes the sky's reflection along its own normal instead.
 var<private> ground_blend_w: f32 = 0.0;
 
-/// The ground point a band pixel stands for and the ground's normal there: the band takes that point's sun
-/// (`band_sun_visibility`, shading.wgsl) as it takes its surface.
-var<private> ground_blend_pos: vec3<f32> = vec3<f32>(0.0);
-var<private> ground_blend_n: vec3<f32> = vec3<f32>(0.0, 1.0, 0.0);
-
 /// The list entry whose rectangle holds `xz`, or -1.
 fn ground_terrain_at(xz: vec2<f32>) -> i32 {
     let count = min(u32(ground_blend.params.x), 32u);
@@ -157,8 +152,6 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     let open = w * ground_blend.params.w;
     ground_blend_open = open;
     ground_blend_w = w;
-    ground_blend_pos = ground_pos;
-    ground_blend_n = ground_n;
     let screen = mix(screen_occlusion, 1.0, open);
     s.occlusion = s.occlusion / max(screen_occlusion, 0.004) * screen;
     screen_occlusion = screen;
