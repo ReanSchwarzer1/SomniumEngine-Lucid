@@ -4995,6 +4995,19 @@ impl SomniumRenderer {
                 for (name, (bytes, count)) in held.into_iter().take(16) {
                     tracing::info!("GPU memory: {:>6} MiB in {count:>5} of {name}", bytes >> 20);
                 }
+                // The two pools are single allocations of a fixed size, so the table above shows their size, never how
+                // full they are: this does (the geometry pool's number, Sunscar, 12 Nov 2026).
+                let (live_vertex, live_index) = self.geometry.live_bytes();
+                let [vertex, vertex_high, index, index_high] = self.geometry.extent_bytes();
+                tracing::info!(
+                    "GPU memory: geometry pool in use {} of {} MiB vertex (high water {}), {} of {} MiB index (high water {})",
+                    live_vertex >> 20,
+                    vertex >> 20,
+                    vertex_high >> 20,
+                    live_index >> 20,
+                    index >> 20,
+                    index_high >> 20
+                );
             }
         }
         self.profiler.end(&mut encoder); // Frame

@@ -531,6 +531,18 @@ impl GeometryPool {
         )
     }
 
+    /// The pools' sizes and high-water marks, bytes: vertex size, vertex high water, index size, index high water.
+    /// A mesh is refused once a high water reaches its size and no freed span fits, so with [`Self::live_bytes`] this
+    /// says how full the pools are and how much room is left.
+    pub fn extent_bytes(&self) -> [u64; 4] {
+        [
+            self.vertex_bytes,
+            u64::from(self.next_vertex) * std::mem::size_of::<Vertex>() as u64,
+            self.index_bytes,
+            u64::from(self.next_index) * 4,
+        ]
+    }
+
     pub fn reserved_span_counts(&self) -> (usize, usize) {
         (self.vertex_spans.len(), self.index_spans.len())
     }
