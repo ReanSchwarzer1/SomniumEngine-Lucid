@@ -4744,7 +4744,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                         self.apply_marquee(band);
                     } else {
                         let hit = self.click_pick();
-                        self.selection.set_single(hit);
+                        self.select_clicked(hit);
                         self.after_selection_change();
                         self.reveal_selection_in_outliner(true);
                     }
@@ -5038,12 +5038,17 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             {
                 *t = new_t;
             }
+            // The point the gizmo holds: a part's pivot (`GizmoDragState::pivot`), else the origin.
+            let held = self.gizmo_drag.as_ref().and_then(|drag| drag.pivot).unwrap_or(glam::Vec3::ZERO);
+            let held_world = |drag: &GizmoDragState| {
+                drag.parent_world.transform_point3(new_t.translation + new_t.rotation * (new_t.scale * held))
+            };
             // The same delta, applied to every follower's own starting
             // transform. Rotation composes and scale multiplies, because that
             // is what those operations mean; translation adds.
             let world_offset = self.gizmo_drag.as_ref().map_or_else(
                 || new_t.translation - start.translation,
-                |drag| drag.parent_world.transform_point3(new_t.translation) - drag.gizmo_pos,
+                |drag| held_world(drag) - drag.gizmo_pos,
             );
             // The followers take the turn in world space (each writes it into its own parent's frame).
             let spin = self.gizmo_drag.as_ref().map_or_else(
@@ -5058,12 +5063,15 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 safe_ratio(new_t.scale.y, start.scale.y),
                 safe_ratio(new_t.scale.z, start.scale.z),
             );
-            let pivot = self
-                .settings
-                .editor()
-                .gizmo_pivot_centre
-                .then(|| self.focus_target().map(|(centre, _)| centre))
-                .flatten();
+            // Followers of a part turn about the part's pivot too, so a far LOD twin (same frame) stays on it.
+            let part_pivot_world = self.gizmo_drag.as_ref().filter(|drag| drag.pivot.is_some()).map(|drag| drag.gizmo_pos);
+            let pivot = part_pivot_world.or_else(|| {
+                self.settings
+                    .editor()
+                    .gizmo_pivot_centre
+                    .then(|| self.focus_target().map(|(centre, _)| centre))
+                    .flatten()
+            });
             let followers = self
                 .gizmo_drag
                 .as_ref()
@@ -5077,10 +5085,8 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 growth,
                 pivot,
             );
+            let world_position = self.gizmo_drag.as_ref().map_or(new_t.translation, held_world);
             if let Some(r) = &mut self.renderer {
-                let world_position = self.gizmo_drag.as_ref().map_or(new_t.translation, |drag| {
-                    drag.parent_world.transform_point3(new_t.translation)
-                });
                 r.set_gizmo_world_pos(world_position);
             }
         }

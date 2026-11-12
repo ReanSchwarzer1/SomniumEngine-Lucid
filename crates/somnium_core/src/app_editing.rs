@@ -47,6 +47,63 @@ const TREE_WORDS: [&str; 22] = [
     "poplar", "plane", "holm", "juniper", "carob", "hornbeam", "shrub", "bush", "palm", "laurel",
 ];
 
+/// The parent of `entity`, if it has a live one.
+fn parent_of(world: &World, entity: Entity) -> Option<Entity> {
+    world.get::<Parent>(entity).map(|p| p.entity).filter(|p| *p != Entity::DANGLING && world.is_alive(*p))
+}
+
+/// Whether `entity` lies in a level of detail its group does not draw for a camera at `camera` (`lod_group`'s rule:
+/// the levels are the group's children in name order), so a click finds the drawn twin, never the hidden one.
+fn in_undrawn_level(world: &World, children: &HashMap<Entity, Vec<Entity>>, entity: Entity, camera: glam::Vec3) -> bool {
+    let mut node = entity;
+    while let Some(parent) = parent_of(world, node) {
+        if let Some(group) = world.get::<crate::lod_group::LodGroupComponent>(parent) {
+            if !group.enabled {
+                return false;
+            }
+            let mut levels = children.get(&parent).cloned().unwrap_or_default();
+            levels.sort_by_key(|level| name_of(world, *level));
+            let at = world.get::<WorldTransform>(parent).map_or(glam::Vec3::ZERO, |w| w.0.w_axis.truncate());
+            return crate::lod_group::level_for(group, at.distance(camera), levels.len())
+                .is_none_or(|drawn| levels.get(drawn) != Some(&node));
+        }
+        node = parent;
+    }
+    false
+}
+
+/// A part's twins in the other levels of its LOD group: the same names from the level down, under each sibling level.
+/// Selected with it, they move, turn, delete and save together, so the far copy follows the near one
+/// (design/editor/EDIT_ANYTHING.md, B). Empty for anything not inside a level.
+fn lod_twins(world: &World, children: &HashMap<Entity, Vec<Entity>>, part: Entity) -> Vec<Entity> {
+    let mut path = vec![name_of(world, part)];
+    let mut level = part;
+    let group = loop {
+        let Some(up) = parent_of(world, level) else { return Vec::new() };
+        if world.get::<crate::lod_group::LodGroupComponent>(up).is_some() {
+            break up;
+        }
+        path.push(name_of(world, up));
+        level = up;
+    };
+    if level == part {
+        return Vec::new();
+    }
+    path.pop();
+    path.reverse();
+    children
+        .get(&group)
+        .into_iter()
+        .flatten()
+        .filter(|sibling| **sibling != level)
+        .filter_map(|sibling| {
+            path.iter().try_fold(*sibling, |at, name| {
+                children.get(&at)?.iter().copied().find(|child| name_of(world, *child) == *name)
+            })
+        })
+        .collect()
+}
+
 /// The warning for a scene the world is composed from: Sunscar's `places_*` scenes are read raw by its composer, so
 /// edits saved with one open never reach the world (design/editor/EDIT_ANYTHING.md, D). `None` for the world itself
 /// (the startup scene) and for any other scene.
@@ -1024,13 +1081,23 @@ impl<G: GameApp> Engine<G> {
         };
         match id.and_then(|id| self.world.entity_by_persistent_id(id)) {
             Some(entity) => {
-                self.selection.set_single(Some(entity));
+                self.select_clicked(Some(entity));
                 self.after_selection_change();
                 self.focus_camera_on_selection();
                 self.reveal_selection_in_outliner(true);
                 self.toast(&format!("{name}: selected, the thing you were looking at. End drops it; Ctrl+S keeps it"));
             }
             None => self.toast(&format!("{name} only exists while the game runs (the game made it), so there is nothing to edit")),
+        }
+    }
+
+    /// Select what a click found, with its LOD twins ([`lod_twins`]); the clicked part stays the primary.
+    pub(super) fn select_clicked(&mut self, hit: Option<Entity>) {
+        let twins = hit.map(|part| lod_twins(&self.world, &children_map(&self.world), part)).unwrap_or_default();
+        if twins.is_empty() {
+            self.selection.set_single(hit);
+        } else {
+            self.selection.set_many(twins.into_iter().chain(hit));
         }
     }
 
@@ -1041,6 +1108,8 @@ impl<G: GameApp> Engine<G> {
             world.get::<EditorFlags>(entity).is_none_or(|flags| !flags.locked && !flags.hidden)
         };
         let mut boxes: Vec<(f32, Entity)> = Vec::new();
+        let children = children_map(&self.world);
+        let camera = renderer.camera_pos;
         let proxies = self
             .world
             .entities_with::<crate::decal::DecalComponent>()
@@ -1050,6 +1119,7 @@ impl<G: GameApp> Engine<G> {
         for entity in self.world.entities_with::<MeshComponent>().chain(proxies) {
             if pickable(&self.world, entity)
                 && let Some(d2) = entity_ray_hit_distance(&self.world, renderer, entity, origin, direction)
+                && !in_undrawn_level(&self.world, &children, entity, camera)
             {
                 boxes.push((d2.sqrt(), entity));
             }
@@ -2612,7 +2682,7 @@ impl<G: GameApp> Engine<G> {
                     self.cursor_pos = (x * width, y * height);
                     let hit = self.click_pick();
                     info!(picked = %hit.map_or_else(|| "nothing".to_owned(), |e| name_of(&self.world, e)), "editor script");
-                    self.selection.set_single(hit);
+                    self.select_clicked(hit);
                     self.after_selection_change();
                     self.reveal_selection_in_outliner(true);
                 }
@@ -2750,7 +2820,12 @@ impl<G: GameApp> Engine<G> {
             format!("{}  \u{203a}  {name}", name_of(&self.world, object))
         };
         if self.selection.len() > 1 {
-            title.push_str(&format!("   (+{} more selected)", self.selection.len() - 1));
+            let twins = lod_twins(&self.world, &children_map(&self.world), entity);
+            if twins.len() == self.selection.len() - 1 && twins.iter().all(|t| self.selection.contains(*t)) {
+                title.push_str("   (with its far copy)");
+            } else {
+                title.push_str(&format!("   (+{} more selected)", self.selection.len() - 1));
+            }
         }
         if id.is_some_and(|id| self.editing.edited.contains(&id)) {
             title.push_str("   [edited]");
@@ -3065,6 +3140,34 @@ fn decal_slab_distance(world: &World, entity: Entity, origin: glam::Vec3, direct
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_click_finds_the_drawn_level_and_a_part_brings_its_far_twin() {
+        use crate::lod_group::LodGroupComponent;
+        let mut world = World::new();
+        let spawn = |world: &mut World, name: &str, parent: Option<Entity>| {
+            let entity = world.spawn((Name::new(name), Transform::from_translation(glam::Vec3::ZERO), WorldTransform::identity()));
+            if let Some(parent) = parent {
+                world.insert_component(entity, Parent { entity: parent }).expect("a parent");
+            }
+            entity
+        };
+        let yard = spawn(&mut world, "yard", None);
+        world.insert_component(yard, LodGroupComponent { enabled: true, distances: glam::Vec3::new(25.0, 100_000.0, 0.0) }).expect("a group");
+        let (near, far) = (spawn(&mut world, "LOD0", Some(yard)), spawn(&mut world, "LOD1", Some(yard)));
+        let (bench, bench_far) = (spawn(&mut world, "ks_bench", Some(near)), spawn(&mut world, "ks_bench", Some(far)));
+        let woodpile = spawn(&mut world, "ks_wood", Some(near));
+        let children = children_map(&world);
+        assert_eq!(lod_twins(&world, &children, bench), vec![bench_far]);
+        assert_eq!(lod_twins(&world, &children, bench_far), vec![bench]);
+        assert!(lod_twins(&world, &children, woodpile).is_empty(), "no twin of that name in the far level");
+        assert!(lod_twins(&world, &children, yard).is_empty() && lod_twins(&world, &children, near).is_empty());
+        let close = glam::Vec3::new(5.0, 0.0, 0.0);
+        let away = glam::Vec3::new(60.0, 0.0, 0.0);
+        assert!(!in_undrawn_level(&world, &children, bench, close) && in_undrawn_level(&world, &children, bench_far, close));
+        assert!(in_undrawn_level(&world, &children, bench, away) && !in_undrawn_level(&world, &children, bench_far, away));
+        assert!(!in_undrawn_level(&world, &children, yard, away), "the group itself is always drawn");
+    }
 
     #[test]
     fn a_places_scene_warns_that_its_edits_never_reach_the_world() {
