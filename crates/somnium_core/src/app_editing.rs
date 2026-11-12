@@ -769,6 +769,11 @@ impl<G: GameApp> Engine<G> {
                 // Take the ring on the camera's side, where no other ring's handle lies in front of it.
                 let toward = renderer.camera_pos - at;
                 let near = toward.dot(bitangent).atan2(toward.dot(tangent));
+                // The rings cross every quarter turn of each other, and with the camera along a world axis the point
+                // nearest it is such a crossing: `turn,y` then took the x ring and tipped a shrub over (12 Nov). Press
+                // on the diagonal next to it, an eighth of a turn from every crossing.
+                use std::f32::consts::{FRAC_PI_2, FRAC_PI_4};
+                let near = ((near - FRAC_PI_4) / FRAC_PI_2).round() * FRAC_PI_2 + FRAC_PI_4;
                 let on_ring = |angle: f32| at + (tangent * angle.cos() + bitangent * angle.sin()) * (0.84 * reach);
                 (on_ring(near), on_ring(near + amount.to_radians()))
             }
