@@ -492,7 +492,11 @@ impl<G: GameApp> Engine<G> {
             let id = match runtime.get(&component.terrain_id) {
                 Some(&id) => id,
                 None => {
-                    let sidecar = sidecars.remove(&component.terrain_id);
+                    let mut sidecar = sidecars.remove(&component.terrain_id);
+                    // The copies the author took out stay out (the edit layer's `painted`).
+                    if let Some(sidecar) = sidecar.as_mut() {
+                        self.painted_before_install(&self.cell_streamer.cells[index].file.clone(), &mut sidecar.foliage);
+                    }
                     let slot = self.adopt_terrain(index, entity, &component, sidecar, &asset_dir);
                     let id = slot.as_ref().map_or(u32::MAX, |slot| slot.id);
                     slots.extend(slot);

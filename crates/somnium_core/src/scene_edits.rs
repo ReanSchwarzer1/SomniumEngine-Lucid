@@ -46,7 +46,26 @@ pub struct SceneEdits {
     /// One entry per edited entity.
     #[serde(default)]
     pub entities: Vec<EditEntry>,
+    /// Painted copies (trees, shrubs, plants) the author took out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub painted: Vec<PaintedEdit>,
 }
+
+/// A painted copy the author took out: its ground's file (project-relative, the tile scene its foliage sidecar sits
+/// beside), its kind and its terrain-local place. The copy within [`PAINTED_MATCH`] of it stays out as the ground's
+/// foliage installs (design/editor/EDIT_ANYTHING.md, C).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PaintedEdit {
+    /// The ground's file, project-relative (a streamed tile's scene, or the scene a terrain is in).
+    pub ground: String,
+    /// The copy's foliage kind.
+    pub kind: u16,
+    /// Where it stood, terrain-local metres.
+    pub at: [f32; 3],
+}
+
+/// How near a copy must stand to a [`PaintedEdit`] to be that copy, metres.
+pub const PAINTED_MATCH: f32 = 0.05;
 
 impl SceneEdits {
     /// An empty layer for `scene`.
@@ -62,6 +81,7 @@ impl SceneEdits {
             ),
             scene: name,
             entities: Vec::new(),
+            painted: Vec::new(),
         }
     }
 
