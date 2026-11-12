@@ -1429,6 +1429,8 @@ pub struct UiManager {
     outliner_selection: Vec<u32>,
     clipboard_filled: bool,
     picked_copy: bool,
+    /// Models that did not load this run (core's count), first in the status bar's right-hand cluster.
+    models_missing: usize,
     /// User keybinding overrides. Dispatch reads this, not the declarations.
     keybindings: crate::commands::KeyBindings,
     /// The command whose binding is being captured, if the Preferences window
@@ -2226,6 +2228,7 @@ impl UiManager {
             outliner_selection: Vec::new(),
             clipboard_filled: false,
             picked_copy: false,
+            models_missing: 0,
             keybindings: crate::commands::KeyBindings::load(),
             rebinding: None,
             preferences_open: false,
@@ -3721,6 +3724,11 @@ impl UiManager {
         if self.script_errors > 0 {
             let plural = if self.script_errors == 1 { "" } else { "s" };
             text = format!("{} script error{plural} · {text}", self.script_errors);
+        }
+        // Before everything else, for the same reason: it is the one fact here that makes the picture untrue.
+        if self.models_missing > 0 {
+            let plural = if self.models_missing == 1 { "" } else { "s" };
+            text = format!("{} model{plural} missing · {text}", self.models_missing);
         }
         self.native_ui
             .send(TextMessage::set_text(self.status_stats, text));
@@ -5768,6 +5776,12 @@ impl UiManager {
     /// Core owns the painted pick; this mirror lets Delete and Make This an Object act on a clicked tree or shrub.
     pub fn set_picked_copy(&mut self, picked: bool) {
         self.picked_copy = picked;
+    }
+
+    /// Core counts the models that did not load this run (broken ones skipped, files not found); the status bar says
+    /// so from then on, because a world with pieces missing must not be taken for a whole one.
+    pub fn set_models_missing(&mut self, count: usize) {
+        self.models_missing = count;
     }
 
     /// Output Log lines for an agent (Phase ALYX-M): at least `min` severe, newer than id `after`, containing

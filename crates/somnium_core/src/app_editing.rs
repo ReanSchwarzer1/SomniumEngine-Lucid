@@ -1943,9 +1943,25 @@ impl<G: GameApp> Engine<G> {
     }
 
     /// Models the importer refused since the last frame (`somnium_asset::take_refused`; it logged each once): one
-    /// toast in the editor naming the first and the count. A game alone only drains the list: its log has them.
+    /// toast in the editor naming the first and the count. Every model that did not load this run, these and the
+    /// imported meshes that could not be restored, is also kept in front of the author (`model_faults`): the count in
+    /// the status bar from the frame it changes, and one toast that stays once a burst has settled. A game alone draws
+    /// its own line (`GameUiAdapter`).
     pub(super) fn report_refused_models(&mut self) {
         let refused = somnium_asset::take_refused();
+        for (file, _) in &refused {
+            self.model_faults.skipped(project_relative(self.config.project_root.as_deref(), file));
+        }
+        let (changed, settled) = self.model_faults.tick();
+        if let Some(counts) = changed {
+            warn!("Models missing so far this run: {}", crate::model_faults::counted(counts));
+            if let Some(ui) = self.ui_manager.as_mut() {
+                ui.set_models_missing(counts.0 + counts.1);
+            }
+        }
+        if let Some(line) = settled.filter(|_| !self.config.player_mode) {
+            self.toast(&line);
+        }
         let Some((file, reason)) = refused.first() else { return };
         if self.config.player_mode {
             return;

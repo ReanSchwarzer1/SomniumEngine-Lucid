@@ -91,6 +91,7 @@ pub mod prefab;
 pub mod reflect_registry;
 pub mod save_game;
 pub mod scatter_scene;
+mod model_faults;
 mod scene_delta;
 pub mod scene_edits;
 pub mod scene_places;

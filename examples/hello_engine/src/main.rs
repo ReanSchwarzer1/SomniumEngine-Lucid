@@ -1023,9 +1023,14 @@ impl HelloGame {
         preset: somnium_core::DefaultLandscapePreset,
         water: somnium_core::WaterComponent,
     ) {
-        let scene = match somnium_asset::load_gltf(
-            "assets/models/gislinge_viking_boat/gislinge_viking_boat.glb",
-        ) {
+        // The shell's own demo vessel. A game that embeds the shell with its own project has no such file, and a
+        // warning on every launch for a file nobody expects hides the warnings that matter (Sunscar, 12 Nov 2026).
+        const BOAT: &str = "assets/models/gislinge_viking_boat/gislinge_viking_boat.glb";
+        if !std::path::Path::new(BOAT).is_file() {
+            tracing::debug!("no demo vessel in this project ({BOAT})");
+            return;
+        }
+        let scene = match somnium_asset::load_gltf(BOAT) {
             Ok(scene) => scene,
             Err(error) => {
                 tracing::warn!("Gislinge Viking Boat load failed: {error}");
@@ -1366,6 +1371,11 @@ impl GameApp for HelloGame {
                             ));
                         }
                         true
+                    }
+                    // The shell's own demo scene: a project without the file is no warning (as the vessel's).
+                    Err(e) if !std::path::Path::new("assets/test_scene.glb").is_file() => {
+                        tracing::debug!("no demo scene in this project ({e}); using procedural cube scene");
+                        false
                     }
                     Err(e) => {
                         tracing::warn!("glTF load failed ({e}); using procedural cube scene");
@@ -3437,6 +3447,12 @@ fn setup_scripting(game: &mut HelloGame, ctx: &mut EngineContext) {
     // Imported from disk so the file watcher picks up edits: change the
     // walk speed in the `.luau` and it takes effect without a restart.
     for (path, slot) in [(CONTROLLER_SCRIPT_PATH, 0), (CAMERA_SCRIPT_PATH, 1)] {
+        // The shell's own demo scripts: a game with its own project and its own walker has neither file, and an
+        // ERROR line for each on every launch hides the errors that matter.
+        if !std::path::Path::new(path).is_file() {
+            tracing::debug!("no {path} in this project");
+            continue;
+        }
         match ctx.scripts.import_script_file(std::path::Path::new(path)) {
             Ok(id) => {
                 if slot == 0 {

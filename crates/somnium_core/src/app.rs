@@ -604,11 +604,16 @@ pub trait GameApp {
 /// a trait object it *can* name and this is the six lines that satisfy it.
 struct GameUiAdapter<'g, G: GameApp + ?Sized> {
     game: &'g mut G,
+    /// The standalone game's line for models that did not load (`model_faults`), drawn over the game's own UI.
+    notice: Option<(&'g mut crate::model_faults::Notice, String)>,
 }
 
 impl<G: GameApp + ?Sized> somnium_ui::GameUi for GameUiAdapter<'_, G> {
     fn draw_ui(&mut self, frame: &mut somnium_ui::GameUiFrame) {
         self.game.on_render_ui(frame);
+        if let Some((notice, line)) = self.notice.as_mut() {
+            notice.draw(frame, line);
+        }
     }
 }
 
@@ -1381,6 +1386,10 @@ pub struct Engine<G: GameApp> {
     /// step it pays for actually runs: deriving the flag from it made
     /// `stepping` false during the very step it describes.
     stepping_now: bool,
+    /// Models that did not load this run: for the status bar, the game's screen and the run's last log line.
+    model_faults: crate::model_faults::ModelFaults,
+    /// The standalone game's line for them.
+    model_notice: crate::model_faults::Notice,
 }
 
 /// One floating window's swapchain image, acquired before the frame that fills
@@ -2000,6 +2009,8 @@ impl<G: GameApp + 'static> Engine<G> {
             pending_steps: 0,
             stepping_now: false,
             script_step: 0,
+            model_faults: crate::model_faults::ModelFaults::default(),
+            model_notice: crate::model_faults::Notice::default(),
         };
 
         engine.foliage_erase = crate::authoring_settings::BrushPreferences::load()
@@ -2008,7 +2019,8 @@ impl<G: GameApp + 'static> Engine<G> {
             .run_app(&mut engine)
             .map_err(|e| EngineError::EventLoop(e.to_string()))?;
 
-        info!("Somnium Engine shut down cleanly");
+        // The run's last line says what did not load, so a launch can be judged by the end of its log alone.
+        info!("Somnium Engine shut down cleanly: {}", crate::model_faults::counted(engine.model_faults.counts()));
         Ok(())
     }
 }
@@ -2990,6 +3002,7 @@ impl<G: GameApp> Engine<G> {
                         Some(Ok(scene)) => scene,
                         Some(Err(error)) => {
                             warn!(%error,%source,"Imported mesh could not be restored");
+                            self.model_faults.unrestored(&source.to_string());
                             continue;
                         }
                         None => continue,
@@ -6123,8 +6136,11 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             // MORROWIND-E2. `self.game` is a disjoint field from the four
             // borrowed above, so the game can be handed to the renderer as a
             // callback without any of this becoming a `RefCell`.
+            // The game alone has no status bar: what did not load is one line on its screen.
+            let notice = if self.config.player_mode { self.model_faults.line() } else { None };
             let mut adapter = GameUiAdapter {
                 game: self.game.as_mut(),
+                notice: notice.map(|line| (&mut self.model_notice, line)),
             };
             r.render_with_game_ui(c, ui, window, Some(&mut adapter), scene_target);
         }
