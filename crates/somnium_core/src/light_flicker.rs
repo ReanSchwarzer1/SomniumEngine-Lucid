@@ -100,8 +100,14 @@ impl Default for LampComponent {
 /// more than [`LAMP_OFF_LUX`]: between the two they stay as they are, so a cloud's edge does not flick a village.
 pub const LAMP_LUX: f32 = 1000.0;
 pub const LAMP_OFF_LUX: f32 = 1200.0;
-/// Seconds over which a land's lamps are lit, one after another, once it is dark, and put out once it is light.
+/// Seconds over which a land's lamps are lit, one after another, as dusk falls, and put out as the day comes.
 pub const LAMP_STAGGER_S: f32 = 90.0;
+/// In less light than [`LAMP_NIGHT_LUX`] the night has come already, and in more than [`LAMP_DAY_LUX`] the day (a
+/// clock moved on by hand, a still taken at midnight): the lamps still to be lit or put out are, one after another,
+/// within [`LAMP_CATCH_UP_S`]. A picture taken seconds after the hour was set to midnight showed no lantern lit.
+pub const LAMP_NIGHT_LUX: f32 = 10.0;
+pub const LAMP_DAY_LUX: f32 = 10_000.0;
+pub const LAMP_CATCH_UP_S: f32 = 4.0;
 
 impl LampComponent {
     /// Output multiplier for the lamp at `position`, `time` seconds in, when the lamps are `night` of the way lit
@@ -133,7 +139,8 @@ impl LampSwitch {
         self.night = match self.last {
             None => f32::from(u8::from(self.dark)),
             Some(last) => {
-                let turn = (time - last).clamp(0.0, 1.0) / LAMP_STAGGER_S;
+                let come = if self.dark { lux < LAMP_NIGHT_LUX } else { lux > LAMP_DAY_LUX };
+                let turn = (time - last).clamp(0.0, 1.0) / if come { LAMP_CATCH_UP_S } else { LAMP_STAGGER_S };
                 (self.night + if self.dark { turn } else { -turn }).clamp(0.0, 1.0)
             }
         };
@@ -186,12 +193,24 @@ mod tests {
         assert_eq!((switch.night(), lit(&switch)), (1.0, 40));
         let mut counts = Vec::new();
         for second in 1..=100 {
-            switch.step(50_000.0, second as f32);
+            switch.step(5_000.0, second as f32);
             counts.push(lit(&switch));
         }
         assert!(counts.windows(2).all(|pair| pair[1] <= pair[0]), "{counts:?}");
         assert!(counts[30] > 5 && counts[30] < 35, "a third of the way through some are out: {}", counts[30]);
         assert_eq!((counts[95], switch.night()), (0, 0.0));
+        // The hour set to midnight by hand: the night has come, and they are all lit within a few seconds, still
+        // one after another. Set back to noon, they are out as soon.
+        let mut after = Vec::new();
+        for tenth in 1..=50 {
+            switch.step(0.5, 100.0 + tenth as f32 * 0.1);
+            after.push(lit(&switch));
+        }
+        assert!(after[5] > 0 && after[5] < 40 && after[45] == 40, "{after:?}");
+        for tenth in 1..=50 {
+            switch.step(60_000.0, 105.0 + tenth as f32 * 0.1);
+        }
+        assert_eq!((lit(&switch), switch.night()), (0, 0.0));
         // Between 1,000 and 1,200 lux nothing changes: lit lamps stay lit, and lamps that are out stay out.
         let mut dusk_edge = LampSwitch::default();
         dusk_edge.step(900.0, 0.0);
