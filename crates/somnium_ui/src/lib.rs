@@ -1150,6 +1150,8 @@ pub struct UiManager {
     outliner_rows: Vec<(NodeHandle, u32)>,
     /// Entities the palette can jump to, mirrored from the Outliner.
     palette_entities: Vec<(u32, String)>,
+    /// The open scene's places, as the palette's "Go to" rows show them.
+    palette_places: Vec<String>,
     /// Stable dynamic palette ids mapped to their current targets.
     palette_targets: std::collections::HashMap<String, PaletteTarget>,
     /// Persisted palette learning state.
@@ -1700,6 +1702,8 @@ enum PaletteTarget {
     Help(u8),
     Drawer,
     Log,
+    /// Place `n` of [`UiManager::set_palette_places`].
+    Place(usize),
 }
 
 impl UiManager {
@@ -2028,6 +2032,7 @@ impl UiManager {
             terrain_tool_items: layout.terrain_tool_items,
             outliner_rows: Vec::new(),
             palette_entities: Vec::new(),
+            palette_places: Vec::new(),
             palette_targets: std::collections::HashMap::new(),
             command_history: crate::commands::CommandHistory::load(),
             inspector_handles: layout.inspector_handles,
@@ -4595,6 +4600,11 @@ impl UiManager {
         self.native_ui.invalidate_ancestors(self.palette_popup);
     }
 
+    /// The open scene's places, one "Go to" row each in the Command Palette (empty: no rows).
+    pub fn set_palette_places(&mut self, labels: Vec<String>) {
+        self.palette_places = labels;
+    }
+
     /// Rebuild the searchable set from the command registry and current
     /// dynamic editor objects. Every row has a stable id.
     fn refresh_palette_items(&mut self) {
@@ -4630,6 +4640,16 @@ impl UiManager {
                     .with_icon(crate::metaphor::icon_for_entity_name(name)),
             );
             targets.insert(key, PaletteTarget::Entity(*id));
+        }
+
+        // The open scene's places: "Go to" rows, for getting about a big world.
+        for (index, label) in self.palette_places.iter().enumerate() {
+            let key = format!("place:{index}");
+            items.push(
+                PaletteItem::new(&key, format!("Go to: {label}"), "Go to", Cat::Command)
+                    .with_recency(self.command_history.recency(&key)),
+            );
+            targets.insert(key, PaletteTarget::Place(index));
         }
 
         // Assets in the current Content Drawer folder.
@@ -5829,6 +5849,9 @@ impl UiManager {
                 Some(PaletteTarget::Entity(entity)) => self
                     .editor_events
                     .push_back(EditorEvent::SelectEntity(Some(entity))),
+                Some(PaletteTarget::Place(index)) => {
+                    self.editor_events.push_back(EditorEvent::GoToPlace(index as u32));
+                }
                 Some(PaletteTarget::Asset(path)) => {
                     self.editor_events
                         .push_back(EditorEvent::ShowContentItemInFolder(

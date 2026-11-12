@@ -47,6 +47,49 @@ const TREE_WORDS: [&str; 22] = [
     "poplar", "plane", "holm", "juniper", "carob", "hornbeam", "shrub", "bush", "palm", "laurel",
 ];
 
+/// A place of the open scene's places file (`<scene>.places.json`, format `sunscar-places-index`): where a "Go to" row
+/// takes the camera.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Place {
+    pub name: String,
+    pub group: String,
+    /// Scene metres; the camera stands on the ground there.
+    pub x: f32,
+    pub z: f32,
+    /// Degrees, as the camera's yaw (and `SUNSCAR_START`) take them.
+    pub yaw: Option<f32>,
+    /// False for a place that is planned, not built.
+    pub built: bool,
+}
+
+/// The places file beside `scene`, if there is one that reads: rows without a name or numeric x, z are skipped.
+fn read_places(scene: &Path) -> Vec<Place> {
+    let path = PathBuf::from(format!("{}.places.json", scene.display()));
+    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let document: Value = match serde_json::from_str(&text) {
+        Ok(document) => document,
+        Err(error) => {
+            warn!(file = %path.display(), %error, "places file does not read; no Go to rows");
+            return Vec::new();
+        }
+    };
+    let rows = document.get("places").unwrap_or(&document);
+    rows.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| {
+            Some(Place {
+                name: row["name"].as_str()?.to_owned(),
+                group: row["group"].as_str().unwrap_or_default().to_owned(),
+                x: row["x"].as_f64()? as f32,
+                z: row["z"].as_f64()? as f32,
+                yaw: row["yaw"].as_f64().map(|yaw| yaw as f32),
+                built: row["built"].as_bool().unwrap_or(true),
+            })
+        })
+        .collect()
+}
+
 /// The parent of `entity`, if it has a live one.
 fn parent_of(world: &World, entity: Entity) -> Option<Entity> {
     world.get::<Parent>(entity).map(|p| p.entity).filter(|p| *p != Entity::DANGLING && world.is_alive(*p))
@@ -251,6 +294,9 @@ pub(crate) struct EditingState {
     palette_tools: Option<Vec<(String, String)>>,
     /// Each ground material set's names for its slots, by the set's folder (`SOURCE.json`), read once.
     set_names: HashMap<PathBuf, Arc<BTreeMap<u8, String>>>,
+    /// The open scene's places ([`read_places`]) and the one the camera is on its way to, with when it set off.
+    places: Vec<Place>,
+    landing: Option<(usize, std::time::Instant)>,
     /// Each mesh's surface, by mesh range (`None`: too big or unreadable).
     shapes: HashMap<(u32, u32, u32), Option<MeshShape>>,
 }
@@ -573,6 +619,21 @@ impl<G: GameApp> Engine<G> {
         let warning = (!self.config.player_mode)
             .then(|| composed_scene_warning(&scene, self.config.startup_scene.as_deref()))
             .flatten();
+        if !self.config.player_mode {
+            self.editing.places = read_places(&scene);
+            let labels = self
+                .editing
+                .places
+                .iter()
+                .map(|p| {
+                    let planned = if p.built { "" } else { ", planned" };
+                    if p.group.is_empty() { format!("{}{planned}", p.name) } else { format!("{} ({}{planned})", p.name, p.group) }
+                })
+                .collect();
+            if let Some(ui) = self.ui_manager.as_mut() {
+                ui.set_palette_places(labels);
+            }
+        }
         let result = match SceneEdits::read(&scene) {
             Ok(Some(mut layer)) => {
                 let mut edited = document.clone();
@@ -1088,6 +1149,72 @@ impl<G: GameApp> Engine<G> {
                 self.toast(&format!("{name}: selected, the thing you were looking at. End drops it; Ctrl+S keeps it"));
             }
             None => self.toast(&format!("{name} only exists while the game runs (the game made it), so there is nothing to edit")),
+        }
+    }
+
+    /// Turn the selection about the vertical by `degrees` as the rotate gizmo does (a part about its pivot, the rest of
+    /// the selection about the same point), for proof runs: the `turn=` step of `SOMNIUM_EDITOR_SCRIPT`.
+    fn script_turn(&mut self, degrees: f32) {
+        let Some(primary) = self.selection.primary.filter(|e| self.world.is_alive(*e)) else { return };
+        let Some(renderer) = self.renderer.as_ref() else { return };
+        let pivot = part_pivot(&self.world, renderer, primary);
+        let (Some(world), Some(start)) =
+            (self.world.get::<WorldTransform>(primary).map(|w| w.0), self.world.get::<Transform>(primary).copied())
+        else {
+            return;
+        };
+        let parent = crate::editor_gizmo::parent_world_matrix(&self.world, primary);
+        let Some(parent_inverse) = crate::editor_gizmo::invert_affine(parent) else { return };
+        let pivot_world = world.transform_point3(pivot.unwrap_or(glam::Vec3::ZERO));
+        let spin = glam::Quat::from_rotation_y(degrees.to_radians());
+        let followers =
+            crate::editor_gizmo::capture_followers(&self.world, self.selection.as_slice(), primary.index()).unwrap_or_default();
+        let mut turned = start;
+        turned.rotation = crate::editor_gizmo::spin_in_parent(parent.to_scale_rotation_translation().1, spin) * start.rotation;
+        if let Some(pivot) = pivot {
+            turned.translation = pivot_translation(parent_inverse, pivot_world, &turned, pivot);
+        }
+        if let Some(transform) = self.world.get_mut::<Transform>(primary) {
+            *transform = turned;
+        }
+        crate::editor_gizmo::apply_followers(&mut self.world, &followers, glam::Vec3::ZERO, spin, glam::Vec3::ONE, Some(pivot_world));
+        self.scene_dirty = true;
+        info!(degrees, pivot = ?pivot, at = %pivot_world, followers = followers.len(), "editor script: turned the selection");
+    }
+
+    /// A "Go to" row: the camera to the place's x, z at its height now, facing the place's yaw, then onto the ground
+    /// once the tile there is in ([`Self::land_at_place`]). In Play, Play stops first, so pressing Play starts there.
+    pub(super) fn go_to_place(&mut self, index: usize) {
+        let Some(place) = self.editing.places.get(index).cloned() else { return };
+        if self.play_session_active {
+            self.handle_editor_event(EditorEvent::StopSimulation);
+        }
+        let (height, facing) = self.renderer.as_ref().map_or((100.0, -90.0), |r| {
+            let ahead = r.picking_view_proj().inverse().project_point3(glam::Vec3::new(0.0, 0.0, 0.5)) - r.camera_pos;
+            (r.camera_pos.y, ahead.z.atan2(ahead.x).to_degrees())
+        });
+        let yaw = place.yaw.unwrap_or(facing);
+        self.camera_pose_request = Some((glam::Vec3::new(place.x, height, place.z), yaw, -10.0));
+        self.editing.landing = Some((index, std::time::Instant::now()));
+        info!(place = %place.name, x = place.x, z = place.z, "going to a place");
+    }
+
+    /// Each frame: stand the camera on the ground of the place it is going to, once that ground is in; give up after a
+    /// minute (the camera stays at the place's x, z).
+    pub(super) fn land_at_place(&mut self) {
+        let Some((index, since)) = self.editing.landing else { return };
+        let Some(place) = self.editing.places.get(index).cloned() else {
+            self.editing.landing = None;
+            return;
+        };
+        if let Some(ground) = self.ground_height(place.x, place.z) {
+            let yaw = place.yaw.unwrap_or(-90.0);
+            self.camera_pose_request = Some((glam::Vec3::new(place.x, ground + 1.7, place.z), yaw, -10.0));
+            self.editing.landing = None;
+            self.toast(&format!("At {}: press Play to start here", place.name));
+        } else if since.elapsed().as_secs() > 60 {
+            self.editing.landing = None;
+            self.toast(&format!("{}: its ground has not streamed in; the camera waits above it", place.name));
         }
     }
 
@@ -2705,6 +2832,16 @@ impl<G: GameApp> Engine<G> {
                     };
                     self.camera_pose_request = Some((glam::Vec3::new(x, y, z), yaw, pitch.clamp(-89.0, 89.0)));
                 }
+                Some(("place", part)) => {
+                    match self.editing.places.iter().position(|p| p.name.contains(part)) {
+                        Some(index) => self.go_to_place(index),
+                        None => warn!(part, "editor script: no place by that name"),
+                    }
+                }
+                Some(("turn", degrees)) => match degrees.trim().parse::<f32>() {
+                    Ok(degrees) => self.script_turn(degrees),
+                    Err(_) => warn!(action = %action, "editor script: turn wants degrees"),
+                },
                 Some(("eye", at)) => {
                     // The editor camera 1.7 m over the ground at scene x, z, turned to yaw and pitch (degrees).
                     let numbers: Vec<f32> = at.split(',').filter_map(|v| v.trim().parse::<f32>().ok()).collect();
@@ -3167,6 +3304,27 @@ mod tests {
         assert!(!in_undrawn_level(&world, &children, bench, close) && in_undrawn_level(&world, &children, bench_far, close));
         assert!(in_undrawn_level(&world, &children, bench, away) && !in_undrawn_level(&world, &children, bench_far, away));
         assert!(!in_undrawn_level(&world, &children, yard, away), "the group itself is always drawn");
+    }
+
+    #[test]
+    fn the_places_file_gives_the_go_to_rows() {
+        let dir = std::env::temp_dir().join(format!("somnium-places-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let scene = dir.join("world.scene.json");
+        assert!(read_places(&scene).is_empty(), "no file: no rows (TSF)");
+        std::fs::write(
+            dir.join("world.scene.json.places.json"),
+            r#"{"format": "sunscar-places-index", "version": 1, "places": [
+                {"name": "Monargent piazza (Play start)", "group": "town", "x": -15482.0, "z": 331.5, "yaw": 315},
+                {"name": "Celestine", "group": "city site", "x": 4100, "z": 900, "yaw": null, "built": false},
+                {"name": "no place", "group": "town", "x": "east"}]}"#,
+        )
+        .unwrap();
+        let places = read_places(&scene);
+        assert_eq!(places.len(), 2, "a row without numbers is skipped");
+        assert_eq!((places[0].x, places[0].z, places[0].yaw, places[0].built), (-15482.0, 331.5, Some(315.0), true));
+        assert_eq!((places[1].yaw, places[1].built), (None, false));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

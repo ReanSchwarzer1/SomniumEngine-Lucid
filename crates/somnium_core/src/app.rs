@@ -5577,6 +5577,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             self.zone_end();
             self.run_editor_script();
             self.report_refused_models();
+            self.land_at_place();
             self.touch_selection();
             let selection_card = self.selection_card();
             self.zone_begin("Panel: hand to UI");
@@ -11538,6 +11539,8 @@ impl<G: GameApp> Engine<G> {
                     ui.push_toast(&format!("Bookmark {slot} set"));
                 }
             }
+
+            EditorEvent::GoToPlace(index) => self.go_to_place(index as usize),
 
             EditorEvent::RecallCameraBookmark(slot) => {
                 let Some(index) = slot.checked_sub(1).map(usize::from) else {

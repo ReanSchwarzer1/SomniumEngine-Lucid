@@ -306,6 +306,8 @@ pub enum EditorEvent {
     /// exactly one command/undo record.
     CompleteDrop(crate::drag_drop::DropRequest),
     SelectEntity(Option<u32>),
+    /// Take the camera to place `n` of the open scene's places file (`<scene>.places.json`), on the ground.
+    GoToPlace(u32),
     /// A modifier-aware Outliner or viewport click. The core owns the row
     /// order, so it — not the widget — resolves what a `Shift` range means.
     ModifySelection {
