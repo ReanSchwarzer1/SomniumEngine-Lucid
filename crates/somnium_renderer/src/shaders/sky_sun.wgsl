@@ -108,11 +108,20 @@ fn five_shards(p: vec2<f32>, t: f32, px: f32) -> f32 {
     return lit;
 }
 
+/// How far the disc is lifted so it stays at least `floor_lum` (cd/m2): sky_detail's disc is drawn thousands of
+/// times under the sun's true radiance, which is fine against a noon sky but sinks into a sunset sky that is drawn
+/// true, where the real disc still outshines it a hundredfold and the pieces read best. Shading passes a floor only
+/// for a low sun.
+fn low_sun_lift(disc: vec3<f32>, floor_lum: f32) -> f32 {
+    let l = dot(disc, vec3<f32>(0.2126, 0.7152, 0.0722));
+    return clamp(floor_lum / max(l, 1e-3), 1.0, 2000.0);
+}
+
 /// The sun seen along `dir` through the Lid's wreck. `sun_dir` its centre; `radius` the form's disc, radians; `lux` its
 /// light on the ground per channel (the air's colour in it); `beside` its light above the air, dimmed by the air along
 /// this ray (the lanes are in space); `pole` the celestial pole; `time` seconds; `variant` 0..2. Radiance, cd/m2.
 fn fragmented_sun(dir: vec3<f32>, sun_dir: vec3<f32>, radius: f32, lux: vec3<f32>, beside: vec3<f32>, pole: vec3<f32>,
-                  time: f32, variant: i32) -> vec3<f32> {
+                  time: f32, variant: i32, floor_lum: f32) -> vec3<f32> {
     let c = dot(dir, sun_dir);
     // Nothing reaches past seven degrees.
     if c < 0.99254 {
@@ -133,7 +142,8 @@ fn fragmented_sun(dir: vec3<f32>, sun_dir: vec3<f32>, radius: f32, lux: vec3<f32
         // The shards keep sky_detail's sun (0.6 cd/m2 per lux for a 0.2667 degree disc) spread over their area, about
         // 1.9 times the Heart's, so the glare they throw is the whole sun's.
         if r < 1.1 {
-            light += lux * (0.6 * 0.2667 * 0.2667 / (0.275 * 0.275 * 1.89)) * five_shards(p, t, px);
+            let shard = lux * (0.6 * 0.2667 * 0.2667 / (0.275 * 0.275 * 1.89));
+            light += shard * low_sun_lift(shard, floor_lum) * five_shards(p, t, px);
         }
         // The dust they shine through, a soft halo fading over a degree and a half.
         light += beside * 0.0006 * exp(-r / 1.5) * sun_hg(c, 0.95);
@@ -147,7 +157,8 @@ fn fragmented_sun(dir: vec3<f32>, sun_dir: vec3<f32>, radius: f32, lux: vec3<f32
             let limb = (0.4 + 0.6 * mu) / 0.8;
             let edge = 1.0 - smoothstep(disc_deg - px, disc_deg + px, r);
             let spread = 0.6 * (0.2667 / disc_deg) * (0.2667 / disc_deg);
-            light += lux * spread * limb * edge * (1.0 - lanes.x) / wreck_open_share(disc_deg, variant, t);
+            let disc = lux * spread / wreck_open_share(disc_deg, variant, t);
+            light += disc * low_sun_lift(disc, floor_lum) * limb * edge * (1.0 - lanes.x);
         }
         // Beside the disc the lanes' dust glows by forward scattering (large grains: g 0.95, so a streak falls tenfold
         // from one degree to six). Over the disc it is nothing against the disc and is left out.
