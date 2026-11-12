@@ -99,7 +99,15 @@ fn upload_heights(
     tz: u32,
     height_scale: f32,
 ) -> Option<(wgpu::Texture, wgpu::TextureView)> {
-    if !device.features().contains(wgpu::Features::FLOAT32_FILTERABLE) || heights.len() != (tx * tz) as usize {
+    if !device.features().contains(wgpu::Features::FLOAT32_FILTERABLE) {
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!("meshes do not blend into the ground: the device has no FLOAT32_FILTERABLE for the terrain heights")
+        });
+        return None;
+    }
+    if heights.len() != (tx * tz) as usize {
+        tracing::warn!(heights = heights.len(), expected = tx * tz, "a terrain's heights do not fit its grid: meshes do not blend into it");
         return None;
     }
     let texture = device.create_texture(&wgpu::TextureDescriptor {

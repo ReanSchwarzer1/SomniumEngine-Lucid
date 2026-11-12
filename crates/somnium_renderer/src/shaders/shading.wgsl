@@ -4019,6 +4019,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(material.transmission, select(0.0, 1.0, leaf), gi.through, 1.0);
     }
 
+    // 38: the blended band, as numbers for a linear capture (`.somcap`): red its weight w, green how far its sky and
+    // occlusion opened toward the ground's (ground_blend.wgsl; 0 off the band).
+    if dbg > 37.5 && dbg < 38.5 {
+        return vec4<f32>(ground_blend_w, ground_blend_open, 0.0, 1.0);
+    }
+
     // Phase 24AB: lighting debug views (24–31). 0–23 remain the existing
     // material / terrain / shadow probes.
     if dbg > 23.5 && dbg < 31.5 {

@@ -72,6 +72,11 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     if above > reach * 4.1 {
         return s;
     }
+    // A face standing more than its reach under the ground is in front of a cut, not standing in soil: a retaining
+    // wall at a scarp's toe, where the 2 m cells rise across its face. Below 0 the band would otherwise be whole.
+    if above < -reach {
+        return s;
+    }
     // The ground's slope and normal, by central differences one vertex apart.
     let step = vec2<f32>(1.0) / (vec2<f32>(t.info.w, t.grid.x) - 1.0);
     let span = step / t.rect.zw;
@@ -83,9 +88,19 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     // it), against the reach: lower on faces turned up, which would otherwise read as buried, and the line rises in the
     // mesh's own crevices (its material occlusion), where soil collects first. The edge is ragged: two octaves of noise
     // over the ground move the line by up to half the reach either way.
-    let ragged = (snow_noise(world.xz, 0.45) - 0.5) * 0.7 + (snow_noise(world.xz + vec2<f32>(31.7), 0.13) - 0.5) * 0.35;
+    //
+    // The noise runs over the unfolded point (below), which moves along the face and out with the height, so the
+    // line wanders up and down as well as along; its cells are 1.5 and 0.45 of the reach (0.45 and 0.13 m on a
+    // 0.3 m wall, as before), and the fade is the last 40% of the band, so the line stays ragged (12 Nov).
+    let along = dot(geo_n, ground_n);
+    let n_t = geo_n - ground_n * along;
+    let k3 = n_t * (1.0 + along) / max(dot(n_t, n_t), 0.06);
+    let k = k3.xz * ground_n.y;
+    let fold = world.xz + k * max(above, 0.0);
+    let ragged = (snow_noise(fold, reach * 1.5) - 0.5) * 0.7
+        + (snow_noise(fold + vec2<f32>(31.7), reach * 0.45) - 0.5) * 0.35;
     let crevice = (1.0 - micro_occlusion) * 0.5;
-    var w = 1.0 - smoothstep(0.35, 1.0, above * ground_n.y / reach + ragged - crevice);
+    var w = 1.0 - smoothstep(0.6, 1.0, above * ground_n.y / reach + ragged - crevice);
     // A face lying along the ground (a floor, paving, a road) is ground already: only faces meeting it at an angle
     // (a boulder's flank, a wall foot, a heap's sides) take the ground's surface.
     w *= 1.0 - smoothstep(0.9, 0.985, dot(geo_n, ground_n));
@@ -106,11 +121,6 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     // that is out along the face's horizontal normal; on a wall it stays on the wall, where folding out level reached
     // the canyon's floor or bench and fringed a rock shell with their colour (12 Nov). The footprint follows by the
     // chain rule, the ground's height moving with the slope.
-    let along = dot(geo_n, ground_n);
-    let n_t = geo_n - ground_n * along;
-    let k3 = n_t * (1.0 + along) / max(dot(n_t, n_t), 0.06);
-    let k = k3.xz * ground_n.y;
-    let fold = world.xz + k * max(above, 0.0);
     let fold_dx = dwx.xz + k * (dwx.y - dot(slope, dwx.xz));
     let fold_dy = dwy.xz + k * (dwy.y - dot(slope, dwy.xz));
     // The terrain's own surface there, by the path the terrain itself is shaded with.
