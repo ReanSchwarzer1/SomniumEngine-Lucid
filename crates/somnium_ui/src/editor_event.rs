@@ -808,6 +808,8 @@ pub enum LevelTool {
     CheckMeshes,
     /// Select the object at the centre of the view; in Play, stop first, so what you saw is what you fix.
     SelectLookedAt,
+    /// Make the painted tree or shrub you clicked an object, to move, turn, delete and save like any prop.
+    MakeObject,
 }
 
 /// Designer actions whose implementation belongs to the engine host.

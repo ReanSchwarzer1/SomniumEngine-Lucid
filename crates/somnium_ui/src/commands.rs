@@ -1285,6 +1285,16 @@ fn declarations() -> Vec<Command> {
             always
         ),
         command!(
+            "editor.level.make_object",
+            "Make This an Object",
+            "Level",
+            Some(Chord::press(CommandKey::Letter('O')).ctrl().shift()),
+            "Make the painted tree or shrub you clicked an object, to move, turn, delete and save like any prop.",
+            A::LevelTool(L::MakeObject),
+            EDIT,
+            always
+        ),
+        command!(
             "editor.level.select_looked_at",
             "Select What You Look At",
             "Level",
