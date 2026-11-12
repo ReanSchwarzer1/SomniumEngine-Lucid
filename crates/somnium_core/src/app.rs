@@ -11733,6 +11733,7 @@ impl<G: GameApp> Engine<G> {
                     L::Census => self.census(),
                     L::CheckMeshes => self.check_meshes(),
                     L::SelectSameAsset => self.select_same_asset(),
+                    L::MakeObject => self.make_painted_object(),
                 }
             }
 

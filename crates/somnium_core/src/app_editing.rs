@@ -67,6 +67,36 @@ fn hide_painted(
     before - copies.len()
 }
 
+/// A painted copy as a new object, ready to paste: a root where the copy stood (`placed`) and a part for each piece
+/// of its kind's model, each an `ImportedMesh` of `source` so a reopened scene draws it again. `pieces`: the mesh, its
+/// material, its node in `source` and its transform within the model.
+fn painted_object(
+    name: &str,
+    source: &str,
+    placed: glam::Mat4,
+    pieces: &[(MeshComponent, u32, u32, glam::Mat4)],
+) -> crate::clipboard::EntityClipboard {
+    let transform = |matrix: glam::Mat4| {
+        let (scale, rotation, translation) = matrix.to_scale_rotation_translation();
+        Transform { translation, rotation, scale }
+    };
+    let mut scratch = somnium_ecs::World::new();
+    let root = scratch.spawn((Name::new(name), transform(placed), WorldTransform::identity()));
+    for (n, (mesh, material, node, local)) in pieces.iter().enumerate() {
+        let part = scratch.spawn((
+            Name::new(&format!("{name} part {}", n + 1)),
+            transform(*local),
+            WorldTransform::identity(),
+            *mesh,
+            MaterialComponent { asset: somnium_asset::database::AssetId::NONE, runtime_id: *material },
+            crate::ImportedMesh { source: source.to_owned(), node: *node },
+            Parent { entity: root },
+        ));
+        debug_assert!(scratch.is_alive(part));
+    }
+    crate::clipboard::EntityClipboard::copy(&scratch, &[root])
+}
+
 /// The warning for a scene the world is composed from: Sunscar's `places_*` scenes are read raw by its composer, so
 /// edits saved with one open never reach the world (design/editor/EDIT_ANYTHING.md, D). `None` for the world itself
 /// (the startup scene) and for any other scene.
@@ -1283,34 +1313,97 @@ impl<G: GameApp> Engine<G> {
         }
     }
 
-    /// Delete with a painted copy picked (its card showing): take it out of its ground, undoable, and note it in the
-    /// layer so Ctrl+S keeps it out. Returns whether there was one.
-    pub(super) fn delete_painted_copy(&mut self) -> bool {
-        let Some(pick) = self.editing.painted.take() else { return false };
+    /// Take the picked painted copy out of its ground and note it in the layer so Ctrl+S keeps it out: the copy, where
+    /// it stood in the world, and the undo step (not yet pushed). `None` when nothing painted is picked.
+    fn take_painted_copy(
+        &mut self,
+    ) -> Option<(
+        somnium_renderer::terrain::foliage_paint::PaintedFoliage,
+        glam::Mat4,
+        Box<dyn crate::editor_commands::EditorCommand>,
+    )> {
+        let pick = self.editing.painted.take()?;
         self.editing.painted_card = None;
-        let Some(ground) = self.ground_file(pick.terrain) else { return false };
+        let ground = self.ground_file(pick.terrain)?;
         let ground = project_relative(self.config.project_root.as_deref(), &ground);
-        let name = self.foliage_kind_name(pick.kind).to_owned();
-        let Some(terrain) = self.renderer.as_mut().and_then(|r| r.terrain_mut(pick.terrain)) else { return false };
-        let Some(copy) = terrain.painted_foliage.get(pick.index).copied().filter(|copy| copy.kind == pick.kind) else {
-            return false;
-        };
+        let terrain = self.renderer.as_mut().and_then(|r| r.terrain_mut(pick.terrain))?;
+        let copy = terrain.painted_foliage.get(pick.index).copied().filter(|copy| copy.kind == pick.kind)?;
+        let placed = terrain.model
+            * glam::Mat4::from_scale_rotation_translation(
+                glam::Vec3::splat(copy.scale),
+                glam::Quat::from_rotation_y(copy.yaw) * glam::Quat::from_rotation_x(copy.tilt),
+                copy.position,
+            );
         let before = terrain.painted_foliage.clone();
         terrain.painted_foliage.remove(pick.index);
         terrain.edit_revision = terrain.edit_revision.wrapping_add(1);
         let after = terrain.painted_foliage.clone();
-        self.undo_stack.push_silent(Box::new(crate::editor_commands::FoliageEditCmd::new(
-            pick.terrain,
-            before,
-            after,
-            self.terrain_restore_queue.clone(),
-        )));
+        let undo = crate::editor_commands::FoliageEditCmd::new(pick.terrain, before, after, self.terrain_restore_queue.clone());
         if let Some(layer) = self.editing.layer.as_mut() {
             layer.painted.push(scene_edits::PaintedEdit { ground, kind: copy.kind, at: copy.position.to_array() });
         }
         self.scene_dirty = true;
+        Some((copy, placed, Box::new(undo)))
+    }
+
+    /// Delete with a painted copy picked (its card showing): take it out of its ground, undoable, and note it in the
+    /// layer so Ctrl+S keeps it out. Returns whether there was one.
+    pub(super) fn delete_painted_copy(&mut self) -> bool {
+        let Some(kind) = self.editing.painted.map(|pick| pick.kind) else { return false };
+        let name = self.foliage_kind_name(kind).to_owned();
+        let Some((_, _, undo)) = self.take_painted_copy() else { return false };
+        self.undo_stack.push_silent(undo);
         self.toast(&format!("Took out {name}: Ctrl+S keeps it out, Ctrl+Z brings it back"));
         true
+    }
+
+    /// Ctrl+Shift+O with a painted copy picked: it becomes an object. The copy goes (as Delete takes it out) and an
+    /// object of its kind's model stands where it stood, selected, to move, turn, delete and save like any prop; Ctrl+S
+    /// keeps both. One undo step.
+    pub(super) fn make_painted_object(&mut self) {
+        let Some(pick) = self.editing.painted else {
+            self.toast("Click a painted tree or shrub first, then make it an object");
+            return;
+        };
+        let name = self.foliage_kind_name(pick.kind).to_owned();
+        let Some(entry) = self.project_foliage.get(&pick.kind) else {
+            self.toast(&format!("{name} is one of the engine's own kinds, with no model file to make an object of"));
+            return;
+        };
+        let source = project_relative(self.config.project_root.as_deref(), &entry.source);
+        let pieces: Vec<(MeshComponent, u32, u32, glam::Mat4)> = self
+            .foliage_meshes
+            .get(usize::from(pick.kind))
+            .and_then(Option::as_ref)
+            .into_iter()
+            .flatten()
+            .zip(&entry.primitives)
+            .map(|(part, node)| {
+                let mesh = MeshComponent {
+                    vertex_offset: part.vertex_offset,
+                    index_offset: part.index_offset,
+                    index_count: part.index_count,
+                };
+                (mesh, part.material_id, *node, part.local)
+            })
+            .collect();
+        if pieces.is_empty() || pieces.len() != entry.primitives.len() {
+            self.toast(&format!("{name}'s model is not loaded yet: try again in a moment"));
+            return;
+        }
+        let Some((_, placed, hide)) = self.take_painted_copy() else { return };
+        use crate::editor_commands::EditorCommand as _;
+        let mut paste = crate::clipboard::PasteEntitiesCmd::new(painted_object(&name, &source, placed, &pieces), None);
+        paste.execute(&mut self.world, &mut self.selection.primary);
+        let roots = paste.roots().to_vec();
+        self.undo_stack.push_silent(Box::new(crate::editor_commands::CommandGroup::new(
+            "Make an Object",
+            vec![hide, Box::new(paste)],
+        )));
+        self.selection.set_many(roots);
+        self.after_selection_change();
+        info!(kind = pick.kind, name = %name, source = %source, "a painted copy became an object");
+        self.toast(&format!("{name} is an object now: move, turn or delete it, and Ctrl+S keeps it"));
     }
 
     /// Before a save: a taken-out copy that is back on its loaded ground (Ctrl+Z) is no longer taken out.
@@ -2168,7 +2261,11 @@ impl<G: GameApp> Engine<G> {
             copy.scale,
             copy.yaw.to_degrees().rem_euclid(360.0)
         ));
-        lines.push("Census (Level) counts every painted kind and model loaded".to_owned());
+        lines.push(if self.project_foliage.contains_key(&pick.kind) {
+            "Ctrl+Shift+O makes it an object (move, turn, save it); Delete takes it out".to_owned()
+        } else {
+            "Delete takes it out; Census (Level) counts every painted kind and model loaded".to_owned()
+        });
         let card = lines.join("\n");
         info!("painted card:\n{card}");
         self.editing.painted_card = Some((pick, card.clone()));
@@ -3443,6 +3540,36 @@ mod tests {
             serde_json::from_str(r#"{"format":"somnium-scene-edits","version":1,"scene":"s","entities":[]}"#).unwrap();
         assert!(old.painted.is_empty());
         assert!(!serde_json::to_string(&old).unwrap().contains("painted"));
+    }
+
+    #[test]
+    fn a_painted_copy_made_an_object_stands_where_it_stood_and_draws_its_model_again() {
+        use crate::editor_commands::EditorCommand as _;
+        let placed = glam::Mat4::from_scale_rotation_translation(
+            glam::Vec3::splat(1.3),
+            glam::Quat::from_rotation_y(0.7),
+            glam::Vec3::new(-15464.9, 28.2, 273.0),
+        );
+        let local = glam::Mat4::from_translation(glam::Vec3::new(0.0, 0.4, 0.0));
+        let mesh = |offset| MeshComponent { vertex_offset: offset, index_offset: 0, index_count: 36 };
+        let pieces = [(mesh(100), 7, 2, local), (mesh(200), 8, 5, glam::Mat4::IDENTITY)];
+        let clipboard = painted_object("myrtle shrub", "assets/plants/myrtle.gltf", placed, &pieces);
+        let mut world = World::new();
+        let mut selected = None;
+        let mut paste = crate::clipboard::PasteEntitiesCmd::new(clipboard, None);
+        paste.execute(&mut world, &mut selected);
+        let [root] = paste.roots() else { panic!("one object") };
+        crate::propagate_transforms(&mut world);
+        let parts: Vec<Entity> =
+            world.iter_with::<Parent>().filter(|(_, parent)| parent.entity == *root).map(|(e, _)| e).collect();
+        assert_eq!(parts.len(), 2, "a part for each piece of the model");
+        let first = parts.iter().copied().find(|p| world.get::<MeshComponent>(*p).unwrap().vertex_offset == 100).unwrap();
+        let drawn = world.get::<WorldTransform>(first).unwrap().0;
+        assert!(drawn.abs_diff_eq(placed * local, 1e-3), "the part draws where the painted copy drew it");
+        let source = world.get::<crate::ImportedMesh>(first).unwrap();
+        assert_eq!((source.source.as_str(), source.node), ("assets/plants/myrtle.gltf", 2), "a reopened scene finds it");
+        assert_eq!(world.get::<MaterialComponent>(first).unwrap().runtime_id, 7);
+        assert!(world.persistent_id(*root).is_some() && world.persistent_id(first).is_some(), "Ctrl+S can keep it");
     }
 
     #[test]
