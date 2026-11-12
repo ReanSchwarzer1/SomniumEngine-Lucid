@@ -125,8 +125,9 @@ struct FrameViewState {
 }
 
 /// How far a blended band's occlusion and traced share of the sky open toward the ground's (`ground_blend.wgsl`
-/// `ground_blend_open`).
-const GROUND_BLEND_OPEN: f32 = 0.5;
+/// `ground_blend_open`). Fully: at the piazza's wall foot the band then lies between the wall and the ground (0.077
+/// against 0.104 and 0.067 linear); at 0.5 it read 0.067, darker than both (the lead's band test, gx4, 12 Nov).
+const GROUND_BLEND_OPEN: f32 = 1.0;
 
 /// `SOMNIUM_SHADING_DEBUG_CYCLE=0,2,3`: the shading debug view for this pair of captures (proof stills, as
 /// SOMNIUM_GROUND_BLEND_OPENS), the list wrapping round; `None` when it is unset.

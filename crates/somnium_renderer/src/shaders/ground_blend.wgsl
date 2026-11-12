@@ -89,6 +89,10 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     // A face lying along the ground (a floor, paving, a road) is ground already: only faces meeting it at an angle
     // (a boulder's flank, a wall foot, a heap's sides) take the ground's surface.
     w *= 1.0 - smoothstep(0.9, 0.985, dot(geo_n, ground_n));
+    // Nothing stands on a cliff: on ground steeper than 45 degrees the band fades, and past 60 it is gone. Measured
+    // across the ground, a shell cladding a canyon wall stood within its reach of the wall everywhere and wore a pale
+    // fringe of the wall's own surface round every edge (gx4, the Vela's floor, 12 Nov).
+    w *= smoothstep(0.5, 0.7, ground_n.y);
     if w <= 0.0 {
         return s;
     }
