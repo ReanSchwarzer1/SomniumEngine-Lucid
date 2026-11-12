@@ -82,6 +82,11 @@ pub(crate) struct ProjectEntry {
     /// reflections, and a forest within a 400 m draw distance overflows the traced scene), else everywhere.
     #[serde(default)]
     pub trace_distance: Option<f32>,
+    /// Kinds this one grows on (mistletoe in its trees' crowns): it is drawn only while none of them has failed to
+    /// load or is still being read, so a tree kind that cannot load never leaves it hanging in the air (Sunscar,
+    /// 12 Nov 2026: 43 tree kinds were refused for five hours and their mistletoe floated). Unset: drawn on its own.
+    #[serde(default)]
+    pub hosts: Option<Vec<u16>>,
 }
 
 impl ProjectEntry {
@@ -146,6 +151,11 @@ struct Document {
 #[must_use]
 pub(crate) fn is_project_kind(kind: u16) -> bool {
     usize::from(kind) >= crate::app::FOLIAGE_PALETTE.len()
+}
+
+/// Whether a kind that grows on `hosts` may draw: none of them `missing` (failed to load, or still being read).
+pub(crate) fn hosts_drawn(hosts: &[u16], missing: impl Fn(u16) -> bool) -> bool {
+    !hosts.iter().any(|&host| missing(host))
 }
 
 fn parse(bytes: &[u8]) -> Result<BTreeMap<u16, ProjectEntry>, String> {
@@ -274,6 +284,18 @@ pub(crate) fn load(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mistletoe_draws_only_while_its_hosts_do() {
+        let document = serde_json::json!({"version":1,"entries":[
+            {"kind":544,"name":"poplar","source":"poplar.gltf","primitives":[0]},
+            {"kind":608,"name":"mistletoe","source":"mistletoe.gltf","primitives":[0],"hosts":[544,545]}]});
+        let parsed = parse(&serde_json::to_vec(&document).unwrap()).unwrap();
+        assert!(parsed[&544].hosts.is_none(), "a kind without hosts is unchanged");
+        let hosts = parsed[&608].hosts.as_deref().unwrap();
+        assert_eq!(hosts, [544, 545]);
+        assert!(hosts_drawn(hosts, |_| false), "every host drawn: the mistletoe draws");
+        assert!(!hosts_drawn(hosts, |host| host == 545), "one host refused or still read: no ball hangs in the air");
+    }
     #[test]
     fn a_ground_kind_grows_only_on_the_layer_sets_it_names() {
         let document = serde_json::json!({"version":1,"entries":[
