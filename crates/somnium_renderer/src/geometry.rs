@@ -61,6 +61,19 @@ const VERTEX_POOL_BYTES: u64 = 1024 * 1024 * 512;
 /// Index pool size we ask for — 256 MB, about 64 million indices.
 const INDEX_POOL_BYTES: u64 = 1024 * 1024 * 256;
 
+/// The vertex and index pools' sizes in bytes, for a vertex pool asked for in megabytes (`SOMNIUM_GEOMETRY_POOL_MB`)
+/// or not at all, on a device that binds at most `max_binding` bytes.
+///
+/// The index pool keeps the default pools' two to one beside a larger vertex pool. Left at 256 MB beside Sunscar's
+/// 1,536 MB it filled first: a place streamed in while another was still loaded (a far jump) had its meshes skipped
+/// and its terrain chunks waiting, with half the vertex pool free (12 Nov 2026). Offsets into it are 32-bit
+/// everywhere (the visibility buffer stores a draw's own primitive index, not the pool's), so its size is not held
+/// to anything narrower.
+fn pool_bytes(asked_mb: Option<u64>, max_binding: u64) -> (u64, u64) {
+    let vertex = asked_mb.map_or(VERTEX_POOL_BYTES, |mb| mb.max(64) * 1024 * 1024);
+    (vertex.min(max_binding), (vertex / 2).max(INDEX_POOL_BYTES).min(max_binding))
+}
+
 /// Where a releasable static upload lives (see [`GeometryPool::release_static_mesh`]).
 #[derive(Debug, Clone, Copy)]
 struct StaticSpan {
@@ -137,12 +150,8 @@ impl GeometryPool {
         let max_binding = u64::from(device.limits().max_storage_buffer_binding_size);
         // An open world can ask for more (Rimeborn: several 4 km terrain windows near the camera at once); the default
         // stays what every other game has always had.
-        let vertex_request = std::env::var("SOMNIUM_GEOMETRY_POOL_MB")
-            .ok()
-            .and_then(|mb| mb.trim().parse::<u64>().ok())
-            .map_or(VERTEX_POOL_BYTES, |mb| mb.max(64) * 1024 * 1024);
-        let vertex_bytes = vertex_request.min(max_binding);
-        let index_bytes = INDEX_POOL_BYTES.min(max_binding);
+        let asked = std::env::var("SOMNIUM_GEOMETRY_POOL_MB").ok().and_then(|mb| mb.trim().parse::<u64>().ok());
+        let (vertex_bytes, index_bytes) = pool_bytes(asked, max_binding);
         tracing::info!(
             "Geometry pool: {:.0} MB vertex / {:.0} MB index (device limit {:.0} MB)",
             vertex_bytes as f64 / 1048576.0,
@@ -921,6 +930,18 @@ fn compute_aabb(vertices: &[Vertex]) -> ([f32; 3], [f32; 3]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pools as every other game has them, and as Sunscar asks for them: the index pool grows with the vertex
+    /// pool, and neither passes what the device binds.
+    #[test]
+    fn the_index_pool_grows_with_the_vertex_pool() {
+        const MB: u64 = 1024 * 1024;
+        assert_eq!(pool_bytes(None, 2048 * MB), (512 * MB, 256 * MB));
+        assert_eq!(pool_bytes(Some(1536), 2048 * MB), (1536 * MB, 768 * MB));
+        assert_eq!(pool_bytes(Some(256), 2048 * MB), (256 * MB, 256 * MB), "a smaller vertex pool keeps the index pool");
+        assert_eq!(pool_bytes(Some(4096), 2048 * MB), (2048 * MB, 2048 * MB));
+        assert_eq!(pool_bytes(Some(1), 128 * MB), (64 * MB, 128 * MB));
+    }
 
     fn vert(p: [f32; 3]) -> Vertex {
         Vertex {
