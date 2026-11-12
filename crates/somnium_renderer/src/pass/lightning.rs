@@ -19,7 +19,8 @@ pub struct Bolt {
     pub to: Vec3,
     /// Its path: the same seed grows the same channel, so a flash's return strokes relight one path.
     pub seed: u32,
-    /// Luminous intensity per metre of channel, by colour, candela per metre (a return stroke about 2e7).
+    /// Luminous intensity per metre of channel, by colour, candela per metre (a return stroke about 2e7). A channel
+    /// that is not white is drawn mostly as a soft glow in its colour ([`glow_share`]).
     pub candela_per_metre: Vec3,
     /// How much it forks: 0 a single channel, 1 heavily branched.
     pub branching: f32,
@@ -135,7 +136,22 @@ struct Corner {
     side: f32,
     /// Candela per metre, by colour, with the span's level in.
     light: [f32; 3],
-    _pad: f32,
+    /// The share of it drawn as a soft glow round the channel ([`glow_share`]).
+    glow: f32,
+}
+
+/// The share of a channel's light drawn as a glow round it, from its colour: a hot channel is white and is its core
+/// alone (bloom glows it); a cold one is coloured (a slow discharge in charged air, a meteor's train) and is mostly
+/// glow, which is what keeps its colour on a picture exposed for the land. By how far from white it is: none under a
+/// third, nine tenths from six tenths.
+#[must_use]
+pub fn glow_share(candela_per_metre: Vec3) -> f32 {
+    let (low, high) = (candela_per_metre.min_element().max(0.0), candela_per_metre.max_element());
+    if !high.is_finite() || high <= 0.0 {
+        return 0.0;
+    }
+    let t = ((1.0 - low / high - 0.33) / (0.6 - 0.33)).clamp(0.0, 1.0);
+    0.9 * t * t * (3.0 - 2.0 * t)
 }
 
 #[repr(C)]
@@ -283,8 +299,9 @@ impl LightningPass {
                     break;
                 }
                 let light = (bolt.candela_per_metre * span.level).to_array();
+                let glow = glow_share(bolt.candela_per_metre);
                 for (end, side) in [(0.0, -1.0), (0.0, 1.0), (1.0, -1.0), (1.0, -1.0), (0.0, 1.0), (1.0, 1.0)] {
-                    corners.push(Corner { a: span.a.to_array(), end, b: span.b.to_array(), side, light, _pad: 0.0 });
+                    corners.push(Corner { a: span.a.to_array(), end, b: span.b.to_array(), side, light, glow });
                 }
             }
         }
@@ -341,6 +358,15 @@ impl LightningPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hot_channel_is_its_core_and_a_cold_one_mostly_glow() {
+        assert_eq!(glow_share(Vec3::new(0.86, 0.90, 1.0) * 2.0e7), 0.0);
+        assert!(glow_share(Vec3::new(0.62, 0.42, 1.0) * 1.0e5) > 0.7);
+        assert!(glow_share(Vec3::new(1.0, 0.24, 0.20)) > 0.89);
+        assert_eq!(glow_share(Vec3::ZERO), 0.0);
+        assert_eq!(glow_share(Vec3::splat(f32::NAN)), 0.0);
+    }
 
     fn strike() -> Bolt {
         Bolt { from: Vec3::new(0.0, 1200.0, 0.0), to: Vec3::new(150.0, 0.0, -80.0), seed: 7, candela_per_metre: Vec3::splat(2.0e7), branching: 0.7, grown: 1.0, straight: false }

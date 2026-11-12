@@ -374,13 +374,17 @@ fn storm_shelf(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
     // underside is torn by the air rolling under it, in lumps as deep as its nose.
     let along_arc = off * v.size.x;
     let rough = textureSampleLevel(base_noise_tex, cloud_sampler, vec3<f32>(along_arc, 0.0, behind) / (nose * 6.0) + vec3<f32>(0.23, 0.61, 0.07), 0.0);
-    let tiers = 0.5 + 0.5 * sin(u * 26.0 + (rough.r - 0.5) * 3.0);
+    // The plates are not ruled: each wanders along the arc, runs into the next and pinches out. (In the game the
+    // squall's shelf was a band of flat parallel stripes: Sunscar, 12 Nov 2026.)
+    let wander = 2.6 * sin(along_arc / (nose * 2.5) + 1.3) + 1.7 * sin(along_arc / (nose * 0.9) + 4.1);
+    let tiers = 0.5 + 0.5 * sin(u * 15.0 + wander + (rough.r - 0.5) * 6.0);
     let top = nose + (height - nose) * pow(u, 0.75) - nose * 0.45 * tiers * smoothstep(0.02, 0.12, u) * (1.0 - smoothstep(0.7, 1.0, u));
     let under = height * 0.55 * u * u * (3.0 - 2.0 * u) + nose * (1.1 * rough.g - 0.35) * smoothstep(0.0, 0.2, u);
     let inside = smoothstep(under - 0.12 * nose, under + 0.25 * nose, q.y) * (1.0 - smoothstep(top - 0.1 * nose, top, q.y));
     let front = smoothstep(-0.5 * nose, 0.3 * nose, behind) * (1.0 - smoothstep(0.85, 1.0, u));
     // Laminar bands along the face near the leading edge.
-    let bands = 0.78 + 0.22 * sin(q.y / max(nose, 1.0) * 31.0 + behind * 0.01);
+    // They lie along its upper face, not level across it.
+    let bands = 0.78 + 0.22 * sin((top - q.y) / max(nose, 1.0) * 19.0 + (rough.b - 0.5) * 5.0);
     let m = arc * front * inside * mix(1.0, bands, 1.0 - smoothstep(0.0, 0.3, u));
     let ragged = 1.0 - smoothstep(under, under + 0.6 * nose, q.y);
     return vec2<f32>(m, mix(0.12, 1.0, ragged));
@@ -477,6 +481,12 @@ fn storm_ring(v: StormVolume, q: vec3<f32>) -> vec2<f32> {
     return vec2<f32>(wall, fray);
 }
 
+/// Set while a storm body's light is marched toward the sun (`storm_light_march`). There a body is its plain shape,
+/// with no noise moving its outline or fraying it: what shades a point is how much storm lies toward the sun, not
+/// its lumps, and those taps were most of a storm's cost (a cell from under its base 6 ms, a body at a time 0.5 to
+/// 1 ms: Sunscar, 12 Nov 2026).
+var<private> storm_light_only: bool = false;
+
 /// One body's density at a world point (not a hole's: `storm_slab`).
 fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
     let q = p - v.pos.xyz;
@@ -490,7 +500,9 @@ fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
     // a radius across) and its next octave, and up or down a little, before the shape is asked.
     var qs = q;
     let kind = i32(v.pos.w + 0.5);
-    if kind == 1 || kind == 2 || kind == 5 {
+    if storm_light_only {
+        // The plain shape.
+    } else if kind == 1 || kind == 2 || kind == 5 {
         let lump = textureSampleLevel(base_noise_tex, cloud_sampler, q / v.size.w + vec3<f32>(0.31, 0.0, 0.17), 0.0);
         // The cell noise's octaves are round lumps with creases between, a cauliflower's: they carry most of it.
         let swell = clamp(1.0 + (lump.r - 0.5) * 0.3 + (lump.g - 0.6) * 0.5 + (lump.b - 0.6) * 0.22, 0.7, 1.35);
@@ -586,6 +598,9 @@ fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
     if m.x <= 0.0 {
         return 0.0;
     }
+    if storm_light_only {
+        return m.x * 0.7 * v.size.z * select(1.0, v.b.x, v.pos.w > 7.5 && v.pos.w < 8.5 && q.y < 0.0);
+    }
     let n = textureSampleLevel(base_noise_tex, cloud_sampler, np / v.size.w, 0.0);
     let worley = n.g * 0.625 + n.b * 0.25 + n.a * 0.125;
     let shape = clamp(cloud_remap(n.r, worley - 1.0, 1.0, 0.0, 1.0), 0.0, 1.0);
@@ -615,10 +630,13 @@ struct StormSample {
     density: f32,
     albedo: vec3<f32>,
     step: f32,
+    /// It is in rain and in no cloud body.
+    rain: bool,
 }
 
 fn storm_sample(p: vec3<f32>, cheap: bool) -> StormSample {
-    var s = StormSample(0.0, vec3<f32>(0.0), 1e9);
+    var s = StormSample(0.0, vec3<f32>(0.0), 1e9, false);
+    var cloud = false;
     for (var i = 0u; i < storm.counts.x; i = i + 1u) {
         let v = storm.volumes[i];
         let o = p.xz - v.bound.xy;
@@ -630,10 +648,12 @@ fn storm_sample(p: vec3<f32>, cheap: bool) -> StormSample {
             s.density += d;
             s.albedo += v.albedo.rgb * d;
             s.step = min(s.step, v.bound.w);
+            cloud = cloud || v.pos.w < 6.5 || v.pos.w > 7.5;
         }
     }
     if s.density > 0.0 {
         s.albedo = s.albedo / s.density;
+        s.rain = !cloud;
     }
     return s;
 }
@@ -675,6 +695,7 @@ fn storm_light_march(origin: vec3<f32>, sun: vec3<f32>, finest: f32) -> f32 {
     var optical_depth = 0.0;
     var width = finest;
     var near = 0.0;
+    storm_light_only = true;
     for (var i = 0; i < 4; i = i + 1) {
         optical_depth += cloud_density(origin + sun * (near + width * 0.5), true) * width * 0.01;
         near += width;
@@ -685,6 +706,7 @@ fn storm_light_march(origin: vec3<f32>, sun: vec3<f32>, finest: f32) -> f32 {
     if near < 4000.0 {
         optical_depth += cloud_density(origin + sun * 2600.0, true) * 2400.0 * 0.01;
     }
+    storm_light_only = false;
     return optical_depth;
 }
 
@@ -914,6 +936,7 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
     var hit_enter: array<f32, 16>;
     var hit_exit: array<f32, 16>;
     var hit_step: array<f32, 16>;
+    var hit_rain: array<bool, 16>;
     for (var i = 0u; i < storm.counts.x; i = i + 1u) {
         let v = storm.volumes[i];
         if storm_is_modifier(v) {
@@ -924,6 +947,7 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
             hit_enter[hits] = c.x;
             hit_exit[hits] = c.y;
             hit_step[hits] = v.bound.w;
+            hit_rain[hits] = v.pos.w > 6.5 && v.pos.w < 7.5;
             hits = hits + 1;
         }
     }
@@ -1012,6 +1036,8 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
     var empty_runs = 0;
     var lit = 0;
     var inside = false;
+    // The rain's stride where the last sample was in rain and in no cloud body (else 1e9).
+    var rain_step = 1e9;
     // The last optical depth marched toward the sun inside a storm body, and the samples since.
     var body_light = 0.0;
     var body_light_age = 99;
@@ -1030,12 +1056,32 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
             // Far cloud is small in the picture: the step grows with the distance, and the iterations reach it.
             step_len = max(step_len, t * cp.far_step * select(1.0, 0.35, inside));
         }
+        // The finest step of the cloud bodies (not rain) whose cylinders the ray is in, and how far ahead the next
+        // one starts.
+        var cloud_step = 1e9;
+        var cloud_ahead = 1e9;
         for (var k = 0; k < hits; k = k + 1) {
+            if !hit_rain[k] && hit_enter[k] > t {
+                cloud_ahead = min(cloud_ahead, hit_enter[k] - t);
+            }
             if t + step_len >= hit_enter[k] && t <= hit_exit[k] {
                 // No finer than a body's own detail, and no finer than the eye can tell at that range (a body ten
                 // kilometres off is not stepped as one at one).
-                step_len = min(step_len, max(hit_step[k], t * 0.012) * select(2.5, 1.0, inside));
+                let own = max(hit_step[k], t * 0.012);
+                step_len = min(step_len, own * select(2.5, 1.0, inside));
+                if !hit_rain[k] {
+                    cloud_step = min(cloud_step, own);
+                }
             }
+        }
+        if inside && rain_step < 1e8 && (cp.density <= 0.0 || cp.camera_pos.y + ray_dir.y * t < cp.layer_bottom - 2.0 * long_step) {
+            // In rain alone, under the layer, the stride is the rain's own: a veil with nothing fine in it. (It was
+            // the layer's fine step everywhere: under a thin layer a curtain five kilometres through was marched
+            // every thirty metres, far below any cloud, and ran out of samples half way. A squall's rain was half
+            // its cost: Sunscar, 12 Nov 2026.) Inside a cloud body's cylinder, four of that body's steps at most, so
+            // the body is still met; and no further than the next cloud body's cylinder, so a stride does not land
+            // deep inside it (a storm's base over its rain came out in rings).
+            step_len = max(step_len, min(min(max(rain_step, t * 0.012), cloud_step * 4.0), cloud_ahead));
         }
         if first {
             // The start's jitter, as a share of the step the march starts with: of the slab's long step it skipped up
@@ -1066,11 +1112,12 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
             break;
         }
         let slab = slab_density(p, false);
-        var body = StormSample(0.0, vec3<f32>(0.0), 1e9);
+        var body = StormSample(0.0, vec3<f32>(0.0), 1e9, false);
         if hits > 0 {
             body = storm_sample(p, false);
         }
         let density = slab + body.density;
+        rain_step = select(1e9, body.step, body.rain);
         if density <= 0.0 {
             empty_runs += 1;
             if empty_runs >= CLOUD_EMPTY_BEFORE_ESCAPE {
