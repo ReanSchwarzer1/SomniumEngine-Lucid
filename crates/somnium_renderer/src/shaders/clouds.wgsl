@@ -118,6 +118,8 @@ const CLOUD_MIN_TRANSMITTANCE: f32 = 0.01;
 const CLOUD_EMPTY_BEFORE_ESCAPE: i32 = 8;
 /// Samples a ray may light. The slab alone never reaches it (it is opaque long before).
 const CLOUD_MAX_LIT: i32 = 96;
+/// The step inside a storm body's own cloud, as a share of the body's finest step (`march_ray`).
+const BODY_STEP_SHARE: f32 = 0.35;
 
 // ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 // Shape
@@ -607,6 +609,12 @@ fn storm_body(v: StormVolume, p: vec3<f32>, cheap: bool) -> f32 {
     // Frayed as coverage frays the slab; where the surface is laminar the shape alone holds.
     let frayed = clamp(cloud_remap(shape, 1.0 - m.x, 1.0, 0.0, 1.0), 0.0, 1.0) * m.x;
     var density = mix(m.x * 0.6, frayed, m.y);
+    if cheap {
+        // The search's and the light's: eroded by the detail's mean, so the search does not find cloud in a fringe
+        // that the detail then eats to nothing. (Round a storm a ray took a dozen full samples of empty air that
+        // way, half of all it took: Sunscar, 12 Nov 2026.)
+        density = clamp(cloud_remap(density, 0.15 * m.y, 1.0, 0.0, 1.0), 0.0, 1.0);
+    }
     if !cheap && density > 0.0 {
         let detail = textureSampleLevel(detail_noise_tex, cloud_sampler, np / (v.size.w * 0.13), 0.0);
         let fbm = detail.r * 0.625 + detail.g * 0.25 + detail.b * 0.125;
@@ -1038,6 +1046,8 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
     var inside = false;
     // The rain's stride where the last sample was in rain and in no cloud body (else 1e9).
     var rain_step = 1e9;
+    // The finest step of the storm's cloud bodies the last sample was in, where the layer had no cloud (else 1e9).
+    var body_step = 1e9;
     // The last optical depth marched toward the sun inside a storm body, and the samples since.
     var body_light = 0.0;
     var body_light_age = 99;
@@ -1052,6 +1062,12 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
             break;
         }
         var step_len = select(long_step, short_step, inside);
+        if inside && body_step < 1e8 {
+            // In a storm body's own cloud, with none of the layer's in it, the step is a share of the body's: the
+            // layer's fine step is for the layer's lumps. (Under a squall every ray took twenty-six lit samples
+            // through the storm's deck at a thin layer's thirty metres: Sunscar, 12 Nov 2026.)
+            step_len = max(step_len, BODY_STEP_SHARE * body_step);
+        }
         if cp.far_step > 0.0 {
             // Far cloud is small in the picture: the step grows with the distance, and the iterations reach it.
             step_len = max(step_len, t * cp.far_step * select(1.0, 0.35, inside));
@@ -1118,6 +1134,7 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
         }
         let density = slab + body.density;
         rain_step = select(1e9, body.step, body.rain);
+        body_step = select(1e9, body.step, body.density > 0.0 && !body.rain && slab <= 0.0);
         if density <= 0.0 {
             empty_runs += 1;
             if empty_runs >= CLOUD_EMPTY_BEFORE_ESCAPE {
