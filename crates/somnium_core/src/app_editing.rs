@@ -1339,8 +1339,10 @@ impl<G: GameApp> Engine<G> {
         terrain.edit_revision = terrain.edit_revision.wrapping_add(1);
         let after = terrain.painted_foliage.clone();
         let undo = crate::editor_commands::FoliageEditCmd::new(pick.terrain, before, after, self.terrain_restore_queue.clone());
-        if let Some(layer) = self.editing.layer.as_mut() {
-            layer.painted.push(scene_edits::PaintedEdit { ground, kind: copy.kind, at: copy.position.to_array() });
+        // Taken out, brought back (Ctrl+Z) and taken out again before a save: one entry.
+        let edit = scene_edits::PaintedEdit { ground, kind: copy.kind, at: copy.position.to_array() };
+        if let Some(layer) = self.editing.layer.as_mut().filter(|layer| !layer.painted.contains(&edit)) {
+            layer.painted.push(edit);
         }
         self.scene_dirty = true;
         Some((copy, placed, Box::new(undo)))
