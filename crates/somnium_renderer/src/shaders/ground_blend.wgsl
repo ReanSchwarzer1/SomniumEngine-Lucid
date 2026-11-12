@@ -31,6 +31,11 @@ var<private> ground_blend_open: f32 = 0.0;
 /// mirror where the band shades as ground, so the band takes the sky's reflection along its own normal instead.
 var<private> ground_blend_w: f32 = 0.0;
 
+/// The ground point a band pixel stands for and the ground's normal there: the band takes that point's sun
+/// (`band_sun_visibility`, shading.wgsl) as it takes its surface.
+var<private> ground_blend_pos: vec3<f32> = vec3<f32>(0.0);
+var<private> ground_blend_n: vec3<f32> = vec3<f32>(0.0, 1.0, 0.0);
+
 /// The list entry whose rectangle holds `xz`, or -1.
 fn ground_terrain_at(xz: vec2<f32>) -> i32 {
     let count = min(u32(ground_blend.params.x), 32u);
@@ -126,6 +131,12 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
         ground = evaluate_terrain_material(tm_idx, ground_pos, terrain_xz, ground_n, splat_uv, fold_dx, fold_dy);
     }
     s.albedo = mix(s.albedo, ground.albedo, w);
+    // The ground's sky as the terrain's own path gives it (shading.wgsl's terrain branch): its baked sky visibility
+    // at the fold point, and the hue of sheltered ground there. Without them the band was bluer than the ground
+    // beside it in every weather (MESH_BLENDING.md 2.3).
+    let sky_vis = terrain_sky_visibility(tm, splat_uv);
+    let sheltered = smoothstep(1.0, 0.88, sky_vis) * tm.macro_octave_strength.w;
+    s.albedo = s.albedo * mix(vec3<f32>(1.0), vec3<f32>(0.88, 0.97, 0.78), sheltered * w);
     s.roughness = mix(s.roughness, ground.roughness, w);
     s.metallic = mix(s.metallic, 0.0, w);
     // Lit as the ground where it is the ground, so the foot meets the terrain without a step in the light; the sky is
@@ -138,9 +149,16 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     let occlusion = mix(micro_occlusion, ground.occlusion, w);
     s.occlusion = s.occlusion / max(micro_occlusion, 0.05) * occlusion;
     micro_occlusion = occlusion;
+    // The bake in the occlusion and in `baked_sky_vis`, as on the ground: the untraced sky takes it, and the traced
+    // sky, which sees the ridges itself, takes it back out.
+    let baked = mix(1.0, sky_vis, w);
+    s.occlusion = s.occlusion * baked;
+    baked_sky_vis = baked;
     let open = w * ground_blend.params.w;
     ground_blend_open = open;
     ground_blend_w = w;
+    ground_blend_pos = ground_pos;
+    ground_blend_n = ground_n;
     let screen = mix(screen_occlusion, 1.0, open);
     s.occlusion = s.occlusion / max(screen_occlusion, 0.004) * screen;
     screen_occlusion = screen;

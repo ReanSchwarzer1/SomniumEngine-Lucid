@@ -168,6 +168,49 @@ fn skin_visibility(p: vec3<f32>, emitter: vec3<f32>, reach: f32) -> f32 {
     return 0.0;
 }
 
+/// A ray from under the ground leaving through its top, as the traced sun's own test has it (`rt_ground_underside`):
+/// the drawn ground can lie under the traced one, and a ray from it would meet the hill's underside.
+fn band_ray_leaves_ground(inst: Instance, primitive: u32, dir: vec3<f32>) -> bool {
+    let base = inst.index_offset + primitive * 3u;
+    let v0 = vertices[inst.vertex_offset + indices[base]];
+    let v1 = vertices[inst.vertex_offset + indices[base + 1u]];
+    let v2 = vertices[inst.vertex_offset + indices[base + 2u]];
+    let p0 = vec3<f32>(v0.pos_x, v0.pos_y, v0.pos_z);
+    var up = (inst.model * vec4<f32>(cross(vec3<f32>(v1.pos_x, v1.pos_y, v1.pos_z) - p0,
+        vec3<f32>(v2.pos_x, v2.pos_y, v2.pos_z) - p0), 0.0)).xyz;
+    if up.y < 0.0 {
+        up = -up;
+    }
+    return dot(dir, up) > 0.0;
+}
+
+/// The sun as the ground point under a blended band sees it (ground_blend.wgsl): one ray toward the sun from 2 cm
+/// over that point, opaque casters only as the traced sun takes them, and the cascades there for the cut-out leaves
+/// and grass the rays leave out. The band took the wall face's sun before, with the shadows that fall on the wall's
+/// foot (MESH_BLENDING.md 2.3, cause 2).
+fn band_sun_visibility(view_depth: f32, pixel: vec2<f32>) -> f32 {
+    let p = ground_blend_pos + ground_blend_n * 0.02;
+    let dir = normalize(light.direction);
+    var ray = 1.0;
+    //!if LOCAL_SHADOWS
+    if (cluster_params.shading_mode & 16u) != 0u {
+        var rq: ray_query;
+        rayQueryInitialize(&rq, local_shadow_accel, RayDesc(0x6u, 0x1u, 0.01, 10000.0, p, dir));
+        while rayQueryProceed(&rq) {
+            let c = rayQueryGetCandidateIntersection(&rq);
+            let inst = instances[c.instance_custom_data];
+            if materials[inst.material_id].terrain_index < 0 || !band_ray_leaves_ground(inst, c.primitive_index, dir) {
+                rayQueryConfirmIntersection(&rq);
+            }
+        }
+        ray = select(0.0, 1.0, rayQueryGetCommittedIntersection(&rq).kind == RAY_QUERY_INTERSECTION_NONE);
+    }
+    //!endif
+    let raster = sample_shadow(p, ground_blend_n, view_depth, pixel);
+    let reach = smoothstep(0.85, 1.0, view_depth / max(light.cascade_splits.w, 1.0));
+    return ray * mix(raster, 1.0, reach);
+}
+
 // Somnium Engine — Visibility Buffer Shading Pass
 // Phase 12: Clustered Local Lights + Cel-Shading Mode
 
@@ -3376,6 +3419,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     } else {
         shadow_factor = sample_shadow(hit_point, shadow_normal, view_depth, in.clip_pos.xy)
             * terrain_parallax_shadow_factor;
+    }
+    // A blended band takes the sun its ground point gets, not the wall face's (MESH_BLENDING.md, step 1).
+    if ground_blend_w > 0.0 {
+        shadow_factor = mix(shadow_factor, band_sun_visibility(view_depth, in.clip_pos.xy), ground_blend_w);
     }
     // Phase TSUSHIMA-F1: micro-shadowing. Folded in here for the same reason
     // the relief self-shadow is — one definition of how much direct light
