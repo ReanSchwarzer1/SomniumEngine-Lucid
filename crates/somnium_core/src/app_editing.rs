@@ -90,6 +90,26 @@ fn read_places(scene: &Path) -> Vec<Place> {
         .collect()
 }
 
+/// Take out of `copies` every one a [`scene_edits::PaintedEdit`] on `ground` names (same kind, within
+/// [`scene_edits::PAINTED_MATCH`]); how many went.
+fn hide_painted(
+    edits: &[scene_edits::PaintedEdit],
+    ground: &str,
+    copies: &mut Vec<somnium_renderer::terrain::foliage_paint::PaintedFoliage>,
+) -> usize {
+    let here: Vec<&scene_edits::PaintedEdit> = edits.iter().filter(|edit| edit.ground == ground).collect();
+    if here.is_empty() {
+        return 0;
+    }
+    let before = copies.len();
+    copies.retain(|copy| {
+        !here.iter().any(|edit| {
+            edit.kind == copy.kind && glam::Vec3::from_array(edit.at).distance(copy.position) <= scene_edits::PAINTED_MATCH
+        })
+    });
+    before - copies.len()
+}
+
 /// The parent of `entity`, if it has a live one.
 fn parent_of(world: &World, entity: Entity) -> Option<Entity> {
     world.get::<Parent>(entity).map(|p| p.entity).filter(|p| *p != Entity::DANGLING && world.is_alive(*p))
@@ -924,10 +944,11 @@ impl<G: GameApp> Engine<G> {
         }
         self.flush_material_assets();
         self.fold_session(None, false);
+        self.prune_painted_edits();
         let Some(layer) = self.editing.layer.as_ref() else {
             return;
         };
-        let count = layer.entities.len();
+        let count = layer.entities.len() + layer.painted.len();
         match layer.write(&scene) {
             Ok(()) => {
                 self.scene_dirty = false;
@@ -1216,6 +1237,77 @@ impl<G: GameApp> Engine<G> {
             self.editing.landing = None;
             self.toast(&format!("{}: its ground has not streamed in; the camera waits above it", place.name));
         }
+    }
+
+    /// A tile's painted copies as they install: the ones the open scene's layer took out stay out.
+    pub(super) fn painted_before_install(&self, ground: &Path, copies: &mut Vec<somnium_renderer::terrain::foliage_paint::PaintedFoliage>) {
+        let Some(layer) = self.editing.layer.as_ref().filter(|layer| !layer.painted.is_empty()) else { return };
+        let ground = project_relative(self.config.project_root.as_deref(), ground);
+        let hidden = hide_painted(&layer.painted, &ground, copies);
+        if hidden > 0 {
+            info!(ground = %ground, hidden, "painted copies kept out by the edit layer");
+        }
+    }
+
+    /// Delete with a painted copy picked (its card showing): take it out of its ground, undoable, and note it in the
+    /// layer so Ctrl+S keeps it out. Returns whether there was one.
+    pub(super) fn delete_painted_copy(&mut self) -> bool {
+        let Some(pick) = self.editing.painted.take() else { return false };
+        self.editing.painted_card = None;
+        let Some(ground) = self.ground_file(pick.terrain) else { return false };
+        let ground = project_relative(self.config.project_root.as_deref(), &ground);
+        let name = self.foliage_kind_name(pick.kind).to_owned();
+        let Some(terrain) = self.renderer.as_mut().and_then(|r| r.terrain_mut(pick.terrain)) else { return false };
+        let Some(copy) = terrain.painted_foliage.get(pick.index).copied().filter(|copy| copy.kind == pick.kind) else {
+            return false;
+        };
+        let before = terrain.painted_foliage.clone();
+        terrain.painted_foliage.remove(pick.index);
+        terrain.edit_revision = terrain.edit_revision.wrapping_add(1);
+        let after = terrain.painted_foliage.clone();
+        self.undo_stack.push_silent(Box::new(crate::editor_commands::FoliageEditCmd::new(
+            pick.terrain,
+            before,
+            after,
+            self.terrain_restore_queue.clone(),
+        )));
+        if let Some(layer) = self.editing.layer.as_mut() {
+            layer.painted.push(scene_edits::PaintedEdit { ground, kind: copy.kind, at: copy.position.to_array() });
+        }
+        self.scene_dirty = true;
+        self.toast(&format!("Took out {name}: Ctrl+S keeps it out, Ctrl+Z brings it back"));
+        true
+    }
+
+    /// Before a save: a taken-out copy that is back on its loaded ground (Ctrl+Z) is no longer taken out.
+    fn prune_painted_edits(&mut self) {
+        let Some(layer) = self.editing.layer.as_mut().filter(|layer| !layer.painted.is_empty()) else { return };
+        let Some(renderer) = self.renderer.as_ref() else { return };
+        let root = self.config.project_root.clone();
+        let grounds: Vec<(String, u32)> = self
+            .world
+            .iter_with::<TerrainComponent>()
+            .filter_map(|(entity, t)| {
+                let file = self
+                    .world
+                    .get::<crate::cell_streaming::Streamed>(entity)
+                    .and_then(|s| self.cell_streamer.cells.get(s.cell as usize))
+                    .map(|cell| cell.file.clone())
+                    .or_else(|| self.editing.scene.clone())?;
+                Some((project_relative(root.as_deref(), &file), t.terrain_id))
+            })
+            .collect();
+        layer.painted.retain(|edit| {
+            let back = grounds.iter().filter(|(ground, _)| *ground == edit.ground).any(|(_, id)| {
+                renderer.terrain(*id).is_some_and(|data| {
+                    data.painted_foliage.iter().any(|copy| {
+                        copy.kind == edit.kind
+                            && glam::Vec3::from_array(edit.at).distance(copy.position) <= scene_edits::PAINTED_MATCH
+                    })
+                })
+            });
+            !back
+        });
     }
 
     /// Select what a click found, with its LOD twins ([`lod_twins`]); the clicked part stays the primary.
@@ -3304,6 +3396,23 @@ mod tests {
         assert!(!in_undrawn_level(&world, &children, bench, close) && in_undrawn_level(&world, &children, bench_far, close));
         assert!(in_undrawn_level(&world, &children, bench, away) && !in_undrawn_level(&world, &children, bench_far, away));
         assert!(!in_undrawn_level(&world, &children, yard, away), "the group itself is always drawn");
+    }
+
+    #[test]
+    fn a_painted_copy_taken_out_stays_out_on_its_own_ground_only() {
+        use somnium_renderer::terrain::foliage_paint::PaintedFoliage;
+        let copy = |kind: u16, x: f32| PaintedFoliage { kind, position: glam::Vec3::new(x, 2.0, 10.0), yaw: 0.0, tilt: 0.0, scale: 1.0 };
+        let edits = vec![scene_edits::PaintedEdit { ground: "scenes/terrain_tiles/t_-14_0.scene.json".into(), kind: 410, at: [5.02, 2.0, 10.0] }];
+        let mut copies = vec![copy(410, 5.0), copy(410, 9.0), copy(411, 5.0)];
+        assert_eq!(hide_painted(&edits, "scenes/terrain_tiles/t_-14_0.scene.json", &mut copies), 1);
+        assert_eq!(copies, vec![copy(410, 9.0), copy(411, 5.0)], "the other copy and the other kind stay");
+        let mut other = vec![copy(410, 5.0)];
+        assert_eq!(hide_painted(&edits, "scenes/terrain_tiles/t_-13_0.scene.json", &mut other), 0, "another tile");
+        // A layer written before painted edits existed still reads; an empty list is not written.
+        let old: scene_edits::SceneEdits =
+            serde_json::from_str(r#"{"format":"somnium-scene-edits","version":1,"scene":"s","entities":[]}"#).unwrap();
+        assert!(old.painted.is_empty());
+        assert!(!serde_json::to_string(&old).unwrap().contains("painted"));
     }
 
     #[test]

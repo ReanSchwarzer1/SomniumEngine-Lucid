@@ -12119,6 +12119,10 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::DeleteSelected => {
+                // A painted copy picked (nothing selected, its card showing) is taken out of its ground.
+                if self.selection.is_empty() && self.delete_painted_copy() {
+                    return;
+                }
                 // Every selected entity with every part under it. Deleting the primary alone left the rest of a
                 // multi-selection, and walking `Children` (sixteen slots) left parts seventeen on standing.
                 let roots = self.selection.as_slice().to_vec();
