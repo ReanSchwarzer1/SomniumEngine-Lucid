@@ -1348,6 +1348,11 @@ impl<G: GameApp> Engine<G> {
         Some((copy, placed, Box::new(undo)))
     }
 
+    /// A painted copy is picked (its card showing) and no entity is selected: Delete and Make This an Object act on it.
+    pub(super) fn has_picked_copy(&self) -> bool {
+        self.selection.is_empty() && self.editing.painted.is_some()
+    }
+
     /// Delete with a painted copy picked (its card showing): take it out of its ground, undoable, and note it in the
     /// layer so Ctrl+S keeps it out. Returns whether there was one.
     pub(super) fn delete_painted_copy(&mut self) -> bool {

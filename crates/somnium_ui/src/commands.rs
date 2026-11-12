@@ -223,6 +223,8 @@ pub struct EditorCtx {
     pub has_content_target: bool,
     /// The entity clipboard holds something to paste.
     pub has_clipboard: bool,
+    /// A painted copy (a tree, a shrub) is picked, its card showing, with no entity selected.
+    pub has_picked_copy: bool,
 }
 
 /// Application menu that owns a command row.
@@ -400,6 +402,20 @@ fn selection(ctx: &EditorCtx) -> Enablement {
         Enablement::Enabled
     } else {
         Enablement::Disabled("Select an entity first")
+    }
+}
+fn selection_or_copy(ctx: &EditorCtx) -> Enablement {
+    if ctx.has_selection || ctx.has_picked_copy {
+        Enablement::Enabled
+    } else {
+        Enablement::Disabled("Select an entity first")
+    }
+}
+fn picked_copy(ctx: &EditorCtx) -> Enablement {
+    if ctx.has_picked_copy {
+        Enablement::Enabled
+    } else {
+        Enablement::Disabled("Click a painted tree or shrub first")
     }
 }
 fn undo(ctx: &EditorCtx) -> Enablement {
@@ -1119,10 +1135,10 @@ fn declarations() -> Vec<Command> {
             "Delete",
             "Edit",
             Some(Chord::press(CommandKey::Delete)),
-            "Delete the selected entity.",
+            "Delete the selected entity, or take out the painted tree or shrub you clicked.",
             A::DeleteSelected,
             EDIT_OUTLINER,
-            selection
+            selection_or_copy
         ),
         command!(
             "editor.edit.duplicate",
@@ -1292,7 +1308,7 @@ fn declarations() -> Vec<Command> {
             "Make the painted tree or shrub you clicked an object, to move, turn, delete and save like any prop.",
             A::LevelTool(L::MakeObject),
             EDIT,
-            always
+            picked_copy
         ),
         command!(
             "editor.level.select_looked_at",
@@ -2888,6 +2904,15 @@ mod tests {
             ..EditorCtx::default()
         };
         assert!(command.enabled(&filled).is_enabled());
+    }
+
+    /// A clicked painted copy is something to delete or make an object of; nothing picked is neither.
+    #[test]
+    fn a_picked_painted_copy_can_be_deleted_or_made_an_object() {
+        let (delete, make) = (*registry().get("editor.edit.delete").unwrap(), *registry().get("editor.level.make_object").unwrap());
+        let picked = EditorCtx { has_picked_copy: true, ..EditorCtx::default() };
+        assert!(delete.enabled(&picked).is_enabled() && make.enabled(&picked).is_enabled());
+        assert!(!delete.enabled(&EditorCtx::default()).is_enabled() && !make.enabled(&EditorCtx::default()).is_enabled());
     }
 
     #[test]

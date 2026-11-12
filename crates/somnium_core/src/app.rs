@@ -5623,6 +5623,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             self.touch_selection();
             let selection_card = self.selection_card();
             self.zone_begin("Panel: hand to UI");
+            let picked_copy = self.has_picked_copy();
             if let Some(ui) = &mut self.ui_manager {
                 if refresh {
                     ui.update_outliner_tree(tree, selected_idx);
@@ -5630,6 +5631,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 }
                 ui.set_outliner_selection(selected_ids);
                 ui.set_clipboard_filled(!self.entity_clipboard.is_empty());
+                ui.set_picked_copy(picked_copy);
                 ui.set_history(history_entries, history_position);
                 ui.set_viewport_statistics(viewport_statistics);
                 ui.set_axis_widget(axis_directions);

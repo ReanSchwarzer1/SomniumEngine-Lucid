@@ -1428,6 +1428,7 @@ pub struct UiManager {
     outliner_entity_handles: HashMap<u32, somnium_ecs::Entity>,
     outliner_selection: Vec<u32>,
     clipboard_filled: bool,
+    picked_copy: bool,
     /// User keybinding overrides. Dispatch reads this, not the declarations.
     keybindings: crate::commands::KeyBindings,
     /// The command whose binding is being captured, if the Preferences window
@@ -2224,6 +2225,7 @@ impl UiManager {
             outliner_entity_handles: HashMap::new(),
             outliner_selection: Vec::new(),
             clipboard_filled: false,
+            picked_copy: false,
             keybindings: crate::commands::KeyBindings::load(),
             rebinding: None,
             preferences_open: false,
@@ -5753,6 +5755,7 @@ impl UiManager {
             can_redo: self.history_position < self.history_rows.len(),
             has_content_target: self.content_menu_target.is_some(),
             has_clipboard: self.clipboard_filled,
+            has_picked_copy: self.picked_copy,
         }
     }
 
@@ -5760,6 +5763,11 @@ impl UiManager {
     /// every frame so `Paste` greys out honestly instead of always offering.
     pub fn set_clipboard_filled(&mut self, filled: bool) {
         self.clipboard_filled = filled;
+    }
+
+    /// Core owns the painted pick; this mirror lets Delete and Make This an Object act on a clicked tree or shrub.
+    pub fn set_picked_copy(&mut self, picked: bool) {
+        self.picked_copy = picked;
     }
 
     /// Output Log lines for an agent (Phase ALYX-M): at least `min` severe, newer than id `after`, containing
