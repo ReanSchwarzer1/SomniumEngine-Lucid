@@ -1092,7 +1092,11 @@ fn march_ray(ray_dir: vec3<f32>, interval: vec2<f32>, jitter: f32, flashes: bool
         // crossed in twenty samples that all see the same sky) the light of two samples back still holds.
         var optical_depth = 0.0;
         if body.density > 0.0 {
-            if body_light_age >= 2 || extinction * step_len > 0.3 {
+            // In a veil as thin as rain the light holds for six samples, not two: a ray crosses a rain core
+            // three kilometres wide in dozens of samples that all see the same sky (a squall's curtain cost
+            // 5.5 ms and the view from under a storm cell 8: the 05:52 stills, 12 Nov).
+            let holds = select(2, 6, extinction * step_len < 0.05);
+            if body_light_age >= holds || extinction * step_len > 0.3 {
                 body_light = storm_light_march(p, light_dir, body.step) * 4.0;
                 body_light_age = 0;
             } else {
