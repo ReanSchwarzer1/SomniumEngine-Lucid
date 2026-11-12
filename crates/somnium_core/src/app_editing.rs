@@ -3279,7 +3279,9 @@ impl<G: GameApp> Engine<G> {
                     format!(", {:.2} x {:.2} x {:.2} m", s.x, s.y, s.z)
                 })
                 .unwrap_or_default();
-            lines.push(format!("object    {parts} part{}{size}", if parts == 1 { "" } else { "s" }));
+            // The first click takes the whole model; the second takes the part under the pointer (design 4a).
+            let again = if parts > 1 { "   (click again for one part)" } else { "" };
+            lines.push(format!("object    {parts} part{}{size}{again}", if parts == 1 { "" } else { "s" }));
         }
 
         // Whether its surface is closed: a rock or cliff open on a side is hollow from behind.
