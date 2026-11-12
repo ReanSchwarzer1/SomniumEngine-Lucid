@@ -93,6 +93,7 @@ pub mod save_game;
 pub mod scatter_scene;
 mod scene_delta;
 pub mod scene_edits;
+pub mod scene_places;
 pub mod spline;
 pub mod story_actor;
 pub mod story_authoring;

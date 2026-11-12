@@ -468,6 +468,9 @@ struct GizmoDragState {
     parent_world_inverse: glam::Mat4,
     /// The selected entity's world rotation at drag start, for local axes.
     start_world_rotation: glam::Quat,
+    /// The handle is the middle of a part's mesh, not the entity's origin ([`part_handle`]): the body moves, turns and
+    /// grows about `gizmo_pos`, and its origin follows.
+    part_handle: bool,
     /// The rest of the selection, with the transform each started at.
     ///
     /// CONTROL-F made the selection a set; a gizmo that still moved one thing
@@ -3385,8 +3388,68 @@ impl<G: GameApp> Engine<G> {
             self.terrain_edit_active = false;
             self.terrain_stroke = None;
         }
+        self.select_lod_twins();
         self.refresh_gizmo_anchor();
         self.touch_selection();
+    }
+
+    /// The pointer went down: take hold of the gizmo handle under it, if there is one. True when a drag began.
+    fn begin_gizmo_drag(&mut self) -> bool {
+        let started = try_start_gizmo_drag(
+            self.renderer.as_ref(),
+            &self.world,
+            &self.selection.primary,
+            self.cursor_pos,
+            self.viewport_size(),
+            self.settings.editor().gizmo_local_space,
+        );
+        let blocked = started.is_some() && self.settings.editor().select_only;
+        if blocked {
+            let message = "Select Only is on — click it in the toolbar to move, rotate and scale";
+            info!("{message}");
+            if let Some(ui) = self.ui_manager.as_mut() {
+                ui.push_toast(message);
+            }
+        }
+        let drag = if blocked {
+            None
+        } else {
+            started.and_then(|mut drag| {
+                drag.followers = capture_followers(&self.world, self.selection.as_slice(), drag.entity_index)?;
+                Some(drag)
+            })
+        };
+        let began = drag.is_some();
+        if began {
+            self.gizmo_drag = drag;
+        }
+        began
+    }
+
+    /// The pointer came up: the drag in hand, if any, becomes one undoable step. True when there was one.
+    fn end_gizmo_drag(&mut self) -> bool {
+        let Some(drag) = self.gizmo_drag.take() else {
+            return false;
+        };
+        // Every moved entity, the followers too: undo used to put back only the primary.
+        let starts = std::iter::once((drag.entity_index, drag.start_transform))
+            .chain(drag.followers.iter().map(|f| (f.entity_index, f.start_transform)));
+        let mut moves: Vec<Box<dyn EditorCommand>> = Vec::new();
+        for (index, start) in starts {
+            let Some(entity) = self.world.find_entity_by_index(index) else {
+                continue;
+            };
+            let end = self.world.get::<Transform>(entity).copied().unwrap_or(start);
+            if end.translation != start.translation || end.rotation != start.rotation || end.scale != start.scale {
+                moves.push(Box::new(SetTransformCmd::new(index, start, end)));
+            }
+        }
+        if !moves.is_empty() {
+            self.undo_stack
+                .push_silent(Box::new(CommandGroup::named("Transform".to_owned(), moves)));
+            self.scene_dirty = true;
+        }
+        true
     }
 
     /// Put the transform gizmo where the primary selection actually is.
@@ -3419,7 +3482,14 @@ impl<G: GameApp> Engine<G> {
         {
             return;
         }
-        let anchor = gizmo_anchor(&self.world, self.selection.primary);
+        // A part of a merged model is handled at the middle of its mesh, not at the model's origin.
+        let anchor = gizmo_anchor(&self.world, self.selection.primary).map(|origin| {
+            self.selection
+                .primary
+                .zip(self.renderer.as_ref())
+                .and_then(|(entity, renderer)| part_handle(&self.world, renderer, entity))
+                .unwrap_or(origin)
+        });
         if let Some(renderer) = self.renderer.as_mut() {
             match anchor {
                 Some(pos) => {
@@ -4683,37 +4753,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 // anywhere said why. A mode that refuses a gesture has to
                 // admit it at the moment it refuses, or it is indistinguishable
                 // from a broken feature.
-                let started = try_start_gizmo_drag(
-                    self.renderer.as_ref(),
-                    &self.world,
-                    &self.selection.primary,
-                    self.cursor_pos,
-                    self.viewport_size(),
-                    self.settings.editor().gizmo_local_space,
-                );
-                let blocked = started.is_some() && self.settings.editor().select_only;
-                if blocked {
-                    let message =
-                        "Select Only is on — click it in the toolbar to move, rotate and scale";
-                    info!("{message}");
-                    if let Some(ui) = self.ui_manager.as_mut() {
-                        ui.push_toast(message);
-                    }
-                }
-                let drag = if blocked {
-                    None
-                } else {
-                    started.and_then(|mut drag| {
-                        drag.followers = capture_followers(
-                            &self.world,
-                            self.selection.as_slice(),
-                            drag.entity_index,
-                        )?;
-                        Some(drag)
-                    })
-                };
-                if drag.is_some() {
-                    self.gizmo_drag = drag;
+                if self.begin_gizmo_drag() {
                     gizmo_consumed = true;
                 } else {
                     // No gizmo axis under the pointer, so a left press in the
@@ -4740,28 +4780,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                     }
                     gizmo_consumed = true;
                 }
-                if let Some(drag) = self.gizmo_drag.take() {
-                    // Every moved entity, the followers too: undo used to put back only the primary.
-                    let starts = std::iter::once((drag.entity_index, drag.start_transform))
-                        .chain(drag.followers.iter().map(|f| (f.entity_index, f.start_transform)));
-                    let mut moves: Vec<Box<dyn EditorCommand>> = Vec::new();
-                    for (index, start) in starts {
-                        let Some(entity) = self.world.find_entity_by_index(index) else {
-                            continue;
-                        };
-                        let end = self.world.get::<Transform>(entity).copied().unwrap_or(start);
-                        if end.translation != start.translation
-                            || end.rotation != start.rotation
-                            || end.scale != start.scale
-                        {
-                            moves.push(Box::new(SetTransformCmd::new(index, start, end)));
-                        }
-                    }
-                    if !moves.is_empty() {
-                        self.undo_stack
-                            .push_silent(Box::new(CommandGroup::named("Transform".to_owned(), moves)));
-                        self.scene_dirty = true;
-                    }
+                if self.end_gizmo_drag() {
                     gizmo_consumed = true;
                 }
             }
@@ -5007,7 +5026,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 && self
                     .gizmo_drag
                     .as_ref()
-                    .is_some_and(|drag| drag.mode == GizmoMode::Translate)
+                    .is_some_and(|drag| drag.mode == GizmoMode::Translate && !drag.part_handle)
                 && let Some(mut world_position) = self
                     .gizmo_drag
                     .as_ref()
@@ -5018,6 +5037,27 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 if let Some(drag) = self.gizmo_drag.as_ref() {
                     new_t.translation = drag.parent_world_inverse.transform_point3(world_position);
                 }
+            } else if self.settings.editor().snap_to_surface
+                && let Some((start, arm, parent_inverse)) = self
+                    .gizmo_drag
+                    .as_ref()
+                    .filter(|drag| drag.mode == GizmoMode::Translate && drag.part_handle)
+                    .map(|drag| {
+                        let origin = drag.parent_world.transform_point3(drag.start_transform.translation);
+                        (drag.gizmo_pos, origin - drag.gizmo_pos, drag.parent_world_inverse)
+                    })
+                && let Some(origin) = self
+                    .gizmo_drag
+                    .as_ref()
+                    .map(|drag| drag.parent_world.transform_point3(new_t.translation))
+                && let Some(ground_then) = self.surface_height_at(start)
+                && let Some(ground_now) = self.surface_height_at(origin - arm)
+            {
+                // A part handled at its middle has its origin at the model's corner, so it is not the origin that
+                // goes on the ground: the part keeps the height it stood at over the ground as it is moved.
+                let mut handle = origin - arm;
+                handle.y = ground_now + (start.y - ground_then);
+                new_t.translation = parent_inverse.transform_point3(handle + arm);
             }
             let start = self
                 .gizmo_drag
@@ -5031,9 +5071,21 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             // The same delta, applied to every follower's own starting
             // transform. Rotation composes and scale multiplies, because that
             // is what those operations mean; translation adds.
-            let world_offset = self.gizmo_drag.as_ref().map_or_else(
+            // Where the handle is now. On the origin it goes where the origin goes; on a part's middle a turn or a
+            // scale leaves it where it is and a move carries it along.
+            let handle = self.gizmo_drag.as_ref().map(|drag| {
+                let origin = drag.parent_world.transform_point3(new_t.translation);
+                match (drag.part_handle, drag.mode) {
+                    (false, _) => origin,
+                    (true, GizmoMode::Translate) => {
+                        origin - drag.parent_world.transform_point3(drag.start_transform.translation) + drag.gizmo_pos
+                    }
+                    (true, _) => drag.gizmo_pos,
+                }
+            });
+            let world_offset = self.gizmo_drag.as_ref().zip(handle).map_or_else(
                 || new_t.translation - start.translation,
-                |drag| drag.parent_world.transform_point3(new_t.translation) - drag.gizmo_pos,
+                |(drag, handle)| handle - drag.gizmo_pos,
             );
             // The followers take the turn in world space (each writes it into its own parent's frame).
             let spin = self.gizmo_drag.as_ref().map_or_else(
@@ -5048,12 +5100,20 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 safe_ratio(new_t.scale.y, start.scale.y),
                 safe_ratio(new_t.scale.z, start.scale.z),
             );
+            // The rest of the selection turns with a part about the part's handle (its far twin most of all, which
+            // must stay on it); otherwise each about itself, or all about the selection's middle if that is set.
             let pivot = self
-                .settings
-                .editor()
-                .gizmo_pivot_centre
-                .then(|| self.focus_target().map(|(centre, _)| centre))
-                .flatten();
+                .gizmo_drag
+                .as_ref()
+                .filter(|drag| drag.part_handle)
+                .map(|drag| drag.gizmo_pos)
+                .or_else(|| {
+                    self.settings
+                        .editor()
+                        .gizmo_pivot_centre
+                        .then(|| self.focus_target().map(|(centre, _)| centre))
+                        .flatten()
+                });
             let followers = self
                 .gizmo_drag
                 .as_ref()
@@ -5066,12 +5126,10 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 spin,
                 growth,
                 pivot,
+                new_t,
             );
             if let Some(r) = &mut self.renderer {
-                let world_position = self.gizmo_drag.as_ref().map_or(new_t.translation, |drag| {
-                    drag.parent_world.transform_point3(new_t.translation)
-                });
-                r.set_gizmo_world_pos(world_position);
+                r.set_gizmo_world_pos(handle.unwrap_or(new_t.translation));
             }
         }
 
@@ -5561,6 +5619,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             self.zone_end();
             self.run_editor_script();
             self.report_refused_models();
+            self.settle_places();
             self.touch_selection();
             let selection_card = self.selection_card();
             self.zone_begin("Panel: hand to UI");
@@ -11523,6 +11582,8 @@ impl<G: GameApp> Engine<G> {
                 }
             }
 
+            EditorEvent::GoToPlace(index) => self.go_to_place(index),
+
             EditorEvent::RecallCameraBookmark(slot) => {
                 let Some(index) = slot.checked_sub(1).map(usize::from) else {
                     return;
@@ -13620,6 +13681,7 @@ fn try_start_gizmo_drag(
         parent_world,
         parent_world_inverse,
         start_world_rotation,
+        part_handle: part_handle(world, renderer, entity).is_some(),
     })
 }
 
@@ -13779,6 +13841,42 @@ fn gizmo_anchor(
         })
 }
 
+/// The handle of `entity` when it is a part of a merged model whose origin lies off its mesh
+/// ([`crate::editor_gizmo::part_pivot`]): the middle of its mesh, in world space. `None` for an object handled at its
+/// origin.
+fn part_handle(
+    world: &somnium_ecs::World,
+    renderer: &SomniumRenderer,
+    entity: somnium_ecs::entity::Entity,
+) -> Option<glam::Vec3> {
+    let mesh = world.get::<MeshComponent>(entity)?;
+    let (min, max) = renderer.geometry.mesh_aabb(mesh.vertex_offset)?;
+    let model = crate::editor_gizmo::entity_world_matrix(world, entity)?;
+    crate::editor_gizmo::part_pivot(model, glam::Vec3::from_array(min), glam::Vec3::from_array(max))
+}
+
+/// Where a handle dragged along one axis from `from` to `moved` lands with a grid of `step` metres.
+///
+/// It lands on the grid along the axis it is dragged on: an object already off the grid ends on it in that direction,
+/// which is what snapping to a grid means. The other two directions are left as they were. Snapping those as well
+/// threw a prop up to half a step sideways, and up or down, on every one-axis move: with a one-metre grid a bench
+/// nudged along a wall jumped into the wall and off the ground (Sunscar, 12 Nov 2026). A turned (local) axis crosses
+/// no world grid line squarely, so there the distance travelled is what snaps.
+fn snapped_along(from: glam::Vec3, moved: glam::Vec3, axis: GizmoAxis, local_space: bool, step: f32) -> glam::Vec3 {
+    if local_space {
+        let travel = moved - from;
+        let length = travel.length();
+        return if length > 0.0 { from + travel * (SnapSettings::quantise(length, step) / length) } else { from };
+    }
+    let mut at = moved;
+    match axis {
+        GizmoAxis::X => at.x = SnapSettings::quantise(moved.x, step),
+        GizmoAxis::Y => at.y = SnapSettings::quantise(moved.y, step),
+        GizmoAxis::Z => at.z = SnapSettings::quantise(moved.z, step),
+    }
+    at
+}
+
 fn apply_gizmo_drag(
     drag: &GizmoDragState,
     camera_pos: glam::Vec3,
@@ -13811,16 +13909,13 @@ fn apply_gizmo_drag(
         GizmoMode::Translate => {
             if let Some(s) = ray_axis_param(camera_pos, ray_dir, drag.gizmo_pos, axis_dir) {
                 let moved = drag.gizmo_pos + (s - drag.start_axis_param) * axis_dir;
-                // Snap the *result*, not the delta: an object already off the
-                // grid should land on it, which is what "snap to grid" means
-                // to everyone who has used one.
-                let snapped_world = glam::Vec3::new(
-                    SnapSettings::quantise(moved.x, snap.translate_m),
-                    SnapSettings::quantise(moved.y, snap.translate_m),
-                    SnapSettings::quantise(moved.z, snap.translate_m),
-                );
-                result.translation =
-                    world_to_local_translation(drag.parent_world_inverse, snapped_world);
+                let snapped_world = snapped_along(drag.gizmo_pos, moved, drag.axis, drag.local_space, snap.translate_m);
+                let origin = if drag.part_handle {
+                    snapped_world + drag.parent_world.transform_point3(drag.start_transform.translation) - drag.gizmo_pos
+                } else {
+                    snapped_world
+                };
+                result.translation = world_to_local_translation(drag.parent_world_inverse, origin);
             }
         }
         GizmoMode::Scale => {
@@ -13834,6 +13929,14 @@ fn apply_gizmo_drag(
                         GizmoAxis::Z => sc.z = SnapSettings::quantise(sc.z * factor, snap.scale),
                     }
                     result.scale = sc;
+                    if drag.part_handle {
+                        result.translation = crate::editor_gizmo::scaled_about(
+                            drag.parent_world_inverse,
+                            &drag.start_transform,
+                            drag.gizmo_pos,
+                            sc,
+                        );
+                    }
                 }
             }
         }
@@ -13856,6 +13959,15 @@ fn apply_gizmo_drag(
                 let parent = drag.parent_world.to_scale_rotation_translation().1;
                 result.rotation =
                     crate::editor_gizmo::spin_in_parent(parent, turn) * drag.start_transform.rotation;
+                if drag.part_handle {
+                    result.translation = crate::editor_gizmo::turned_about(
+                        drag.parent_world,
+                        drag.parent_world_inverse,
+                        drag.start_transform.translation,
+                        drag.gizmo_pos,
+                        turn,
+                    );
+                }
             }
         }
     }
@@ -14527,6 +14639,21 @@ mod viewport_control_tests {
             super::gizmo_anchor(&world, Some(child)),
             Some(glam::Vec3::new(10.0, 2.0, 0.0))
         );
+    }
+
+    /// Dragged along x with a one-metre grid, a handle lands on the grid in x and keeps its y and z; on a turned
+    /// axis it is the distance that snaps.
+    #[test]
+    fn a_one_axis_move_snaps_along_that_axis_only() {
+        let from = glam::Vec3::new(-15456.6, 28.733, 288.671);
+        let moved = from + glam::Vec3::X * 0.8;
+        let at = super::snapped_along(from, moved, super::GizmoAxis::X, false, 1.0);
+        assert_eq!((at.x, at.y, at.z), (-15456.0, from.y, from.z));
+        assert_eq!(super::snapped_along(from, moved, super::GizmoAxis::X, false, 0.0), moved, "no grid, no snap");
+        let slant = glam::Vec3::new(0.6, 0.0, 0.8);
+        let turned = super::snapped_along(from, from + slant * 1.4, super::GizmoAxis::X, true, 1.0);
+        assert!(turned.abs_diff_eq(from + slant, 2e-3), "a turned axis snaps the distance: {turned}");
+        assert_eq!(super::snapped_along(from, from, super::GizmoAxis::Z, true, 1.0), from);
     }
 
     /// A world-space gizmo result must cross the inverse parent transform

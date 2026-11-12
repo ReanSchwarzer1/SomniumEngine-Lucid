@@ -1150,6 +1150,8 @@ pub struct UiManager {
     outliner_rows: Vec<(NodeHandle, u32)>,
     /// Entities the palette can jump to, mirrored from the Outliner.
     palette_entities: Vec<(u32, String)>,
+    /// The open scene's places for the palette's "Go to" rows: name, kind, and whether it is built yet.
+    palette_places: Vec<(String, String, bool)>,
     /// Stable dynamic palette ids mapped to their current targets.
     palette_targets: std::collections::HashMap<String, PaletteTarget>,
     /// Persisted palette learning state.
@@ -1696,6 +1698,8 @@ enum PaletteTarget {
     /// Add this component (stable id) to the selected entity.
     AddComponent(String),
     Entity(u32),
+    /// A place of the open scene, by its row.
+    Place(usize),
     Asset(std::path::PathBuf),
     Help(u8),
     Drawer,
@@ -1703,6 +1707,13 @@ enum PaletteTarget {
 }
 
 impl UiManager {
+    /// The open scene's places, for the Command Palette's "Go to" rows: each a name, what kind of place it is, and
+    /// whether it is built yet. Choosing a row raises [`EditorEvent::GoToPlace`] with its index here. An empty list
+    /// shows no rows.
+    pub fn set_palette_places(&mut self, places: Vec<(String, String, bool)>) {
+        self.palette_places = places;
+    }
+
     fn allocate_property_gesture(&mut self) -> GestureId {
         let gesture = GestureId(self.next_property_gesture);
         self.next_property_gesture = self.next_property_gesture.wrapping_add(1).max(1);
@@ -2028,6 +2039,7 @@ impl UiManager {
             terrain_tool_items: layout.terrain_tool_items,
             outliner_rows: Vec::new(),
             palette_entities: Vec::new(),
+            palette_places: Vec::new(),
             palette_targets: std::collections::HashMap::new(),
             command_history: crate::commands::CommandHistory::load(),
             inspector_handles: layout.inspector_handles,
@@ -4632,6 +4644,23 @@ impl UiManager {
             targets.insert(key, PaletteTarget::Entity(*id));
         }
 
+        // The scene's places: "Go to Lucara" takes the camera there. A planned place says so and can still be
+        // gone to, to look at its site.
+        for (i, (name, group, built)) in self.palette_places.iter().enumerate() {
+            let key = format!("place:{name}");
+            let hint = match (group.is_empty(), *built) {
+                (_, true) => group.clone(),
+                (true, false) => "planned".to_owned(),
+                (false, false) => format!("{group}, planned"),
+            };
+            items.push(
+                PaletteItem::new(&key, format!("Go to {name}"), hint, Cat::Panel)
+                    .with_recency(self.command_history.recency(&key))
+                    .with_icon(crate::icons::IconId::Pin),
+            );
+            targets.insert(key, PaletteTarget::Place(i));
+        }
+
         // Assets in the current Content Drawer folder.
         for (_, entry) in &self.content_entries {
             if entry.is_dir {
@@ -5835,6 +5864,7 @@ impl UiManager {
                             path.to_string_lossy().into_owned(),
                         ))
                 }
+                Some(PaletteTarget::Place(place)) => self.editor_events.push_back(EditorEvent::GoToPlace(place)),
                 Some(PaletteTarget::Help(page)) => self.toggle_help(Some(page)),
                 Some(PaletteTarget::Drawer) => self.toggle_drawer(),
                 Some(PaletteTarget::AddComponent(component)) => {

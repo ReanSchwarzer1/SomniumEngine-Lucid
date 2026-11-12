@@ -125,6 +125,25 @@ pub(crate) struct CoverPick {
     pub distance: f32,
 }
 
+/// An eye that has gone to a place and is not settled there yet: in the air until the ground under it streams in,
+/// then on the ground until the place's own cells are in and it can stand on what is built there.
+#[derive(Clone, Copy)]
+struct PlaceDrop {
+    x: f32,
+    z: f32,
+    yaw: f32,
+    pitch: f32,
+    /// The height it stands on now, once it is down.
+    stood: Option<f32>,
+    /// When it last moved: the look for something built there waits a moment for the streamer to start on the place.
+    since: std::time::Instant,
+    until: std::time::Instant,
+}
+
+/// How far above the ground a place's eye may stand on something built there (a bridge's deck over its river). A
+/// roof higher than this over a place is not stood on.
+const STRUCTURE_REACH: f32 = 12.0;
+
 /// What the editor knows about the open scene's edits and the level tools' state.
 #[derive(Default)]
 pub(crate) struct EditingState {
@@ -156,6 +175,14 @@ pub(crate) struct EditingState {
     cube: Option<Arc<TriangleBvh>>,
     /// Entities Isolate hid, with the flags they had.
     isolated: Vec<(Entity, Option<EditorFlags>)>,
+    /// The opened scene's places (`<scene>.places.json`), in the order the palette's "Go to" rows name them.
+    places: Vec<crate::scene_places::Place>,
+    /// The palette has been given `places`.
+    places_shown: bool,
+    /// A place the camera went to before its ground was loaded: the eye drops onto the ground when it comes.
+    place_drop: Option<PlaceDrop>,
+    /// The editor script pressed the gizmo last frame: it lets go this frame.
+    script_release: bool,
     /// What the last scene load did with its layer, for one toast.
     summary: Option<String>,
     /// Terrain was sculpted or painted, which the layer does not hold.
@@ -494,6 +521,20 @@ impl<G: GameApp> Engine<G> {
     pub(super) fn edits_before_scene_spawn(&mut self, path: &str, document: &Value) -> Option<Value> {
         let scene = PathBuf::from(path);
         self.reset_editing(Some(scene.clone()));
+        if !self.config.player_mode {
+            self.editing.places = match crate::scene_places::read(&scene) {
+                Ok((places, left_out)) => {
+                    if left_out > 0 {
+                        warn!(left_out, "places: rows without a name, an x or a z were left out of the Go to list");
+                    }
+                    places
+                }
+                Err(error) => {
+                    warn!(%error, "places: the list could not be read");
+                    Vec::new()
+                }
+            };
+        }
         // A shipped game applies the layer and keeps nothing else: the bookkeeping below serves the editor.
         if !self.config.player_mode {
             let root = self.config.project_root.clone();
@@ -609,6 +650,183 @@ impl<G: GameApp> Engine<G> {
         if !ids.is_empty() {
             self.fold_session(Some(&ids), true);
         }
+    }
+
+    /// A selected part of one level of detail takes the same part of the other levels with it, so a move, a turn, a
+    /// delete or a save is of the prop and not of one of its copies ([`crate::lod_group::twins_of`]).
+    pub(super) fn select_lod_twins(&mut self) {
+        let in_a_level = |entity: &Entity| {
+            self.world
+                .get::<Parent>(*entity)
+                .and_then(|level| self.world.get::<Parent>(level.entity))
+                .is_some()
+        };
+        // Most selections are of things with no grandparent at all: no pass over the world for those.
+        if self.world.entities_with::<crate::lod_group::LodGroupComponent>().next().is_none()
+            || !self.selection.as_slice().iter().any(in_a_level)
+        {
+            return;
+        }
+        let twins = crate::lod_group::twins_of(&self.world, &children_map(&self.world), self.selection.as_slice());
+        self.selection.add_followers(twins);
+    }
+
+    /// The script's gizmo gesture (`drag` in [`Self::run_editor_script`]): the pointer on the handle of `axis`,
+    /// pressed, and taken to where a gesture of `amount` ends. False when no handle could be taken.
+    fn script_drag(&mut self, mode: GizmoMode, axis: GizmoAxis, amount: f32) -> bool {
+        if let Some(renderer) = self.renderer.as_mut() {
+            renderer.set_gizmo_mode(mode);
+        }
+        self.refresh_gizmo_anchor();
+        let Some(renderer) = self.renderer.as_ref() else {
+            return false;
+        };
+        let Some(at) = renderer.gizmo_world_pos else {
+            return false;
+        };
+        let turned = if self.settings.editor().gizmo_local_space { renderer.gizmo_world_rotation } else { glam::Quat::IDENTITY };
+        // The gizmo's size in the world: it is drawn at a constant size on screen (`gizmo_axis_under_ray`).
+        let reach = (renderer.camera_pos - at).length().max(0.5) * 0.15;
+        let along = turned * axis.world_dir();
+        let (from, to) = match mode {
+            GizmoMode::Translate => (at + along * (0.6 * reach), at + along * (0.6 * reach + amount)),
+            GizmoMode::Scale => (at + along * (0.6 * reach), at + along * (0.6 * reach * amount)),
+            GizmoMode::Rotate => {
+                let (tangent, bitangent) = ring_plane_basis(axis);
+                let (tangent, bitangent) = (turned * tangent, turned * bitangent);
+                // Take the ring on the camera's side, where no other ring's handle lies in front of it.
+                let toward = renderer.camera_pos - at;
+                let near = toward.dot(bitangent).atan2(toward.dot(tangent));
+                let on_ring = |angle: f32| at + (tangent * angle.cos() + bitangent * angle.sin()) * (0.84 * reach);
+                (on_ring(near), on_ring(near + amount.to_radians()))
+            }
+        };
+        let (width, height) = self.viewport_size();
+        let view_proj = renderer.picking_view_proj();
+        let to_pointer = |point: glam::Vec3| {
+            let clip = view_proj * point.extend(1.0);
+            (clip.w > 0.0).then(|| ((clip.x / clip.w + 1.0) * 0.5 * width, (1.0 - clip.y / clip.w) * 0.5 * height))
+        };
+        let (Some(press), Some(release)) = (to_pointer(from), to_pointer(to)) else {
+            return false;
+        };
+        self.cursor_pos = press;
+        if !self.begin_gizmo_drag() {
+            return false;
+        }
+        self.cursor_pos = release;
+        self.editing.script_release = true;
+        true
+    }
+
+    // ─── Places ──────────────────────────────────────────────────────
+
+    /// Each frame: the palette is given the scene's places once it is there, and an eye waiting over a place whose
+    /// ground had not loaded drops onto it when it comes.
+    pub(super) fn settle_places(&mut self) {
+        if !self.editing.places_shown
+            && let Some(ui) = self.ui_manager.as_mut()
+        {
+            ui.set_palette_places(
+                self.editing.places.iter().map(|p| (p.name.clone(), p.group.clone(), p.built)).collect(),
+            );
+            self.editing.places_shown = true;
+        }
+        let Some(mut drop) = self.editing.place_drop else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        let eye = |height: f32| glam::Vec3::new(drop.x, height + crate::scene_places::EYE_HEIGHT, drop.z);
+        match drop.stood {
+            // In the air: down onto the ground as soon as its tile is in.
+            None => {
+                if let Some(ground) = self.ground_height(drop.x, drop.z) {
+                    self.camera_pose_request = Some((eye(ground), drop.yaw, drop.pitch));
+                    (drop.stood, drop.since) = (Some(ground), now);
+                    self.editing.place_drop = Some(drop);
+                } else if now > drop.until {
+                    self.editing.place_drop = None;
+                    self.toast("No ground has loaded under that place: the camera stays in the air over it");
+                }
+            }
+            // Down: once the place's cells are in, onto what is built there, if anything is.
+            Some(stood) => {
+                let settled = now.duration_since(drop.since).as_secs_f32() > 1.5 && self.cell_streamer.reading.is_empty();
+                if settled || now > drop.until {
+                    self.editing.place_drop = None;
+                    if let Some(height) = self.standing_height(drop.x, drop.z)
+                        && (height - stood).abs() > 0.2
+                    {
+                        self.camera_pose_request = Some((eye(height), drop.yaw, drop.pitch));
+                    }
+                }
+            }
+        }
+    }
+
+    /// What an eye stands on at scene (x, z): the ground, or what is built over it there (a bridge's deck, a quay, a
+    /// stair) up to [`STRUCTURE_REACH`] above it. The support search End uses. `None` while no ground is loaded there.
+    fn standing_height(&mut self, x: f32, z: f32) -> Option<f32> {
+        let ground = self.ground_height(x, z)?;
+        let renderer = self.renderer.as_ref()?;
+        let index = MeshIndex::build(&self.world, renderer);
+        let terrains = self.prepare_terrains();
+        let over = glam::Vec3::new(x, ground + STRUCTURE_REACH, z);
+        let half = glam::Vec3::splat(0.05);
+        let support = self.support_for(&[over], over - half, over + half, &HashSet::new(), &index, &terrains);
+        Some(support.gap.map_or(ground, |gap| (over.y - gap).max(ground)))
+    }
+
+    /// The palette's "Go to" row `index`: the camera stands at that place, eye height over its ground, facing the
+    /// way the place names (or the way it faced).
+    pub(super) fn go_to_place(&mut self, index: usize) {
+        let Some(place) = self.editing.places.get(index).cloned() else {
+            return;
+        };
+        // ponytail: Play stands the player under the editor camera when it starts, so going somewhere while playing
+        // means stop, go, play. That is left to him (one key each) until he asks for it in one step.
+        if self.play_session_active {
+            self.toast("Stop Play first, then go to the place: Play starts where the camera stands");
+            return;
+        }
+        let Some(renderer) = self.renderer.as_ref() else {
+            return;
+        };
+        // The way the camera faces now, for a place that names no yaw.
+        let (width, height) = self.viewport_size();
+        let ahead = ndc_to_world(width * 0.5, height * 0.5, width, height, &renderer.picking_view_proj().inverse());
+        let forward = (ahead - renderer.camera_pos).normalize_or_zero();
+        let (yaw, pitch) = match place.camera_yaw() {
+            Some(yaw) => (yaw, 0.0),
+            None => (forward.z.atan2(forward.x).to_degrees(), forward.y.clamp(-1.0, 1.0).asin().to_degrees().clamp(-89.0, 89.0)),
+        };
+        let here = renderer.camera_pos.y;
+        let now = std::time::Instant::now();
+        let waiting = PlaceDrop {
+            x: place.x,
+            z: place.z,
+            yaw,
+            pitch,
+            stood: None,
+            since: now,
+            until: now + std::time::Duration::from_secs(120),
+        };
+        self.editing.place_drop = None;
+        if let Some(y) = place.y {
+            // A place in the air names its own height.
+            self.camera_pose_request = Some((glam::Vec3::new(place.x, y, place.z), yaw, pitch));
+        } else if let Some(height) = self.standing_height(place.x, place.z) {
+            // Loaded already: stand there now, and look once more when the streamer has settled round the eye.
+            let eye = glam::Vec3::new(place.x, height + crate::scene_places::EYE_HEIGHT, place.z);
+            self.camera_pose_request = Some((eye, yaw, pitch));
+            self.editing.place_drop = Some(PlaceDrop { stood: Some(height), ..waiting });
+        } else {
+            // Its ground has not streamed in: go there at this height and come down when it has.
+            self.camera_pose_request = Some((glam::Vec3::new(place.x, here, place.z), yaw, pitch));
+            self.editing.place_drop = Some(waiting);
+        }
+        let note = if place.note.is_empty() { String::new() } else { format!(": {}", place.note) };
+        self.toast(&format!("{}{note}", place.name));
     }
 
     /// Snapshot whatever has just been selected (and everything under it) before anything can change it.
@@ -1054,6 +1272,12 @@ impl<G: GameApp> Engine<G> {
         }
         boxes.sort_by(|a, b| a.0.total_cmp(&b.0));
         boxes.dedup_by_key(|(_, entity)| *entity);
+        // Of a prop's levels of detail only the one on screen can be clicked: the others stand unseen in the same
+        // place, and a click that took one of those moved a copy nobody was looking at.
+        if self.world.entities_with::<crate::lod_group::LodGroupComponent>().next().is_some() {
+            let children = children_map(&self.world);
+            boxes.retain(|(_, entity)| !crate::lod_group::hidden_from(&self.world, &children, *entity, origin));
+        }
         let mut best: Option<(f32, Entity)> = None;
         for (box_distance, entity) in boxes {
             if best.is_some_and(|(d, _)| box_distance > d) {
@@ -2577,6 +2801,9 @@ impl<G: GameApp> Engine<G> {
         }
         self.editing.script_frame += 1;
         let frame = self.editing.script_frame;
+        if std::mem::take(&mut self.editing.script_release) {
+            self.end_gizmo_drag();
+        }
         for (_, action) in SCRIPT.iter().filter(|(at, _)| *at == frame) {
             info!(frame, action = %action, "editor script");
             match action.split_once('=') {
@@ -2674,7 +2901,50 @@ impl<G: GameApp> Engine<G> {
                         None => warn!(id, "editor script: no such debug view"),
                     }
                 }
+                // A gizmo gesture on the selection, through the code a mouse drag runs: `drag=turn,y,180` (degrees),
+                // `drag=move,x,1.5` (metres), `drag=scale,y,2` (times). The pointer is put on the handle and pressed,
+                // taken to where the gesture ends, and let go on the next frame.
+                Some(("drag", what)) => {
+                    let parts: Vec<&str> = what.split(',').map(str::trim).collect();
+                    let gesture = match parts[..] {
+                        [mode, axis, amount] => {
+                            let mode = match mode {
+                                "move" => Some(GizmoMode::Translate),
+                                "turn" => Some(GizmoMode::Rotate),
+                                "scale" => Some(GizmoMode::Scale),
+                                _ => None,
+                            };
+                            let axis = match axis {
+                                "x" => Some(GizmoAxis::X),
+                                "y" => Some(GizmoAxis::Y),
+                                "z" => Some(GizmoAxis::Z),
+                                _ => None,
+                            };
+                            mode.zip(axis).zip(amount.parse::<f32>().ok())
+                        }
+                        _ => None,
+                    };
+                    match gesture {
+                        Some(((mode, axis), amount)) if self.script_drag(mode, axis, amount) => {}
+                        Some(_) => warn!(action = %action, "editor script: no gizmo handle could be taken (is something selected, and in view?)"),
+                        None => warn!(action = %action, "editor script: drag wants move|turn|scale, x|y|z, amount"),
+                    }
+                }
                 Some(("select", part)) => {
+                    // `#` and the start of a persistent id names one entity among the many of one name.
+                    if let Some(id) = part.strip_prefix('#') {
+                        let found = self
+                            .world
+                            .entities()
+                            .find(|e| self.world.persistent_id(*e).is_some_and(|p| p.to_string().starts_with(id)));
+                        if found.is_none() {
+                            warn!(id, "editor script: nothing loaded has that id");
+                        }
+                        self.selection.set_single(found);
+                        self.after_selection_change();
+                        self.reveal_selection_in_outliner(true);
+                        continue;
+                    }
                     let found = self.world.iter_with::<Name>().find(|(_, name)| name.as_str().contains(part)).map(|(e, _)| e);
                     if found.is_none() {
                         warn!(part, "editor script: nothing by that name");

@@ -121,6 +121,19 @@ impl Selection {
         self.anchor = None;
     }
 
+    /// Add entities that go with the selection without becoming its primary or its anchor: a part's twins in the
+    /// other levels of detail. Nothing is added to an empty selection.
+    pub fn add_followers(&mut self, entities: impl IntoIterator<Item = Entity>) {
+        if self.primary.is_none() {
+            return;
+        }
+        for entity in entities {
+            if !self.entities.contains(&entity) {
+                self.entities.push(entity);
+            }
+        }
+    }
+
     /// Replace the whole selection, preserving order and dropping duplicates.
     /// The last entity becomes the primary — marquee and paste both end on the
     /// thing the user most recently caused to exist or touch.

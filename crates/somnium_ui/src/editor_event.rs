@@ -386,6 +386,9 @@ pub enum EditorEvent {
     SetCameraBookmark(u8),
     /// Recall slot 1..=9.
     RecallCameraBookmark(u8),
+    /// Take the camera to a place of the open scene: the index of a row last given to
+    /// `UiManager::set_palette_places`.
+    GoToPlace(usize),
     /// Orbit around the selection rather than around the camera itself.
     ToggleOrbitSelection,
     /// `command()`+right-click: list everything selectable under the cursor.
