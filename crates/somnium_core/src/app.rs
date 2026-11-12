@@ -9571,8 +9571,11 @@ impl<G: GameApp> Engine<G> {
             let mut kind_lod = vec![f32::INFINITY; span];
             let mut kind_impostor = vec![f32::INFINITY; span];
             let mut kind_reach = vec![cull_distance; span];
+            // A kind that grows on others (mistletoe on its trees) waits while one of them is refused or still read.
+            let mut kind_unhosted = vec![false; span];
             for (kind, entry) in &self.project_foliage {
                 let k = *kind as usize;
+                kind_unhosted[k] = entry.hosts.is_some() && !self.hosts_drawn(*kind);
                 // Ground cover draws as far as it is generated unless told otherwise.
                 if let Some(d) = entry.draw_distance.or(entry.ground_cover.as_ref().map(|g| g.radius)) {
                     (kind_cull[k], kind_reach[k]) = (d * d, d);
@@ -9604,7 +9607,7 @@ impl<G: GameApp> Engine<G> {
                 let mut parts: Vec<Option<Vec<somnium_renderer::instance_batch::BatchPart>>> = vec![None; span];
                 for &kind in kinds.iter().filter(|&&kind| usize::from(kind) < span) {
                     let k = kind as usize;
-                    let Some(Some(near)) = self.foliage_meshes.get(k) else {
+                    let Some(Some(near)) = self.foliage_meshes.get(k).filter(|_| !kind_unhosted[k]) else {
                         continue;
                     };
                     let near: Vec<_> = near.iter().map(piece).collect();
@@ -9730,7 +9733,7 @@ impl<G: GameApp> Engine<G> {
                     counts.distance_culled = counts.distance_culled.saturating_add(1);
                     continue;
                 }
-                let Some(Some(parts)) = self.foliage_meshes.get(inst.kind as usize) else {
+                let Some(Some(parts)) = self.foliage_meshes.get(k).filter(|_| !kind_unhosted[k]) else {
                     counts.unavailable_mesh = counts.unavailable_mesh.saturating_add(1);
                     continue;
                 };

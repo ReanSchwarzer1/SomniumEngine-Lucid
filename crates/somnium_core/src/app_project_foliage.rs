@@ -128,6 +128,20 @@ impl<G: GameApp> Engine<G> {
         (kind as usize) < FOLIAGE_PALETTE.len() || self.project_foliage.contains_key(&kind)
     }
 
+    /// Whether a kind's hosts (`ProjectEntry::hosts`) let it draw this frame: none has failed and none is still
+    /// being read. A kind without hosts always may.
+    pub(super) fn hosts_drawn(&self, kind: u16) -> bool {
+        let Some(hosts) = self.project_foliage.get(&kind).and_then(|entry| entry.hosts.as_deref()) else {
+            return true;
+        };
+        crate::foliage_palette::hosts_drawn(hosts, |host| {
+            self.foliage_failed.get(usize::from(host)).copied().unwrap_or(false)
+                || self.project_foliage.get(&host).is_some_and(|entry| {
+                    self.palette_failed.contains(&entry.source) || self.palette_reads.contains_key(&entry.source)
+                })
+        })
+    }
+
     fn foliage_kind_name(&self, kind: u16) -> &str {
         self.project_foliage
             .get(&kind)
