@@ -661,7 +661,7 @@ fn specular_aa_runs_after_every_normal_and_roughness_writer() {
         "surface.normal = terrain.normal;",
         "widen_roughness_toksvig(surface.roughness, relief.w)",
         "apply_decals(&surface, hit_point, decal_froxel);",
-        "apply_wetness(&surface, material.porosity);",
+        "apply_wetness(&surface, material.porosity * (1.0 - ground_blend_w));",
     ] {
         let at = source
             .find(writer)
@@ -679,7 +679,7 @@ fn specular_aa_runs_after_every_normal_and_roughness_writer() {
         .find("surface.f0       = mix(vec3<f32>(0.04)")
         .expect("f0 derivation is still there");
     let wetness = source
-        .find("apply_wetness(&surface, material.porosity);")
+        .find("apply_wetness(&surface, material.porosity * (1.0 - ground_blend_w));")
         .expect("mesh wetness is still there");
     let shading = source
         .find("let view_pos   = view.view * vec4<f32>(hit_point, 1.0);")
