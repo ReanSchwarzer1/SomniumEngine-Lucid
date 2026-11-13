@@ -40,6 +40,12 @@ struct Out {
     @location(7) @interpolate(flat) flutter: f32,
     @location(8) view_dir: vec3<f32>,
 }
+// A flame tongue's turbulence (bit 4).
+fn flame_hash(p: vec2<f32>) -> f32 { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+fn flame_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p); let f = fract(p); let u = f * f * (3. - 2. * f);
+    return mix(mix(flame_hash(i), flame_hash(i + vec2(1., 0.)), u.x), mix(flame_hash(i + vec2(0., 1.)), flame_hash(i + vec2(1., 1.)), u.x), u.y);
+}
 @vertex fn vs_main(@builtin(vertex_index) vid: u32, @builtin(instance_index) iid: u32) -> Out {
     let p = particles[iid]; let uv = UV[vid];
     let xy = vec2((uv.x - .5) * p.size, (.5 - uv.y) * p.size * p.aspect);
@@ -81,13 +87,22 @@ struct Fragment {
         sprite = vec4(pow(max(sprite.rgb,vec3(0.)),vec3(2.2)),sprite.a);
     } else if (in.flags & 16u) != 0u {
         // A flame's tongue (bit 4; Sunscar, 13 Nov 2026): round at its base, drawn to a point at its tip, bent by its
-        // flutter with the base pinned as a textured flame's is, and hottest along its axis low down.
+        // flutter with the base pinned as a textured flame's is, torn by turbulence that rises through it, its tip
+        // licking up and down, white-yellow along its axis low down and orange-red at its edges. `uv_rect` carries
+        // the tongue's seed and age (somnium_core particle.rs), so no two tongues burn alike.
+        let seed = in.uv_rect.x;
+        let age = in.uv_rect.y;
         let h = 1. - in.local_uv.y;
-        let x = in.local_uv.x - .5 - in.flutter * h * h;
-        let half = .46 * sqrt(clamp(h * 3.5, 0., 1.)) * pow(clamp((1. - h) / .72, 0., 1.), .85);
-        let edge = 1. - smoothstep(half * .45, half + .001, abs(x));
-        let core = (1. - smoothstep(0., half * .6 + .001, abs(x))) * (1. - h);
-        sprite = vec4(vec3(1. + .7 * core), edge);
+        let n1 = flame_noise(vec2(in.local_uv.x * 3. + seed * 7.1, h * 2.5 - age * 3.2));
+        let n2 = flame_noise(vec2(in.local_uv.x * 7. - seed * 3.3, h * 5. - age * 5.7));
+        let x = in.local_uv.x - .5 - in.flutter * h * h - ((n1 - .5) * .24 + (n2 - .5) * .1) * h;
+        let tip = .74 + .24 * flame_noise(vec2(seed * 11. + 3., age * 4.5));
+        let hh = h / tip;
+        let half = .46 * sqrt(clamp(hh * 3.5, 0., 1.)) * pow(clamp((1. - hh) / .72, 0., 1.), .85) * (.8 + .4 * n1);
+        let edge = (1. - smoothstep(half * .35, half + .001, abs(x))) * step(hh, 1.);
+        let core = (1. - smoothstep(0., half * .55 + .001, abs(x))) * (1. - smoothstep(.15, .75, hh));
+        let hot = mix(vec3(1., .5, .26), vec3(1.45, 1.4, 1.55), core);
+        sprite = vec4(hot * (.75 + .5 * n2), edge);
     } else {
         sprite.a = 1. - smoothstep(.2,.5,distance(in.local_uv,vec2(.5)));
     }

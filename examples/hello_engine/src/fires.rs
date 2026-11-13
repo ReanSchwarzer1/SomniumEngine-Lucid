@@ -112,7 +112,9 @@ impl Fires {
                         .filter(|&(_, d)| d <= OWN_LIGHT)
                         .min_by(|a, b| a.1.total_cmp(&b.1))
                         .map(|(light, _)| light);
-                    let smoked = smoke.iter().any(|p| p.distance(at) <= 1.0);
+                    // ponytail: a place's own smoke (the Kept's rose brazier) did not show in any still, so every
+                    // open fire makes its own column; take `smoke` into account again if the two ever show doubled.
+                    let smoked = smoke.iter().any(|p| p.distance(at) <= 1.0) && false;
                     let fire = burn(world, carrier, model, flame, spot, own, smoked);
                     self.burning.push(fire);
                 }
@@ -143,7 +145,9 @@ impl Fires {
             if let Some(smoke) = fire.smoke
                 && let Some(emitter) = world.get_mut::<ParticleEmitter>(smoke)
             {
-                emitter.velocity_bias = [wind[0] / 3.0, 0.0, wind[1] / 3.0];
+                let drift = glam::Vec2::new(wind[0], wind[1]) / 3.0;
+                let drift = if drift.length() < 0.25 { drift.try_normalize().unwrap_or(glam::Vec2::X) * 0.25 } else { drift };
+                emitter.velocity_bias = [drift.x, 0.0, drift.y];
             }
         }
     }
@@ -204,15 +208,50 @@ fn burn(
             tip_tint: Vec3::new(1.0, 0.36, 0.08),
             spawn_extents: [radius * 0.5, 0.0, radius * 0.5],
             color_over_life: ramp(&[
-                (0.0, [3.2, 1.5, 0.4, 0.0]),
-                (0.1, [3.2, 1.5, 0.4, 1.0]),
-                (0.55, [2.6, 1.0, 0.22, 0.75]),
-                (1.0, [1.2, 0.3, 0.05, 0.0]),
+                (0.0, [7.5, 5.0, 2.0, 0.0]),
+                (0.1, [7.5, 5.0, 2.0, 1.0]),
+                (0.55, [6.0, 3.2, 1.0, 0.8]),
+                (1.0, [3.0, 1.0, 0.2, 0.0]),
             ]),
             spawn_accum: seed,
             ..Default::default()
         };
+        // Short, quick tongues among the long ones: tongues born and dying at different rates.
+        let licks = ParticleEmitter {
+            max_particles: 16,
+            spawn_rate: 30.0,
+            lifetime: 0.22,
+            initial_speed: 0.35,
+            size_start: width * 0.6,
+            size_end: width * 0.2,
+            flutter_hz: 8.5,
+            spawn_accum: (seed + 0.5).fract(),
+            ..tongues.clone()
+        };
         emitters.push(child(world, "fire: tongues", width * aspect * 0.45, Some(tongues), None));
+        emitters.push(child(world, "fire: licks", width * aspect * 0.35, Some(licks), None));
+        // The smoke just over the fire, lit by it from below: a warm haze that rises and fades.
+        let glow = ParticleEmitter {
+            additive: true,
+            max_particles: 12,
+            spawn_rate: 6.0,
+            lifetime: 1.6,
+            initial_speed: 0.45,
+            spread_angle: 0.25,
+            gravity: -0.1,
+            size_start: (radius * 2.2).max(0.25),
+            size_end: (radius * 4.0).max(0.7),
+            spawn_extents: [radius * 0.3, 0.0, radius * 0.3],
+            color_over_life: ramp(&[
+                (0.0, [0.9, 0.38, 0.1, 0.0]),
+                (0.15, [0.9, 0.38, 0.1, 0.45]),
+                (0.55, [0.35, 0.13, 0.04, 0.25]),
+                (1.0, [0.05, 0.02, 0.01, 0.0]),
+            ]),
+            spawn_accum: seed,
+            ..Default::default()
+        };
+        emitters.push(child(world, "fire: glow", height * 0.9, Some(glow), None));
         let sparks = ParticleEmitter {
             additive: true,
             max_particles: 10,
@@ -229,21 +268,23 @@ fn burn(
             ..Default::default()
         };
         emitters.push(child(world, "fire: sparks", height * 0.4, Some(sparks), None));
+        // A column of grey-brown smoke, lit by the sun and the sky: it rises, widens, thins and leans with the wind.
         let smoke = ParticleEmitter {
             lit: true,
-            max_particles: 24,
-            spawn_rate: 3.0,
-            lifetime: 5.5,
-            initial_speed: 0.3,
-            spread_angle: 0.2,
-            gravity: -0.05,
-            size_start: (radius * 1.6).max(0.2),
-            size_end: 1.3,
+            max_particles: 40,
+            spawn_rate: 5.0,
+            lifetime: 7.0,
+            initial_speed: 0.45,
+            spread_angle: 0.15,
+            gravity: -0.03,
+            size_start: (radius * 2.0).max(0.25),
+            size_end: 1.8,
             rotation_spread: 3.1,
             color_over_life: ramp(&[
-                (0.0, [0.045, 0.042, 0.04, 0.0]),
-                (0.12, [0.045, 0.042, 0.04, 0.3]),
-                (1.0, [0.06, 0.058, 0.055, 0.0]),
+                (0.0, [0.14, 0.125, 0.105, 0.0]),
+                (0.08, [0.14, 0.125, 0.105, 0.5]),
+                (0.45, [0.16, 0.15, 0.135, 0.32]),
+                (1.0, [0.2, 0.19, 0.18, 0.0]),
             ]),
             spawn_accum: seed,
             ..Default::default()
@@ -276,10 +317,10 @@ fn burn(
             flutter_hz: 7.5,
             tip_tint: Vec3::new(1.0, 0.42, 0.12),
             color_over_life: ramp(&[
-                (0.0, [3.0, 1.45, 0.38, 0.0]),
-                (0.12, [3.0, 1.45, 0.38, 1.0]),
-                (0.6, [2.4, 1.0, 0.22, 0.8]),
-                (1.0, [1.2, 0.35, 0.06, 0.0]),
+                (0.0, [6.0, 4.0, 1.6, 0.0]),
+                (0.12, [6.0, 4.0, 1.6, 1.0]),
+                (0.6, [4.8, 2.6, 0.8, 0.85]),
+                (1.0, [2.4, 0.8, 0.15, 0.0]),
             ]),
             spawn_accum: seed,
             ..Default::default()

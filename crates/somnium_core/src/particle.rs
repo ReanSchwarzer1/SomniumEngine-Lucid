@@ -526,12 +526,17 @@ pub(crate) fn simulate_particles_reflected(
                 color,
                 tip_tint: emitter.tip_tint.to_array(),
                 aspect: emitter.aspect.clamp(0.01, 100.0),
-                uv_rect: [
-                    (frame % cols) as f32 / cols as f32,
-                    (frame / cols) as f32 / rows as f32,
-                    1.0 / cols as f32,
-                    1.0 / rows as f32,
-                ],
+                // An untextured flame tongue reads no atlas: it takes its seed and age, for its turbulence.
+                uv_rect: if emitter.flame && emitter.texture_slot < 0 {
+                    [p.rotation_seed, p.age, 0.0, 0.0]
+                } else {
+                    [
+                        (frame % cols) as f32 / cols as f32,
+                        (frame / cols) as f32 / rows as f32,
+                        1.0 / cols as f32,
+                        1.0 / rows as f32,
+                    ]
+                },
                 rotation: emitter.spin * p.age + emitter.rotation_spread * p.rotation_seed,
                 texture_index: emitter.texture_slot,
                 flags: u32::from(emitter.additive)
