@@ -99,7 +99,9 @@ struct Fragment {
         let tip = .74 + .24 * flame_noise(vec2(seed * 11. + 3., age * 4.5));
         let hh = h / tip;
         let half = .46 * sqrt(clamp(hh * 3.5, 0., 1.)) * pow(clamp((1. - hh) / .72, 0., 1.), .85) * (.8 + .4 * n1);
-        let edge = (1. - smoothstep(half * .35, half + .001, abs(x))) * step(hh, 1.);
+        // Torn at the top: the noise eats the tongue from its tip down, so it ends in wisps that break away.
+        let tear = smoothstep(.3, .62, n1 * .6 + n2 * .4 + (1. - hh) * .55);
+        let edge = (1. - smoothstep(half * .35, half + .001, abs(x))) * step(hh, 1.) * tear;
         let core = (1. - smoothstep(0., half * .55 + .001, abs(x))) * (1. - smoothstep(.15, .75, hh));
         let hot = mix(vec3(1., .5, .26), vec3(1.45, 1.4, 1.55), core);
         sprite = vec4(hot * (.75 + .5 * n2), edge);

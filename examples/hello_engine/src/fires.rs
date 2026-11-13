@@ -34,6 +34,8 @@ struct Burning {
     /// The light it burns with.
     light: Option<Entity>,
     lit: Option<bool>,
+    /// A fire's (brazier, torch) rather than a lamp's: its light flickers hard.
+    open: bool,
 }
 
 #[derive(Default)]
@@ -134,6 +136,14 @@ impl Fires {
                     _ => true,
                 }
             });
+            // A fire's own light (the place's) flickers as hard as the fire does: the ground and walls with it.
+            if fire.open
+                && let Some(light) = fire.light
+                && let Some(lamp) = world.get_mut::<LampComponent>(light)
+                && lamp.flicker < 0.45
+            {
+                lamp.flicker = 0.45;
+            }
             if fire.lit != Some(lit) {
                 for &emitter in &fire.emitters {
                     if let Some(emitter) = world.get_mut::<ParticleEmitter>(emitter) {
@@ -187,54 +197,59 @@ fn burn(
         entity
     };
     let smoke = if open {
-        // A wood or tar fire: tongues over its bed, sparks, and smoke.
-        let width = (height * 0.5).max(0.06);
-        let aspect = 1.8;
-        let tongues = ParticleEmitter {
+        // A wood or tar fire is one body over its whole bed (the developer, 13 Nov 11:58, of separate cones on a pan:
+        // "looks dogshit"): many small licks born all over the bed, rising, merging and splitting, torn into wisps at
+        // the top (the shader), white-yellow low down, orange, then deep red as they die; a bed of glowing coals
+        // under them; sparks; smoke soot-dark close over the flame and lit from below at night.
+        let lick = (radius * 0.75).clamp(0.07, 0.22);
+        let fire = ParticleEmitter {
             additive: true,
             world_up: true,
             flame: true,
-            max_particles: 28,
-            spawn_rate: 36.0,
-            lifetime: 0.45,
-            initial_speed: 0.15,
-            spread_angle: 0.35,
-            gravity: -0.9,
-            size_start: width,
-            size_end: width * 0.3,
-            aspect,
-            flutter: 0.17,
-            flutter_hz: 5.5,
-            tip_tint: Vec3::new(1.0, 0.36, 0.08),
-            spawn_extents: [radius * 0.5, 0.0, radius * 0.5],
+            max_particles: 110,
+            spawn_rate: 170.0,
+            lifetime: 0.55,
+            initial_speed: 0.25,
+            spread_angle: 0.3,
+            gravity: -1.6,
+            size_start: lick,
+            size_end: lick * 0.25,
+            aspect: 1.7,
+            flutter: 0.2,
+            flutter_hz: 6.5,
+            tip_tint: Vec3::new(1.0, 0.3, 0.06),
+            spawn_extents: [radius * 0.7, 0.0, radius * 0.7],
             color_over_life: ramp(&[
-                (0.0, [7.5, 5.0, 2.0, 0.0]),
-                (0.1, [7.5, 5.0, 2.0, 1.0]),
-                (0.55, [6.0, 3.2, 1.0, 0.8]),
-                (1.0, [3.0, 1.0, 0.2, 0.0]),
+                (0.0, [2.2, 1.9, 1.2, 0.0]),
+                (0.08, [2.2, 1.8, 1.0, 0.9]),
+                (0.35, [2.0, 1.1, 0.35, 0.8]),
+                (0.7, [1.3, 0.35, 0.06, 0.55]),
+                (1.0, [0.5, 0.08, 0.01, 0.0]),
             ]),
             spawn_accum: seed,
             ..Default::default()
         };
-        // Short, quick tongues among the long ones: tongues born and dying at different rates.
-        let licks = ParticleEmitter {
+        emitters.push(child(world, "fire: body", lick * 1.7 * 0.4, Some(fire), None));
+        let coals = ParticleEmitter {
+            additive: true,
             max_particles: 16,
-            spawn_rate: 30.0,
-            lifetime: 0.22,
-            initial_speed: 0.35,
-            size_start: width * 0.6,
-            size_end: width * 0.2,
-            flutter_hz: 8.5,
-            spawn_accum: (seed + 0.5).fract(),
-            ..tongues.clone()
+            spawn_rate: 12.0,
+            lifetime: 1.3,
+            initial_speed: 0.01,
+            spread_angle: 0.0,
+            gravity: 0.0,
+            size_start: (radius * 0.8).max(0.06),
+            size_end: (radius * 0.6).max(0.05),
+            spawn_extents: [radius * 0.55, 0.0, radius * 0.55],
+            color_over_life: ramp(&[(0.0, [1.4, 0.3, 0.04, 0.0]), (0.3, [1.6, 0.36, 0.05, 0.85]), (1.0, [0.7, 0.1, 0.01, 0.0])]),
+            spawn_accum: seed,
+            ..Default::default()
         };
-        emitters.push(child(world, "fire: tongues", width * aspect * 0.45, Some(tongues), None));
-        emitters.push(child(world, "fire: licks", width * aspect * 0.35, Some(licks), None));
-        // The smoke just over the fire, lit by it from below: a warm haze that rises and fades.
+        emitters.push(child(world, "fire: coals", 0.02, Some(coals), None));
         let glow = ParticleEmitter {
             additive: true,
-            max_particles: 12,
-            spawn_rate: 6.0,
+            max_particles: 14,
+            spawn_rate: 7.0,
             lifetime: 1.6,
             initial_speed: 0.45,
             spread_angle: 0.25,
@@ -243,15 +258,15 @@ fn burn(
             size_end: (radius * 4.0).max(0.7),
             spawn_extents: [radius * 0.3, 0.0, radius * 0.3],
             color_over_life: ramp(&[
-                (0.0, [0.9, 0.38, 0.1, 0.0]),
-                (0.15, [0.9, 0.38, 0.1, 0.45]),
-                (0.55, [0.35, 0.13, 0.04, 0.25]),
+                (0.0, [1.2, 0.5, 0.13, 0.0]),
+                (0.15, [1.2, 0.5, 0.13, 0.5]),
+                (0.55, [0.45, 0.17, 0.05, 0.25]),
                 (1.0, [0.05, 0.02, 0.01, 0.0]),
             ]),
             spawn_accum: seed,
             ..Default::default()
         };
-        emitters.push(child(world, "fire: glow", height * 0.9, Some(glow), None));
+        emitters.push(child(world, "fire: glow", lick * 1.7 + 0.3, Some(glow), None));
         let sparks = ParticleEmitter {
             additive: true,
             max_particles: 10,
@@ -281,10 +296,10 @@ fn burn(
             size_end: 1.8,
             rotation_spread: 3.1,
             color_over_life: ramp(&[
-                (0.0, [0.14, 0.125, 0.105, 0.0]),
-                (0.08, [0.14, 0.125, 0.105, 0.5]),
-                (0.45, [0.16, 0.15, 0.135, 0.32]),
-                (1.0, [0.2, 0.19, 0.18, 0.0]),
+                (0.0, [0.03, 0.028, 0.025, 0.0]),
+                (0.1, [0.035, 0.031, 0.028, 0.55]),
+                (0.45, [0.1, 0.095, 0.085, 0.35]),
+                (1.0, [0.16, 0.15, 0.14, 0.0]),
             ]),
             spawn_accum: seed,
             ..Default::default()
@@ -292,7 +307,7 @@ fn burn(
         if smoked {
             None
         } else {
-            let smoke = child(world, "fire: smoke", height * 1.05, Some(smoke), None);
+            let smoke = child(world, "fire: smoke", lick * 1.7 + 0.3, Some(smoke), None);
             emitters.push(smoke);
             Some(smoke)
         }
@@ -334,8 +349,8 @@ fn burn(
         let mut light = LightComponent::point(if open { 220.0 + 900.0 * height } else { 35.0 }, if open { 9.0 } else { 4.0 });
         light.color_temperature_k = if open { 1700.0 } else { 1900.0 };
         light.source_radius = radius.clamp(0.01, 0.2);
-        let lamp = LampComponent { switched: true, flicker: if open { 0.3 } else { 0.15 } };
+        let lamp = LampComponent { switched: true, flicker: if open { 0.45 } else { 0.15 } };
         Some(child(world, "fire: light", height * 0.6, None, Some((light, lamp))))
     });
-    Burning { carrier, spot, made, emitters, smoke, light, lit: None }
+    Burning { carrier, spot, made, emitters, smoke, light, lit: None, open }
 }
