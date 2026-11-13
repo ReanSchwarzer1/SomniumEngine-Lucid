@@ -12,7 +12,7 @@ pub struct GpuParticle {
     pub rotation: f32,
     pub texture_index: i32,
     /// Bit 0 additive; bit 1 world-up billboard; bit 2 mirrored sprite UV; bit 3 lit by the sun and sky
-    /// (`colour` is then an albedo).
+    /// (`colour` is then an albedo); bit 4 an untextured sprite drawn as a flame's tongue.
     pub flags: u32,
     /// Tip displacement in sprite-width units; its base stays pinned.
     pub flutter: f32,

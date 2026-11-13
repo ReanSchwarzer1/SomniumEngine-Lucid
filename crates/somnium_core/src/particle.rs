@@ -75,6 +75,9 @@ pub struct ParticleEmitter {
     pub flutter: f32,
     /// Deformation frequency in Hz, driven by simulation age (respects Pause).
     pub flutter_hz: f32,
+    /// An untextured sprite drawn as a flame's tongue: round at its base, pointed at its tip, bent by its flutter
+    /// (Sunscar's fire, 13 Nov 2026). Off, it is the soft round particle.
+    pub flame: bool,
     /// One-shot burst, consumed by simulation.
     pub burst: u32,
     /// Resolved texture state, not persisted.
@@ -347,6 +350,7 @@ impl Default for ParticleEmitter {
             spin: 0.0,
             flutter: 0.0,
             flutter_hz: 4.0,
+            flame: false,
             burst: 0,
             texture_status: "Soft round particle".into(),
             texture_slot: -1,
@@ -453,7 +457,10 @@ pub(crate) fn simulate_particles_reflected(
             // Deterministic LCG pseudo-random — good enough for particles.
             let seed = frame
                 .wrapping_mul(1_000_003)
-                .wrapping_add((i as u64).wrapping_mul(6_364_136_223_846_793_005));
+                .wrapping_add((i as u64).wrapping_mul(6_364_136_223_846_793_005))
+                // Each emitter its own draw: with the frame and the particle alone, every emitter spawned the same
+                // directions on the same frame, and a street of lanterns flickered in step (Sunscar, 13 Nov 2026).
+                .wrapping_add(u64::from(entity.index()).wrapping_mul(0x9E37_79B9_7F4A_7C15));
             let r1 = ((seed >> 33) & 0xFFFF) as f32 / 65535.0; // 0..1
             let r2 = ((seed >> 17) & 0xFFFF) as f32 / 65535.0 * 2.0 * std::f32::consts::PI;
             let theta = r1 * spread;
@@ -527,7 +534,10 @@ pub(crate) fn simulate_particles_reflected(
                 ],
                 rotation: emitter.spin * p.age + emitter.rotation_spread * p.rotation_seed,
                 texture_index: emitter.texture_slot,
-                flags: u32::from(emitter.additive) | (u32::from(emitter.world_up) << 1) | (u32::from(emitter.lit) << 3),
+                flags: u32::from(emitter.additive)
+                    | (u32::from(emitter.world_up) << 1)
+                    | (u32::from(emitter.lit) << 3)
+                    | (u32::from(emitter.flame) << 4),
                 flutter: emitter.flutter.clamp(0.0, 0.4)
                     * ((p.age * emitter.flutter_hz.clamp(0.0, 30.0) * std::f32::consts::TAU
                         + p.rotation_seed * 3.0)

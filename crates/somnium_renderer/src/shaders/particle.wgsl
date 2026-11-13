@@ -79,6 +79,15 @@ struct Fragment {
         if any(warped < vec2(0.)) || any(warped > vec2(1.)) { sprite.a = 0.; }
         // Shared standalone asset textures are RGBA8 UNORM; colour input is sRGB.
         sprite = vec4(pow(max(sprite.rgb,vec3(0.)),vec3(2.2)),sprite.a);
+    } else if (in.flags & 16u) != 0u {
+        // A flame's tongue (bit 4; Sunscar, 13 Nov 2026): round at its base, drawn to a point at its tip, bent by its
+        // flutter with the base pinned as a textured flame's is, and hottest along its axis low down.
+        let h = 1. - in.local_uv.y;
+        let x = in.local_uv.x - .5 - in.flutter * h * h;
+        let half = .46 * sqrt(clamp(h * 3.5, 0., 1.)) * pow(clamp((1. - h) / .72, 0., 1.), .85);
+        let edge = 1. - smoothstep(half * .45, half + .001, abs(x));
+        let core = (1. - smoothstep(0., half * .6 + .001, abs(x))) * (1. - h);
+        sprite = vec4(vec3(1. + .7 * core), edge);
     } else {
         sprite.a = 1. - smoothstep(.2,.5,distance(in.local_uv,vec2(.5)));
     }

@@ -1390,6 +1390,10 @@ pub struct Engine<G: GameApp> {
     model_faults: crate::model_faults::ModelFaults,
     /// The standalone game's line for them.
     model_notice: crate::model_faults::Notice,
+    /// Every imported source's made flames by node (`fire.rs`), by its resolved file (the upload cache's key), kept
+    /// from its first load, a cell reader's included, for every entity that reuses the upload.
+    pub(crate) flame_nodes:
+        std::collections::HashMap<std::path::PathBuf, std::collections::HashMap<u32, std::sync::Arc<[crate::fire::Flame]>>>,
 }
 
 /// One floating window's swapchain image, acquired before the frame that fills
@@ -2011,6 +2015,7 @@ impl<G: GameApp + 'static> Engine<G> {
             script_step: 0,
             model_faults: crate::model_faults::ModelFaults::default(),
             model_notice: crate::model_faults::Notice::default(),
+            flame_nodes: std::collections::HashMap::new(),
         };
 
         engine.foliage_erase = crate::authoring_settings::BrushPreferences::load()
@@ -2940,8 +2945,9 @@ impl<G: GameApp> Engine<G> {
                 (Some(_), None) => None,
                 (None, _) => Some(parts.clone()),
             };
+            let key = resolved.clone();
             let load = load.filter(|_| drawing).map(|parts| (resolved, parts));
-            restores.push((source, entities, stamp, cached, load, parts));
+            restores.push((source, entities, stamp, cached, load, parts, key));
         }
         self.zone_end();
         self.zone_begin("Restore uploads");
@@ -2972,7 +2978,7 @@ impl<G: GameApp> Engine<G> {
                 })
                 .collect();
             let mut next = 0;
-            for (source, entities, stamp, cached, load, parts) in restores {
+            for (source, entities, stamp, cached, load, parts, key) in restores {
                 let waited = std::time::Instant::now();
                 let loaded = load.as_ref().map(|_| {
                     next += 1;
@@ -3007,6 +3013,10 @@ impl<G: GameApp> Engine<G> {
                         }
                         None => continue,
                     };
+                    // The made flames in this source, kept for every later cell that uses it (`fire.rs`).
+                    if crate::fire::rule_on() {
+                        self.flame_nodes.insert(key.clone(), crate::fire::scene_flames(&scene));
+                    }
                     let nodes = renderer.upload_scene_for(ctx, &scene, Some(&parts));
                     if let Some(stamp) = stamp {
                         self.imported_uploads.insert(stamp, &nodes, Some(parts));
@@ -3014,6 +3024,12 @@ impl<G: GameApp> Engine<G> {
                     nodes
                 };
                 for (entity, ordinal) in entities {
+                    // A made flame is not drawn: the shell burns it in its place (`fire.rs`).
+                    if let Some(flames) = self.flame_nodes.get(&key).and_then(|nodes| nodes.get(&ordinal)) {
+                        let _ = self.world.remove_component::<MeshComponent>(entity);
+                        let _ = self.world.insert_component(entity, crate::fire::FlameSource { flames: flames.clone() });
+                        continue;
+                    }
                     if let Some(node) = uploaded.get(ordinal as usize) {
                         let _ = self.world.insert_component(
                             entity,

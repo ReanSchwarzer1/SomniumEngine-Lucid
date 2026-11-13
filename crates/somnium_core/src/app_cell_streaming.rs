@@ -402,6 +402,11 @@ impl<G: GameApp> Engine<G> {
         scene: &somnium_asset::LoadedScene,
         prepared: somnium_renderer::PreparedScene,
     ) {
+        // Its made flames, by the same resolved file the restore looks them up by (`fire.rs`): a cell's sources are
+        // uploaded here, so its restore finds them cached and never sees the scene.
+        if crate::fire::rule_on() && !self.flame_nodes.contains_key(path) {
+            self.flame_nodes.insert(path.to_path_buf(), crate::fire::scene_flames(scene));
+        }
         let stamp = import_cache::SourceStamp::read(path);
         if stamp.as_ref().is_some_and(|stamp| self.imported_uploads.get(stamp).is_some()) {
             return;

@@ -20,6 +20,7 @@
 //! - Editor mode (Play/Pause/Stop) (11.5L)
 
 mod animated_preview;
+mod fires;
 mod skinned_crowd;
 mod authoring_demo;
 mod boats;
@@ -768,6 +769,8 @@ pub struct HelloGame {
     pub sky_dim: f32,
     /// Whether the living's lamps burn (`somnium.Lamp` beside a light; somnium_core::light_flicker).
     lamps: somnium_core::light_flicker::LampSwitch,
+    /// Fire, smoke and a wavering light for every made flame (`fires.rs`).
+    fires: fires::Fires,
     /// Roofs and upper floors opened for the camera while the viewer is inside (somnium_core::cutaway).
     cutaways: somnium_core::cutaway::Cutaways,
     /// Levels of detail not drawn this frame (somnium_core::lod_group).
@@ -904,6 +907,7 @@ impl HelloGame {
             game_eye: None,
             sky_dim: 1.0,
             lamps: Default::default(),
+            fires: Default::default(),
             cutaways: Default::default(),
             imported_draws: Default::default(),
             lods: Default::default(),
@@ -2377,6 +2381,8 @@ impl GameApp for HelloGame {
     fn on_render(&mut self, ctx: &mut EngineContext) {
         fracture_demo::Demo::sync(ctx.world);
         somnium_core::propagate_transforms(ctx.world);
+        // After the transforms, so a flame that just streamed in is lit where it stands.
+        self.fires.update(ctx.world, self.lamps.night(), ctx.time.elapsed().as_secs_f32());
         let (view_mat, eye) = self
             .combat
             .view(ctx.world)
