@@ -246,27 +246,8 @@ fn burn(
             ..Default::default()
         };
         emitters.push(child(world, "fire: coals", 0.02, Some(coals), None));
-        let glow = ParticleEmitter {
-            additive: true,
-            max_particles: 14,
-            spawn_rate: 7.0,
-            lifetime: 1.6,
-            initial_speed: 0.45,
-            spread_angle: 0.25,
-            gravity: -0.1,
-            size_start: (radius * 2.2).max(0.25),
-            size_end: (radius * 4.0).max(0.7),
-            spawn_extents: [radius * 0.3, 0.0, radius * 0.3],
-            color_over_life: ramp(&[
-                (0.0, [1.2, 0.5, 0.13, 0.0]),
-                (0.15, [1.2, 0.5, 0.13, 0.5]),
-                (0.55, [0.45, 0.17, 0.05, 0.25]),
-                (1.0, [0.05, 0.02, 0.01, 0.0]),
-            ]),
-            spawn_accum: seed,
-            ..Default::default()
-        };
-        emitters.push(child(world, "fire: glow", lick * 1.7 + 0.3, Some(glow), None));
+        // No glow sprite over the fire: it read as a soft orb hanging over the brazier (13 Nov 12:32, beside real
+        // photographs); the smoke and the fire's own light carry it.
         let sparks = ParticleEmitter {
             additive: true,
             max_particles: 10,
