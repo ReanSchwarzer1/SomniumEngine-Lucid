@@ -380,8 +380,10 @@ fn grow(cell: u32, tile: GrassTile, k: u32, rank: f32) -> Grown {
     }
     g.width = width * s * widen * widen_cover;
     g.facing = c_face + (unit(h5) - 0.5) * 3.7699;
-    // Lodged and trodden places: where the small patches peak, most blades lie over, the same way.
-    let lodged_here = smoothstep(0.72, 0.86, n_small) * select(0.85, 0.2, tussock);
+    // Lodged and trodden places: where the small patches peak, most blades lie over, the same way. Only a sward tall
+    // enough to fall over lodges: a grazed turf lying flat all but vanishes from a standing eye (fr_gk_2, 20 Nov: the
+    // lawn's bare patches a few metres across at 10-30 m).
+    let lodged_here = smoothstep(0.72, 0.86, n_small) * select(0.85, 0.2, tussock) * smoothstep(0.12, 0.25, h_mean);
     if unit(h6) < max(hab.lodged, lodged_here) {
         g.lean = mix(1.05, 1.48, unit(hash(h6)));
         g.facing = mix(g.facing, patch_noise(xz / 9.0, 0x1f83d9abu) * 12.566371, lodged_here);
