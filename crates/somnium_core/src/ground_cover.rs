@@ -1089,10 +1089,20 @@ mod tests {
         let mut cover = GroundCover::default();
         let camera = Vec3::new(250.0, 0.0, 262.0);
         cover.update_seeded(5, 5, &Strips, &palette, camera, None, glam::Vec2::ZERO, "");
+        // An optimised build reads this plain ground's layers inside one frame (2 ms); a debug build takes a few
+        // frames, each planning again from the layers read so far (19 Nov 2026: it failed here unoptimised).
+        let mut frames = 1;
+        while cover.terrains[&5].plan_partial && frames < 50 {
+            cover.update_seeded(5, 5, &Strips, &palette, camera, None, glam::Vec2::ZERO, "");
+            frames += 1;
+        }
         let t = &cover.terrains[&5];
-        assert!(!t.plan_partial, "a plain ground's layers read well inside a frame");
-        let mut planned: Vec<(u16, i32, i32)> = t.plan.iter().map(|&(_, i, cx, cz)| (1000 + i as u16, cx, cz)).collect();
+        assert!(!t.plan_partial && (frames == 1 || cfg!(debug_assertions)), "a plain ground's layers read well inside a frame");
+        // What the last plan holds, with the cells the frames before it made (a plan leaves out a cell already made).
+        let mut planned: Vec<(u16, i32, i32)> =
+            t.plan.iter().map(|&(_, i, cx, cz)| (1000 + i as u16, cx, cz)).chain(t.cells.keys().copied()).collect();
         planned.sort_unstable();
+        planned.dedup();
         // Kind by kind, cell by cell, as the plan was first made.
         let mut wanted = Vec::new();
         for (&kind, entry) in &palette {
