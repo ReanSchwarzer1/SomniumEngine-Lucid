@@ -2842,6 +2842,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var surface: Surface;
     surface.albedo    = material.base_color.rgb;
     surface.normal    = geo_normal;
+    // A grass blade is lit partly as the ground under it is: its own normal lies near the horizontal, so under a
+    // high sky a sward of them read grey and dull beside the tufts and the photographs (fr_gg_1, 19 Nov). After the
+    // two-sided flip, tilted toward up: some near the eye, where each blade's own shape reads, most far off, where
+    // the sward is a surface (Ghost of Tsushima blends toward the clump's normal with distance).
+    if is_grass {
+        let tilt = mix(0.45, 0.85, smoothstep(5.0, 40.0, distance(hit_point, view.camera_pos)));
+        surface.normal = normalize(mix(geo_normal, vec3<f32>(0.0, 1.0, 0.0), tilt));
+    }
     // De-tiling needs the analytic gradients: implicit ones jump at every
     // region's offset and would pick the finest mip along the seams.
     let detiled = material.detile > 0.5 && analytic_grad;
