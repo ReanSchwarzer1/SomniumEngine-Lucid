@@ -746,7 +746,7 @@ fn sun_transmission_uses_sun_visibility() {
         .find("// Transmitted sunlight")
         .expect("the transmitted sunlight block is still there");
     let end = source[start..]
-        .find("let gi_texel")
+        .find("var gi_texel")
         .map(|offset| start + offset)
         .expect("GI setup still follows transmitted sunlight");
     let compact: String = source[start..end]
