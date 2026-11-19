@@ -60,9 +60,9 @@ pub struct TimeOfDayComponent {
     /// Degrees east. Negative is west. The time zone is derived from this
     /// rather than authored, so a longitude change moves noon where it should.
     pub longitude: f32,
-    /// Degrees added to every azimuth the solar clock gives, in [`sun_rotation`]'s convention: where the clock's
-    /// true north stands in the world. Zero puts it toward +Z. A world whose noon sun must stand where an old fixed
-    /// sun stood turns its north by this.
+    /// Where the clock's true north stands in the world, as an azimuth in [`sun_rotation`]'s convention: zero puts
+    /// it toward +Z, and then east is toward -X (y up, right-handed). A world whose noon sun must stand where an old
+    /// fixed sun stood turns its north by this.
     pub north_offset: f32,
     /// Game hours advanced per real second while Play is running. Zero freezes
     /// the clock, which is the default: a scene should not start moving the
@@ -353,8 +353,11 @@ impl TimeOfDayComponent {
         let (azimuth_deg, elevation_deg) = if self.fixed_sun {
             (self.fixed_azimuth.rem_euclid(360.0), self.fixed_elevation.clamp(-90.0, 90.0))
         } else {
+            // The clock's azimuth turns clockwise seen from above (north, then east) and the light's the other way
+            // (+Z, then +X), so it is taken from the north, not added to it. Added, the sun crossed the sky backwards:
+            // facing the noon sun, he watched it go from right to left (Sunscar, 19 Nov 2026).
             let (azimuth, elevation) = solar_position(self.day_of_year, hour, self.latitude, self.longitude);
-            ((azimuth + self.north_offset).rem_euclid(360.0), elevation)
+            ((self.north_offset - azimuth).rem_euclid(360.0), elevation)
         };
         // A fixed sun keeps the noon tint: its colour at a low elevation comes
         // from the transmittance physics, not from a clock it does not have.
@@ -643,7 +646,28 @@ mod tests {
         assert!(up(17.15) && !up(17.3), "sunset");
         // The offset turns the whole day: the morning sun still climbs on the side the noon sun stands.
         let morning = TimeOfDayComponent { hour: 9.0, ..clock.clone() }.evaluate();
-        assert!((morning.azimuth_deg - (solar_position(307, 9.0, 40.17, -4.091).0 - 66.0)).abs() < 1e-3);
+        assert!((morning.azimuth_deg - (-66.0 - solar_position(307, 9.0, 40.17, -4.091).0).rem_euclid(360.0)).abs() < 1e-3);
+    }
+
+    /// A northern sun rises in the east, stands in the south at noon and sets in the west, whichever way the world's
+    /// north is turned: with north toward -Z (east +X, south +Z), and with it turned a quarter to +X.
+    #[test]
+    fn the_sun_crosses_the_sky_east_to_west() {
+        for (north_offset, north) in [(180.0, glam::Vec3::NEG_Z), (90.0, glam::Vec3::X)] {
+            let east = north.cross(glam::Vec3::Y);
+            let clock = TimeOfDayComponent {
+                fixed_sun: false,
+                day_of_year: 172,
+                latitude: 45.0,
+                longitude: 0.0,
+                north_offset,
+                ..TimeOfDayComponent::default()
+            };
+            let toward = |hour: f32| -(TimeOfDayComponent { hour, ..clock.clone() }.evaluate().rotation * glam::Vec3::NEG_Z);
+            assert!(toward(8.0).dot(east) > 0.5, "the morning sun is east of {north}: {}", toward(8.0));
+            assert!(toward(12.0).dot(-north) > 0.3, "the noon sun is south: {}", toward(12.0));
+            assert!(toward(16.0).dot(-east) > 0.5, "the afternoon sun is west: {}", toward(16.0));
+        }
     }
 
     /// Covering the sun scales its light in either model, and an Earth sun
