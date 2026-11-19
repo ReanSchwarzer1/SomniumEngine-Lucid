@@ -1714,7 +1714,7 @@ impl TerrainData {
         );
         let world = self.desc.world_size();
         // A sample by a hole is Jolt's no-collision value (`HeightFieldShapeConstants::cNoCollisionValue`, FLT_MAX).
-        let samples = collider::resample(n, world, |x, z| if self.hole_near(x, z) { f32::MAX } else { self.world_height_at(x, z) });
+        let samples = collider::resample(n, world, |x, z| if self.collider_hole(x, z) { f32::MAX } else { self.world_height_at(x, z) });
         (samples, n, collider::heightfield_scale(world, n))
     }
 
@@ -2100,17 +2100,16 @@ impl TerrainData {
         let Some(holes) = self.holes.as_deref() else { return false };
         let qx = i64::from(self.desc.total_vertices_x().saturating_sub(1));
         let qz = i64::from(self.desc.total_vertices_z().saturating_sub(1));
-        let x = (local_x / self.desc.cell_size).floor() as i64;
-        let z = (local_z / self.desc.cell_size).floor() as i64;
-        (0..qx).contains(&x) && (0..qz).contains(&z) && holes[(z * qx + x) as usize] >= 128
+        quad_hole(holes, qx, qz, self.desc.cell_size, local_x, local_z)
     }
 
-    /// Whether a hole quad lies within one quad of `(x, z)`: a collider sample there takes no collision, so the
-    /// collision hole is a quad wider than the drawn one on every side.
-    fn hole_near(&self, local_x: f32, local_z: f32) -> bool {
-        let c = self.desc.cell_size;
-        self.holes.is_some()
-            && [-c, 0.0, c].iter().any(|&dx| [-c, 0.0, c].iter().any(|&dz| self.is_hole_at(local_x + dx, local_z + dz)))
+    /// Whether a collider sample at the terrain-local point `(x, z)` takes no collision: only where every quad that
+    /// meets it is a hole ([`hole_all_round`]).
+    fn collider_hole(&self, local_x: f32, local_z: f32) -> bool {
+        let Some(holes) = self.holes.as_deref() else { return false };
+        let qx = i64::from(self.desc.total_vertices_x().saturating_sub(1));
+        let qz = i64::from(self.desc.total_vertices_z().saturating_sub(1));
+        hole_all_round(holes, qx, qz, self.desc.cell_size, local_x, local_z)
     }
 
     /// Vertices in one chunk's grid — what a chunk BLAS is sized for.
@@ -2520,6 +2519,54 @@ fn lod_distance(camera: glam::Vec3, lo: glam::Vec3, hi: glam::Vec3) -> f32 {
     let outside = (lo - camera).max(camera - hi).max(glam::Vec3::ZERO).length();
     let half = (hi.x - lo.x).max(hi.z - lo.z) * 0.5;
     camera.distance((lo + hi) * 0.5).min(outside + half).max(0.01)
+}
+
+/// Whether the quad under the terrain-local point `(x, z)` is a hole in `holes` (`qx` x `qz` quads of `cell` metres,
+/// row by row from the least z, 128 or more a hole). Outside the grid: no.
+fn quad_hole(holes: &[u8], qx: i64, qz: i64, cell: f32, x: f32, z: f32) -> bool {
+    let (ix, iz) = ((x / cell).floor() as i64, (z / cell).floor() as i64);
+    (0..qx).contains(&ix) && (0..qz).contains(&iz) && holes[(iz * qx + ix) as usize] >= 128
+}
+
+/// Whether every quad that meets the point `(x, z)` is a hole: there a collider sample takes Jolt's no-collision value,
+/// which takes out every triangle that uses it. Asked of each quad round the point, so the collision hole never
+/// reaches past the drawn one (sunscar-terrain, 19 Nov 2026): a hole two quads wide or more collides where it is drawn,
+/// and a strip one quad wide keeps its ground (the mouth mesh stands over it either way).
+fn hole_all_round(holes: &[u8], qx: i64, qz: i64, cell: f32, x: f32, z: f32) -> bool {
+    let h = cell * 0.5;
+    [-h, h].iter().all(|&dx| [-h, h].iter().all(|&dz| quad_hole(holes, qx, qz, cell, x + dx, z + dz)))
+}
+
+#[cfg(test)]
+mod hole_collider_tests {
+    use super::hole_all_round;
+
+    /// 8 x 8 quads of 2 m: a 3 x 3 hole at quads 2..5 and a hole one quad wide at (7, 0).
+    #[test]
+    fn the_collision_hole_never_reaches_past_the_drawn_one() {
+        let mut holes = vec![0u8; 64];
+        for z in 2..5 {
+            for x in 2..5 {
+                holes[z * 8 + x] = 255;
+            }
+        }
+        holes[7] = 255;
+        let at = |vx: i64, vz: i64| hole_all_round(&holes, 8, 8, 2.0, vx as f32 * 2.0, vz as f32 * 2.0);
+        assert!(at(3, 3) && at(4, 4) && at(3, 4) && at(4, 3), "inside the block every vertex is a hole");
+        assert!(!at(2, 2) && !at(5, 5) && !at(2, 3) && !at(5, 3), "the rim's vertices touch ground: they keep collision");
+        assert!(!at(7, 0) && !at(8, 1), "a strip one quad wide keeps its ground");
+        for vz in 0..=8i64 {
+            for vx in 0..=8i64 {
+                if !at(vx, vz) {
+                    continue;
+                }
+                for (dx, dz) in [(-1, -1), (0, -1), (-1, 0), (0, 0)] {
+                    let (x, z) = (vx + dx, vz + dz);
+                    assert!(holes[(z * 8 + x) as usize] >= 128, "vertex ({vx}, {vz}) takes out ground at quad ({x}, {z})");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
