@@ -2224,10 +2224,12 @@ impl GameApp for HelloGame {
             ComponentId::of::<Transform>(),
             ComponentId::of::<PhysicsBody>(),
         ]);
-        for archetype in ctx
-            .world
-            .query_archetypes_mut(&required, &ComponentSet::empty())
-        {
+        // Read through the shared query, and in play only a Transform the physics moved is written (`get_mut`, a
+        // change to Transform alone). Raw mutable columns (`query_archetypes_mut`) count as a change to everything:
+        // every frame they kept propagate_transforms from skipping and made it rebuild its order twice (Sunscar's
+        // piazza, 19 Nov 2026: the shell's update 8-10 ms of the main thread, its render hook 6).
+        let mut moved = Vec::new();
+        for archetype in ctx.world.query_archetypes(&required, &ComponentSet::empty()) {
             let t_col = archetype
                 .column_index(ComponentId::of::<Transform>())
                 .unwrap();
@@ -2236,10 +2238,12 @@ impl GameApp for HelloGame {
                 .unwrap();
             for row in 0..archetype.len() {
                 let body = unsafe { *archetype.column(b_col).get::<PhysicsBody>(row) };
-                let transform = unsafe { archetype.column_mut(t_col).get_mut::<Transform>(row) };
+                let transform = unsafe { archetype.column(t_col).get::<Transform>(row) };
                 if playing_now {
-                    transform.translation = ctx.physics.get_position(body.id);
-                    transform.rotation = ctx.physics.get_rotation(body.id);
+                    let (position, rotation) = (ctx.physics.get_position(body.id), ctx.physics.get_rotation(body.id));
+                    if position != transform.translation || rotation != transform.rotation {
+                        moved.push((archetype.entities()[row], position, rotation));
+                    }
                 } else {
                     // Edit mode owns authored transforms. Physics preview must not
                     // move the designer's objects or invalidate every automation plan.
@@ -2249,6 +2253,12 @@ impl GameApp for HelloGame {
                     ctx.physics.set_linear_velocity(body.id, Vec3::ZERO);
                     ctx.physics.set_angular_velocity(body.id, Vec3::ZERO);
                 }
+            }
+        }
+        for (entity, position, rotation) in moved {
+            if let Some(transform) = ctx.world.get_mut::<Transform>(entity) {
+                transform.translation = position;
+                transform.rotation = rotation;
             }
         }
         self.last_simulation_time = ctx.simulation.elapsed_seconds;
@@ -3897,6 +3907,13 @@ mod profiler_zone_tests {
     /// SIM_LOD_PLAN step 0: the combat host's fixed step, the shell's fixed step and the skinned crowd each time
     /// their parts, every zone closed in the function that opens it. A source check because the profiler needs a
     /// GPU: a zone left open would nest every later scope of the frame under it.
+    /// The shell's update runs every frame: a raw mutable query there counts as a change to everything, so the
+    /// transform pass could never skip (19 Nov 2026).
+    #[test]
+    fn the_update_takes_no_change_everything_query() {
+        assert!(!body(include_str!("main.rs"), "fn on_update(&mut self, ctx").contains(".query_archetypes_mut("));
+    }
+
     #[test]
     fn the_simulation_zones_open_and_close_in_pairs() {
         let shell = r#"zone(&mut ctx.renderer, Some(""#;
