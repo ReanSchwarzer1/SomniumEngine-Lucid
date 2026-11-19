@@ -3366,18 +3366,33 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // blocker loads + 24 compares (and the 12-step contact march inside
     // `sample_shadow`) still ran on every terrain pixel. That is why turning
     // hex/POM off did not move Shading ms — those were not the 40 ms.
-    let traced = textureLoad(restir_vis, pixel_coords, 0);
+    // A blended band stands for the ground beside its foot, and is lit as that ground: where its ground point is seen
+    // (ground_blend.wgsl), the sun's visibility is looked up there, as its sky and its gathered light already are. At
+    // the face the contact march grazes along the wall and the cascades see the wall's own depth, which left the band
+    // 5% under the soil's sun beside it (19 Nov). Over the band's top edge (weight under a half) the face keeps its own.
+    var sun_at = hit_point;
+    var sun_normal = shadow_normal;
+    var sun_depth = view_depth;
+    var sun_pixel = in.clip_pos.xy;
+    var traced = textureLoad(restir_vis, pixel_coords, 0);
+    if ground_blend_seen > 0.0 && ground_blend_w > 0.5 {
+        sun_at = ground_blend_point;
+        sun_normal = ground_blend_normal;
+        sun_depth = -(view.view * vec4<f32>(ground_blend_point, 1.0)).z;
+        sun_pixel = ground_blend_pixel;
+        traced = textureLoad(restir_vis, vec2<i32>(ground_blend_pixel), 0);
+    }
     var shadow_factor: f32;
     if (cluster_params.shading_mode & 16u) != 0u {
         // Hybrid (Sunscar, 6 Nov 2026): the traced sun covers opaque casters (TLAS mask 0x1); the cascades hold only
         // what it does not: cut-out leaf and grass cards (alpha-tested in the shadow pass, so light dapples through
         // them at a fraction of an alpha-tested ray's cost) and whatever is left out of the traced scene, as ground
         // cover is (`rays_shade_opaque`, renderer.rs). Faded out over the last cascade's last 15%.
-        let raster = sample_shadow(hit_point, shadow_normal, view_depth, in.clip_pos.xy);
-        let reach = smoothstep(0.85, 1.0, view_depth / max(light.cascade_splits.w, 1.0));
+        let raster = sample_shadow(sun_at, sun_normal, sun_depth, sun_pixel);
+        let reach = smoothstep(0.85, 1.0, sun_depth / max(light.cascade_splits.w, 1.0));
         shadow_factor = traced.r * mix(raster, 1.0, reach) * terrain_parallax_shadow_factor;
     } else {
-        shadow_factor = sample_shadow(hit_point, shadow_normal, view_depth, in.clip_pos.xy)
+        shadow_factor = sample_shadow(sun_at, sun_normal, sun_depth, sun_pixel)
             * terrain_parallax_shadow_factor;
     }
     // Phase TSUSHIMA-F1: micro-shadowing. Folded in here for the same reason

@@ -41,6 +41,11 @@ var<private> ground_blend_seen: f32 = 0.0;
 var<private> ground_blend_pixel: vec2<f32> = vec2<f32>(0.0);
 var<private> ground_blend_dist: f32 = 0.0;
 var<private> ground_blend_contact: f32 = 1.0;
+/// The ground point itself (world metres) and the ground's normal there, where it is seen: the band looks up the
+/// sun's visibility there too (shading.wgsl's shadow factor), not at the face, where the contact march grazes along
+/// the wall and the cascades see the wall's own depth (19 Nov: the band's sun 5% under the soil's beside it).
+var<private> ground_blend_point: vec3<f32> = vec3<f32>(0.0);
+var<private> ground_blend_normal: vec3<f32> = vec3<f32>(0.0, 1.0, 0.0);
 
 /// The list entry whose rectangle holds `xz`, or -1.
 fn ground_terrain_at(xz: vec2<f32>) -> i32 {
@@ -175,6 +180,8 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
                     }
                 }
                 ground_blend_seen = 1.0;
+                ground_blend_point = probe + view.camera_pos;
+                ground_blend_normal = ground_n;
                 ground_blend_pixel = probe_uv * dims;
                 ground_blend_dist = reach_m;
                 ground_blend_contact = textureLoad(gtao_tex, texel, 0).a;
