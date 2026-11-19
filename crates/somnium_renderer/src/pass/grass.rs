@@ -129,6 +129,9 @@ pub struct HabitatTable {
     /// Per layer set ("" the project's own): each splat slot's habitat and its weight in it.
     pub sets: std::collections::HashMap<String, [(u8, f32); 32]>,
     pub season: String,
+    /// Palette kinds the blades replace, by their source file's name (`"replaces"`: prefixes, as "gp_sward_"):
+    /// not drawn as ground cover while the blades draw. `SOMNIUM_GRASS_REPLACES` (comma-separated) overrides it.
+    pub replaces: Vec<String>,
 }
 
 fn pair(v: &serde_json::Value, key: &str, default: [f32; 2]) -> [f32; 2] {
@@ -163,7 +166,16 @@ impl HabitatTable {
         let doc: serde_json::Value = serde_json::from_str(text).map_err(|e| format!("grass habitats: {e}"))?;
         let season = doc.get("season_now").and_then(|s| s.as_str()).unwrap_or("winter").to_owned();
         let rows = doc.get("habitats").and_then(|h| h.as_array()).ok_or("grass habitats: no \"habitats\" list")?;
-        let mut table = Self { habitats: Vec::new(), names: Vec::new(), sets: Default::default(), season };
+        let replaces = match std::env::var("SOMNIUM_GRASS_REPLACES") {
+            Ok(list) => list.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect(),
+            Err(_) => doc
+                .get("replaces")
+                .and_then(|r| r.as_array())
+                .map(|a| a.iter().filter_map(|s| s.as_str()).map(str::to_owned).collect())
+                .unwrap_or_default(),
+        };
+        let mut table =
+            Self { habitats: Vec::new(), names: Vec::new(), sets: Default::default(), season, replaces };
         for row in rows {
             if table.habitats.len() >= usize::from(NO_HABITAT) {
                 tracing::warn!("grass habitats: more than {NO_HABITAT}; the rest are left out");
@@ -327,6 +339,8 @@ pub struct GrassPass {
     frame: u32,
     /// The grass instance's index this frame, set by the renderer after it appends it (`instance`).
     instance_index: Option<u32>,
+    /// Blades were laid out last frame (not held off by the A/B): the kinds they replace stay hidden.
+    drawing: bool,
 }
 
 fn storage(device: &wgpu::Device, label: &str, size: u64, extra: wgpu::BufferUsages) -> wgpu::Buffer {
@@ -352,6 +366,24 @@ pub fn table_path(project_root: Option<&std::path::Path>) -> Option<std::path::P
         return Some(std::path::PathBuf::from(path));
     }
     project_root.map(|root| root.join("data").join("foliage").join("grass_habitats.json"))
+}
+
+/// `SOMNIUM_GPU_GRASS_AB=captures` (proof stills): no blades until the run's first capture is written, then blades,
+/// none, ... by each one written, so a walk naming every view twice shoots before and after in one launch, as
+/// `SOMNIUM_SURFACES_AB` does. `=1` (cost): none in the frame=120, 360, ... blocks of a run with
+/// SOMNIUM_PROFILE_EVERY=120. While there are none the kinds the blades replace draw again.
+pub fn ab_off(frame: u64) -> bool {
+    static AB: std::sync::LazyLock<u8> =
+        std::sync::LazyLock::new(|| match std::env::var("SOMNIUM_GPU_GRASS_AB").as_deref() {
+            Ok("1") => 1,
+            Ok("captures") => 2,
+            _ => 0,
+        });
+    match *AB {
+        1 => (frame + 60) / 120 % 2 == 1,
+        2 => crate::capture::captures_written() % 2 == 0,
+        _ => false,
+    }
 }
 
 /// Whether GPU grass may run at all: `SOMNIUM_GPU_GRASS=0` turns it off.
@@ -544,7 +576,18 @@ impl GrassPass {
             chunk_count: 0,
             frame: 0,
             instance_index: None,
+            drawing: false,
         })
+    }
+
+    /// Whether blades are laid out this frame (on, and not held off by the A/B).
+    pub fn drawing(&self) -> bool {
+        self.drawing
+    }
+
+    /// The palette kinds (source name prefixes) not to draw as ground cover: the blades' while they draw, else none.
+    pub fn replaces(&self) -> &[String] {
+        if self.drawing { self.table.replaces.as_slice() } else { &[] }
     }
 
     /// Which habitat set terrain `terrain_id` grows (its ground layer set; "" the project's own). Cheap when unchanged.
@@ -676,10 +719,15 @@ impl GrassPass {
         view_proj_rel: glam::Mat4,
         pixel_angle: f32,
         hiz: Option<((u32, u32), u32)>,
+        on: bool,
     ) {
         self.chunk_count = 0;
         self.instance_index = None;
         self.frame = self.frame.wrapping_add(1);
+        self.drawing = on;
+        if !on {
+            return;
+        }
         self.update_slots(queue, terrains, eye);
 
         let k = self.knobs;
@@ -946,6 +994,13 @@ mod tests {
         assert_eq!(t.sets[""][18], (1, 1.0));
         assert_eq!(t.sets["spine"][0], (0, 1.0));
         assert_eq!(t.sets["spine"][12].0, NO_HABITAT, "turf is not in spine");
+    }
+
+    #[test]
+    fn the_table_names_what_the_blades_replace() {
+        let t = HabitatTable::parse(&TABLE.replacen('{', r#"{"replaces": ["gp_sward_", "gp_thatch"], "#, 1)).unwrap();
+        assert_eq!(t.replaces, ["gp_sward_", "gp_thatch"]);
+        assert!(HabitatTable::parse(TABLE).unwrap().replaces.is_empty());
     }
 
     #[test]

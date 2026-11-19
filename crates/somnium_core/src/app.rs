@@ -9710,7 +9710,19 @@ impl<G: GameApp> Engine<G> {
             // Batched, ground cover is one instanced batch per kind and cell (`CoverBatches`), not a draw per copy.
             if painted_batched {
                 let mut parts: Vec<Option<Vec<somnium_renderer::instance_batch::BatchPart>>> = vec![None; span];
-                for (&kind, _) in self.project_foliage.iter().filter(|(_, e)| e.ground_cover.is_some()) {
+                // GPU grass draws the sward itself: the kinds it replaces are not drawn while it does.
+                let replaced: Vec<String> =
+                    self.renderer.as_ref().map(|r| r.grass_replaces().to_vec()).unwrap_or_default();
+                for (&kind, entry) in self.project_foliage.iter().filter(|(_, e)| e.ground_cover.is_some()) {
+                    if !replaced.is_empty()
+                        && entry
+                            .source
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|stem| replaced.iter().any(|p| stem.starts_with(p.as_str())))
+                    {
+                        continue;
+                    }
                     let k = usize::from(kind);
                     let Some(Some(near)) = self.foliage_meshes.get(k) else { continue };
                     let near: Vec<_> = near

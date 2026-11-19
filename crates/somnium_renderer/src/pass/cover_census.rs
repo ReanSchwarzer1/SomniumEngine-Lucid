@@ -2,7 +2,7 @@
 //!
 //! Every 30 frames it counts the pixels within 10 m and within 10-30 m of the eye as terrain (bare ground), GPU grass,
 //! ground cover (cut-out foliage below the eye less 0.3 m) or other, and logs them with the eye:
-//! `cover census: eye (x, y, z); 0-10 m bare 12.3% (terrain t, grass g, cover c, other o); 10-30 m ...`.
+//! `cover census: eye (x, y, z), blades on; 0-10 m bare 12.3% (terrain t, grass g, cover c, other o); 10-30 m ...`.
 //! The bare share is terrain / (terrain + grass + cover). Off by default; no window shows it.
 
 use std::sync::Arc;
@@ -25,6 +25,7 @@ pub struct CoverCensus {
     state: Arc<AtomicU8>,
     frame: u32,
     eye: glam::Vec3,
+    blades: bool,
 }
 
 impl CoverCensus {
@@ -119,7 +120,7 @@ impl CoverCensus {
             mapped_at_creation: false,
         });
         tracing::info!("cover census on: the bare share within 10 m and 30 m, every {EVERY} frames");
-        Some(Self { pipeline, layout, counts, readback, params, state: Arc::new(AtomicU8::new(IDLE)), frame: 0, eye: glam::Vec3::ZERO })
+        Some(Self { pipeline, layout, counts, readback, params, state: Arc::new(AtomicU8::new(IDLE)), frame: 0, eye: glam::Vec3::ZERO, blades: false })
     }
 
     /// Count this frame's finished visibility buffer, every 30 frames while no read is pending.
@@ -134,6 +135,7 @@ impl CoverCensus {
         depth_view: &wgpu::TextureView,
         size: (u32, u32),
         eye: glam::Vec3,
+        blades: bool,
     ) {
         self.frame = self.frame.wrapping_add(1);
         if self.frame % EVERY != 0 || self.state.load(Ordering::Acquire) != IDLE || size.0 == 0 || size.1 == 0 {
@@ -163,6 +165,7 @@ impl CoverCensus {
         }
         encoder.copy_buffer_to_buffer(&self.counts, 0, &self.readback, 0, BYTES);
         self.eye = eye;
+        self.blades = blades;
         self.state.store(COPIED, Ordering::Release);
     }
 
@@ -194,10 +197,11 @@ impl CoverCensus {
         self.state.store(IDLE, Ordering::Release);
         let e = self.eye;
         tracing::info!(
-            "cover census: eye ({:.1}, {:.1}, {:.1}); 0-10 m {}; 10-30 m {}",
+            "cover census: eye ({:.1}, {:.1}, {:.1}), blades {}; 0-10 m {}; 10-30 m {}",
             e.x,
             e.y,
             e.z,
+            if self.blades { "on" } else { "off" },
             band(&c[0..4]),
             band(&c[4..8])
         );

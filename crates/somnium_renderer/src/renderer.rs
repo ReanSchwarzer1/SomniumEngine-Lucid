@@ -4403,6 +4403,14 @@ impl SomniumRenderer {
         }
     }
 
+    /// The palette kinds GPU grass replaces (source name prefixes), while it draws: not drawn as ground cover.
+    pub fn grass_replaces(&self) -> &[String] {
+        match &self.grass {
+            Some(grass) => grass.replaces(),
+            None => &[],
+        }
+    }
+
     /// Which habitat set terrain `terrain_id` grows: its ground layer set ("" the project's own).
     pub fn grass_terrain_set(&mut self, terrain_id: u32, set: &str) {
         if let Some(grass) = self.grass.as_mut() {
@@ -5946,8 +5954,9 @@ impl SomniumRenderer {
                 let (hiz_size, hiz_mips) = (self.hiz_pass.size(), self.hiz_pass.mip_count());
                 let pixel_angle = 2.0 / (self.proj_matrix.y_axis.y.abs().max(1e-6) * hiz_size.1.max(1) as f32);
                 let hiz = (self.hiz_ready && !self.occlusion_off).then_some((hiz_size, hiz_mips));
+                let on = !crate::pass::grass::ab_off(self.profiler.frame_index());
                 grass.prepare(&ctx.device, &ctx.queue, &self.terrains, self.camera_pos, self.view_proj_rel,
-                              pixel_angle, hiz);
+                              pixel_angle, hiz, on);
                 grass.instance()
             }
             None => None,
@@ -7022,6 +7031,7 @@ impl SomniumRenderer {
                 &self.vis_pass.depth_view,
                 (self.render_width, self.render_height),
                 self.camera_pos,
+                self.grass.as_ref().is_some_and(|grass| grass.drawing()),
             );
         }
 
