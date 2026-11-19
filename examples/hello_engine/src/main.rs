@@ -2220,6 +2220,7 @@ impl GameApp for HelloGame {
                 }
             }
         }
+        zone(&mut ctx.renderer, Some("Shell physics sync"));
         let required = ComponentSet::from_ids(vec![
             ComponentId::of::<Transform>(),
             ComponentId::of::<PhysicsBody>(),
@@ -2251,6 +2252,7 @@ impl GameApp for HelloGame {
                 }
             }
         }
+        zone(&mut ctx.renderer, None);
         self.last_simulation_time = ctx.simulation.elapsed_seconds;
 
         // The scripted first-person character exists only during a play
@@ -2280,6 +2282,7 @@ impl GameApp for HelloGame {
             despawn_player(self, ctx);
         }
         self.was_playing = playing;
+        zone(&mut ctx.renderer, Some("Shell play hosts"));
         if playing {
             // A second place the game holds streamed (the protagonists' switch, a joint mission) thinks too.
             let held = somnium_core::cell_streaming::held_points(ctx.world);
@@ -2288,10 +2291,13 @@ impl GameApp for HelloGame {
             self.combat.update(ctx);
             self.life.update(ctx);
         }
+        zone(&mut ctx.renderer, None);
 
         // Propagate after physics/editor synchronization so render transforms
         // reflect Play, Pause, and Stop in the same frame.
+        zone(&mut ctx.renderer, Some("Shell transforms"));
         propagate_transforms(ctx.world);
+        zone(&mut ctx.renderer, None);
 
         // Flip a render switch mid-run, the way the Details panel does.
         //
@@ -2358,6 +2364,7 @@ impl GameApp for HelloGame {
         // Phase 14: create/destroy the voxel driver to match the ECS, then
         // stream chunks around the camera (async generation; finished meshes
         // are uploaded here, freed allocations recycled).
+        zone(&mut ctx.renderer, Some("Shell voxel"));
         self.sync_voxel_terrain(ctx);
         let eye = self
             .combat
@@ -2370,6 +2377,7 @@ impl GameApp for HelloGame {
         {
             vt.update(ctx.jobs, eye, renderer, render_ctx);
         }
+        zone(&mut ctx.renderer, None);
 
         // Handle mesh-creating IPC commands that require renderer access.
         // These arrive after the engine-level IPC loop (which handles non-mesh commands).
@@ -2380,9 +2388,13 @@ impl GameApp for HelloGame {
 
     fn on_render(&mut self, ctx: &mut EngineContext) {
         fracture_demo::Demo::sync(ctx.world);
+        zone(&mut ctx.renderer, Some("Shell render transforms"));
         somnium_core::propagate_transforms(ctx.world);
+        zone(&mut ctx.renderer, None);
         // After the transforms, so a flame that just streamed in is lit where it stands.
+        zone(&mut ctx.renderer, Some("Shell fires"));
         self.fires.update(ctx.world, self.lamps.night(), ctx.time.elapsed().as_secs_f32());
+        zone(&mut ctx.renderer, None);
         let (view_mat, eye) = self
             .combat
             .view(ctx.world)
@@ -3915,6 +3927,8 @@ mod profiler_zone_tests {
         );
         let host = zones(&body(include_str!("main.rs"), "fn on_fixed_update("), shell, shut);
         assert_eq!(host, ["Boats fixed", "Interactions tick"]);
+        let update = zones(&body(include_str!("main.rs"), "fn on_update(&mut self, ctx"), shell, shut);
+        assert_eq!(update, ["Shell physics sync", "Shell play hosts", "Shell transforms", "Shell voxel"]);
         let crowd = zones(
             &body(include_str!("skinned_crowd.rs"), "pub fn render("),
             r#"profiler.cpu_begin(""#,
