@@ -580,6 +580,11 @@ impl GrassPass {
         })
     }
 
+    /// The ground slots' records and habitat map, and how many slots, for the cover census's paths and rock.
+    pub fn ground_buffers(&self) -> (&wgpu::Buffer, &wgpu::Buffer, u32) {
+        (&self.terrains, &self.habitat_map, SLOTS as u32)
+    }
+
     /// Whether blades are laid out this frame (on, and not held off by the A/B).
     pub fn drawing(&self) -> bool {
         self.drawing

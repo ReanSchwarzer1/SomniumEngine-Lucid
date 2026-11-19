@@ -7032,6 +7032,7 @@ impl SomniumRenderer {
                 (self.render_width, self.render_height),
                 self.camera_pos,
                 self.grass.as_ref().is_some_and(|grass| grass.drawing()),
+                self.grass.as_ref().map(|grass| grass.ground_buffers()),
             );
         }
 

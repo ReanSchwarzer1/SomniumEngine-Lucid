@@ -1,14 +1,15 @@
 //! The ground's bare share near the eye (Sunscar, 19 Nov 2026), for the GPU grass proof: `SOMNIUM_COVER_CENSUS=1`.
 //!
-//! Every 30 frames it counts the pixels within 10 m and within 10-30 m of the eye as terrain (bare ground), GPU grass,
-//! ground cover (cut-out foliage below the eye less 0.3 m) or other, and logs them with the eye:
-//! `cover census: eye (x, y, z), blades on; 0-10 m bare 12.3% (terrain t, grass g, cover c, other o); 10-30 m ...`.
-//! The bare share is terrain / (terrain + grass + cover). Off by default; no window shows it.
+//! Every 30 frames it counts the pixels within 10 m and within 10-30 m of the eye as terrain where grass can grow
+//! (bare ground), GPU grass, ground cover (cut-out foliage below the eye less 0.3 m), other, or terrain where no grass
+//! grows (paths and rock, by the grass pass's habitat map), and logs them with the eye: `cover census: eye (x, y, z),
+//! blades on; 0-10 m bare 12.3% (terrain t, grass g, cover c, other o, path/rock r); 10-30 m ...`. The bare share is
+//! terrain / (terrain + grass + cover): paths, rock and water are left out, as the lead's PASS asks. Off by default.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
-const BINS: usize = 8;
+const BINS: usize = 10;
 const BYTES: u64 = (BINS * 4) as u64;
 const EVERY: u32 = 30;
 const IDLE: u8 = 0;
@@ -26,6 +27,8 @@ pub struct CoverCensus {
     frame: u32,
     eye: glam::Vec3,
     blades: bool,
+    /// Stands in for the grass pass's ground buffers when there is none.
+    dummy: wgpu::Buffer,
 }
 
 impl CoverCensus {
@@ -82,6 +85,26 @@ impl CoverCensus {
                     },
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: compute,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: compute,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -119,8 +142,14 @@ impl CoverCensus {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let dummy = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Cover Census Dummy Ground"),
+            size: 64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
         tracing::info!("cover census on: the bare share within 10 m and 30 m, every {EVERY} frames");
-        Some(Self { pipeline, layout, counts, readback, params, state: Arc::new(AtomicU8::new(IDLE)), frame: 0, eye: glam::Vec3::ZERO, blades: false })
+        Some(Self { pipeline, layout, counts, readback, params, state: Arc::new(AtomicU8::new(IDLE)), frame: 0, eye: glam::Vec3::ZERO, blades: false, dummy })
     }
 
     /// Count this frame's finished visibility buffer, every 30 frames while no read is pending.
@@ -136,12 +165,14 @@ impl CoverCensus {
         size: (u32, u32),
         eye: glam::Vec3,
         blades: bool,
+        ground: Option<(&wgpu::Buffer, &wgpu::Buffer, u32)>,
     ) {
         self.frame = self.frame.wrapping_add(1);
         if self.frame % EVERY != 0 || self.state.load(Ordering::Acquire) != IDLE || size.0 == 0 || size.1 == 0 {
             return;
         }
-        queue.write_buffer(&self.params, 0, bytemuck::cast_slice(&[size.0, size.1, 0u32, 0u32]));
+        let (terrains, habitats, slots) = ground.unwrap_or((&self.dummy, &self.dummy, 0));
+        queue.write_buffer(&self.params, 0, bytemuck::cast_slice(&[size.0, size.1, slots, 0u32]));
         let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Cover Census BG"),
             layout: &self.layout,
@@ -150,6 +181,8 @@ impl CoverCensus {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(depth_view) },
                 wgpu::BindGroupEntry { binding: 2, resource: self.counts.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: self.params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: terrains.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: habitats.as_entire_binding() },
             ],
         });
         encoder.clear_buffer(&self.counts, 0, None);
@@ -202,24 +235,28 @@ impl CoverCensus {
             e.y,
             e.z,
             if self.blades { "on" } else { "off" },
-            band(&c[0..4]),
-            band(&c[4..8])
+            band(&c[0..5]),
+            band(&c[5..10])
         );
     }
 }
 
-/// One band's line: bare share, then the counts (terrain, grass, cover, other).
+/// One band's line: bare share, then the counts (terrain where grass grows, grass, cover, other, path or rock).
 fn band(c: &[u32]) -> String {
     let ground = c[0] + c[1] + c[2];
     let bare = if ground == 0 { 0.0 } else { 100.0 * c[0] as f32 / ground as f32 };
-    format!("bare {bare:.1}% (terrain {}, grass {}, cover {}, other {})", c[0], c[1], c[2], c[3])
+    format!("bare {bare:.1}% (terrain {}, grass {}, cover {}, other {}, path/rock {})", c[0], c[1], c[2], c[3], c[4])
 }
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn the_bare_share_is_terrain_among_ground_pixels() {
-        assert_eq!(super::band(&[25, 50, 25, 900]), "bare 25.0% (terrain 25, grass 50, cover 25, other 900)");
-        assert_eq!(super::band(&[0, 0, 0, 7]), "bare 0.0% (terrain 0, grass 0, cover 0, other 7)");
+        assert_eq!(
+            super::band(&[25, 50, 25, 900, 40]),
+            "bare 25.0% (terrain 25, grass 50, cover 25, other 900, path/rock 40)",
+            "paths and rock are left out"
+        );
+        assert_eq!(super::band(&[0, 0, 0, 7, 0]), "bare 0.0% (terrain 0, grass 0, cover 0, other 7, path/rock 0)");
     }
 }
