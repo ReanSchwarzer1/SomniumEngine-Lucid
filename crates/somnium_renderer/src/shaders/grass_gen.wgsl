@@ -331,7 +331,13 @@ fn grow(cell: u32, tile: GrassTile, k: u32, rank: f32) -> Grown {
     colour *= 0.92 + 0.16 * unit(h4);
     g.root = vec3<f32>(xz.x, g0.w - 0.01 * height, xz.y);
     g.height = max(height * rise, 0.002);
-    g.width = width * s * widen;
+    // Coverage floor: a short sward at its true width shows the ground between its blades to a standing eye (v2's
+    // grazed pasture: 9.4% bare within 10 m at the meadow, fr_gg_2 23:22). From 1.7 m the cover goes as density x width
+    // x height x d_lod (the falloff holds it from d_lod out). Where that falls short of about 2% bare, its blades
+    // widen from 2 m out, at most 4x, never at the feet: the same count, so the same cost.
+    let cover = 0.375 * min(hab.density, params.lod.w) * hab.w_mean * 0.5 * (hab.h_min + hab.h_max) * params.lod.x;
+    let widen_cover = mix(1.0, clamp(4.0 / max(cover, 1e-3), 1.0, 4.0), smoothstep(2.0, 6.0, d));
+    g.width = width * s * widen * widen_cover;
     g.facing = c_face + (unit(h5) - 0.5) * 3.7699;
     // Lodged and trodden places: where the small patches peak, most blades lie over, the same way.
     let lodged_here = smoothstep(0.72, 0.86, n_small) * select(0.85, 0.2, tussock);
