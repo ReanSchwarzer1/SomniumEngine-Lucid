@@ -165,6 +165,10 @@ pub struct FlameCard {
     pub lean: [f32; 2],
     /// 0..1: lit and put out with its lamp.
     pub fade: f32,
+    /// The card's mean luminance over its peak (its book's intensity over peak times area): what a far card spreads.
+    pub mean_rel: f32,
+    /// The book's power at this frame over its mean (the shell's): a far card's flicker.
+    pub power: f32,
 }
 
 /// A bed of embers: lumps with a dark crust and cracks glowing at `hot_k`, each breathing slowly.
@@ -374,6 +378,8 @@ mod tests {
             small: false,
             lean: [0.1, 0.0],
             fade: 1.0,
+            mean_rel: 0.2,
+            power: 1.0,
         };
         let e = world.spawn((
             Transform::from_translation(glam::Vec3::new(1.0, 0.9, 2.0)),
@@ -570,7 +576,7 @@ pub(crate) fn simulate_particles_reflected(
                     texture_index: emitter.texture_slot,
                     flags: 2 | (1 << 5) | (u32::from(card.small) << 9),
                     flutter: 0.0,
-                    extra: [0.0; 4],
+                    extra: [card.mean_rel, card.power, 0.0, 0.0],
                 });
             }
             continue;

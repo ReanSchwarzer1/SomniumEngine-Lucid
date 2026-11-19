@@ -316,6 +316,7 @@ impl Fires {
                     && let Some(card) = emitter.card.as_mut()
                 {
                     card.fade = fade;
+                    card.power = power;
                     // A fire leans into the wind, a lantern's flame inside its glass does not.
                     let lean = if b.kind.open() { (0.12 * wind.length()).min(0.6) } else if b.kind == FlameKind::Candle { 0.02 * wind.length().min(2.0) } else { 0.0 };
                     let dir = wind.try_normalize().unwrap_or(glam::Vec2::ZERO);
@@ -448,6 +449,8 @@ fn burn_book(
             small: !kind.open(),
             lean: [0.0; 2],
             fade: 0.0,
+            mean_rel: (book.intensity_cd / (book.peak_cd_m2 * book.card_m[0] * book.card_m[1]).max(1.0e-6)).min(1.0),
+            power: 1.0,
         }),
         ..Default::default()
     };

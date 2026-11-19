@@ -48,11 +48,13 @@ pub struct FireView {
     pub eye_ev: f32,
     /// How far in front of what it meets a flame fades, metres.
     pub soft_m: f32,
+    /// One pixel's angle, radians (the vertical field of view over the render height): a far card's size.
+    pub pixel_angle: f32,
 }
 
 impl Default for FireView {
     fn default() -> Self {
-        Self { manual_ev: Some(15.0), near: 0.1, eye_ev: fire_eye_ev(), soft_m: 0.06 }
+        Self { manual_ev: Some(15.0), near: 0.1, eye_ev: fire_eye_ev(), soft_m: 0.06, pixel_angle: 0.001 }
     }
 }
 
@@ -322,7 +324,7 @@ impl ParticlePass {
             bytemuck::bytes_of(&ParticleView {
                 view_proj: view_proj.to_cols_array(),
                 camera_right: right.to_array(),
-                _pad0: 0.0,
+                _pad0: self.fire.pixel_angle,
                 camera_up: up.to_array(),
                 _pad1: 0.0,
                 camera_pos: view.inverse().w_axis.truncate().to_array(),

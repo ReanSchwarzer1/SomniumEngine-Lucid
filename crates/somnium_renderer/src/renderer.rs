@@ -7517,6 +7517,7 @@ impl SomniumRenderer {
         self.particle_pass.set_fire_view(crate::pass::particle::FireView {
             manual_ev: (!self.auto_exposure).then(|| (1.0 / (1.2 * self.exposure.max(1.0e-12))).log2()),
             near: crate::view::near_plane(self.proj_matrix),
+            pixel_angle: 2.0 / (self.proj_matrix.y_axis.y.abs().max(1.0e-6) * self.render_height.max(1) as f32),
             ..Default::default()
         });
         self.particle_pass.record(

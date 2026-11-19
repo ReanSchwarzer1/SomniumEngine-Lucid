@@ -2,6 +2,7 @@
 enable wgpu_binding_array;
 struct ParticleView {
     view_proj: mat4x4<f32>,
+    // _pad0: one pixel's angle, radians (Sunscar's fire: a far card's size).
     camera_right: vec3<f32>, _pad0: f32,
     camera_up: vec3<f32>, _pad1: f32,
     camera_pos: vec3<f32>, _pad2: f32,
@@ -68,6 +69,8 @@ const BLUE_FOOT = vec3<f32>(0.53, 0.88, 3.53);
 // The book's encoding (fire_book.py): R and a small book's B are log2(Y / peak) over 16 stops; motion +-12 px.
 const BOOK_STOPS = 16.0;
 const BOOK_MOTION_PX = 12.0;
+// A flame's card is never drawn smaller than this, pixels tall: past it, it is a soft point of its own whole light.
+const FAR_PX = 2.5;
 
 fn blackbody_rgb(t: f32) -> vec3<f32> {
     let x = clamp((t - 800.) / 100., 0., 13.999);
@@ -133,11 +136,18 @@ fn coal_cells(p: vec2<f32>) -> vec3<f32> {
         let tilt = select(0., clamp(atan2(to_eye.y, max(flat_len, 1.0e-4)), 0., .6981317), has_down);
         let right = vec3(f.z, 0., -f.x);
         let up = cos(tilt) * vec3(0., 1., 0.) - sin(tilt) * f;
-        let x = (uv.x - .5) * w;
-        let y = (bed_v - uv.y) * h;
+        // A card smaller than FAR_PX pixels grows about its light's centre to that size, its light spread over the
+        // larger card (the fragment's far blob), so a far lamp is a steady point of its own light, never a sprite
+        // that falls between pixels and blinks under FSR (photoreal's glints draw only the 256 nearest lamps).
+        let centre_y = .35 * h * bed_v;
+        let seen = h / max((pview.view_proj * vec4(p.position + up * centre_y, 1.)).w * pview._pad0, 1.0e-6);
+        let grow = max(1., FAR_PX / max(seen, 1.0e-4));
+        let x = (uv.x - .5) * w * grow;
+        let y = centre_y + ((bed_v - uv.y) * h - centre_y) * grow;
         let rise = clamp(y / max(h * bed_v, 1.0e-4), 0., 1.);
         corner = p.position + right * x + up * y + vec3(p.color.z, 0., p.color.w) * pow(rise, 1.5);
         out.flutter = tilt / .6981317;
+        out.extra = vec4(p.extra.x, p.extra.y, grow, 0.);
     } else if (p.flags & 64u) != 0u {
         // A bed of coals (bit 6): a disc lying flat; `uv` is metres across it.
         let offset = (uv - .5) * p.size;
@@ -170,7 +180,8 @@ fn coal_cells(p: vec2<f32>) -> vec3<f32> {
     out.view_dir = corner - pview.camera_pos;
     if (p.flags & 64u) == 0u { out.uv = p.uv_rect.xy + uv*p.uv_rect.zw; }
     out.local_uv = uv; out.colour = p.color; out.tip = p.tip_tint;
-    out.uv_rect = p.uv_rect; out.extra = p.extra;
+    out.uv_rect = p.uv_rect;
+    if (p.flags & 32u) == 0u { out.extra = p.extra; }
     out.texture_index = p.texture_index; out.flags = p.flags;
     return out;
 }
@@ -222,7 +233,18 @@ struct Fragment {
         let temperature = yt / max(y, 1.0e-12);
         let gain = in.colour.x * clamp(in.colour.y, 0., 1.) * fire_eye()
             * soft_depth(in.position, in.view_depth, pview.fire.w);
-        let rgb = (y * blackbody_rgb(temperature) + blue * BLUE_FOOT) * gain;
+        var rgb = (y * blackbody_rgb(temperature) + blue * BLUE_FOOT) * gain;
+        // Far (bit 5 grown, `extra.z`): the card's whole light, its mean over its peak (`extra.x`) at this frame's power
+        // (`extra.y`), as a soft blob over the grown card, so a point's light is the flame's at any distance.
+        let grow = in.extra.z;
+        if grow > 1.001 {
+            let c = vec2(.5, in.tip.x * .65);
+            let q = (in.local_uv - c) / .18;
+            let blob = exp(-.5 * dot(q, q)) / .2036;
+            let far = in.extra.x * in.extra.y / (grow * grow) * blob;
+            rgb = mix(rgb, far * blackbody_rgb(select(1750., 1800., small)) * gain, smoothstep(1., 2., grow));
+            y = mix(y, far, smoothstep(1., 2., grow));
+        }
         out.colour = vec4(max(rgb, vec3(0.)), 0.);
         // Fast-moving light: as reactive as it is bright, so FSR does not smear a tongue's last place.
         out.reactive = vec4(clamp(log2(max(y, 1.0e-6)) / 8. + 1., 0., 1.) * clamp(in.colour.y, 0., 1.), 0., 0., 0.);
