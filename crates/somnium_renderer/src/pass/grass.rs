@@ -56,6 +56,7 @@ struct GpuParams {
     planes: [[f32; 4]; 6],
     lod: [f32; 4],
     seg: [f32; 4],
+    look: [f32; 4],
     hiz: [f32; 4],
     base: [u32; 4],
     misc: [u32; 4],
@@ -274,6 +275,7 @@ struct Knobs {
     d_lod: f32,
     range: f32,
     min_px: f32,
+    width: f32,
     log: bool,
 }
 
@@ -288,6 +290,8 @@ impl Knobs {
             d_lod: env_f32("SOMNIUM_GRASS_LOD", 5.0),
             range: env_f32("SOMNIUM_GRASS_RANGE", 300.0),
             min_px: env_f32("SOMNIUM_GRASS_MIN_PX", 1.0),
+            // 1.6 x the table's widths, 1/1.6 as many: true widths read as hair at 3-8 m (fr_gg_1, 19 Nov).
+            width: env_f32("SOMNIUM_GRASS_WIDTH", 1.6),
             log: std::env::var("SOMNIUM_GRASS_LOG").as_deref() == Ok("1"),
         }
     }
@@ -802,6 +806,7 @@ impl GrassPass {
             planes,
             lod: [k.d_lod, k.range, k.range * 0.82, k.cap],
             seg: [NEAR_M, MID_M, k.min_px, per_cell as f32],
+            look: [k.width, 0.0, 0.0, 0.0],
             hiz: [hiz_w as f32, hiz_h as f32, hiz_mips as f32, if hiz.is_some() { 1.0 } else { 0.0 }],
             base: [self.span, CAPACITY[0], CAPACITY[1], CAPACITY[2]],
             misc: [self.tile_scratch.len() as u32, self.chunk_count, self.table.habitats.len() as u32, self.frame],
@@ -1052,7 +1057,7 @@ mod tests {
 
     #[test]
     fn the_gpu_structs_match_their_wgsl() {
-        assert_eq!(std::mem::size_of::<GpuParams>(), 272);
+        assert_eq!(std::mem::size_of::<GpuParams>(), 288);
         assert_eq!(std::mem::size_of::<GpuHabitat>(), 160);
         assert_eq!(std::mem::size_of::<GpuTerrain>(), 32);
         assert_eq!(std::mem::size_of::<GpuTile>(), 16);

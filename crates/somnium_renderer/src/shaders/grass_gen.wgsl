@@ -34,6 +34,8 @@ struct GrassParams {
     lod: vec4<f32>,
     /// x three segments within (m), y two within (m), z the narrowest blade (pixels), w candidates per cell at the cap.
     seg: vec4<f32>,
+    /// x the blades' width factor (that many times the table's width, and that many fewer: the cover holds).
+    look: vec4<f32>,
     /// xy the pyramid's size, z its levels, w 1 when it holds this frame's depth.
     hiz: vec4<f32>,
     /// x the span's first slot, y..w each class's capacity.
@@ -236,7 +238,7 @@ fn grow(cell: u32, tile: GrassTile, k: u32, rank: f32) -> Grown {
     let px = params.seg.z * d * params.eye.w;
     let widen = max(1.0, px / max(hab.w_mean * s, 1e-5));
     let far = 1.0 - smoothstep(params.lod.z, params.lod.y, d);
-    let keep = min(hab.density, params.lod.w) / params.lod.w * presence * slope * far / (s * s * widen);
+    let keep = min(hab.density, params.lod.w) / params.lod.w * presence * slope * far / (s * s * widen * params.look.x);
     if rank >= keep {
         return nothing;
     }
@@ -266,6 +268,10 @@ fn grow(cell: u32, tile: GrassTile, k: u32, rank: f32) -> Grown {
     let c_height = unit(hash(clump ^ 0x1b56c4e9u)) * 2.0 - 1.0;
     let c_tone = unit(hash(clump ^ 0x7f4a7c15u));
     let c_face = unit(hash(clump ^ 0x94d049bbu)) * 6.2831855;
+    // A clump is greener or deader as a whole (a winter sward is green tussocks among dead patches): blade by blade at
+    // one share, green and dead averaged to a flat grey at a few metres (fr_gg_1, 19 Nov).
+    let c_green = clamp(hab.share_green + 0.6 * (unit(hash(clump ^ 0x3c6ef372u)) - 0.5), 0.05, 0.95);
+    let c_dead = (1.0 - c_green) * hab.share_dead / max(hab.share_dead + max(1.0 - hab.share_green - hab.share_dead, 0.0), 1e-3);
 
     // The blade itself.
     let h1 = hash(h0 ^ 0xc2b2ae35u);
@@ -277,11 +283,11 @@ fn grow(cell: u32, tile: GrassTile, k: u32, rank: f32) -> Grown {
     let state = unit(h1);
     var g: GrassBlade;
     var height = mix(hab.h_min, hab.h_max, pow(unit(h2), 1.3)) * (1.0 + hab.contrast * c_height);
-    var width = mix(hab.w_min, hab.w_max, unit(h3));
+    var width = mix(hab.w_min, hab.w_max, unit(h3)) * params.look.x;
     var colour: vec3<f32>;
-    if state < hab.share_green {
+    if state < c_green {
         colour = mix(hab.green.rgb, hab.green_alt.rgb, c_tone);
-    } else if state < hab.share_green + hab.share_dead {
+    } else if state < c_green + c_dead {
         colour = mix(hab.dead.rgb, hab.dead_alt.rgb, c_tone);
     } else {
         colour = hab.seed.rgb;
