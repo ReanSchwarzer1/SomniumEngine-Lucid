@@ -24,8 +24,15 @@ const RAYLEIGH_SCALE_H: f32 = 8.0;
 
 /// Mie: aerosols. Nearly colourless, strongly forward-scattering, which gives
 /// the bright halo around the sun and the whiteness near the horizon.
-const MIE_SCATTERING: f32 = 3.996e-3;
-const MIE_EXTINCTION: f32 = 4.4e-3;
+///
+/// Hillaire's published 3.996e-3 and 4.4e-3 per km are a very clean day: an aerosol optical depth of about 0.005 at
+/// 550 nm. Late-autumn air over Italy is about 0.1-0.25 (a visibility of 20-45 km). At the clean value the clear sky
+/// put about 4,300 lux of sky light on open ground under a 35-degree sun, against 8,000-12,000 in life, so shade sat
+/// 3.6 stops under sun against 2.2-2.6; and dusk came out 1.5-2.5 times published twilight (sunscar-photoreal and
+/// sunscar-sky, 19 Nov 2026). Here the aerosols are 25 times that: an optical depth of about 0.13, the single-
+/// scattering albedo kept at 0.9.
+const MIE_SCATTERING: f32 = 0.0999;
+const MIE_EXTINCTION: f32 = 0.111;
 const MIE_SCALE_H:    f32 = 1.2;
 const MIE_G:          f32 = 0.8;
 
