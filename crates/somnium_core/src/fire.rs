@@ -237,12 +237,12 @@ pub fn flames_of_kind(positions: &[glam::Vec3], indices: &[u32], named: Option<F
     let mut fires: Vec<Vec<Flame>> = Vec::new();
     let open_named = named.filter(|kind| kind.open());
     let spread = open_named.map_or(FIRE_SPREAD, FlameKind::spread);
-    for tongue in tongues {
-        if tongue.height < OPEN_HEIGHT && open_named.is_none() {
-            let kind = named.unwrap_or_else(|| FlameKind::infer(tongue.height, tongue.radius, 1));
-            flames.push(Flame { kind, ..tongue });
-            continue;
-        }
+    // Tall tongues found the fires first; a short one then joins a fire within its spread (a brazier's tongues
+    // shorten toward the pan's edge), and only a lone short tongue is a lamp's or a candle's flame.
+    let (tall, short): (Vec<Flame>, Vec<Flame>) =
+        tongues.into_iter().partition(|t| t.height >= OPEN_HEIGHT || open_named.is_some());
+    let mut lone = Vec::new();
+    for tongue in tall {
         let near = fires.iter_mut().find(|fire| {
             let first = fire[0];
             glam::Vec2::new(tongue.base.x - first.base.x, tongue.base.z - first.base.z).length() <= spread
@@ -252,6 +252,22 @@ pub fn flames_of_kind(positions: &[glam::Vec3], indices: &[u32], named: Option<F
             Some(fire) => fire.push(tongue),
             None => fires.push(vec![tongue]),
         }
+    }
+    for tongue in short {
+        let near = fires.iter_mut().find(|fire| {
+            fire.iter().any(|t| {
+                glam::Vec2::new(tongue.base.x - t.base.x, tongue.base.z - t.base.z).length() <= spread
+                    && (tongue.base.y - t.base.y).abs() <= 0.1
+            })
+        });
+        match near {
+            Some(fire) => fire.push(tongue),
+            None => lone.push(tongue),
+        }
+    }
+    for tongue in lone {
+        let kind = named.unwrap_or_else(|| FlameKind::infer(tongue.height, tongue.radius, 1));
+        flames.push(Flame { kind, ..tongue });
     }
     for fire in fires {
         let n = fire.len() as f32;
@@ -400,6 +416,8 @@ mod tests {
         for (dx, dz, h) in [(0.0, 0.0, 0.28), (0.07, 0.02, 0.2), (-0.05, 0.06, 0.18), (0.02, -0.08, 0.15), (-0.08, -0.03, 0.13)] {
             teardrop(glam::Vec3::new(10.0 + dx, 0.9, 4.0 + dz), h, 0.04, &mut mesh);
         }
+        // and a short tongue at its rim, under a lamp's 9 cm: part of the fire, not a lamp
+        teardrop(glam::Vec3::new(10.11, 0.9, 4.0), 0.06, 0.03, &mut mesh);
         let flames = flames_of(&mesh.0, &mesh.1);
         assert_eq!(flames.len(), 4, "{flames:?}");
         // The kinds by size: a lantern's 5 cm, a candle's 2.5 cm, and the brazier's pan of 13 cm a brazier.
@@ -414,9 +432,9 @@ mod tests {
         let lantern = small.iter().find(|f| f.base.x.abs() < 1e-3).expect("the first lantern");
         assert!(lantern.base.distance(glam::Vec3::new(0.0, 2.2, 0.0)) < 1e-3, "at its wick: {lantern:?}");
         let fire = flames.iter().find(|f| f.open()).expect("the brazier");
-        assert_eq!(fire.tongues, 5);
+        assert_eq!(fire.tongues, 6, "the rim's short tongue joins the fire");
         assert!((fire.base.y - 0.9).abs() < 1e-3 && (fire.height - 0.28).abs() < 1e-3, "{fire:?}");
-        assert!(fire.base.distance(glam::Vec3::new(10.0, 0.9, 4.0)) < 0.05 && fire.radius < 0.15, "{fire:?}");
+        assert!(fire.base.distance(glam::Vec3::new(10.0, 0.9, 4.0)) < 0.05 && fire.radius < 0.16, "{fire:?}");
         // No mesh, no flames.
         assert!(flames_of(&[], &[]).is_empty());
     }

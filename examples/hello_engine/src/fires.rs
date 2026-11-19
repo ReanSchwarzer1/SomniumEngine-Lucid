@@ -152,14 +152,14 @@ fn look(kind: FlameKind) -> Look {
             kelvin: 1700.0,
             range: 9.0,
             coal_k: 0.0,
-            smoke: Some((14.0, 3.0, 0.12, 1.0, 0.8, 0.05, 0.35, 50)),
+            smoke: Some((14.0, 3.0, 0.12, 1.0, 0.8, 0.05, 0.55, 50)),
             sparks: Some((1.2, 1.0, 1.1, 0.5, 6)),
         },
         FlameKind::Brazier => Look {
             kelvin: 1750.0,
             range: 10.0,
             coal_k: 1150.0,
-            smoke: Some((9.0, 6.0, 0.3, 1.8, 0.45, 0.22, 0.14, 60)),
+            smoke: Some((9.0, 6.0, 0.3, 1.8, 0.45, 0.35, 0.32, 60)),
             sparks: Some((2.5, 1.6, 1.0, 0.5, 10)),
         },
         // A hearth's smoke goes up its flue: short-lived, it never leaves the chimney.
@@ -182,7 +182,7 @@ fn look(kind: FlameKind) -> Look {
             kelvin: 1750.0,
             range: 25.0,
             coal_k: 1150.0,
-            smoke: Some((7.0, 10.0, 1.0, 4.5, 1.4, 0.28, 0.16, 80)),
+            smoke: Some((7.0, 10.0, 1.0, 4.5, 1.4, 0.35, 0.32, 80)),
             sparks: Some((12.0, 2.2, 2.0, 0.6, 40)),
         },
     }
