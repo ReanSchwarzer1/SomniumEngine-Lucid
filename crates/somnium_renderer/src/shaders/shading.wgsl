@@ -4028,9 +4028,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // 38: the blended band, as numbers for a linear capture (`.somcap`): red its weight w, green how far its sky and
-    // occlusion opened toward the ground's (ground_blend.wgsl; 0 off the band).
+    // occlusion opened toward the ground's (ground_blend.wgsl; 0 off the band, and 0 where the ground point is seen),
+    // blue 1 where its ground point shows on screen and lends it its light.
     if dbg > 37.5 && dbg < 38.5 {
-        return vec4<f32>(ground_blend_w, ground_blend_open, 0.0, 1.0);
+        return vec4<f32>(ground_blend_w, ground_blend_open, ground_blend_seen, 1.0);
     }
 
     // Phase 24AB: lighting debug views (24–31). 0–23 remain the existing

@@ -17,6 +17,7 @@ struct GroundTerrain {
 }
 struct GroundBlendList {
     params: vec4<f32>,  // live terrains in the list, the scene's blend height m, every height's scale, open
+    edge: vec4<f32>,    // the band's top line: its fade and its noise as shares of the reach, the joints' gain, unused
     terrains: array<GroundTerrain, 32>,
 }
 @group(1) @binding(36) var<storage, read> ground_blend: GroundBlendList;
@@ -76,9 +77,9 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     let above = world.y - ground_y;
     let reach = blend_m * (1.0 - 0.4 * saturate(geo_n.y));
     // Most of a mesh stands far above its band: out before the slope's four reads and the noise. The band's top lies
-    // under 2.03 reach measured across the ground (ragged line and crevices at their most), which is under 4.1 reach
-    // straight up on ground as steep as 60 degrees.
-    if above > reach * 4.1 {
+    // under 2.35 reach measured across the ground (ragged line, crevices and joints at their most), which is under
+    // 4.7 reach straight up on ground as steep as 60 degrees.
+    if above > reach * 4.7 {
         return s;
     }
     // A face standing more than its reach under the ground is in front of a cut, not standing in soil: a retaining
@@ -100,16 +101,26 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     //
     // The noise runs over the unfolded point (below), which moves along the face and out with the height, so the
     // line wanders up and down as well as along; its cells are 1.5 and 0.45 of the reach (0.45 and 0.13 m on a
-    // 0.3 m wall, as before), and the fade is the last 40% of the band, so the line stays ragged (12 Nov).
+    // 0.3 m wall, as before).
     let along = dot(geo_n, ground_n);
     let n_t = geo_n - ground_n * along;
     let k3 = n_t * (1.0 + along) / max(dot(n_t, n_t), 0.06);
     let k = k3.xz * ground_n.y;
     let fold = world.xz + k * max(above, 0.0);
-    let ragged = (snow_noise(fold, reach * 1.5) - 0.5) * 0.7
-        + (snow_noise(fold + vec2<f32>(31.7), reach * 0.45) - 0.5) * 0.35;
-    let crevice = (1.0 - micro_occlusion) * 0.5;
-    var w = 1.0 - smoothstep(0.6, 1.0, above * ground_n.y / reach + ragged - crevice);
+    let ragged = ((snow_noise(fold, reach * 1.5) - 0.5) * 0.7
+        + (snow_noise(fold + vec2<f32>(31.7), reach * 0.45) - 0.5) * 0.35) * ground_blend.edge.y;
+    // Soil lies higher where the mesh's own surface turns away from its face: a joint between stones, a stone's
+    // edge, a crack. So the line follows the masonry or the rock it climbs, stone by stone, and a stone's face stands
+    // proud of it (19 Nov: a line moved by noise alone crossed stones and joints alike).
+    let joint = saturate((1.0 - dot(s.normal, geo_n)) * 3.0) * ground_blend.edge.z;
+    let crevice = (1.0 - micro_occlusion) * 0.5 + joint;
+    // Soil is opaque, so the line is crisp: the fade takes `edge.x` of the reach (a soft fade of 0.4 showed the wall
+    // through the ground like a ghost at 4 m, 19 Nov), but never less than a pixel and a half, so the line neither
+    // crawls nor stairs far off.
+    let line = above * ground_n.y / reach + ragged - crevice;
+    let per_pixel = (abs(dwx.y) + abs(dwy.y)) * ground_n.y / reach;
+    let half_fade = max(0.5 * ground_blend.edge.x, 0.75 * per_pixel);
+    var w = 1.0 - smoothstep(0.8 - half_fade, 0.8 + half_fade, line);
     // A face lying along the ground (a floor, paving, a road) is ground already: only faces meeting it at an angle
     // (a boulder's flank, a wall foot, a heap's sides) take the ground's surface.
     w *= 1.0 - smoothstep(0.9, 0.985, dot(geo_n, ground_n));
@@ -119,6 +130,44 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     w *= smoothstep(0.5, 0.7, ground_n.y);
     if w <= 0.0 {
         return s;
+    }
+    // The ground the band stands for, where it shows on screen: the unfolded point, but at least 8 cm and two pixels
+    // out from the foot, so the band's lowest rows read the ground in front of them and not themselves. It counts as
+    // seen when the surface at its pixel lies within 10 cm and 2% of its distance (the ground, or a blade or pebble
+    // on it); a heap or a post in front of it does not.
+    let probe_xz = world.xz + k * max(above, 0.08 + 2.0 * length(dwx));
+    let probe = vec3<f32>(probe_xz.x, ground_y + dot(slope, probe_xz - world.xz), probe_xz.y) - view.camera_pos;
+    let clip = view.view_proj * vec4<f32>(probe, 0.0) + view.view_proj * vec4<f32>(view.camera_pos, 1.0);
+    if clip.w > 0.0 {
+        let ndc = clip.xyz / clip.w;
+        let probe_uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        if all(probe_uv >= vec2<f32>(0.0)) && all(probe_uv < vec2<f32>(1.0)) {
+            let dims = vec2<f32>(textureDimensions(scene_depth));
+            let texel = vec2<i32>(probe_uv * dims);
+            let scene_z = textureLoad(scene_depth, texel, 0);
+            let there = view.inv_view_proj_rel * vec4<f32>(ndc.xy, scene_z, 1.0);
+            let reach_m = length(probe);
+            if scene_z > 0.0 && distance(there.xyz / there.w, probe) < 0.10 + 0.02 * reach_m {
+                // What lies there. A mesh that is no leaf, card or far ground, that blends into no soil itself and
+                // lies where the ground should show, is a floor: paving, a slab, a low step, a road. A foot standing
+                // on it stands in no soil and takes no band, whatever height its material carries (the lead, 19 Nov:
+                // "No band on paving, steps, sills or anything that stands on a mesh floor"). Nothing has been mixed
+                // yet, so the surface leaves as it came, and the terrain's material is never read for it.
+                let beside_vis = textureLoad(vis_buffer, texel, 0).x;
+                if beside_vis != 0u {
+                    let beside = materials[instances[beside_vis - 1u].material_id];
+                    let beside_m = select(ground_blend.params.y, beside.ground_blend, beside.ground_blend != 0.0);
+                    if beside.terrain_index < 0 && beside.alpha_cutoff <= 0.0 && (beside.flags & 118u) == 0u
+                        && beside_m <= 0.0 {
+                        return s;
+                    }
+                }
+                ground_blend_seen = 1.0;
+                ground_blend_pixel = probe_uv * dims;
+                ground_blend_dist = reach_m;
+                ground_blend_contact = textureLoad(gtao_tex, texel, 0).a;
+            }
+        }
     }
     // The face unfolded onto the ground: a point some way up it reads the ground as far out from its foot as it stands
     // along the face. So the band wears the terrain's own surface as the terrain shows it beside the foot (its layers,
@@ -169,33 +218,12 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     s.occlusion = s.occlusion * baked;
     baked_sky_vis = baked;
     ground_blend_w = w;
+    // Seen (above), the band stands under its ground point's own screen occlusion and opens nothing by a constant.
     var open = w * ground_blend.params.w;
     var screen = mix(screen_occlusion, 1.0, open);
-    // The ground the band stands for, where it shows on screen: the unfolded point, but at least 8 cm and two pixels
-    // out from the foot, so the band's lowest rows read the ground in front of them and not themselves. It counts as
-    // seen when the surface at its pixel lies within 10 cm and 2% of its distance (the ground, or a blade or pebble
-    // on it); a heap or a post in front of it does not.
-    let probe_xz = world.xz + k * max(above, 0.08 + 2.0 * length(dwx));
-    let probe = vec3<f32>(probe_xz.x, ground_y + dot(slope, probe_xz - world.xz), probe_xz.y) - view.camera_pos;
-    let clip = view.view_proj * vec4<f32>(probe, 0.0) + view.view_proj * vec4<f32>(view.camera_pos, 1.0);
-    if clip.w > 0.0 {
-        let ndc = clip.xyz / clip.w;
-        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
-        if all(uv >= vec2<f32>(0.0)) && all(uv < vec2<f32>(1.0)) {
-            let dims = vec2<f32>(textureDimensions(scene_depth));
-            let texel = vec2<i32>(uv * dims);
-            let scene_z = textureLoad(scene_depth, texel, 0);
-            let there = view.inv_view_proj_rel * vec4<f32>(ndc.xy, scene_z, 1.0);
-            let reach_m = length(probe);
-            if scene_z > 0.0 && distance(there.xyz / there.w, probe) < 0.10 + 0.02 * reach_m {
-                ground_blend_seen = 1.0;
-                ground_blend_pixel = uv * dims;
-                ground_blend_dist = reach_m;
-                ground_blend_contact = textureLoad(gtao_tex, texel, 0).a;
-                screen = mix(screen_occlusion, ground_blend_contact, w);
-                open = 0.0;
-            }
-        }
+    if ground_blend_seen > 0.0 {
+        screen = mix(screen_occlusion, ground_blend_contact, w);
+        open = 0.0;
     }
     ground_blend_open = open;
     s.occlusion = s.occlusion / max(screen_occlusion, 0.004) * screen;

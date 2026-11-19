@@ -130,6 +130,12 @@ struct FrameViewState {
 /// light, bluer (step 0's ambient view at the piazza, 12 Nov). The city's proofs check it (MESH_BLENDING.md 6).
 const GROUND_BLEND_OPEN: f32 = 0.25;
 
+/// The band's top line (`ground_blend.wgsl` `GroundBlendList::edge`), each as a share of the band's reach: how much
+/// of it the fade takes, how far the noise moves the line (1 is half the reach either way), and how much higher the
+/// soil lies in the mesh's own joints. Soil is opaque, so the fade is short; a proof tries others by pair of captures
+/// (SOMNIUM_GROUND_BLEND_EDGES, _RAGGED, _JOINTS, as SOMNIUM_GROUND_BLEND_OPENS).
+const GROUND_BLEND_EDGE: [f32; 3] = [0.12, 1.0, 0.3];
+
 /// `SOMNIUM_SHADING_DEBUG_CYCLE=0,2,3`: the shading debug view for this pair of captures (proof stills, as
 /// SOMNIUM_GROUND_BLEND_OPENS), the list wrapping round; `None` when it is unset.
 fn debug_cycle_view() -> Option<f32> {
@@ -5824,7 +5830,8 @@ impl SomniumRenderer {
         }
         // Meshes blending into the ground (ground_blend.wgsl): the live terrains' rectangles, heights and indices.
         // ponytail: a terrain's model is a translation (Sunscar's tiles); a turned or scaled one needs its inverse.
-        let mut ground = [0.0f32; 4 + 32 * 12];
+        const HEAD: usize = 8;
+        let mut ground = [0.0f32; crate::pass::shading::GROUND_BLEND_FLOATS];
         let mut count = 0;
         for &(id, model) in &self.terrain_queue {
             let Some(terrain) = self.terrains.get(id as usize) else {
@@ -5835,7 +5842,7 @@ impl SomniumRenderer {
             }
             let [wx, wz] = terrain.desc.world_size();
             let o = model.w_axis;
-            ground[4 + count * 12..4 + (count + 1) * 12].copy_from_slice(&[
+            ground[HEAD + count * 12..HEAD + (count + 1) * 12].copy_from_slice(&[
                 o.x,
                 o.z,
                 1.0 / wx,
@@ -5882,6 +5889,13 @@ impl SomniumRenderer {
         });
         let pair = crate::capture::captures_written() / 2;
         ground[3] = OPENS[pair % OPENS.len()];
+        static EDGES: std::sync::LazyLock<[Vec<f32>; 3]> = std::sync::LazyLock::new(|| {
+            let list = |name: &str, i: usize| env_floats(name).unwrap_or_else(|| vec![GROUND_BLEND_EDGE[i]]);
+            [list("SOMNIUM_GROUND_BLEND_EDGES", 0), list("SOMNIUM_GROUND_BLEND_RAGGED", 1), list("SOMNIUM_GROUND_BLEND_JOINTS", 2)]
+        });
+        for (i, values) in EDGES.iter().enumerate() {
+            ground[4 + i] = values[pair % values.len()];
+        }
         self.shading_pass.set_ground_blend(&ctx.queue, &ground);
 
         self.profiler.cpu_end();
