@@ -81,6 +81,10 @@ struct GrassHabitat {
     root_ao: f32,
     bare: f32,
     w_mean: f32,
+    tussock_share: f32,
+    tussock_h_min: f32,
+    tussock_h_max: f32,
+    _pad: f32,
     green: vec4<f32>,
     green_alt: vec4<f32>,
     dead: vec4<f32>,
@@ -122,6 +126,19 @@ fn hash2(c: vec2<i32>, seed: u32) -> u32 {
 
 fn unit(h: u32) -> f32 {
     return f32(h >> 8u) * (1.0 / 16777216.0);
+}
+
+/// Smooth value noise in 0..1 on a unit grid: the sward's patches (taller and shorter, thicker and thinner, lodged,
+/// greener and deader) at the scales a field shows them, half a metre to tens of metres.
+fn patch_noise(p: vec2<f32>, seed: u32) -> f32 {
+    let i = vec2<i32>(floor(p));
+    let f = p - floor(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = unit(hash2(i, seed));
+    let b = unit(hash2(i + vec2<i32>(1, 0), seed));
+    let c = unit(hash2(i + vec2<i32>(0, 1), seed));
+    let d = unit(hash2(i + vec2<i32>(1, 1), seed));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
 }
 
 /// The terrain's height at world xz (bilinear), and the ground's normal.
@@ -238,7 +255,14 @@ fn grow(cell: u32, tile: GrassTile, k: u32, rank: f32) -> Grown {
     let px = params.seg.z * d * params.eye.w;
     let widen = max(1.0, px / max(hab.w_mean * s, 1e-5));
     let far = 1.0 - smoothstep(params.lod.z, params.lod.y, d);
-    let keep = min(hab.density, params.lod.w) / params.lod.w * presence * slope * far / (s * s * widen * params.look.x);
+    // The sward's patches (the lead, 21:42: "it reads as fur"): a few metres across (n_small) and a field's worth
+    // (n_large). They make it thicker and thinner here (never bare), taller and shorter, lodged in places, greener
+    // and deader.
+    let n_small = patch_noise(xz / 3.5, 0x51ed270bu);
+    let n_large = patch_noise(xz / 11.0, 0x7a2f9c13u);
+    let thick = mix(0.7, 1.1, n_large);
+    let keep = min(hab.density, params.lod.w) / params.lod.w * presence * slope * far * thick
+        / (s * s * widen * params.look.x);
     if rank >= keep {
         return nothing;
     }
@@ -270,7 +294,13 @@ fn grow(cell: u32, tile: GrassTile, k: u32, rank: f32) -> Grown {
     let c_face = unit(hash(clump ^ 0x94d049bbu)) * 6.2831855;
     // A clump is greener or deader as a whole (a winter sward is green tussocks among dead patches): blade by blade at
     // one share, green and dead averaged to a flat grey at a few metres (fr_gg_1, 19 Nov).
-    let c_green = clamp(hab.share_green + 0.6 * (unit(hash(clump ^ 0x3c6ef372u)) - 0.5), 0.05, 0.95);
+    // A tussock: a clump the grazers left, standing rank (and mostly dead) out of the short turf round it.
+    let tussock = unit(hash(clump ^ 0x2d358dccu)) < hab.tussock_share;
+    var c_green = clamp(hab.share_green + 0.6 * (unit(hash(clump ^ 0x3c6ef372u)) - 0.5) + 0.3 * (n_large - 0.5),
+                        0.05, 0.95);
+    if tussock {
+        c_green *= 0.45;
+    }
     let c_dead = (1.0 - c_green) * hab.share_dead / max(hab.share_dead + max(1.0 - hab.share_green - hab.share_dead, 0.0), 1e-3);
 
     // The blade itself.
@@ -282,7 +312,11 @@ fn grow(cell: u32, tile: GrassTile, k: u32, rank: f32) -> Grown {
     let h6 = hash(h5);
     let state = unit(h1);
     var g: GrassBlade;
-    var height = mix(hab.h_min, hab.h_max, pow(unit(h2), 1.3)) * (1.0 + hab.contrast * c_height);
+    var height = mix(hab.h_min, hab.h_max, pow(unit(h2), 1.3)) * (1.0 + hab.contrast * c_height)
+        * mix(0.7, 1.3, 0.55 * n_small + 0.45 * n_large);
+    if tussock {
+        height = mix(hab.tussock_h_min, hab.tussock_h_max, unit(h2));
+    }
     var width = mix(hab.w_min, hab.w_max, unit(h3)) * params.look.x;
     var colour: vec3<f32>;
     if state < c_green {
@@ -299,8 +333,11 @@ fn grow(cell: u32, tile: GrassTile, k: u32, rank: f32) -> Grown {
     g.height = max(height * rise, 0.002);
     g.width = width * s * widen;
     g.facing = c_face + (unit(h5) - 0.5) * 3.7699;
-    if unit(h6) < hab.lodged {
+    // Lodged and trodden places: where the small patches peak, most blades lie over, the same way.
+    let lodged_here = smoothstep(0.72, 0.86, n_small) * select(0.85, 0.2, tussock);
+    if unit(h6) < max(hab.lodged, lodged_here) {
         g.lean = mix(1.05, 1.48, unit(hash(h6)));
+        g.facing = mix(g.facing, patch_noise(xz / 9.0, 0x1f83d9abu) * 12.566371, lodged_here);
     } else {
         g.lean = mix(hab.lean_min, hab.lean_max, unit(hash(h6)) * unit(hash(h6)));
     }

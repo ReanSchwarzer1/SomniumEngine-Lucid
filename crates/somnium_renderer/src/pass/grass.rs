@@ -106,6 +106,11 @@ pub struct GpuHabitat {
     pub root_ao: f32,
     pub bare: f32,
     pub w_mean: f32,
+    /// Share of clumps that are tussocks (rank tufts grazers leave), and their height range (m).
+    pub tussock_share: f32,
+    pub tussock_h_min: f32,
+    pub tussock_h_max: f32,
+    pub _pad: f32,
     pub green: [f32; 4],
     pub green_alt: [f32; 4],
     pub dead: [f32; 4],
@@ -130,6 +135,10 @@ pub struct HabitatTable {
     /// Per layer set ("" the project's own): each splat slot's habitat and its weight in it.
     pub sets: std::collections::HashMap<String, [(u8, f32); 32]>,
     pub season: String,
+    /// Per layer set: each cover class's habitat (`habitats_by_class`, look's class map), NO_HABITAT where none.
+    pub class_rows: std::collections::HashMap<String, [u8; 256]>,
+    /// The class map of a tile, relative to the project: `<tile file>` stands for the tile's scene file name.
+    pub class_map: Option<String>,
     /// Palette kinds the blades replace, by their source file's name (`"replaces"`: prefixes, as "gp_sward_"):
     /// not drawn as ground cover while the blades draw. `SOMNIUM_GRASS_REPLACES` (comma-separated) overrides it.
     pub replaces: Vec<String>,
@@ -175,9 +184,20 @@ impl HabitatTable {
                 .map(|a| a.iter().filter_map(|s| s.as_str()).map(str::to_owned).collect())
                 .unwrap_or_default(),
         };
-        let mut table =
-            Self { habitats: Vec::new(), names: Vec::new(), sets: Default::default(), season, replaces };
-        for row in rows {
+        // "data/foliage/cover/<tile file>.cover.png (...)": the path, without its note.
+        let class_map = doc.get("class_map").and_then(|c| c.as_str()).map(|c| c.split(" (").next().unwrap_or(c).trim().to_owned());
+        let mut table = Self {
+            habitats: Vec::new(),
+            names: Vec::new(),
+            sets: Default::default(),
+            season,
+            class_rows: Default::default(),
+            class_map,
+            replaces,
+        };
+        let class_rows: Vec<serde_json::Value> =
+            doc.get("habitats_by_class").and_then(|h| h.as_array()).cloned().unwrap_or_default();
+        for (by_class, row) in rows.iter().map(|r| (false, r)).chain(class_rows.iter().map(|r| (true, r))) {
             if table.habitats.len() >= usize::from(NO_HABITAT) {
                 tracing::warn!("grass habitats: more than {NO_HABITAT}; the rest are left out");
                 break;
@@ -218,12 +238,35 @@ impl HabitatTable {
                 dead: colour(row, "dead", [0.118, 0.107, 0.088]),
                 dead_alt: colour(row, "dead_alt", [0.189, 0.152, 0.094]),
                 seed: colour(row, "seed", [0.34, 0.313, 0.239]),
+                tussock_share: number(row, "tussock_share", 0.0),
+                tussock_h_min: pair(row, "tussock_height_m", [h[1], h[1] * 1.5])[0],
+                tussock_h_max: pair(row, "tussock_height_m", [h[1], h[1] * 1.5])[1],
+                _pad: 0.0,
             });
             let sets: Vec<String> = row
                 .get("sets")
                 .and_then(|s| s.as_array())
                 .map(|a| a.iter().filter_map(|s| s.as_str()).map(|s| s.trim().to_owned()).collect())
                 .unwrap_or_else(|| vec![String::new()]);
+            if by_class {
+                // A class row: the cover classes it stands for, per set. A class two rows claim is refused, as a slot.
+                let classes: Vec<usize> = row
+                    .get("classes")
+                    .and_then(|c| c.as_array())
+                    .map(|a| a.iter().filter_map(serde_json::Value::as_u64).map(|c| c as usize).filter(|c| *c < 256).collect())
+                    .unwrap_or_default();
+                for set in &sets {
+                    let map = table.class_rows.entry(set.clone()).or_insert([NO_HABITAT; 256]);
+                    for &c in &classes {
+                        if map[c] != NO_HABITAT {
+                            return Err(format!("grass habitats: class {c} of set \"{set}\" is claimed twice ({id})"));
+                        }
+                        map[c] = index;
+                    }
+                }
+                table.names.push(id);
+                continue;
+            }
             let slots = row.get("slots").and_then(|s| s.as_object());
             for set in sets {
                 let map = table.sets.entry(set.clone()).or_insert([(NO_HABITAT, 0.0); 32]);
@@ -245,6 +288,16 @@ impl HabitatTable {
 
     /// Two habitats per splat texel (the strongest), packed as `grass_gen.wgsl` reads them:
     /// habitat a | weight a << 5 | habitat b << 13 | weight b << 18. Texels in no habitat hold 31 with weight 0.
+    /// The word with the place's own habitat: where look's class map names one for `class` and the paint grows
+    /// grass at all, the class's habitat takes the texel's whole grassland weight; elsewhere the paint's word.
+    pub fn class_word(word: u32, class_habitat: u8) -> u32 {
+        let total = (((word >> 5) & 255) + ((word >> 18) & 255)).min(255);
+        if class_habitat == NO_HABITAT || total == 0 {
+            return word;
+        }
+        u32::from(class_habitat) | (total << 5) | (u32::from(NO_HABITAT) << 13)
+    }
+
     pub fn habitat_word(map: &[(u8, f32); 32], texel: &[u8; 32]) -> u32 {
         let mut found: [(u8, f32); 4] = [(NO_HABITAT, 0.0); 4];
         let mut n = 0;
@@ -318,6 +371,10 @@ pub struct GrassPass {
     knobs: Knobs,
     /// Each terrain's habitat set by terrain id (`set_terrain_set`): `None` until the game says, and grows nothing.
     terrain_sets: Vec<Option<String>>,
+    /// Each terrain's tile (its scene file's name), for its class map; `None` where it has none.
+    terrain_tiles: Vec<Option<String>>,
+    /// The project's root, which the class maps' paths are relative to.
+    root: Option<std::path::PathBuf>,
     slots: [Option<GroundSlot>; SLOTS],
     /// The blades' span in the vertex pool, and the grass instance's material.
     span: u32,
@@ -407,6 +464,7 @@ impl GrassPass {
         geometry: &mut crate::geometry::GeometryPool,
         materials: &mut MaterialPool,
         table: HabitatTable,
+        root: Option<std::path::PathBuf>,
     ) -> Option<Self> {
         let total: u32 = CAPACITY.iter().sum();
         let Some(span) = geometry.reserve_vertices(total) else {
@@ -559,6 +617,8 @@ impl GrassPass {
             table,
             knobs,
             terrain_sets: Vec::new(),
+            terrain_tiles: Vec::new(),
+            root,
             slots: Default::default(),
             span,
             material_id,
@@ -600,13 +660,15 @@ impl GrassPass {
     }
 
     /// Which habitat set terrain `terrain_id` grows (its ground layer set; "" the project's own). Cheap when unchanged.
-    pub fn set_terrain_set(&mut self, terrain_id: u32, set: &str) {
+    pub fn set_terrain_set(&mut self, terrain_id: u32, set: &str, tile: Option<&str>) {
         let i = terrain_id as usize;
         if self.terrain_sets.len() <= i {
             self.terrain_sets.resize(i + 1, None);
+            self.terrain_tiles.resize(i + 1, None);
         }
-        if self.terrain_sets[i].as_deref() != Some(set) {
+        if self.terrain_sets[i].as_deref() != Some(set) || self.terrain_tiles[i].as_deref() != tile {
             self.terrain_sets[i] = Some(set.to_owned());
+            self.terrain_tiles[i] = tile.map(str::to_owned);
             // A slot built under another set is rebuilt.
             for slot in &mut self.slots {
                 if slot.as_ref().is_some_and(|s| s.terrain_id == terrain_id) {
@@ -684,8 +746,30 @@ impl GrassPass {
             let Some(free) = self.slots.iter().position(Option::is_none) else { break };
             let scale = t.desc.height_scale;
             let heights: Vec<f32> = t.heightmap[..nx * nz].iter().map(|h| h * scale + origin.y).collect();
-            let words: Vec<u32> =
+            let mut words: Vec<u32> =
                 t.splatmap.data[..sw * sh].iter().map(|texel| HabitatTable::habitat_word(map, texel)).collect();
+            // Habitat by place where the tile has look's class map (`habitats_by_class`): a pasture is grazed turf
+            // and a meadow tall, whatever the slot painted under them (the lead, 21:42).
+            let classes = self.table.class_rows.get(set);
+            let tile = self.terrain_tiles.get(id as usize).and_then(Option::as_deref);
+            if let (Some(classes), Some(tile), Some(template), Some(root)) =
+                (classes, tile, self.table.class_map.as_deref(), self.root.as_deref())
+            {
+                let path = root.join(template.replace("<tile file>", tile));
+                match image::open(&path).map(|i| i.to_luma8()) {
+                    Ok(img) if img.width() as usize == sw && img.height() as usize == sh => {
+                        for (w, px) in words.iter_mut().zip(img.as_raw()) {
+                            *w = HabitatTable::class_word(*w, classes[usize::from(*px)]);
+                        }
+                    }
+                    Ok(img) => tracing::warn!(path = %path.display(), w = img.width(), h = img.height(), "GPU grass: a class map not the splat's size"),
+                    Err(error) => {
+                        if self.knobs.log {
+                            tracing::info!(path = %path.display(), %error, "GPU grass: no class map; habitats by paint");
+                        }
+                    }
+                }
+            }
             let cell = t.desc.cell_size;
             let texel_size = size.x / sw as f32;
             let tiles = [(size.x / TILE).floor() as u32, (size.y / TILE).floor() as u32];
@@ -1014,6 +1098,21 @@ mod tests {
     }
 
     #[test]
+    fn a_class_row_names_the_place_and_keeps_the_paints_weight() {
+        let doc = TABLE.replacen('{', r#"{"class_map": "data/foliage/cover/<tile file>.cover.png (u8)", "habitats_by_class": [{"id": "grazed", "sets": [""], "classes": [11], "height_m": [0.02, 0.08], "tussock_share": 0.08}], "#, 1);
+        let t = HabitatTable::parse(&doc).unwrap();
+        assert_eq!(t.class_map.as_deref(), Some("data/foliage/cover/<tile file>.cover.png"));
+        assert_eq!(t.class_rows[""][11], 2, "the class row follows the two slot rows");
+        assert_eq!(t.habitats[2].tussock_share, 0.08);
+        let mut texel = [0u8; 32];
+        texel[0] = 200;
+        let paint = HabitatTable::habitat_word(&t.sets[""], &texel);
+        let placed = HabitatTable::class_word(paint, t.class_rows[""][11]);
+        assert_eq!((placed & 31, (placed >> 5) & 255, (placed >> 13) & 31), (2, 200, 31));
+        assert_eq!(HabitatTable::class_word(paint, NO_HABITAT), paint, "no class row: the paint's");
+    }
+
+    #[test]
     fn a_slot_two_habitats_claim_is_refused() {
         let twice = TABLE.replace(r#""slots": {"12": 1.0, "18": 1.0}"#, r#""slots": {"0": 1.0}"#);
         assert!(HabitatTable::parse(&twice).unwrap_err().contains("claimed by meadow and turf"));
@@ -1058,7 +1157,7 @@ mod tests {
     #[test]
     fn the_gpu_structs_match_their_wgsl() {
         assert_eq!(std::mem::size_of::<GpuParams>(), 288);
-        assert_eq!(std::mem::size_of::<GpuHabitat>(), 160);
+        assert_eq!(std::mem::size_of::<GpuHabitat>(), 176);
         assert_eq!(std::mem::size_of::<GpuTerrain>(), 32);
         assert_eq!(std::mem::size_of::<GpuTile>(), 16);
         assert_eq!(std::mem::size_of::<GpuDraw>(), 16);

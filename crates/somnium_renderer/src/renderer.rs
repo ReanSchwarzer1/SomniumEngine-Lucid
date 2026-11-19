@@ -4397,6 +4397,7 @@ impl SomniumRenderer {
                     &mut self.geometry,
                     &mut self.materials_pool,
                     table,
+                    project_root.map(std::path::Path::to_path_buf),
                 );
             }
             Err(error) => tracing::warn!("GPU grass: {} not read: {error}", path.display()),
@@ -4412,9 +4413,9 @@ impl SomniumRenderer {
     }
 
     /// Which habitat set terrain `terrain_id` grows: its ground layer set ("" the project's own).
-    pub fn grass_terrain_set(&mut self, terrain_id: u32, set: &str) {
+    pub fn grass_terrain_set(&mut self, terrain_id: u32, set: &str, tile: Option<&str>) {
         if let Some(grass) = self.grass.as_mut() {
-            grass.set_terrain_set(terrain_id, set);
+            grass.set_terrain_set(terrain_id, set, tile);
         }
     }
 

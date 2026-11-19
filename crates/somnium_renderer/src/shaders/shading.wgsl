@@ -2876,7 +2876,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     surface.albedo *= interior_shade;
     if is_grass {
-        surface.albedo *= grass_tint;
+        // Dark at the root, bright at the tip: low in the sward a blade sits in the others' shadow for the sun as well
+        // as the sky (grass casts none), and its tip catches the light (the lead, 21:42: "one flat tone").
+        surface.albedo *= grass_tint * mix(0.6, 1.1, pow(saturate(uv.y), 0.6));
     }
     // Foliage remembered alive (`VertexPaintPool::green`, header word 7): withered leaf colour is
     // pulled to a living green at the leaf's own brightness.

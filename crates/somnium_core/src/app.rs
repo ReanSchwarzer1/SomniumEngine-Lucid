@@ -9531,8 +9531,20 @@ impl<G: GameApp> Engine<G> {
         // terrain's ground layer set, which names the habitats it grows. A project without the table has none.
         if let Some((r, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref()) {
             r.ensure_grass(ctx, self.config.project_root.as_deref());
-            for terrain in &terrains {
-                r.grass_terrain_set(terrain.0, &terrain.9);
+            if r.grass.is_some() {
+                // Each tile's scene file, for its cover class map (habitat by place).
+                let world = &self.world;
+                let cells = &self.cell_streamer.cells;
+                for e in world.entities_with::<TerrainComponent>() {
+                    let Some(tc) = world.get::<TerrainComponent>(e) else { continue };
+                    let Some(terrain) = terrains.iter().find(|t| t.0 == tc.terrain_id) else { continue };
+                    let tile = world
+                        .get::<crate::cell_streaming::Streamed>(e)
+                        .and_then(|s| cells.get(s.cell as usize))
+                        .and_then(|c| c.file.file_name())
+                        .and_then(|n| n.to_str());
+                    r.grass_terrain_set(tc.terrain_id, &terrain.9, tile);
+                }
             }
         }
 
