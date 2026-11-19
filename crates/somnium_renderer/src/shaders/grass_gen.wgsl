@@ -153,9 +153,34 @@ fn ground(t: GrassTerrain, xz: vec2<f32>) -> vec4<f32> {
     let h10 = heights[k + 1u];
     let h01 = heights[k + row];
     let h11 = heights[k + row + 1u];
-    let h = mix(mix(h00, h10, fr.x), mix(h01, h11, fr.x), fr.y);
-    let dx = mix(h10 - h00, h11 - h01, fr.y);
-    let dz = mix(h01 - h00, h11 - h10, fr.x);
+    // On the terrain mesh's own triangles (terrain/mesh.rs fans each 2x2 block from its centre, so a cell's diagonal
+    // runs through the block's centre), not bilinear: a bilinear height sits up to a centimetre or two off the drawn
+    // ground, enough to bury a short leaning blade (fr_gk_2, 20 Nov: a lawn 56.6% bare at 10-30 m with blades).
+    var h: f32;
+    var dx: f32;
+    var dz: f32;
+    if ((i.x + i.y) & 1u) == 0u {
+        // diagonal (0,0)-(1,1)
+        if fr.x >= fr.y {
+            dx = h10 - h00;
+            dz = h11 - h10;
+        } else {
+            dx = h11 - h01;
+            dz = h01 - h00;
+        }
+        h = h00 + fr.x * dx + fr.y * dz;
+    } else {
+        // diagonal (1,0)-(0,1)
+        if fr.x + fr.y <= 1.0 {
+            dx = h10 - h00;
+            dz = h01 - h00;
+            h = h00 + fr.x * dx + fr.y * dz;
+        } else {
+            dx = h11 - h01;
+            dz = h11 - h10;
+            h = h11 - (1.0 - fr.x) * dx - (1.0 - fr.y) * dz;
+        }
+    }
     let n = normalize(vec3<f32>(-dx, t.cell, -dz));
     return vec4<f32>(n, h);
 }
