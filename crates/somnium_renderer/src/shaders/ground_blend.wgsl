@@ -46,6 +46,11 @@ var<private> ground_blend_contact: f32 = 1.0;
 /// the wall and the cascades see the wall's own depth (19 Nov: the band's sun 5% under the soil's beside it).
 var<private> ground_blend_point: vec3<f32> = vec3<f32>(0.0);
 var<private> ground_blend_normal: vec3<f32> = vec3<f32>(0.0, 1.0, 0.0);
+/// The direction the band gathers its sky along: its ground point's own bent normal where that pixel is seen (GTAO's,
+/// weighted by its occlusion as shading.wgsl does for every pixel), else the ground's normal. Straight up, the band
+/// sampled the clear sky's bluest part while the soil beside it sampled toward the open sky (19 Nov 01:11: the band's
+/// ambient 11% brighter and 4.5% bluer than the soil's just under the foot).
+var<private> ground_blend_bent: vec3<f32> = vec3<f32>(0.0, 1.0, 0.0);
 
 /// The list entry whose rectangle holds `xz`, or -1.
 fn ground_terrain_at(xz: vec2<f32>) -> i32 {
@@ -184,7 +189,14 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
                 ground_blend_normal = ground_n;
                 ground_blend_pixel = probe_uv * dims;
                 ground_blend_dist = reach_m;
-                ground_blend_contact = textureLoad(gtao_tex, texel, 0).a;
+                let gtao_there = textureLoad(gtao_tex, texel, 0);
+                ground_blend_contact = gtao_there.a;
+                let bent_view = gtao_there.rgb * 2.0 - 1.0;
+                ground_blend_bent = ground_n;
+                if length(bent_view) > 0.1 {
+                    let bent_world = normalize((transpose(view.view) * vec4<f32>(bent_view, 0.0)).xyz);
+                    ground_blend_bent = normalize(mix(ground_n, bent_world, 1.0 - gtao_there.a));
+                }
             }
         }
     }
@@ -224,7 +236,7 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     // Lit as the ground where it is the ground, so the foot meets the terrain without a step in the light; the sky is
     // gathered along the ground's normal there too.
     s.normal = normalize(mix(s.normal, ground.normal, w));
-    s.bent_normal = normalize(mix(s.bent_normal, ground_n, w));
+    s.bent_normal = normalize(mix(s.bent_normal, select(ground_n, ground_blend_bent, ground_blend_seen > 0.0), w));
     // The ground's own occlusion in place of the mesh's, the screen's term kept, as paint swaps it: a scan's baked
     // contact shadow at its foot is the shadow of the ground it was scanned on. Multiplied together, the two put the
     // band below both sides (the lead, 11 Nov: 0.043 between a wall at 0.213 and ground at 0.090).
