@@ -2382,7 +2382,8 @@ impl GameApp for HelloGame {
         fracture_demo::Demo::sync(ctx.world);
         somnium_core::propagate_transforms(ctx.world);
         // After the transforms, so a flame that just streamed in is lit where it stands.
-        self.fires.update(ctx.world, self.lamps.night(), ctx.time.elapsed().as_secs_f32());
+        let eye = ctx.renderer.as_ref().map(|renderer| renderer.camera_pos);
+        self.fires.update(ctx.world, self.lamps.night(), ctx.time.elapsed().as_secs_f32(), ctx.config.project_root.as_deref(), eye);
         let (view_mat, eye) = self
             .combat
             .view(ctx.world)
@@ -2714,8 +2715,10 @@ impl GameApp for HelloGame {
                                 if lit <= 0.0 {
                                     continue;
                                 }
+                                // A fire's light follows its flame's book: its output and where it shines from.
+                                let (drive, shift) = self.fires.drive(archetype.entities()[row]);
                                 // Spot/rect axis = travel direction. A spot keeps its cookie.
-                                if let Some(lamp) = light.local_light(transform.translation, forward, flicker * lit) {
+                                if let Some(lamp) = light.local_light(transform.translation + shift, forward, flicker * lit * drive) {
                                     renderer.submit_local_light(lamp);
                                 }
                             }

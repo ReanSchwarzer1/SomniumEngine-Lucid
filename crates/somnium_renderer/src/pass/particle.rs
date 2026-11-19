@@ -12,10 +12,14 @@ pub struct GpuParticle {
     pub rotation: f32,
     pub texture_index: i32,
     /// Bit 0 additive; bit 1 world-up billboard; bit 2 mirrored sprite UV; bit 3 lit by the sun and sky
-    /// (`colour` is then an albedo); bit 4 an untextured sprite drawn as a flame's tongue.
+    /// (`colour` is then an albedo); bit 4 an untextured sprite drawn as a flame's tongue. Sunscar's fire (19 Nov
+    /// 2026): bit 5 a flame's card from its simulated book; bit 6 a bed of coals lying flat; bit 7 a spark drawn as
+    /// its streak; bit 8 lit smoke that its fire lights too; bit 9 a candle's or a lantern's book (no motion).
     pub flags: u32,
     /// Tip displacement in sprite-width units; its base stays pinned.
     pub flutter: f32,
+    /// A spark's velocity (m/s) and shutter (s); lit smoke's illuminance from its fire (lux, linear RGB) and 1.
+    pub extra: [f32; 4],
 }
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -27,8 +31,41 @@ struct ParticleView {
     _pad1: f32,
     camera_pos: [f32; 3],
     _pad2: f32,
+    /// The manual EV100 (under -999 with auto exposure), the near plane, the EV a fire's own light is seen at, the
+    /// soft-depth reach (m): particle.wgsl `ParticleView.fire`.
+    fire: [f32; 4],
 }
 const MAX_PARTICLES: usize = 10_000;
+
+/// What the fire's cards need of the frame beyond the view (Sunscar, 19 Nov 2026; `design/fire/FIRE.md`).
+#[derive(Debug, Clone, Copy)]
+pub struct FireView {
+    /// The camera's EV100 when it is set by hand; `None` when the auto exposure meters it.
+    pub manual_ev: Option<f32>,
+    /// The projection's near plane (reversed infinite depth: view depth = near / depth).
+    pub near: f32,
+    /// The EV a fire's own light is seen at, as an eye fixed on it adapts (`SOMNIUM_FIRE_EYE_EV`, 5 by default).
+    pub eye_ev: f32,
+    /// How far in front of what it meets a flame fades, metres.
+    pub soft_m: f32,
+}
+
+impl Default for FireView {
+    fn default() -> Self {
+        Self { manual_ev: Some(15.0), near: 0.1, eye_ev: fire_eye_ev(), soft_m: 0.06 }
+    }
+}
+
+/// `SOMNIUM_FIRE_EYE_EV`: the EV a fire's own pixels are seen at when the camera exposes darker (5 by default,
+/// photoreal's reading of its own curve, 19 Nov: a wood fire's core sits 7 to 9.5 stops over middle grey and clips
+/// white, its thin edges show yellow and orange, the campfire photograph; a candle is a white teardrop with a yellow
+/// rim). It scales every self-lit fire pixel (flame, coals, sparks), never the smoke or what the fire lights.
+/// -100 turns it off.
+#[must_use]
+pub fn fire_eye_ev() -> f32 {
+    static EV: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *EV.get_or_init(|| std::env::var("SOMNIUM_FIRE_EYE_EV").ok().and_then(|v| v.parse().ok()).unwrap_or(5.0))
+}
 struct ViewBuffers {
     view: wgpu::Buffer,
     instances: wgpu::Buffer,
@@ -39,8 +76,14 @@ struct ViewBuffers {
 pub struct ParticlePass {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
+    /// The frame's depth and the auto exposure's reading (group 2), bound each frame.
+    frame_layout: wgpu::BindGroupLayout,
+    /// The auto exposure's result buffer, or a stand-in holding EV 15 until the renderer gives its own.
+    exposure: wgpu::Buffer,
     sampler: wgpu::Sampler,
     views: Vec<ViewBuffers>,
+    /// This frame's fire inputs (`set_fire_view`).
+    fire: FireView,
 }
 impl ParticlePass {
     pub fn new(
@@ -83,9 +126,34 @@ impl ParticlePass {
                 },
             ],
         });
+        let frame_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Particle frame inputs"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Depth,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Particle pipeline layout"),
-            bind_group_layouts: &[Some(&layout), Some(global)],
+            bind_group_layouts: &[Some(&layout), Some(global), Some(&frame_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -145,12 +213,34 @@ impl ParticlePass {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        // Until the renderer hands over its auto exposure's buffer: a multiplier and an EV of 15, a noon's.
+        let exposure = wgpu::util::DeviceExt::create_buffer_init(
+            device,
+            &wgpu::util::BufferInitDescriptor {
+                label: Some("Particle exposure stand-in"),
+                contents: bytemuck::cast_slice(&[1.0 / (1.2 * 32768.0f32), 15.0, 0.0, 0.0]),
+                usage: wgpu::BufferUsages::STORAGE,
+            },
+        );
         Self {
             pipeline,
             layout,
+            frame_layout,
+            exposure,
             sampler,
             views: vec![],
+            fire: FireView::default(),
         }
+    }
+
+    /// The auto exposure's result buffer (`[0]` its multiplier, `[1]` the adapted EV100), read by a fire's cards.
+    pub fn set_exposure_buffer(&mut self, buffer: &wgpu::Buffer) {
+        self.exposure = buffer.clone();
+    }
+
+    /// This frame's camera, for the fire's cards: its exposure if set by hand, its near plane.
+    pub fn set_fire_view(&mut self, fire: FireView) {
+        self.fire = fire;
     }
     fn ensure_view(&mut self, device: &wgpu::Device, index: usize, size: [u32; 2]) {
         while self.views.len() <= index {
@@ -237,6 +327,12 @@ impl ParticlePass {
                 _pad1: 0.0,
                 camera_pos: view.inverse().w_axis.truncate().to_array(),
                 _pad2: 0.0,
+                fire: [
+                    self.fire.manual_ev.unwrap_or(-1000.0),
+                    self.fire.near,
+                    self.fire.eye_ev,
+                    self.fire.soft_m,
+                ],
             }),
         );
         let mut sorted: Vec<_> = particles
@@ -249,10 +345,18 @@ impl ParticlePass {
             })
             .take(MAX_PARTICLES)
             .collect();
-        sorted.sort_by(|a, b| {
-            view.transform_point3(glam::Vec3::from(a.position))
-                .z
-                .total_cmp(&view.transform_point3(glam::Vec3::from(b.position)).z)
+        // Back to front; a bed of coals as if a metre farther, so it is drawn before the flames standing on it.
+        let key = |p: &GpuParticle| {
+            view.transform_point3(glam::Vec3::from(p.position)).z - if p.flags & (1 << 6) != 0 { 1.0 } else { 0.0 }
+        };
+        sorted.sort_by(|a, b| key(a).total_cmp(&key(b)));
+        let frame_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Particle frame inputs"),
+            layout: &self.frame_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(depth) },
+                wgpu::BindGroupEntry { binding: 1, resource: self.exposure.as_entire_binding() },
+            ],
         });
         if !sorted.is_empty() {
             queue.write_buffer(&buffers.instances, 0, bytemuck::cast_slice(&sorted));
@@ -291,6 +395,7 @@ impl ParticlePass {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &buffers.group, &[]);
         pass.set_bind_group(1, global, &[]);
+        pass.set_bind_group(2, &frame_group, &[]);
         pass.draw(0..6, 0..sorted.len() as u32);
     }
 }

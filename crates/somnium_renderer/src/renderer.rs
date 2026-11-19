@@ -1395,8 +1395,9 @@ impl SomniumRenderer {
             &global_pool.view_proj_buffer,
         );
 
-        // Phase 11.5J: GPU billboard particle pass.
-        let particle_pass = ParticlePass::new(&ctx.device, &shaders, &global_pool.layout);
+        // Phase 11.5J: GPU billboard particle pass. A fire's cards read the auto exposure's EV (Sunscar, 19 Nov 2026).
+        let mut particle_pass = ParticlePass::new(&ctx.device, &shaders, &global_pool.layout);
+        particle_pass.set_exposure_buffer(auto_exposure_pass.exposure_buffer());
 
         // Phase 11.5I: Selection outline (stencil-based, renders to swapchain).
         let outline_pass = OutlinePass::new(
@@ -7513,6 +7514,11 @@ impl SomniumRenderer {
         // Sprite particles render after TAA and mark FSR reactivity, inside HDR
         // exposure/bloom. Each view has independent upload buffers.
         self.profiler.begin(&mut encoder, "Particles");
+        self.particle_pass.set_fire_view(crate::pass::particle::FireView {
+            manual_ev: (!self.auto_exposure).then(|| (1.0 / (1.2 * self.exposure.max(1.0e-12))).log2()),
+            near: crate::view::near_plane(self.proj_matrix),
+            ..Default::default()
+        });
         self.particle_pass.record(
             &ctx.device,
             &ctx.queue,

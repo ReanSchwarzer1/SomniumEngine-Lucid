@@ -2625,7 +2625,7 @@ mod propagate_tests {
 }
 
 mod particle;
-pub use particle::{ParticleEmitter, ParticleState, simulate_particles};
+pub use particle::{CoalBed, FlameCard, Glow, ParticleEmitter, ParticleState, simulate_particles};
 
 // ── Water Component ─────────────────────────────────────────────────────────
 

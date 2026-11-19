@@ -92,7 +92,8 @@ fn visible_sprite_coverage_respects_alpha_depth_empty_frames_and_viewports() {
         &device,
         size,
         wgpu::TextureFormat::Depth32Float,
-        wgpu::TextureUsages::RENDER_ATTACHMENT,
+        // The pass reads the depth it tests against (a fire's soft edges): as the renderer's own depth does.
+        wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
     );
     let hdr_view = hdr.create_view(&Default::default());
     let depth_view = depth.create_view(&Default::default());
@@ -108,6 +109,7 @@ fn visible_sprite_coverage_respects_alpha_depth_empty_frames_and_viewports() {
         texture_index: 0,
         flags: 0,
         flutter: 0.0,
+        extra: [0.0; 4],
     };
     // Scene depth is reversed-Z (renderer.rs `set_view`): the sprite at 0.5 is in front of 0.25 and behind 0.75.
     let mut frame = |slot, depth_value, particles: &[GpuParticle]| {

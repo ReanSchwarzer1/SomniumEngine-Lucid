@@ -124,11 +124,66 @@ pub struct ParticleEmitter {
     /// overhead, so precipitation exists where the player is and nowhere else.
     pub spawn_extents: [f32; 3],
 
+    /// A flame's card: one persistent instance from a simulated flipbook in place of spawned particles (Sunscar's
+    /// fire, 19 Nov 2026; `texture` is the book's atlas). Never saved: the shell makes it.
+    pub card: Option<FlameCard>,
+    /// A bed of coals lying flat under an open fire, drawn by the coal shader in place of particles.
+    pub coals: Option<CoalBed>,
+    /// A fire's light on lit particles near it: smoke over a fire glows from below.
+    pub glow: Option<Glow>,
+    /// Seconds of a camera's shutter: above zero each particle is drawn as the streak it makes in that time (sparks).
+    pub stretch: f32,
+
     // ── Runtime state (not user-facing) ──────────────────────────────────────
     /// Live particles owned by this emitter.
     pub particles: Vec<ParticleState>,
     /// Fractional carry-over for sub-frame spawning.
     pub spawn_accum: f32,
+}
+
+/// One flame drawn from its kind's simulated flipbook (`somnium_core::fire::FlameBook`): a card standing on the
+/// emitter's point, its bed there, turning to face the eye and leaning toward it as the eye rises over the fire.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FlameCard {
+    /// Width and height, metres.
+    pub size: [f32; 2],
+    /// Where the bed sits on the card, down from its top (0..1): the emitter's point is there.
+    pub bed_v: f32,
+    /// Luminance where the book's R is 1, cd/m2.
+    pub peak_cd_m2: f32,
+    pub frames: u32,
+    pub columns: u32,
+    pub rows: u32,
+    /// The first row of the 40-degree view (0: level only).
+    pub down_row0: u32,
+    pub fps: f32,
+    /// Seconds into the book; the simulation advances it, so it pauses with the scene.
+    pub clock: f32,
+    /// A candle's or a lantern's book: its B channel is a blue foot, not motion.
+    pub small: bool,
+    /// Metres the card's top leans at its full height (the wind), x and z.
+    pub lean: [f32; 2],
+    /// 0..1: lit and put out with its lamp.
+    pub fade: f32,
+}
+
+/// A bed of embers: lumps with a dark crust and cracks glowing at `hot_k`, each breathing slowly.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoalBed {
+    /// Across, metres.
+    pub diameter: f32,
+    /// The hottest cracks' temperature, kelvin (a brazier's 1,150 K, a forge's under the blast 1,400 K).
+    pub hot_k: f32,
+    pub seed: f32,
+    pub clock: f32,
+    pub fade: f32,
+}
+
+/// A light that lights particles near it, as a point: where it is and its luminous intensity (candela, linear RGB).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Glow {
+    pub at: [f32; 3],
+    pub candela: [f32; 3],
 }
 
 #[cfg(test)]
@@ -304,6 +359,78 @@ mod tests {
         assert_eq!(simulate_particles(&mut world, 0.04, 4)[0].flutter, 0.0);
     }
     #[test]
+    fn a_flame_card_is_one_instance_on_its_clock_and_a_bed_lies_flat() {
+        let mut world = World::new();
+        let card = FlameCard {
+            size: [0.6, 0.9],
+            bed_v: 0.85,
+            peak_cd_m2: 1100.0,
+            frames: 96,
+            columns: 12,
+            rows: 8,
+            down_row0: 8,
+            fps: 30.0,
+            clock: 0.0,
+            small: false,
+            lean: [0.1, 0.0],
+            fade: 1.0,
+        };
+        let e = world.spawn((
+            Transform::from_translation(glam::Vec3::new(1.0, 0.9, 2.0)),
+            ParticleEmitter { card: Some(card), texture_slot: 3, ..Default::default() },
+        ));
+        world.spawn((ParticleEmitter {
+            coals: Some(CoalBed { diameter: 0.32, hot_k: 1150.0, seed: 0.3, clock: 0.0, fade: 1.0 }),
+            ..Default::default()
+        },));
+        let out = simulate_particles(&mut world, 0.05, 1);
+        assert_eq!(out.len(), 2, "one card, one bed, nothing spawned");
+        let c = out.iter().find(|p| p.flags & (1 << 5) != 0).expect("the card");
+        assert_eq!(c.position, [1.0, 0.9, 2.0]);
+        assert_eq!((c.uv_rect[0], c.uv_rect[2], c.uv_rect[3]), (1.0, 12.0, 8.0), "frame 1 at 1.5 frames in");
+        assert!((c.uv_rect[1] - 0.5).abs() < 1e-4);
+        assert_eq!(c.tip_tint, [0.85, 96.0, 8.0]);
+        assert!((c.aspect - 1.5).abs() < 1e-4);
+        assert!(out.iter().any(|p| p.flags == 1 << 6 && p.size == 0.32));
+        assert!(world.get::<ParticleEmitter>(e).unwrap().particles.is_empty());
+        // Out with its lamp: nothing drawn, but its clock still runs.
+        world.get_mut::<ParticleEmitter>(e).unwrap().card.as_mut().unwrap().fade = 0.0;
+        assert_eq!(simulate_particles(&mut world, 0.05, 2).len(), 1);
+        assert!((world.get::<ParticleEmitter>(e).unwrap().card.unwrap().clock - 0.1).abs() < 1e-5);
+    }
+
+    #[test]
+    fn sparks_carry_their_velocity_and_smoke_the_light_of_its_fire() {
+        let mut world = World::new();
+        world.spawn((ParticleEmitter {
+            enabled: false,
+            burst: 1,
+            gravity: 0.0,
+            initial_speed: 0.0,
+            velocity_bias: [0.0, 2.0, 0.0],
+            stretch: 1.0 / 60.0,
+            ..Default::default()
+        },));
+        world.spawn((
+            Transform::from_translation(glam::Vec3::new(0.0, 1.0, 0.0)),
+            ParticleEmitter {
+                enabled: false,
+                burst: 1,
+                gravity: 0.0,
+                initial_speed: 0.0,
+                lit: true,
+                glow: Some(Glow { at: [0.0, 0.0, 0.0], candela: [30.0, 15.0, 5.0] }),
+                ..Default::default()
+            },
+        ));
+        let out = simulate_particles(&mut world, 0.01, 1);
+        let spark = out.iter().find(|p| p.flags & (1 << 7) != 0).expect("a spark");
+        assert_eq!(spark.extra, [0.0, 2.0, 0.0, 1.0 / 60.0]);
+        let smoke = out.iter().find(|p| p.flags & (1 << 8) != 0).expect("lit smoke");
+        assert!((smoke.extra[0] - 30.0).abs() < 1e-3 && (smoke.extra[3] - 1.0).abs() < 1e-6, "1 m from its fire: {:?}", smoke.extra);
+    }
+
+    #[test]
     fn flipbook_uv_tracks_lifetime_without_leaving_the_sheet() {
         let mut world = World::new();
         let entity = world.spawn((ParticleEmitter {
@@ -326,7 +453,7 @@ mod tests {
             });
         let p = simulate_particles(&mut world, 0.0, 0)[0];
         assert_eq!(p.uv_rect, [0.0, 0.5, 0.25, 0.5]);
-        assert_eq!(std::mem::size_of_val(&p), 80);
+        assert_eq!(std::mem::size_of_val(&p), 96);
     }
 }
 
@@ -368,6 +495,10 @@ impl Default for ParticleEmitter {
             velocity_bias: [0.0; 3],
             spawn_extents: [0.0; 3],
             gravity: 1.0,
+            card: None,
+            coals: None,
+            glow: None,
+            stretch: 0.0,
             particles: Vec::new(),
             spawn_accum: 0.0,
         }
@@ -420,6 +551,50 @@ pub(crate) fn simulate_particles_reflected(
         let Some(emitter) = world.get_mut::<ParticleEmitter>(entity) else {
             continue;
         };
+
+        // A flame's card or a bed of coals: one instance where the emitter stands, its clock run by the simulation.
+        if let Some(card) = emitter.card.as_mut() {
+            card.clock += dt;
+            let card = *card;
+            if card.fade > 0.0 && emitter.texture_slot >= 0 && card.frames > 0 {
+                let f = (card.clock * card.fps).max(0.0);
+                let frame = (f.floor() as u64 % u64::from(card.frames)) as f32;
+                gpu_particles.push(GpuParticle {
+                    position: origin.to_array(),
+                    size: card.size[0],
+                    color: [card.peak_cd_m2, card.fade, card.lean[0], card.lean[1]],
+                    tip_tint: [card.bed_v, card.frames as f32, card.down_row0 as f32],
+                    aspect: (card.size[1] / card.size[0].max(1e-4)).clamp(0.01, 100.0),
+                    uv_rect: [frame, f.fract(), card.columns.max(1) as f32, card.rows.max(1) as f32],
+                    rotation: 0.0,
+                    texture_index: emitter.texture_slot,
+                    flags: 2 | (1 << 5) | (u32::from(card.small) << 9),
+                    flutter: 0.0,
+                    extra: [0.0; 4],
+                });
+            }
+            continue;
+        }
+        if let Some(bed) = emitter.coals.as_mut() {
+            bed.clock += dt;
+            let bed = *bed;
+            if bed.fade > 0.0 {
+                gpu_particles.push(GpuParticle {
+                    position: origin.to_array(),
+                    size: bed.diameter,
+                    color: [bed.hot_k, bed.fade, bed.seed, bed.clock],
+                    tip_tint: [0.0; 3],
+                    aspect: 1.0,
+                    uv_rect: [0.0; 4],
+                    rotation: 0.0,
+                    texture_index: -1,
+                    flags: 1 << 6,
+                    flutter: 0.0,
+                    extra: [0.0; 4],
+                });
+            }
+            continue;
+        }
 
         // ── 1. Advance existing particles ─────────────────────────────────────
         let gravity = emitter.gravity;
@@ -542,7 +717,9 @@ pub(crate) fn simulate_particles_reflected(
                 flags: u32::from(emitter.additive)
                     | (u32::from(emitter.world_up) << 1)
                     | (u32::from(emitter.lit) << 3)
-                    | (u32::from(emitter.flame) << 4),
+                    | (u32::from(emitter.flame) << 4)
+                    | (u32::from(emitter.stretch > 0.0) << 7)
+                    | (u32::from(emitter.lit && emitter.glow.is_some()) << 8),
                 flutter: emitter.flutter.clamp(0.0, 0.4)
                     * ((p.age * emitter.flutter_hz.clamp(0.0, 30.0) * std::f32::consts::TAU
                         + p.rotation_seed * 3.0)
@@ -552,6 +729,18 @@ pub(crate) fn simulate_particles_reflected(
                                 + p.rotation_seed * 7.0)
                                 .sin())
                     / 1.35,
+                // A spark: its velocity and the shutter it streaks over. Lit smoke near a fire: the illuminance the
+                // fire puts on it, lux, its distance kept over 0.2 m (a puff is no point).
+                extra: if emitter.stretch > 0.0 {
+                    let v = p.velocity;
+                    [v.x, v.y, v.z, emitter.stretch.min(0.1)]
+                } else if let (true, Some(glow)) = (emitter.lit, emitter.glow) {
+                    let at = p.position + if emitter.local_space { origin } else { glam::Vec3::ZERO };
+                    let d2 = at.distance_squared(glam::Vec3::from(glow.at)).max(0.04);
+                    [glow.candela[0] / d2, glow.candela[1] / d2, glow.candela[2] / d2, 1.0]
+                } else {
+                    [0.0; 4]
+                },
             });
             if emitter.staged_reflection
                 && let Some(matrix) = reflection
