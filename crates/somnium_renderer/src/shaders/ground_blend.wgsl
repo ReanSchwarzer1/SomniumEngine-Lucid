@@ -31,6 +31,15 @@ var<private> ground_blend_open: f32 = 0.0;
 /// mirror where the band shades as ground, so the band takes the sky's reflection along its own normal instead.
 var<private> ground_blend_w: f32 = 0.0;
 
+/// Whether the band's ground point shows on screen (1) or is hidden or off it (0), with its pixel, its distance
+/// from the eye and the screen occlusion there. Seen, the band gathers the light that pixel gathered (shading.wgsl)
+/// under that pixel's screen occlusion, so it is lit as the ground beside the foot is, in every weather and hour.
+/// Unseen, it keeps the face's own light, opened by `ground_blend.params.w`.
+var<private> ground_blend_seen: f32 = 0.0;
+var<private> ground_blend_pixel: vec2<f32> = vec2<f32>(0.0);
+var<private> ground_blend_dist: f32 = 0.0;
+var<private> ground_blend_contact: f32 = 1.0;
+
 /// The list entry whose rectangle holds `xz`, or -1.
 fn ground_terrain_at(xz: vec2<f32>) -> i32 {
     let count = min(u32(ground_blend.params.x), 32u);
@@ -159,10 +168,36 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     let baked = mix(1.0, sky_vis, w);
     s.occlusion = s.occlusion * baked;
     baked_sky_vis = baked;
-    let open = w * ground_blend.params.w;
-    ground_blend_open = open;
     ground_blend_w = w;
-    let screen = mix(screen_occlusion, 1.0, open);
+    var open = w * ground_blend.params.w;
+    var screen = mix(screen_occlusion, 1.0, open);
+    // The ground the band stands for, where it shows on screen: the unfolded point, but at least 8 cm and two pixels
+    // out from the foot, so the band's lowest rows read the ground in front of them and not themselves. It counts as
+    // seen when the surface at its pixel lies within 10 cm and 2% of its distance (the ground, or a blade or pebble
+    // on it); a heap or a post in front of it does not.
+    let probe_xz = world.xz + k * max(above, 0.08 + 2.0 * length(dwx));
+    let probe = vec3<f32>(probe_xz.x, ground_y + dot(slope, probe_xz - world.xz), probe_xz.y) - view.camera_pos;
+    let clip = view.view_proj * vec4<f32>(probe, 0.0) + view.view_proj * vec4<f32>(view.camera_pos, 1.0);
+    if clip.w > 0.0 {
+        let ndc = clip.xyz / clip.w;
+        let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+        if all(uv >= vec2<f32>(0.0)) && all(uv < vec2<f32>(1.0)) {
+            let dims = vec2<f32>(textureDimensions(scene_depth));
+            let texel = vec2<i32>(uv * dims);
+            let scene_z = textureLoad(scene_depth, texel, 0);
+            let there = view.inv_view_proj_rel * vec4<f32>(ndc.xy, scene_z, 1.0);
+            let reach_m = length(probe);
+            if scene_z > 0.0 && distance(there.xyz / there.w, probe) < 0.10 + 0.02 * reach_m {
+                ground_blend_seen = 1.0;
+                ground_blend_pixel = uv * dims;
+                ground_blend_dist = reach_m;
+                ground_blend_contact = textureLoad(gtao_tex, texel, 0).a;
+                screen = mix(screen_occlusion, ground_blend_contact, w);
+                open = 0.0;
+            }
+        }
+    }
+    ground_blend_open = open;
     s.occlusion = s.occlusion / max(screen_occlusion, 0.004) * screen;
     screen_occlusion = screen;
     return s;

@@ -3729,8 +3729,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // held under it the crowns went black. A leaf here is any two-sided cut-out. The foliage flag will not do:
         // it marks a sidecar mask, and a grown tree's leaves are cut out by their glTF's own alpha mode.
         let thin_leaf = (material.flags & 1u) != 0u && material.alpha_cutoff > 0.0;
-        let gi_texel = gi_upsample(in.clip_pos.xy, length(hit_point - view.camera_pos),
+        var gi_texel = gi_upsample(in.clip_pos.xy, length(hit_point - view.camera_pos),
             select(screen_occlusion, 1.0, thin_leaf), select(0.0, material.transmission, thin_leaf));
+        // A blended band gathers what its ground point's own pixel gathered (ground_blend.wgsl): the face's rays saw
+        // the sky and the bounce of a wall, not of the ground at its foot.
+        if ground_blend_seen > 0.0 {
+            let g = gi_upsample(ground_blend_pixel, ground_blend_dist, ground_blend_contact, 0.0);
+            gi_texel = TracedLight(mix(gi_texel.bounce, g.bounce, ground_blend_w), mix(gi_texel.sky, g.sky, ground_blend_w),
+                mix(gi_texel.trust, g.trust, ground_blend_w), mix(gi_texel.contact, g.contact, ground_blend_w),
+                gi_texel.through);
+        }
         var ambient = evaluate_ibl(surface, gi_texel);
         if (material.flags & 8u) != 0u {
             ambient += eye_glint(surface, ambient);
