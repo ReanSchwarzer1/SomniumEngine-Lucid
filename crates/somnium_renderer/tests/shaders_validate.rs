@@ -111,6 +111,10 @@ fn every_composed_root_validates() {
         "scene_capture.wgsl",
         // The editor's preview studio (a material's turning sphere, an asset's thumbnail).
         "preview_studio.wgsl",
+        // 19 Nov 2026: GPU grass, laid out (compute) and drawn into the visibility buffer; the bare-share census.
+        "grass_gen.wgsl",
+        "grass_vis.wgsl",
+        "cover_census.wgsl",
     ] {
         check(root, &shaders.source_or_panic(root));
     }
