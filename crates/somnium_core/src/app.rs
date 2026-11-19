@@ -9726,12 +9726,14 @@ impl<G: GameApp> Engine<G> {
                 let replaced: Vec<String> =
                     self.renderer.as_ref().map(|r| r.grass_replaces().to_vec()).unwrap_or_default();
                 for (&kind, entry) in self.project_foliage.iter().filter(|(_, e)| e.ground_cover.is_some()) {
+                    // Only where blades grow: a sward kind on a slot no habitat claims (a wood floor) stays.
                     if !replaced.is_empty()
                         && entry
                             .source
                             .file_stem()
                             .and_then(|s| s.to_str())
                             .is_some_and(|stem| replaced.iter().any(|p| stem.starts_with(p.as_str())))
+                        && self.renderer.as_ref().is_some_and(|r| r.grass_grows_on(&layer_set, entry.brush.layer))
                     {
                         continue;
                     }

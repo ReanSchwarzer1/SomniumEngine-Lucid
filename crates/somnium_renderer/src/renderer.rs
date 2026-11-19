@@ -4412,6 +4412,11 @@ impl SomniumRenderer {
         }
     }
 
+    /// Whether GPU grass grows on splat slot `layer` of layer set `set`.
+    pub fn grass_grows_on(&self, set: &str, layer: u8) -> bool {
+        self.grass.as_ref().is_some_and(|grass| grass.grows_on(set, layer))
+    }
+
     /// Which habitat set terrain `terrain_id` grows: its ground layer set ("" the project's own).
     pub fn grass_terrain_set(&mut self, terrain_id: u32, set: &str, tile: Option<&str>) {
         if let Some(grass) = self.grass.as_mut() {

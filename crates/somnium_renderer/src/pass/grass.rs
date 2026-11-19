@@ -649,6 +649,12 @@ impl GrassPass {
         (&self.terrains, &self.habitat_map, SLOTS as u32)
     }
 
+    /// Whether blades grow on splat slot `layer` of layer set `set` (a habitat claims it): only there may the kinds
+    /// they replace leave.
+    pub fn grows_on(&self, set: &str, layer: u8) -> bool {
+        self.table.sets.get(set).is_some_and(|m| m.get(usize::from(layer)).is_some_and(|e| e.0 != NO_HABITAT))
+    }
+
     /// Whether blades are laid out this frame (on, and not held off by the A/B).
     pub fn drawing(&self) -> bool {
         self.drawing
