@@ -122,7 +122,11 @@ fn grass_strip_vertex(g: GrassBlade, j: u32, clock: f32, wind: vec4<f32>, eye: v
     var u = 0.5;
     if !at_tip {
         let s = select(-1.0, 1.0, (j & 1u) == 1u);
-        p += side * (s * 0.5 * g.width * (1.0 - t * t));
+        // The same area whatever the segments: 3 cover 0.646 of width x height, 2 cover 0.624, 1 (a triangle) 0.5, so
+        // without this the sward thinned by a fifth where blades turn to one triangle at 24 m (the lead, 21:42: a
+        // darker band near 20 m).
+        let area = select(select(1.0, 1.035, g.segments == 2u), 1.29, g.segments == 1u);
+        p += side * (s * 0.5 * g.width * area * (1.0 - t * t));
         n = normalize(n + side * (0.45 * s));
         u = 0.5 + 0.5 * s;
     }
