@@ -131,10 +131,11 @@ struct FrameViewState {
 const GROUND_BLEND_OPEN: f32 = 0.25;
 
 /// The band's top line (`ground_blend.wgsl` `GroundBlendList::edge`), each as a share of the band's reach: how much
-/// of it the fade takes, how far the noise moves the line (1 is half the reach either way), and how much higher the
-/// soil lies in the mesh's own joints. Soil is opaque, so the fade is short; a proof tries others by pair of captures
-/// (SOMNIUM_GROUND_BLEND_EDGES, _RAGGED, _JOINTS, as SOMNIUM_GROUND_BLEND_OPENS).
-const GROUND_BLEND_EDGE: [f32; 3] = [0.12, 1.0, 0.3];
+/// of it the fade takes, how far the noise moves the line (1 is half the reach either way), how much higher the soil
+/// lies in the mesh's own joints, and how much of the reach an upright face takes (soil does not climb a wall: a
+/// third of a wall's 0.3 m is a hand high). Soil is opaque, so the fade is short; a proof tries others by pair of
+/// captures (SOMNIUM_GROUND_BLEND_EDGES, _RAGGED, _JOINTS, _UPRIGHT, as SOMNIUM_GROUND_BLEND_OPENS).
+const GROUND_BLEND_EDGE: [f32; 4] = [0.12, 1.0, 0.3, 0.33];
 
 /// `SOMNIUM_SHADING_DEBUG_CYCLE=0,2,3`: the shading debug view for this pair of captures (proof stills, as
 /// SOMNIUM_GROUND_BLEND_OPENS), the list wrapping round; `None` when it is unset.
@@ -5880,7 +5881,11 @@ impl SomniumRenderer {
         static GROUND_SCALE: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
             std::env::var("SOMNIUM_GROUND_BLEND_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(1.0f32).max(0.0)
         });
-        ground[2] = *GROUND_SCALE;
+        // SOMNIUM_GROUND_BLEND_SCALES=0,1,1 (proofs): the same by pair of captures, so one launch shows a view with the
+        // blend off beside its variants (0 is off); the list wraps round.
+        static SCALES: std::sync::LazyLock<Vec<f32>> =
+            std::sync::LazyLock::new(|| env_floats("SOMNIUM_GROUND_BLEND_SCALES").unwrap_or_else(|| vec![1.0]));
+        ground[2] = *GROUND_SCALE * SCALES[crate::capture::captures_written() / 2 % SCALES.len()].max(0.0);
         // Proof schedules by pair of captures (SOMNIUM_SURFACES_AB=captures shoots each view off, then on): pair k takes
         // the k-th of SOMNIUM_GROUND_BLEND_OPENS (how far the band's occlusion and traced sky open toward the ground's)
         // and of SOMNIUM_SHADING_DEBUG_CYCLE (a debug view), each list wrapping round.
@@ -5889,9 +5894,14 @@ impl SomniumRenderer {
         });
         let pair = crate::capture::captures_written() / 2;
         ground[3] = OPENS[pair % OPENS.len()];
-        static EDGES: std::sync::LazyLock<[Vec<f32>; 3]> = std::sync::LazyLock::new(|| {
+        static EDGES: std::sync::LazyLock<[Vec<f32>; 4]> = std::sync::LazyLock::new(|| {
             let list = |name: &str, i: usize| env_floats(name).unwrap_or_else(|| vec![GROUND_BLEND_EDGE[i]]);
-            [list("SOMNIUM_GROUND_BLEND_EDGES", 0), list("SOMNIUM_GROUND_BLEND_RAGGED", 1), list("SOMNIUM_GROUND_BLEND_JOINTS", 2)]
+            [
+                list("SOMNIUM_GROUND_BLEND_EDGES", 0),
+                list("SOMNIUM_GROUND_BLEND_RAGGED", 1),
+                list("SOMNIUM_GROUND_BLEND_JOINTS", 2),
+                list("SOMNIUM_GROUND_BLEND_UPRIGHT", 3),
+            ]
         });
         for (i, values) in EDGES.iter().enumerate() {
             ground[4 + i] = values[pair % values.len()];

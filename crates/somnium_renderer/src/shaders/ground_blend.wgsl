@@ -17,7 +17,8 @@ struct GroundTerrain {
 }
 struct GroundBlendList {
     params: vec4<f32>,  // live terrains in the list, the scene's blend height m, every height's scale, open
-    edge: vec4<f32>,    // the band's top line: its fade and its noise as shares of the reach, the joints' gain, unused
+    edge: vec4<f32>,    // the band's top line: its fade and its noise as shares of the reach, the joints' gain, and
+                        // the share of the reach an upright face takes
     terrains: array<GroundTerrain, 32>,
 }
 @group(1) @binding(36) var<storage, read> ground_blend: GroundBlendList;
@@ -75,16 +76,18 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     let uv = (world.xz - t.rect.xy) * t.rect.zw;
     let ground_y = ground_height(t, uv);
     let above = world.y - ground_y;
-    let reach = blend_m * (1.0 - 0.4 * saturate(geo_n.y));
+    // The most the band can reach here: on a face that slopes into the ground, less on faces turned up, which would
+    // otherwise read as buried. An upright face takes a share of it (below, once the ground's normal is known).
+    let reach_most = blend_m * (1.0 - 0.4 * saturate(geo_n.y));
     // Most of a mesh stands far above its band: out before the slope's four reads and the noise. The band's top lies
     // under 2.35 reach measured across the ground (ragged line, crevices and joints at their most), which is under
     // 4.7 reach straight up on ground as steep as 60 degrees.
-    if above > reach * 4.7 {
+    if above > reach_most * 4.7 {
         return s;
     }
     // A face standing more than its reach under the ground is in front of a cut, not standing in soil: a retaining
     // wall at a scarp's toe, where the 2 m cells rise across its face. Below 0 the band would otherwise be whole.
-    if above < -reach {
+    if above < -reach_most {
         return s;
     }
     // The ground's slope and normal, by central differences one vertex apart.
@@ -94,6 +97,16 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     let hz = ground_height(t, uv + vec2<f32>(0.0, step.y)) - ground_height(t, uv - vec2<f32>(0.0, step.y));
     let slope = vec2<f32>(hx / (2.0 * span.x), hz / (2.0 * span.y));
     let ground_n = normalize(vec3<f32>(-slope.x, 1.0, -slope.y));
+    // Loose soil rests only on faces no steeper than its angle of repose, about 35-40 degrees. On a face that slopes
+    // into the ground more gently than that (a heap's stones, a boulder's flank, rubble, a cliff's foot banked with
+    // scree) it lies on the face itself, and the band takes the whole reach. Against a face steeper than about 70
+    // degrees (a wall, a post, a trunk) it only gathers in a low fillet at the foot, a hand high, and the face stays
+    // itself down to a ragged line (the lead, 19 Nov 21:24: "Soil does not climb a wall"). `edge.w` is that share.
+    let along = dot(geo_n, ground_n);
+    let reach = reach_most * mix(ground_blend.edge.w, 1.0, smoothstep(0.34, 0.77, along));
+    if above > reach * 4.7 {
+        return s;
+    }
     // How high the pixel stands, measured across the ground rather than straight up (on a slope the vertical overstates
     // it), against the reach: lower on faces turned up, which would otherwise read as buried, and the line rises in the
     // mesh's own crevices (its material occlusion), where soil collects first. The edge is ragged: two octaves of noise
@@ -102,7 +115,6 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     // The noise runs over the unfolded point (below), which moves along the face and out with the height, so the
     // line wanders up and down as well as along; its cells are 1.5 and 0.45 of the reach (0.45 and 0.13 m on a
     // 0.3 m wall, as before).
-    let along = dot(geo_n, ground_n);
     let n_t = geo_n - ground_n * along;
     let k3 = n_t * (1.0 + along) / max(dot(n_t, n_t), 0.06);
     let k = k3.xz * ground_n.y;
@@ -123,7 +135,7 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     var w = 1.0 - smoothstep(0.8 - half_fade, 0.8 + half_fade, line);
     // A face lying along the ground (a floor, paving, a road) is ground already: only faces meeting it at an angle
     // (a boulder's flank, a wall foot, a heap's sides) take the ground's surface.
-    w *= 1.0 - smoothstep(0.9, 0.985, dot(geo_n, ground_n));
+    w *= 1.0 - smoothstep(0.9, 0.985, along);
     // Nothing stands on a cliff: on ground steeper than 45 degrees the band fades, and past 60 it is gone. Measured
     // across the ground, a shell cladding a canyon wall stood within its reach of the wall everywhere and wore a pale
     // fringe of the wall's own surface round every edge (gx4, the Vela's floor, 12 Nov).

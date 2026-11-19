@@ -9003,10 +9003,14 @@ impl<G: GameApp> Engine<G> {
             })
             .map(|mut pp| {
                 pp.aa = crate::AntiAliasing::env_override().unwrap_or(pp.aa);
-                // `SOMNIUM_PATH_TRACER=1` (or 0) overrides the scene's own choice too, for timing runs.
+                // `SOMNIUM_PATH_TRACER=1` (or 0) overrides the scene's own choice too, for timing runs. `=captures`
+                // (proof stills, sunscar-photoreal 19 Nov): the raster until the run's first capture is written, then
+                // the path tracer, the raster, ... by each one written, so a walk naming every view twice shoots the
+                // raster and the path tracer at one eye in one launch, as SOMNIUM_GROUND_BLEND_AB=captures does.
                 match std::env::var("SOMNIUM_PATH_TRACER").as_deref() {
                     Ok("1") => pp.path_tracer = true,
                     Ok("0") => pp.path_tracer = false,
+                    Ok("captures") => pp.path_tracer = somnium_renderer::capture::captures_written() % 2 == 1,
                     _ => {}
                 }
                 pp
