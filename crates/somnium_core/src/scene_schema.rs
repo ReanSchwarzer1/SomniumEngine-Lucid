@@ -612,13 +612,22 @@ pub fn scene_from_json(
                 .ok_or_else(|| SceneError::Malformed("entity without a persistent id".into()))
         })
         .collect::<Result<_, _>>()?;
-    let unique: std::collections::BTreeSet<_> = ids.iter().copied().collect();
-    for id in &ids {
-        if id.is_none() || existing.contains_key(id) || unique.len() != ids.len() {
-            return Err(SceneError::Malformed(format!(
-                "duplicate persistent id {id}"
-            )));
-        }
+    // The id that is actually repeated (or already in the world), and how many are. This named the file's first
+    // entity whenever any id anywhere was repeated: every Sunscar scene starts with its Environment, so a city scene
+    // whose street dressing repeated 18 ids was refused as "duplicate persistent id <the Environment's>" (13 Nov 2026),
+    // and the weather overlay was blamed for it.
+    let mut seen = std::collections::BTreeSet::new();
+    let repeated: Vec<PersistentId> = ids.iter().copied().filter(|id| !seen.insert(*id)).collect();
+    if let Some(id) = ids.iter().find(|id| id.is_none() || existing.contains_key(*id)).or(repeated.first()) {
+        let name = entities_json
+            .iter()
+            .find(|entry| entry.get("persistent_id").and_then(serde_json::Value::as_str).and_then(PersistentId::parse_hex) == Some(*id))
+            .and_then(|entry| entry.pointer("/components/somnium.Name/fields/value").and_then(serde_json::Value::as_str))
+            .unwrap_or("unnamed");
+        return Err(SceneError::Malformed(format!(
+            "duplicate persistent id {id} (\"{name}\"; {} ids repeated in this scene)",
+            repeated.len()
+        )));
     }
     let mut by_id: BTreeMap<PersistentId, Entity> = BTreeMap::new();
     for id in ids {
@@ -1110,6 +1119,25 @@ mod tests {
             .entities()
             .find(|&e| world.get::<Name>(e).is_some_and(|n| n.as_str() == name))
             .unwrap_or_else(|| panic!("no entity named {name}"))
+    }
+
+    /// A scene whose third entity repeats its second's id is refused naming that entity, not the scene's first (an
+    /// Environment, in every Sunscar scene: 13 Nov 2026).
+    #[test]
+    fn a_repeated_id_is_named_by_the_entity_that_repeats_it() {
+        let registry = component_registry();
+        let entity = |id: &str, name: &str| {
+            serde_json::json!({"persistent_id": id, "components": {"somnium.Name": {"version": 1, "fields": {"value": name}}}, "prefab": null, "scripts": []})
+        };
+        let document = serde_json::json!({"version": SCENE_VERSION, "entities": [
+            entity("3b80145092e6d00c2733d4ca025036a7", "Environment"),
+            entity("00000000000000000000000000000abc", "barrel_07"),
+            entity("00000000000000000000000000000abc", "barrel_07 copy"),
+        ]});
+        let error = scene_from_json(&mut World::new(), &registry, &document).unwrap_err().to_string();
+        assert!(error.contains("00000000000000000000000000000abc") && error.contains("barrel_07"), "{error}");
+        assert!(!error.contains("3b80145092e6d00c2733d4ca025036a7"), "{error}");
+        assert!(error.contains("1 ids repeated"), "{error}");
     }
 
     #[test]
