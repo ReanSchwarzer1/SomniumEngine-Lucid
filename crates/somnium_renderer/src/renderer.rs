@@ -143,6 +143,11 @@ const GROUND_BLEND_EDGE: [f32; 4] = [0.12, 1.0, 0.3, 0.33];
 /// tries both by pair of captures (SOMNIUM_GROUND_BLEND_FOOTPRINTS=0,1).
 const GROUND_BLEND_FOOTPRINT: f32 = 1.0;
 
+/// How far along the face the band's ground is taken, in metres (`GroundBlendList::foot.y`), at the same distance out:
+/// folded straight out, the band was the mirror image of the strip of ground in front of the foot, each pebble twice
+/// at 2 m (20 Nov). A proof tries others by pair of captures (SOMNIUM_GROUND_BLEND_SIDES=0,0.6).
+const GROUND_BLEND_SIDE: f32 = 0.6;
+
 /// `SOMNIUM_SHADING_DEBUG_CYCLE=0,2,3`: the shading debug view for this pair of captures (proof stills, as
 /// SOMNIUM_GROUND_BLEND_OPENS), the list wrapping round; `None` when it is unset.
 fn debug_cycle_view() -> Option<f32> {
@@ -5916,6 +5921,9 @@ impl SomniumRenderer {
             env_floats("SOMNIUM_GROUND_BLEND_FOOTPRINTS").unwrap_or_else(|| vec![GROUND_BLEND_FOOTPRINT])
         });
         ground[8] = FOOTPRINTS[pair % FOOTPRINTS.len()];
+        static SIDES: std::sync::LazyLock<Vec<f32>> =
+            std::sync::LazyLock::new(|| env_floats("SOMNIUM_GROUND_BLEND_SIDES").unwrap_or_else(|| vec![GROUND_BLEND_SIDE]));
+        ground[9] = SIDES[pair % SIDES.len()];
         self.shading_pass.set_ground_blend(&ctx.queue, &ground);
 
         self.profiler.cpu_end();

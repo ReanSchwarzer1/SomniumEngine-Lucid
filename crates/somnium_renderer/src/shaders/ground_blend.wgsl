@@ -20,7 +20,7 @@ struct GroundBlendList {
     edge: vec4<f32>,    // the band's top line: its fade and its noise as shares of the reach, the joints' gain, and
                         // the share of the reach an upright face takes
     foot: vec4<f32>,    // x 1: the band's ground is filtered with the ground's own footprint there (0: the fold's);
-                        // y, z, w unused
+                        // y how far along the face its ground is taken (m); z, w unused
     terrains: array<GroundTerrain, 32>,
 }
 @group(1) @binding(36) var<storage, read> ground_blend: GroundBlendList;
@@ -229,11 +229,21 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     // chain rule, the ground's height moving with the slope.
     let fold_dx = dwx.xz + k * (dwx.y - dot(slope, dwx.xz));
     let fold_dy = dwy.xz + k * (dwy.y - dot(slope, dwy.xz));
+    // What the band is made of is taken `foot.y` metres along the face, at the same distance out from it. Folded
+    // straight out, the band was the mirror image of the strip of ground in front of the foot: at 2 m each pebble
+    // showed twice, once on the ground and once reflected up the wall (20 Nov, f1). Along the foot the ground is
+    // painted as it is at the foot (the terrain's own tint near the wall with it, which the band matched to 1%), so the
+    // band keeps the ground's hue at its foot line and its texture no longer repeats across the line. Its light stays
+    // the ground's straight out (the probe, above), and so does its footprint.
+    let side = vec2<f32>(-k.y, k.x);
+    let side_len = length(side);
+    let fold_tex = fold + side / max(side_len, 1.0e-4) * ground_blend.foot.y * saturate(side_len * 4.0);
     // The terrain's own surface there, by the path the terrain itself is shaded with.
     let tm_idx = u32(t.info.z);
     let tm = terrain_materials[tm_idx];
     let ground_pos = vec3<f32>(fold.x, ground_y + dot(slope, fold - world.xz), fold.y);
-    let terrain_xz = fold - tm.terrain_origin;
+    let tex_pos = vec3<f32>(fold_tex.x, ground_y + dot(slope, fold_tex - world.xz), fold_tex.y);
+    let terrain_xz = fold_tex - tm.terrain_origin;
     let splat_uv = terrain_xz * tm.inv_world_size;
     // Filtered as the ground itself is filtered there (`foot.x` 1): the ground's footprint where the camera's rays
     // through the fold point and its neighbours one pixel over meet the ground's plane. The fold's own footprint is the
@@ -258,9 +268,9 @@ fn apply_ground_blend(surface_in: Surface, world: vec3<f32>, geo_n: vec3<f32>, b
     }
     var ground: TerrainSurface;
     if !enable_live_terrain || (enable_clipmap && tm.clipmap_enabled != 0u) {
-        ground = evaluate_clipmap_material(tm, tm_idx, ground_pos, ground_n, splat_uv, ground_dx, ground_dy);
+        ground = evaluate_clipmap_material(tm, tm_idx, tex_pos, ground_n, splat_uv, ground_dx, ground_dy);
     } else {
-        ground = evaluate_terrain_material(tm_idx, ground_pos, terrain_xz, ground_n, splat_uv, ground_dx, ground_dy);
+        ground = evaluate_terrain_material(tm_idx, tex_pos, terrain_xz, ground_n, splat_uv, ground_dx, ground_dy);
     }
     s.albedo = mix(s.albedo, ground.albedo, w);
     // The ground's sky as the terrain's own path gives it (shading.wgsl's terrain branch): its baked sky visibility
