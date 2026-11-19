@@ -130,6 +130,14 @@ pub(crate) struct GroundCoverRules {
     /// the meadow's slot-k grass (Sunscar, 6 Nov 2026; design/BIOMES_GROUND_COVER.md).
     #[serde(default)]
     pub layer_sets: Option<Vec<String>>,
+    /// The layers that make this kind's habitat (a grass's: every grassland slot). Set, a candidate is kept with its
+    /// share of the habitat's summed weight (its own layer's weight over the sum) times the habitat's presence
+    /// (smoothstep 0.35 to 0.7 of the sum), and `min_layer_weight` gates the sum: a texel of four grasslands at 0.25
+    /// grows a full sward between their kinds, and grass sprinkled at low weight into woods and mud grows none
+    /// (sunscar-groundplants' audit, 19 Nov 2026: pasture was under the 0.3 gate on 71% of its 33 km2). Unset: its
+    /// own layer's weight, as before.
+    #[serde(default)]
+    pub habitat_layers: Option<Vec<u8>>,
 }
 
 impl GroundCoverRules {

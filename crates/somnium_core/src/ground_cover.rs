@@ -417,6 +417,26 @@ fn cell_seed(seed_key: u64, kind: u16, cx: i32, cz: i32) -> u64 {
     }
 }
 
+/// The chance a candidate of a kind on `layer` is kept at `(x, z)`: its own layer's weight, none under `least`; or,
+/// for a kind with a habitat ([`crate::foliage_palette::GroundCoverRules::habitat_layers`]), its share of the
+/// habitat's summed weight times the habitat's presence, none where the sum is under `least`.
+fn keep_weight(terrain: &impl Ground, x: f32, z: f32, layer: u8, habitat: Option<&[u8]>, least: f32) -> f32 {
+    let own = terrain.layer_weight(x, z, layer);
+    let Some(layers) = habitat else {
+        return if own < least { 0.0 } else { own };
+    };
+    if own <= 0.0 {
+        return 0.0; // the cheap test first: most candidates fall on another layer
+    }
+    let others: f32 = layers.iter().filter(|&&l| l != layer).map(|&l| terrain.layer_weight(x, z, l)).sum();
+    let group = (own + others).min(1.0);
+    if group < least {
+        return 0.0;
+    }
+    let t = ((group - 0.35) / (0.7 - 0.35)).clamp(0.0, 1.0);
+    own / (own + others) * t * t * (3.0 - 2.0 * t)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn generate(
     seed_key: u64,
@@ -437,12 +457,15 @@ fn generate(
     let min_slope_cos = b.max_slope_deg.to_radians().cos();
     let least = b.min_layer_weight.max(1e-3);
     let clump = entry.ground_cover.as_ref().and_then(|g| g.clump);
+    let habitat = entry.ground_cover.as_ref().and_then(|g| g.habitat_layers.as_deref());
     let mut out = Vec::new();
-    // A cell with none of the kind's layer on a metre grid grows nothing: skip its candidates.
+    // A cell with none of the kind's layer on a metre grid grows nothing: skip its candidates. A kind with a habitat
+    // grows wherever its own layer has any weight (the gate is on the habitat's sum, `keep_weight`).
+    let present_at = if habitat.is_some() { 1e-3 } else { least };
     let present = (0..=16).any(|j| {
         (0..=16).any(|i| {
             let (x, z) = ((cx as f32 + i as f32 / 16.0) * CELL, (cz as f32 + j as f32 / 16.0) * CELL);
-            terrain.layer_weight(x.clamp(0.0, wx), z.clamp(0.0, wz), b.layer) >= least
+            terrain.layer_weight(x.clamp(0.0, wx), z.clamp(0.0, wz), b.layer) >= present_at
         })
     });
     if !present {
@@ -455,8 +478,8 @@ fn generate(
             continue;
         }
         // The cheap test first: most candidates fall on another layer.
-        let weight = terrain.layer_weight(x, z, b.layer);
-        if weight < least || unit(mix(h ^ 1)) > weight {
+        let weight = keep_weight(terrain, x, z, b.layer, habitat, least);
+        if weight <= 0.0 || unit(mix(h ^ 1)) > weight {
             continue;
         }
         // Drifts, from the world's position so they carry across tile seams.
@@ -494,8 +517,8 @@ fn generate(
 pub(crate) fn density_at(terrain: &impl Ground, kind: u16, entry: &ProjectEntry, x: f32, z: f32, origin: glam::Vec2) -> f32 {
     let Some(rules) = entry.ground_cover.as_ref() else { return 0.0 };
     let b = &entry.brush;
-    let weight = terrain.layer_weight(x, z, b.layer);
-    if weight < b.min_layer_weight.max(1e-3) || ground_normal(terrain, x, z).y < b.max_slope_deg.to_radians().cos() {
+    let weight = keep_weight(terrain, x, z, b.layer, rules.habitat_layers.as_deref(), b.min_layer_weight.max(1e-3));
+    if weight <= 0.0 || ground_normal(terrain, x, z).y < b.max_slope_deg.to_radians().cos() {
         return 0.0;
     }
     let drifts = rules.clump.map_or(1.0, |m| drift(patch_noise((origin.x + x) / m, (origin.y + z) / m, u64::from(kind))));
@@ -858,6 +881,56 @@ mod tests {
         fn layer_weight(&self, x: f32, _z: f32, layer: u8) -> f32 {
             f32::from(u8::from((layer == 0 && x < 64.0) || (layer == 3 && x >= 64.0)))
         }
+    }
+
+    /// Four layers at 0.25 each, three of them a grass's habitat (0, 4 and 8) and the fourth mud (20); or a wood
+    /// floor, grass 0.2 and wood (21) 0.8.
+    struct Blend {
+        wood: bool,
+    }
+
+    impl Ground for Blend {
+        fn edit_revision(&self) -> u64 {
+            1
+        }
+
+        fn world_size(&self) -> [f32; 2] {
+            [64.0, 64.0]
+        }
+
+        fn cell_size(&self) -> f32 {
+            2.0
+        }
+
+        fn world_height_at(&self, _x: f32, _z: f32) -> f32 {
+            0.0
+        }
+
+        fn layer_weight(&self, _x: f32, _z: f32, layer: u8) -> f32 {
+            match (self.wood, layer) {
+                (false, 0 | 4 | 8 | 20) => 0.25,
+                (true, 0) => 0.2,
+                (true, 21) => 0.8,
+                _ => 0.0,
+            }
+        }
+    }
+
+    #[test]
+    fn a_kind_with_a_habitat_grows_by_its_share_of_the_habitat() {
+        let habitat: &[u8] = &[0, 4, 8, 11];
+        let gate = 0.3;
+        // As before without one: the grass's own 0.25 is under the gate, so the blend grows no grass at all.
+        assert_eq!(keep_weight(&Blend { wood: false }, 1.0, 1.0, 0, None, gate), 0.0);
+        // With it, each of the three grasses keeps a third: between them a full sward on 75% grassland.
+        let share = keep_weight(&Blend { wood: false }, 1.0, 1.0, 0, Some(habitat), gate);
+        assert!((share - 1.0 / 3.0).abs() < 1e-4, "{share}");
+        let all: f32 = [0u8, 4, 8].iter().map(|&l| keep_weight(&Blend { wood: false }, 1.0, 1.0, l, Some(habitat), gate)).sum();
+        assert!((all - 1.0).abs() < 1e-3, "{all}");
+        // Grass at 0.2 in a wood grows nothing: the habitat is under its presence.
+        assert_eq!(keep_weight(&Blend { wood: true }, 1.0, 1.0, 0, Some(habitat), gate), 0.0);
+        // A kind off its own layer grows nothing, habitat or not.
+        assert_eq!(keep_weight(&Blend { wood: false }, 1.0, 1.0, 11, Some(habitat), gate), 0.0);
     }
 
     #[test]
