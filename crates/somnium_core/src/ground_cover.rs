@@ -108,7 +108,8 @@ impl Ground for TerrainData {
     }
 
     fn layer_weight(&self, x: f32, z: f32, layer: u8) -> f32 {
-        TerrainData::layer_weight_at(self, x, z, layer)
+        // Nothing grows over a hole (`TerrainData::set_holes`).
+        if self.is_hole_at(x, z) { 0.0 } else { TerrainData::layer_weight_at(self, x, z, layer) }
     }
 
     fn layer_mask(&self, x0: f32, z0: f32, size: f32) -> u32 {

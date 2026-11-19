@@ -653,6 +653,14 @@ pub fn component_registry() -> TypeRegistry {
     registry.register(decal_schema());
     registry.register(light_flicker_schema());
     registry.register(component_schema! {
+        crate::level_portal::LevelPortalComponent as "somnium.LevelPortal", display "Level Portal", version 1,
+        fields {
+            level { group: "Level Portal", doc: "The level this box leads to: a project-relative id. Entering it is logged; nothing is loaded yet." },
+            half_extents { min: 0.05, step: 0.1, precision: 2, group: "Level Portal", unit: "m",
+                doc: "The box's half size in the entity's own axes (its scale applies)." },
+        }
+    });
+    registry.register(component_schema! {
         crate::light_flicker::LampComponent as "somnium.Lamp", display "Lamp", version 1,
         fields {
             switched { group: "Lamp", doc: "A lamp: lit while the open sky is dark, out by day. Off: a fire that burns all day." },

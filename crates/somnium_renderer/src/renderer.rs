@@ -5640,9 +5640,10 @@ impl SomniumRenderer {
                 && !self.rebuilt_chunks.is_empty()
                 && self.debug_toggles.is_on("rt_terrain")
             {
-                if let Some((rt_index_offset, rt_index_count)) = terrain.rt_index_block() {
-                    let vertex_count = terrain.chunk_vertex_capacity();
-                    for &vertex_offset in &self.rebuilt_chunks {
+                // A chunk holding a hole is traced from its own list (`TerrainData::rt_index_block_for`).
+                let vertex_count = terrain.chunk_vertex_capacity();
+                for &vertex_offset in &self.rebuilt_chunks {
+                    if let Some((rt_index_offset, rt_index_count)) = terrain.rt_index_block_for(vertex_offset) {
                         self.raytrace_pass.register_mesh(
                             &ctx.device,
                             vertex_offset,
@@ -5661,13 +5662,11 @@ impl SomniumRenderer {
             );
 
             let material_id = terrain.material_id;
-            for chunk in &terrain.chunks {
+            for (chunk_index, chunk) in terrain.chunks.iter().enumerate() {
                 if chunk.vertex_offset == crate::terrain::UNALLOCATED {
                     continue;
                 }
-                let Some((index_offset, index_count)) =
-                    terrain.index_block(chunk.lod, chunk.edge_mask)
-                else {
+                let Some((index_offset, index_count)) = terrain.chunk_index_block(chunk_index) else {
                     continue;
                 };
                 // Pushed straight onto the opaque queue rather than through
