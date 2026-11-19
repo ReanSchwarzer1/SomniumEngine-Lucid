@@ -809,6 +809,12 @@ fn load_gltf_checked(path: &Path, parts: Option<&HashSet<usize>>) -> Result<Load
         None => warn!("glTF file has no scenes; no nodes spawned"),
     }
 
+    // A blend height never passes a quarter of the model's own height (`capped_ground_blend`).
+    let tall = model_height(&scene);
+    for material in &mut scene.materials {
+        material.ground_blend = capped_ground_blend(material.ground_blend, tall);
+    }
+
     info!(
         "glTF loaded: {} meshes, {} materials, {} textures, {} nodes",
         scene.meshes.len(),
@@ -817,6 +823,35 @@ fn load_gltf_checked(path: &Path, parts: Option<&HashSet<usize>>) -> Result<Load
         scene.nodes.len(),
     );
     Ok(scene)
+}
+
+/// How tall a loaded model stands, in its own space: over every node that draws a mesh. 0 when nothing is drawn.
+fn model_height(scene: &LoadedScene) -> f32 {
+    let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
+    for node in &scene.nodes {
+        let Some(mesh) = node.mesh_index.and_then(|index| scene.meshes.get(index)) else {
+            continue;
+        };
+        for vertex in &mesh.vertices {
+            let y = node.transform.transform_point3(Vec3::from(vertex.position)).y;
+            lo = lo.min(y);
+            hi = hi.max(y);
+        }
+    }
+    if hi > lo { hi - lo } else { 0.0 }
+}
+
+/// The blend height a material may carry on a model `model_height` metres tall (`somnium_ground_blend`): at most a
+/// quarter of that height. A wall's 0.3 m on a stone 0.4 m tall turned most of the stone to soil, and on 19 Nov 2026
+/// about 1,900 of Sunscar's small pieces carried a wall's height (tools/photoreal/blend_census.py). A wall, a house or a
+/// cliff is far taller than four of its band and keeps its own. Negative (never blends), zero and an unknown height pass
+/// through.
+fn capped_ground_blend(blend: f32, model_height: f32) -> f32 {
+    if blend > 0.0 && model_height > 0.0 {
+        blend.min(0.25 * model_height)
+    } else {
+        blend
+    }
 }
 
 // ── Internal helpers ───────────────────────────────────────────────────────
@@ -2160,5 +2195,34 @@ mod broken_file_tests {
         std::fs::write(dir.join("cut.glb"), &glb).unwrap();
         assert!(super::gltf_file_problems(&dir.join("cut.glb"))[0].contains("declares 999 bytes and has 12"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod ground_blend_cap_tests {
+    use super::*;
+
+    #[test]
+    fn a_small_piece_keeps_a_quarter_of_its_height_and_a_wall_keeps_its_own() {
+        assert!((capped_ground_blend(0.3, 0.4) - 0.1).abs() < 1e-6, "a stone 0.4 m tall blends over 0.1 m");
+        assert_eq!(capped_ground_blend(0.3, 8.0), 0.3, "a house keeps its wall's band");
+        assert_eq!(capped_ground_blend(-1.0, 0.4), -1.0, "never blends stays never");
+        assert_eq!(capped_ground_blend(0.0, 0.4), 0.0);
+        assert_eq!(capped_ground_blend(0.3, 0.0), 0.3, "an unknown height changes nothing");
+    }
+
+    #[test]
+    fn a_models_height_is_measured_through_its_nodes() {
+        let mut scene = LoadedScene::default();
+        let at = |y: f32| Vertex { position: [0.0, y, 0.0], normal: [0.0, 1.0, 0.0], uv: [0.0, 0.0] };
+        scene.meshes.push(LoadedMesh { vertices: vec![at(0.1), at(0.3)], indices: Vec::new(), skin: None });
+        assert_eq!(model_height(&scene), 0.0, "no node draws it yet");
+        scene.nodes.push(SceneNode {
+            name: "stone".to_string(),
+            mesh_index: Some(0),
+            material_index: None,
+            transform: Mat4::from_scale(Vec3::splat(2.0)),
+        });
+        assert!((model_height(&scene) - 0.4).abs() < 1e-6, "0.2 m of mesh under a node scaled by two");
     }
 }
