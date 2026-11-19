@@ -321,7 +321,7 @@ fn grow(cell: u32, tile: GrassTile, k: u32, rank: f32) -> Grown {
     // one share, green and dead averaged to a flat grey at a few metres (fr_gg_1, 19 Nov).
     // A tussock: a clump the grazers left, standing rank (and mostly dead) out of the short turf round it.
     let tussock = unit(hash(clump ^ 0x2d358dccu)) < hab.tussock_share;
-    var c_green = clamp(hab.share_green + 0.6 * (unit(hash(clump ^ 0x3c6ef372u)) - 0.5) + 0.3 * (n_large - 0.5),
+    var c_green = clamp(hab.share_green + 0.6 * (unit(hash(clump ^ 0x3c6ef372u)) - 0.5) + 0.5 * (n_large - 0.5),
                         0.05, 0.95);
     if tussock {
         c_green *= 0.45;
@@ -348,6 +348,10 @@ fn grow(cell: u32, tile: GrassTile, k: u32, rank: f32) -> Grown {
         colour = mix(hab.green.rgb, hab.green_alt.rgb, c_tone);
     } else if state < c_green + c_dead {
         colour = mix(hab.dead.rgb, hab.dead_alt.rgb, c_tone);
+        // Rust patches among the tawny (the lead, 20 Nov 03:14: "patches of green, tawny and rust"): where a 7 m noise
+        // peaks, the dead blades redden, as dock, sorrel and browned grass patch a November meadow.
+        let n_rust = patch_noise(xz / 7.0, 0x2f6b9c31u);
+        colour = mix(colour, colour * vec3<f32>(1.25, 0.88, 0.62), smoothstep(0.62, 0.85, n_rust));
     } else {
         colour = hab.seed.rgb;
         height = mix(hab.seed_h_min, hab.seed_h_max, unit(h2));
