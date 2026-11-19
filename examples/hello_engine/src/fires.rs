@@ -350,7 +350,8 @@ impl Fires {
                     card.fade = fade;
                     card.power = power;
                     // A fire leans into the wind, a lantern's flame inside its glass does not.
-                    let lean = if b.kind.open() { (0.12 * wind.length()).min(0.6) } else if b.kind == FlameKind::Candle { 0.02 * wind.length().min(2.0) } else { 0.0 };
+                    // Gently: a whole card sheared reads as a jet (20 Nov 01:51, the Rose brazier at 50 degrees).
+                    let lean = if b.kind.open() { (0.035 * wind.length()).min(0.2) } else if b.kind == FlameKind::Candle { 0.01 * wind.length().min(2.0) } else { 0.0 };
                     let dir = wind.try_normalize().unwrap_or(glam::Vec2::ZERO);
                     card.lean = [dir.x * lean * card.size[1], dir.y * lean * card.size[1]];
                 }

@@ -145,7 +145,7 @@ fn coal_cells(p: vec2<f32>) -> vec3<f32> {
         let x = (uv.x - .5) * w * grow;
         let y = centre_y + ((bed_v - uv.y) * h - centre_y) * grow;
         let rise = clamp(y / max(h * bed_v, 1.0e-4), 0., 1.);
-        corner = p.position + right * x + up * y + vec3(p.color.z, 0., p.color.w) * pow(rise, 1.5);
+        corner = p.position + right * x + up * y + vec3(p.color.z, 0., p.color.w) * rise * rise;
         out.flutter = tilt / .6981317;
         out.extra = vec4(p.extra.x, p.extra.y, grow, 0.);
     } else if (p.flags & 64u) != 0u {
