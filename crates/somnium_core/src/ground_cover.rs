@@ -36,6 +36,9 @@ const CANDIDATES_PER_FRAME: f32 = 16_000.0;
 /// Most time one terrain's generation takes in a frame, on the calling thread; at least one cell. Worker threads were
 /// starved by the engine's own while tiles installed, and the frame waited on them: 20-500 ms for 4-17 cells (5 Nov).
 const GENERATE_MS_PER_FRAME: f32 = 2.0;
+/// Most time one terrain's plan spends reading cells' layers ([`Ground::layer_mask`]) in a frame, nearest first; the
+/// rest are read by the next frames' plans. A tile's first plan reads a thousand cells or more.
+const LAYER_READ_MS_PER_FRAME: f32 = 2.0;
 /// Most copies of parts (slots) set in batches in one frame, nearest cells first (the rest wait a frame): a tile
 /// streaming in beside the player once set 100,000+ in one frame (40 MB of slots, a 350 ms frame).
 const SLOTS_SET_PER_FRAME: i64 = 48_000;
@@ -170,6 +173,10 @@ struct TerrainCover {
     plan: Vec<(f32, usize, i32, i32)>,
     plan_at: usize,
     plan_key: Option<(i32, i32, u64)>,
+    /// The last plan left cells' layers unread (over [`LAYER_READ_MS_PER_FRAME`]): the next frame plans again.
+    plan_partial: bool,
+    /// Plans made, for the slow-frame line and the tests.
+    plans: u64,
 }
 
 /// One generated instance: where it stands (its yaw and tilt as a painted one's) and its whole rotation.
@@ -244,55 +251,92 @@ impl GroundCover {
             *cover = TerrainCover { epoch, revision, seed: seed_key, area, ..TerrainCover::default() };
         }
         cover.focus = camera;
-        // One pass drops every kind's cells past its radius (a pass per kind was kinds x cells a frame, per terrain).
-        let band_of: HashMap<u16, (f32, f32)> =
-            kinds.iter().map(|&(kind, _, _, radius, inner)| (kind, (inner, radius))).collect();
-        let before = cover.cells.len();
-        cover.cells.retain(|&(k, cx, cz), _| {
-            band_of.get(&k).is_some_and(|&(inner, r)| {
-                let d = cell_distance(cx, cz, camera);
-                d <= r + CELL && !inside_inner(d, inner)
-            })
-        });
-        let mut changed = cover.cells.len() != before;
         // Only cells on this terrain's own ground: a tile the player is not on grows nothing round him. Every loaded
         // tile once kept thousands of empty cells round the eye (Sunscar, 30 Oct 2026: 40-100 ms a frame).
         let [wx, wz] = terrain.world_size();
         let own = area.unwrap_or(glam::Vec4::new(0.0, 0.0, wx, wz));
         let (lo_x, lo_z) = ((own.x / CELL).floor() as i32, (own.y / CELL).floor() as i32);
         let (hi_x, hi_z) = (((own.z / CELL).ceil() as i32) - 1, ((own.w / CELL).ceil() as i32) - 1);
-        // Every kind's wanted cells where its layer lies, nearest first: planned when the view enters another cell (or the
-        // kinds or the cover change), then worked through over the frames.
+        // The plan: every kind's wanted cells where its layer lies, nearest first, made when the view enters another
+        // cell (or the kinds or the cover change) and worked through over the frames. Cells past their kind's reach are
+        // dropped only then: dropped every frame, the rim's cells left one by one as the view walked, and each drop
+        // planned again (7 Nov 2026: a 20-40 ms plan every few frames, with 456 kinds).
         let (ox, oz) = ((camera.x / CELL).floor() as i32, (camera.z / CELL).floor() as i32);
         let kinds_key = kinds.iter().fold(kinds.len() as u64, |h, k| mix(h ^ u64::from(k.0)));
         let key = Some((ox, oz, kinds_key));
-        let replan = reset || changed || cover.plan_key != key;
+        let replan = reset || cover.plan_key != key || cover.plan_partial;
+        let mut changed = false;
         if replan {
-            let reach = kinds.iter().map(|k| (k.3 / CELL).ceil() as i32 + 1).max().unwrap_or(0);
+            // One pass drops every kind's cells past its radius (a pass per kind was kinds x cells, per terrain).
+            let band_of: HashMap<u16, (f32, f32)> =
+                kinds.iter().map(|&(kind, _, _, radius, inner)| (kind, (inner, radius))).collect();
+            let before = cover.cells.len();
+            cover.cells.retain(|&(k, cx, cz), _| {
+                band_of.get(&k).is_some_and(|&(inner, r)| {
+                    let d = cell_distance(cx, cz, camera);
+                    d <= r + CELL && !inside_inner(d, inner)
+                })
+            });
+            changed = cover.cells.len() != before;
+            // Kinds by their layer, farthest-reaching first: a cell walks only the kinds of the layers under it and
+            // stops at the first that does not reach it. A kind at a time over its whole square was a map lookup per
+            // kind and cell (7 Nov 2026: 456 kinds, some 110,000 lookups a plan).
+            let mut by_layer: Vec<Vec<usize>> = vec![Vec::new(); 32];
+            for (index, k) in kinds.iter().enumerate() {
+                by_layer[usize::from(k.1.brush.layer.min(31))].push(index);
+            }
+            for list in &mut by_layer {
+                list.sort_by(|&a, &b| kinds[b].3.total_cmp(&kinds[a].3));
+            }
+            let far = kinds.iter().fold(0.0f32, |m, k| m.max(k.3));
+            let reach = (far / CELL).ceil() as i32 + 1;
+            let mut near: Vec<(f32, i32, i32)> = Vec::new();
             for cz in (oz - reach).max(lo_z)..=(oz + reach).min(hi_z) {
                 for cx in (ox - reach).max(lo_x)..=(ox + reach).min(hi_x) {
-                    cover.layers.entry((cx, cz)).or_insert_with(|| terrain.layer_mask(cx as f32 * CELL, cz as f32 * CELL, CELL));
+                    let d = cell_distance(cx, cz, camera);
+                    if d <= far {
+                        near.push((d, cx, cz));
+                    }
                 }
             }
+            near.sort_by(|a, b| a.0.total_cmp(&b.0));
+            // A cell's layers are read once, nearest first, a few milliseconds' worth a frame.
+            let reading = std::time::Instant::now();
+            let mut partial = false;
             let mut plan: Vec<(f32, usize, i32, i32)> = Vec::new();
-            for (index, &(kind, entry, _, radius, inner)) in kinds.iter().enumerate() {
-                let bit = 1u32 << u32::from(entry.brush.layer.min(31));
-                let reach = (radius / CELL).ceil() as i32 + 1;
-                let (cells, layers) = (&cover.cells, &cover.layers);
-                plan.extend(
-                    ((oz - reach).max(lo_z)..=(oz + reach).min(hi_z))
-                        .flat_map(|cz| ((ox - reach).max(lo_x)..=(ox + reach).min(hi_x)).map(move |cx| (cx, cz)))
-                        .filter(|cell| layers.get(cell).is_none_or(|m| m & bit != 0))
-                        .map(|(cx, cz)| (cell_distance(cx, cz, camera), index, cx, cz))
-                        .filter(|&(d, _, cx, cz)| {
-                            d <= radius && !inside_inner(d, inner) && !cells.contains_key(&(kind, cx, cz))
-                        }),
-                );
+            for (d, cx, cz) in near {
+                let mask = match cover.layers.get(&(cx, cz)) {
+                    Some(&mask) => mask,
+                    None if reading.elapsed().as_secs_f32() * 1000.0 > LAYER_READ_MS_PER_FRAME => {
+                        partial = true;
+                        continue;
+                    }
+                    None => {
+                        let mask = terrain.layer_mask(cx as f32 * CELL, cz as f32 * CELL, CELL);
+                        cover.layers.insert((cx, cz), mask);
+                        mask
+                    }
+                };
+                let mut bits = mask;
+                while bits != 0 {
+                    let layer = bits.trailing_zeros() as usize;
+                    bits &= bits - 1;
+                    for &index in &by_layer[layer] {
+                        let (kind, _, _, radius, inner) = kinds[index];
+                        if d > radius {
+                            break;
+                        }
+                        if !inside_inner(d, inner) && !cover.cells.contains_key(&(kind, cx, cz)) {
+                            plan.push((d, index, cx, cz));
+                        }
+                    }
+                }
             }
-            plan.sort_by(|a, b| a.0.total_cmp(&b.0));
             cover.plan = plan;
             cover.plan_at = 0;
             cover.plan_key = key;
+            cover.plan_partial = partial;
+            cover.plans += 1;
         }
         let mut budget = CANDIDATES_PER_FRAME;
         let mut take = 0;
@@ -315,8 +359,10 @@ impl GroundCover {
                 break;
             }
             done += 1;
-            let (kind, entry, density, _, _) = kinds[i];
-            if cover.cells.contains_key(&(kind, cx, cz)) {
+            let (kind, entry, density, radius, inner) = kinds[i];
+            // The plan is kept while the view walks its cell: a job the view has since left behind is not made.
+            let d = cell_distance(cx, cz, camera);
+            if d > radius + CELL || inside_inner(d, inner) || cover.cells.contains_key(&(kind, cx, cz)) {
                 continue;
             }
             made.push(((kind, cx, cz), generate(seed_key, terrain, kind, entry, density, cx, cz, area, origin)));
@@ -341,6 +387,8 @@ impl GroundCover {
                 kinds = kinds.len(),
                 wanted = wanted_len,
                 replan,
+                partial = cover.plan_partial,
+                plans = cover.plans,
                 jobs = take,
                 made_cells,
                 copies,
@@ -417,6 +465,26 @@ fn cell_seed(seed_key: u64, kind: u16, cx: i32, cz: i32) -> u64 {
     }
 }
 
+/// The chance a candidate of a kind on `layer` is kept at `(x, z)`: its own layer's weight, none under `least`; or,
+/// for a kind with a habitat ([`crate::foliage_palette::GroundCoverRules::habitat_layers`]), its share of the
+/// habitat's summed weight times the habitat's presence, none where the sum is under `least`.
+fn keep_weight(terrain: &impl Ground, x: f32, z: f32, layer: u8, habitat: Option<&[u8]>, least: f32) -> f32 {
+    let own = terrain.layer_weight(x, z, layer);
+    let Some(layers) = habitat else {
+        return if own < least { 0.0 } else { own };
+    };
+    if own <= 0.0 {
+        return 0.0; // the cheap test first: most candidates fall on another layer
+    }
+    let others: f32 = layers.iter().filter(|&&l| l != layer).map(|&l| terrain.layer_weight(x, z, l)).sum();
+    let group = (own + others).min(1.0);
+    if group < least {
+        return 0.0;
+    }
+    let t = ((group - 0.35) / (0.7 - 0.35)).clamp(0.0, 1.0);
+    own / (own + others) * t * t * (3.0 - 2.0 * t)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn generate(
     seed_key: u64,
@@ -437,12 +505,15 @@ fn generate(
     let min_slope_cos = b.max_slope_deg.to_radians().cos();
     let least = b.min_layer_weight.max(1e-3);
     let clump = entry.ground_cover.as_ref().and_then(|g| g.clump);
+    let habitat = entry.ground_cover.as_ref().and_then(|g| g.habitat_layers.as_deref());
     let mut out = Vec::new();
-    // A cell with none of the kind's layer on a metre grid grows nothing: skip its candidates.
+    // A cell with none of the kind's layer on a metre grid grows nothing: skip its candidates. A kind with a habitat
+    // grows wherever its own layer has any weight (the gate is on the habitat's sum, `keep_weight`).
+    let present_at = if habitat.is_some() { 1e-3 } else { least };
     let present = (0..=16).any(|j| {
         (0..=16).any(|i| {
             let (x, z) = ((cx as f32 + i as f32 / 16.0) * CELL, (cz as f32 + j as f32 / 16.0) * CELL);
-            terrain.layer_weight(x.clamp(0.0, wx), z.clamp(0.0, wz), b.layer) >= least
+            terrain.layer_weight(x.clamp(0.0, wx), z.clamp(0.0, wz), b.layer) >= present_at
         })
     });
     if !present {
@@ -455,8 +526,8 @@ fn generate(
             continue;
         }
         // The cheap test first: most candidates fall on another layer.
-        let weight = terrain.layer_weight(x, z, b.layer);
-        if weight < least || unit(mix(h ^ 1)) > weight {
+        let weight = keep_weight(terrain, x, z, b.layer, habitat, least);
+        if weight <= 0.0 || unit(mix(h ^ 1)) > weight {
             continue;
         }
         // Drifts, from the world's position so they carry across tile seams.
@@ -494,8 +565,8 @@ fn generate(
 pub(crate) fn density_at(terrain: &impl Ground, kind: u16, entry: &ProjectEntry, x: f32, z: f32, origin: glam::Vec2) -> f32 {
     let Some(rules) = entry.ground_cover.as_ref() else { return 0.0 };
     let b = &entry.brush;
-    let weight = terrain.layer_weight(x, z, b.layer);
-    if weight < b.min_layer_weight.max(1e-3) || ground_normal(terrain, x, z).y < b.max_slope_deg.to_radians().cos() {
+    let weight = keep_weight(terrain, x, z, b.layer, rules.habitat_layers.as_deref(), b.min_layer_weight.max(1e-3));
+    if weight <= 0.0 || ground_normal(terrain, x, z).y < b.max_slope_deg.to_radians().cos() {
         return 0.0;
     }
     let drifts = rules.clump.map_or(1.0, |m| drift(patch_noise((origin.x + x) / m, (origin.y + z) / m, u64::from(kind))));
@@ -860,6 +931,56 @@ mod tests {
         }
     }
 
+    /// Four layers at 0.25 each, three of them a grass's habitat (0, 4 and 8) and the fourth mud (20); or a wood
+    /// floor, grass 0.2 and wood (21) 0.8.
+    struct Blend {
+        wood: bool,
+    }
+
+    impl Ground for Blend {
+        fn edit_revision(&self) -> u64 {
+            1
+        }
+
+        fn world_size(&self) -> [f32; 2] {
+            [64.0, 64.0]
+        }
+
+        fn cell_size(&self) -> f32 {
+            2.0
+        }
+
+        fn world_height_at(&self, _x: f32, _z: f32) -> f32 {
+            0.0
+        }
+
+        fn layer_weight(&self, _x: f32, _z: f32, layer: u8) -> f32 {
+            match (self.wood, layer) {
+                (false, 0 | 4 | 8 | 20) => 0.25,
+                (true, 0) => 0.2,
+                (true, 21) => 0.8,
+                _ => 0.0,
+            }
+        }
+    }
+
+    #[test]
+    fn a_kind_with_a_habitat_grows_by_its_share_of_the_habitat() {
+        let habitat: &[u8] = &[0, 4, 8, 11];
+        let gate = 0.3;
+        // As before without one: the grass's own 0.25 is under the gate, so the blend grows no grass at all.
+        assert_eq!(keep_weight(&Blend { wood: false }, 1.0, 1.0, 0, None, gate), 0.0);
+        // With it, each of the three grasses keeps a third: between them a full sward on 75% grassland.
+        let share = keep_weight(&Blend { wood: false }, 1.0, 1.0, 0, Some(habitat), gate);
+        assert!((share - 1.0 / 3.0).abs() < 1e-4, "{share}");
+        let all: f32 = [0u8, 4, 8].iter().map(|&l| keep_weight(&Blend { wood: false }, 1.0, 1.0, l, Some(habitat), gate)).sum();
+        assert!((all - 1.0).abs() < 1e-3, "{all}");
+        // Grass at 0.2 in a wood grows nothing: the habitat is under its presence.
+        assert_eq!(keep_weight(&Blend { wood: true }, 1.0, 1.0, 0, Some(habitat), gate), 0.0);
+        // A kind off its own layer grows nothing, habitat or not.
+        assert_eq!(keep_weight(&Blend { wood: false }, 1.0, 1.0, 11, Some(habitat), gate), 0.0);
+    }
+
     #[test]
     fn a_cells_layer_mask_holds_the_layers_under_it() {
         assert_eq!(Halves.layer_mask(0.0, 0.0, CELL), 1, "west: layer 0 only");
@@ -902,6 +1023,130 @@ mod tests {
         assert_eq!(cover.terrains[&9].plan_key, first, "same cell: same plan");
         cover.update_seeded(9, 9, &ground, &palette, Vec3::new(90.0, 2.0, 64.0), None, glam::Vec2::ZERO, "");
         assert_ne!(cover.terrains[&9].plan_key, first, "another cell: planned again");
+    }
+
+    /// Flat ground in four strips west to east, layers 0, 3, 7 and 3 again, with layer 12 over the whole south half.
+    struct Strips;
+
+    impl Ground for Strips {
+        fn edit_revision(&self) -> u64 {
+            1
+        }
+
+        fn world_size(&self) -> [f32; 2] {
+            [512.0, 512.0]
+        }
+
+        fn cell_size(&self) -> f32 {
+            2.0
+        }
+
+        fn world_height_at(&self, _x: f32, _z: f32) -> f32 {
+            0.0
+        }
+
+        fn layer_weight(&self, x: f32, z: f32, layer: u8) -> f32 {
+            let strip = [0u8, 3, 7, 3][((x / 128.0) as usize).min(3)];
+            f32::from(u8::from(layer == strip || (layer == 12 && z >= 256.0)))
+        }
+        /// The square's corners hold every layer under it: the strips are wider than a cell.
+        fn layer_mask(&self, x0: f32, z0: f32, size: f32) -> u32 {
+            let mut mask = 0u32;
+            for x in [x0, (x0 + size).min(512.0)] {
+                for z in [z0, (z0 + size).min(512.0)] {
+                    for layer in [0u8, 3, 7, 12] {
+                        if self.layer_weight(x, z, layer) > 0.0 {
+                            mask |= 1 << layer;
+                        }
+                    }
+                }
+            }
+            mask
+        }
+    }
+
+    /// Kinds on layers 0, 3, 7 and 12 at several radii, some with an inner radius (the far bands).
+    fn mixed() -> std::collections::BTreeMap<u16, ProjectEntry> {
+        let mut palette = std::collections::BTreeMap::new();
+        let rules = [(0u8, 40.0f32, 0.0f32), (0, 90.0, 0.0), (0, 150.0, 30.0), (0, 320.0, 120.0), (3, 50.0, 0.0),
+                     (3, 120.0, 0.0), (3, 320.0, 120.0), (7, 45.0, 0.0), (12, 70.0, 0.0), (12, 150.0, 30.0)];
+        for (i, &(layer, radius, inner)) in rules.iter().enumerate() {
+            let kind = 1000 + i as u16;
+            let mut entry: ProjectEntry = serde_json::from_value(serde_json::json!({
+                "kind": kind, "name": "k", "source": "g.gltf", "primitives": [0],
+                "brush": {"layer": layer},
+                "ground_cover": {"density": 0.01, "radius": radius, "inner": inner}}))
+            .unwrap();
+            entry.kind = kind;
+            palette.insert(kind, entry);
+        }
+        palette
+    }
+
+    #[test]
+    fn a_plan_holds_every_wanted_kind_and_cell_and_no_other() {
+        let palette = mixed();
+        let mut cover = GroundCover::default();
+        let camera = Vec3::new(250.0, 0.0, 262.0);
+        cover.update_seeded(5, 5, &Strips, &palette, camera, None, glam::Vec2::ZERO, "");
+        // An optimised build reads this plain ground's layers inside one frame (2 ms); a debug build takes a few
+        // frames, each planning again from the layers read so far (19 Nov 2026: it failed here unoptimised).
+        let mut frames = 1;
+        while cover.terrains[&5].plan_partial && frames < 50 {
+            cover.update_seeded(5, 5, &Strips, &palette, camera, None, glam::Vec2::ZERO, "");
+            frames += 1;
+        }
+        let t = &cover.terrains[&5];
+        assert!(!t.plan_partial && (frames == 1 || cfg!(debug_assertions)), "a plain ground's layers read well inside a frame");
+        // What the last plan holds, with the cells the frames before it made (a plan leaves out a cell already made).
+        let mut planned: Vec<(u16, i32, i32)> =
+            t.plan.iter().map(|&(_, i, cx, cz)| (1000 + i as u16, cx, cz)).chain(t.cells.keys().copied()).collect();
+        planned.sort_unstable();
+        planned.dedup();
+        // Kind by kind, cell by cell, as the plan was first made.
+        let mut wanted = Vec::new();
+        for (&kind, entry) in &palette {
+            let g = entry.ground_cover.as_ref().unwrap();
+            for cz in 0..32 {
+                for cx in 0..32 {
+                    let d = cell_distance(cx, cz, camera);
+                    let mask = Strips.layer_mask(cx as f32 * CELL, cz as f32 * CELL, CELL);
+                    if d <= g.radius && !inside_inner(d, g.inner) && mask & 1 << entry.brush.layer != 0 {
+                        wanted.push((kind, cx, cz));
+                    }
+                }
+            }
+        }
+        wanted.sort_unstable();
+        assert_eq!(planned, wanted);
+        assert!(t.plan.windows(2).all(|w| w[0].0 <= w[1].0), "nearest first");
+    }
+
+    #[test]
+    fn walking_inside_a_cell_plans_nothing_again_as_the_rim_falls_away() {
+        let palette = mixed();
+        let mut cover = GroundCover::default();
+        for _ in 0..400 {
+            cover.update_seeded(6, 6, &Strips, &palette, Vec3::new(240.5, 0.0, 240.5), None, glam::Vec2::ZERO, "");
+        }
+        let plans = cover.terrains[&6].plans;
+        let cells = cover.terrains[&6].cells.len();
+        for step in 0..15 {
+            let camera = Vec3::new(240.5 + step as f32, 0.0, 240.5 + step as f32);
+            cover.update_seeded(6, 6, &Strips, &palette, camera, None, glam::Vec2::ZERO, "");
+        }
+        let t = &cover.terrains[&6];
+        assert_eq!(t.plans, plans, "the same cell: no plan");
+        assert!(t.cells.len() >= cells, "nothing dropped until the next plan");
+        cover.update_seeded(6, 6, &Strips, &palette, Vec3::new(260.0, 0.0, 260.0), None, glam::Vec2::ZERO, "");
+        let t = &cover.terrains[&6];
+        assert_eq!(t.plans, plans + 1, "another cell: one plan");
+        let camera = Vec3::new(260.0, 0.0, 260.0);
+        assert!(t.cells.keys().all(|&(k, cx, cz)| {
+            let g = palette[&k].ground_cover.as_ref().unwrap();
+            let d = cell_distance(cx, cz, camera);
+            d <= g.radius + CELL && !inside_inner(d, g.inner)
+        }), "and the cells past their reach dropped with it");
     }
 
     fn grass() -> std::collections::BTreeMap<u16, ProjectEntry> {
