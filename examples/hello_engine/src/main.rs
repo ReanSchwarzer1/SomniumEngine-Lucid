@@ -226,6 +226,36 @@ impl EditorCamera {
     }
 }
 
+/// `SOMNIUM_PHYSICS_SYNC_AB=1` (cost): the shell's old physics sync (raw mutable columns, a change to everything) in
+/// the frame=120, 360, ... blocks of a run with SOMNIUM_PROFILE_EVERY=120, and the new one between, as
+/// SOMNIUM_SURFACES_AB=1 does for photoreal's surfaces: before and after in one launch (19 Nov 2026).
+fn physics_sync_ab_old(frame: u64) -> bool {
+    static AB: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("SOMNIUM_PHYSICS_SYNC_AB").as_deref() == Ok("1"));
+    *AB && (frame + 60) / 120 % 2 == 1
+}
+
+/// The physics sync as it was before 19 Nov 2026, for `SOMNIUM_PHYSICS_SYNC_AB`'s A blocks only.
+fn old_physics_sync(ctx: &mut EngineContext, required: &ComponentSet, playing_now: bool) {
+    for archetype in ctx.world.query_archetypes_mut(required, &ComponentSet::empty()) {
+        let t_col = archetype.column_index(ComponentId::of::<Transform>()).unwrap();
+        let b_col = archetype.column_index(ComponentId::of::<PhysicsBody>()).unwrap();
+        for row in 0..archetype.len() {
+            let body = unsafe { *archetype.column(b_col).get::<PhysicsBody>(row) };
+            let transform = unsafe { archetype.column_mut(t_col).get_mut::<Transform>(row) };
+            if playing_now {
+                transform.translation = ctx.physics.get_position(body.id);
+                transform.rotation = ctx.physics.get_rotation(body.id);
+            } else {
+                ctx.physics.set_position(body.id, transform.translation, false);
+                ctx.physics.set_rotation(body.id, transform.rotation, false);
+                ctx.physics.set_linear_velocity(body.id, Vec3::ZERO);
+                ctx.physics.set_angular_velocity(body.id, Vec3::ZERO);
+            }
+        }
+    }
+}
+
 fn play_session(ctx: &EngineContext) -> bool {
     ctx.simulation.state != SimulationState::Editing
 }
@@ -2229,8 +2259,12 @@ impl GameApp for HelloGame {
         // change to Transform alone). Raw mutable columns (`query_archetypes_mut`) count as a change to everything:
         // every frame they kept propagate_transforms from skipping and made it rebuild its order twice (Sunscar's
         // piazza, 19 Nov 2026: the shell's update 8-10 ms of the main thread, its render hook 6).
+        let old_sync = physics_sync_ab_old(ctx.time.frame_count());
+        if old_sync {
+            old_physics_sync(ctx, &required, playing_now);
+        }
         let mut moved = Vec::new();
-        for archetype in ctx.world.query_archetypes(&required, &ComponentSet::empty()) {
+        for archetype in ctx.world.query_archetypes(&required, &ComponentSet::empty()).filter(|_| !old_sync) {
             let t_col = archetype
                 .column_index(ComponentId::of::<Transform>())
                 .unwrap();
