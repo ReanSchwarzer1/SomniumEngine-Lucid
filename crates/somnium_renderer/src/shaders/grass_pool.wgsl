@@ -33,7 +33,7 @@ fn grass_pool_tri(base: u32, prim: u32, m: Material, clock: f32) -> GrassTri {
     let k = prim & ((1u << GRASS_TRI_BITS) - 1u);
     var out: GrassTri;
     for (var c = 0u; c < 3u; c++) {
-        let q = grass_strip_vertex(g, k + c, clock, view.wind, view.camera_pos, m.wind_bend, m.wind_flutter);
+        let q = grass_corner(g, k, c, clock, view.wind, view.camera_pos, m.wind_bend, m.wind_flutter);
         out.v[c] = Vertex(q.pos.x, q.pos.y, q.pos.z, q.normal.x, q.normal.y, q.normal.z, q.uv.x, q.uv.y);
     }
     out.colour = g.colour;

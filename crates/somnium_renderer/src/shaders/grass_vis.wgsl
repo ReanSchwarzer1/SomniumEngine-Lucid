@@ -36,8 +36,7 @@ fn vs_grass(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) ->
     let m = materials[inst.material_id];
     let g = grass_load(inst.vertex_offset + slot);
     let tri = vi / 3u;
-    let q = grass_strip_vertex(g, tri + vi % 3u, view.wind_time.x, view.wind, view.camera_pos, m.wind_bend,
-                               m.wind_flutter);
+    let q = grass_corner(g, tri, vi % 3u, view.wind_time.x, view.wind, view.camera_pos, m.wind_bend, m.wind_flutter);
     // Camera-relative, as the visibility pass projects (depth_tie.wgsl `depth_tie_clip`).
     let eye_clip = view.view_proj * vec4<f32>(view.camera_pos, 1.0);
     out.clip = view.view_proj * vec4<f32>(q.pos - view.camera_pos, 0.0) + eye_clip;

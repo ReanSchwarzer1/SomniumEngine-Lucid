@@ -12,6 +12,7 @@
 //   5     facing (16 bits, a turn) | lean (8 bits, 0..90 degrees) << 16
 //   6     colour, the square root of linear albedo in 8 bits each: r | g << 8 | b << 16
 //   7     bend (6 bits) | stiffness (4) << 6 | root occlusion (4) << 10 | segments - 1 (2) << 14 | seed (8) << 16
+//         (segments 4: a tiller, leaves from one root, one triangle each: `grass_corner`)
 //
 // The visibility buffer names a blade's triangle as (grass instance + 1, slot << 3 | triangle).
 // A blade of S segments is a strip of 2S + 1 points (pairs up the blade, one at the tip): 2S - 1 triangles, triangle
@@ -79,8 +80,11 @@ fn grass_encode_tail(g: GrassBlade) -> vec4<f32> {
     return vec4<f32>(g.width, f32(facing | (lean << 16u)), f32(c.x | (c.y << 8u) | (c.z << 16u)), f32(m));
 }
 
-/// Triangles in a blade of `segments` segments.
+/// Triangles in a blade of `segments` segments (a tiller: five leaves at most, as many as its class draws).
 fn grass_tris(segments: u32) -> u32 {
+    if segments == 4u {
+        return 5u;
+    }
     return 2u * segments - 1u;
 }
 
@@ -137,4 +141,40 @@ fn grass_strip_vertex(g: GrassBlade, j: u32, clock: f32, wind: vec4<f32>, eye: v
     out.normal = n;
     out.uv = vec2<f32>(u, t);
     return out;
+}
+
+/// A small integer hash for a tiller's leaves (PCG's output step; grass_gen.wgsl's hashes are not included here).
+fn grass_leaf_hash(x: u32) -> u32 {
+    let h = x * 747796405u + 2891336453u;
+    let w = ((h >> ((h >> 28u) + 4u)) ^ h) * 277803737u;
+    return (w >> 22u) ^ w;
+}
+
+/// Leaf `leaf` of a tiller (a record whose `segments` is 4): its leaves come from one root, fanned round it by the
+/// golden angle, each with its own lean, length and bend, and each is a one-segment blade (one triangle). A grazed
+/// tiller's outer leaves lie open, so later leaves lean further than the record's own lean.
+fn grass_leaf(g: GrassBlade, leaf: u32) -> GrassBlade {
+    let place = (u32(abs(g.root.x) * 37.0) * 3u) ^ (u32(abs(g.root.z) * 53.0) * 7u);
+    let h = grass_leaf_hash(place ^ (g.seed << 8u) ^ (leaf * 0x9e3779b9u));
+    let u1 = f32(h & 255u) / 255.0;
+    let u2 = f32((h >> 8u) & 255u) / 255.0;
+    let u3 = f32((h >> 16u) & 255u) / 255.0;
+    let u4 = f32((h >> 24u) & 255u) / 255.0;
+    var l = g;
+    l.facing = g.facing + f32(leaf) * 2.3999632 + (u1 - 0.5) * 0.5;
+    l.lean = clamp(mix(g.lean * 0.6, g.lean * 1.25 + 0.15, u2) + 0.05 * f32(leaf), 0.05, 1.45);
+    l.height = g.height * mix(0.6, 1.0, u3);
+    l.bend = clamp(g.bend + (u4 - 0.5) * 0.4, 0.0, 1.0);
+    l.segments = 1u;
+    return l;
+}
+
+/// Corner `corner` (0..2) of triangle `tri` of a record's draw, as the grass draw rasterised it and every pass rebuilds
+/// it: a strip's points tri, tri + 1 and tri + 2, or a tiller's leaf `tri` (its root pair and its tip).
+fn grass_corner(g: GrassBlade, tri: u32, corner: u32, clock: f32, wind: vec4<f32>, eye: vec3<f32>, base_bend: f32,
+                base_flutter: f32) -> GrassVertex {
+    if g.segments == 4u {
+        return grass_strip_vertex(grass_leaf(g, tri), corner, clock, wind, eye, base_bend, base_flutter);
+    }
+    return grass_strip_vertex(g, tri + corner, clock, wind, eye, base_bend, base_flutter);
 }

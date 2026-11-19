@@ -331,12 +331,28 @@ fn grow(cell: u32, tile: GrassTile, k: u32, rank: f32) -> Grown {
     colour *= 0.92 + 0.16 * unit(h4);
     g.root = vec3<f32>(xz.x, g0.w - 0.01 * height, xz.y);
     g.height = max(height * rise, 0.002);
-    // Coverage floor: a short sward at its true width shows the ground between its blades to a standing eye (v2's
-    // grazed pasture: 9.4% bare within 10 m at the meadow, fr_gg_2 23:22). From 1.7 m the cover goes as density x width
-    // x height x d_lod (the falloff holds it from d_lod out). Where that falls short of about 2% bare, its blades
-    // widen from 2 m out, at most 4x, never at the feet: the same count, so the same cost.
-    let cover = 0.375 * min(hab.density, params.lod.w) * hab.w_mean * 0.5 * (hab.h_min + hab.h_max) * params.lod.x;
-    let widen_cover = mix(1.0, clamp(4.0 / max(cover, 1e-3), 1.0, 4.0), smoothstep(2.0, 6.0, d));
+    var lod_class = 2u;
+    if d < params.seg.x {
+        lod_class = 0u;
+    } else if d < params.seg.y {
+        lod_class = 1u;
+    }
+    // A short sward is many small leaves, not a few wide ones (fr_gj_2, 20 Nov 00:53: a grazers' lawn at 2-8 cm, its
+    // blades widened 4x by the floor below, read as stubby flecks over 31% bare ground within 10 m). Where the
+    // habitat's mean height is under 16 cm, a kept candidate near the eye is a tiller: 5 leaves from one root within
+    // 8 m (class 0's 15 vertices), 3 within 24 m (class 1's 9), one blade beyond. A tussock or a seed head stays a blade.
+    let h_mean = 0.5 * (hab.h_min + hab.h_max);
+    let tiller = h_mean < 0.16 && !tussock && state < c_green + c_dead && lod_class < 2u;
+    let leaves = select(1.0, select(3.0, 5.0, lod_class == 0u), tiller);
+    // Coverage floor: from 1.7 m the bare share goes as exp(-0.375 x density x leaves x width x height x distance), the
+    // falloff holding it at d_lod past d_lod. Where that leaves more than about 2% bare (v2's grazed pasture: 9.4% at
+    // the meadow, fr_gg_2 23:22), blades widen: a lone blade from 2 m out, at most 4x, never at the feet; a tiller's
+    // leaves at any distance, at most 2x. The same count, so the same cost.
+    let cover = 0.375 * min(hab.density, params.lod.w) * hab.w_mean * h_mean * leaves;
+    var widen_cover = mix(1.0, clamp(4.0 / max(cover * params.lod.x, 1e-3), 1.0, 4.0), smoothstep(2.0, 6.0, d));
+    if tiller {
+        widen_cover = clamp(4.0 / max(cover * clamp(d, 1.5, params.lod.x), 1e-3), 1.0, 2.0);
+    }
     g.width = width * s * widen * widen_cover;
     g.facing = c_face + (unit(h5) - 0.5) * 3.7699;
     // Lodged and trodden places: where the small patches peak, most blades lie over, the same way.
@@ -352,13 +368,7 @@ fn grow(cell: u32, tile: GrassTile, k: u32, rank: f32) -> Grown {
     g.stiffness = clamp(hab.stiffness + 0.3 * (unit(hash(h4 ^ 0x2c1b3c6du)) - 0.5), 0.0, 1.0);
     g.root_ao = hab.root_ao;
     g.seed = h6 & 255u;
-    var lod_class = 2u;
-    if d < params.seg.x {
-        lod_class = 0u;
-    } else if d < params.seg.y {
-        lod_class = 1u;
-    }
-    g.segments = 3u - lod_class;
+    g.segments = select(3u - lod_class, 4u, tiller);
 
     // Frustum, then this frame's depth.
     let rel = g.root - eye;
