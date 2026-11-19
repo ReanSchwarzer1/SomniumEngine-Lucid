@@ -4,6 +4,7 @@
 // hoists every `enable` above everything.
 //!include "rt_hit.wgsl"
 //!include "global_pool.wgsl"
+//!include "grass_pool.wgsl"
 //!include "brdf.wgsl"
 //!include "sampling.wgsl"
 //!include "atmosphere.wgsl"
@@ -72,13 +73,11 @@ fn vis_normal(coord: vec2<i32>) -> vec3<f32> {
         return vec3<f32>(0.0, 1.0, 0.0);
     }
     let inst = instances[vis.x - 1u];
-    let base = inst.index_offset + vis.y * 3u;
-    let a = vertices[inst.vertex_offset + indices[base + 0u]];
-    let b = vertices[inst.vertex_offset + indices[base + 1u]];
-    let c = vertices[inst.vertex_offset + indices[base + 2u]];
-    let p0 = (inst.model * vec4<f32>(a.pos_x, a.pos_y, a.pos_z, 1.0)).xyz;
-    let p1 = (inst.model * vec4<f32>(b.pos_x, b.pos_y, b.pos_z, 1.0)).xyz;
-    let p2 = (inst.model * vec4<f32>(c.pos_x, c.pos_y, c.pos_z, 1.0)).xyz;
+    // A mesh's triangle, or a grass blade's (grass_pool.wgsl).
+    let corners = vis_triangle_world(inst, vis.y);
+    let p0 = corners[0];
+    let p1 = corners[1];
+    let p2 = corners[2];
     var n = normalize(cross(p1 - p0, p2 - p0));
     if dot(n, extra.camera_pos - p0) < 0.0 {
         n = -n;

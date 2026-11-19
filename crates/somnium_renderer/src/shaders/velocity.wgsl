@@ -1,5 +1,6 @@
 // Somnium Engine — screen-space velocity (Phase 24AD).
 //!include "global_pool.wgsl"
+//!include "grass_pool.wgsl"
 //!include "wind.wgsl"
 //
 // Where each pixel was on the previous frame, in UV space. Written once and
@@ -172,13 +173,23 @@ fn fs_main(in: VertexOutput) -> @location(0) vec2<f32> {
             let inst = instances[vis.x - 1u];
             let m = materials[inst.material_id];
             if m.terrain_index < 0 && (m.wind_bend > 0.0 || m.wind_flutter > 0.0) {
-                let pivot = inst.model[3].xyz;
+                var pivot = inst.model[3].xyz;
+                var bend = m.wind_bend;
+                var flutter = m.wind_flutter;
+                // A grass blade (grass_pool.wgsl) sways about its own root, by its own stiffness.
+                if grass_material(m) {
+                    let blade = grass_load(inst.vertex_offset + (vis.y >> GRASS_TRI_BITS));
+                    pivot = blade.root;
+                    let w = grass_wind(blade, m.wind_bend, m.wind_flutter);
+                    bend = w.x;
+                    flutter = w.y;
+                }
                 let here = world + view.camera_pos;
-                var rest = here - wind_offset(here, pivot, m.wind_bend, m.wind_flutter,
+                var rest = here - wind_offset(here, pivot, bend, flutter,
                                                view.wind_time.x, view.wind, view.camera_pos);
-                rest = here - wind_offset(rest, pivot, m.wind_bend, m.wind_flutter,
+                rest = here - wind_offset(rest, pivot, bend, flutter,
                                            view.wind_time.x, view.wind, view.camera_pos);
-                world = rest + wind_offset(rest, pivot, m.wind_bend, m.wind_flutter,
+                world = rest + wind_offset(rest, pivot, bend, flutter,
                                            view.wind_time.y, view.wind, view.camera_pos) - view.camera_pos;
             }
         }

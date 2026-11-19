@@ -9527,6 +9527,15 @@ impl<G: GameApp> Engine<G> {
             })
             .collect();
 
+        // GPU grass (somnium_renderer `pass/grass.rs`): built once from the project's habitat table, then told each
+        // terrain's ground layer set, which names the habitats it grows. A project without the table has none.
+        if let Some((r, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref()) {
+            r.ensure_grass(ctx, self.config.project_root.as_deref());
+            for terrain in &terrains {
+                r.grass_terrain_set(terrain.0, &terrain.9);
+            }
+        }
+
         if let Some(r) = self.renderer.as_mut() {
             r.profiler.cpu_begin("Foliage");
         }

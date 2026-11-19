@@ -115,6 +115,9 @@ pub const MATERIAL_FLAG_HAIR: u32 = 1 << 4;
 pub const MATERIAL_FLAG_HASHED_ALPHA: u32 = 1 << 5;
 /// Far ground (`somnium_asset::Material::far_ground`): shading adds world-space relief and colour (`apply_far_ground`).
 pub const MATERIAL_FLAG_FAR_GROUND: u32 = 1 << 6;
+/// GPU grass (`grass.rs`): the grass instance's material. Its "triangles" are blades in the vertex pool, rebuilt by
+/// `grass_pool.wgsl` (`MATERIAL_GRASS`, `(flags & 128u)`) wherever a pass would fetch a mesh's.
+pub const MATERIAL_FLAG_GRASS: u32 = 1 << 7;
 
 impl GpuMaterial {
     /// Rebuild the frozen 80-byte runtime payload from an authored material.

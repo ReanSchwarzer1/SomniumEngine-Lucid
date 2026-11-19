@@ -9,6 +9,7 @@
 //!include "sky_planet.wgsl"
 //!include "sky_sun.wgsl"
 //!include "global_pool.wgsl"
+//!include "grass_pool.wgsl"
 //!include "brdf.wgsl"
 //!include "sampling.wgsl"
 //!include "atmosphere.wgsl"
@@ -2500,31 +2501,57 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    let i0 = indices[instance.index_offset + prim_id * 3u + 0u];
-    let i1 = indices[instance.index_offset + prim_id * 3u + 1u];
-    let i2 = indices[instance.index_offset + prim_id * 3u + 2u];
+    var i0 = 0u;
+    var i1 = 0u;
+    var i2 = 0u;
+    var v0: Vertex;
+    var v1: Vertex;
+    var v2: Vertex;
+    var p0: vec3<f32>;
+    var p1: vec3<f32>;
+    var p2: vec3<f32>;
+    // GPU grass (grass_pool.wgsl): the grass instance's triangle is a blade's, rebuilt as the grass draw built it,
+    // in world space with its wind; its colour and root shade are the blade's own.
+    let is_grass = grass_material(material);
+    var grass_tint = vec3<f32>(1.0);
+    var grass_root_ao = 0.0;
+    if is_grass {
+        let blade = grass_pool_tri(instance.vertex_offset, prim_id, material, view.wind_time.x);
+        v0 = blade.v[0];
+        v1 = blade.v[1];
+        v2 = blade.v[2];
+        p0 = vec3<f32>(v0.pos_x, v0.pos_y, v0.pos_z);
+        p1 = vec3<f32>(v1.pos_x, v1.pos_y, v1.pos_z);
+        p2 = vec3<f32>(v2.pos_x, v2.pos_y, v2.pos_z);
+        grass_tint = blade.colour;
+        grass_root_ao = blade.root_ao;
+    } else {
+        i0 = indices[instance.index_offset + prim_id * 3u + 0u];
+        i1 = indices[instance.index_offset + prim_id * 3u + 1u];
+        i2 = indices[instance.index_offset + prim_id * 3u + 2u];
 
-    let v0 = vertices[instance.vertex_offset + i0];
-    let v1 = vertices[instance.vertex_offset + i1];
-    let v2 = vertices[instance.vertex_offset + i2];
+        v0 = vertices[instance.vertex_offset + i0];
+        v1 = vertices[instance.vertex_offset + i1];
+        v2 = vertices[instance.vertex_offset + i2];
 
-    // The terrain morph the visibility pass applied (terrain_morph.wgsl): the triangle as it was rasterised.
-    let m0 = terrain_morph(vec3<f32>(v0.pos_x, v0.pos_y, v0.pos_z), i0, instance.vertex_offset, instance._padding,
-                           instance.model, view.camera_pos);
-    let m1 = terrain_morph(vec3<f32>(v1.pos_x, v1.pos_y, v1.pos_z), i1, instance.vertex_offset, instance._padding,
-                           instance.model, view.camera_pos);
-    let m2 = terrain_morph(vec3<f32>(v2.pos_x, v2.pos_y, v2.pos_z), i2, instance.vertex_offset, instance._padding,
-                           instance.model, view.camera_pos);
-    var p0 = (instance.model * vec4<f32>(m0, 1.0)).xyz;
-    var p1 = (instance.model * vec4<f32>(m1, 1.0)).xyz;
-    var p2 = (instance.model * vec4<f32>(m2, 1.0)).xyz;
-    // The triangle the visibility pass rasterised, wind included (visibility.wgsl):
-    // reconstructing the rest pose would shade a leaf where it is not drawn.
-    if material.terrain_index < 0 {
-        let pivot = instance.model[3].xyz;
-        p0 += wind_offset(p0, pivot, material.wind_bend, material.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
-        p1 += wind_offset(p1, pivot, material.wind_bend, material.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
-        p2 += wind_offset(p2, pivot, material.wind_bend, material.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
+        // The terrain morph the visibility pass applied (terrain_morph.wgsl): the triangle as it was rasterised.
+        let m0 = terrain_morph(vec3<f32>(v0.pos_x, v0.pos_y, v0.pos_z), i0, instance.vertex_offset, instance._padding,
+                               instance.model, view.camera_pos);
+        let m1 = terrain_morph(vec3<f32>(v1.pos_x, v1.pos_y, v1.pos_z), i1, instance.vertex_offset, instance._padding,
+                               instance.model, view.camera_pos);
+        let m2 = terrain_morph(vec3<f32>(v2.pos_x, v2.pos_y, v2.pos_z), i2, instance.vertex_offset, instance._padding,
+                               instance.model, view.camera_pos);
+        p0 = (instance.model * vec4<f32>(m0, 1.0)).xyz;
+        p1 = (instance.model * vec4<f32>(m1, 1.0)).xyz;
+        p2 = (instance.model * vec4<f32>(m2, 1.0)).xyz;
+        // The triangle the visibility pass rasterised, wind included (visibility.wgsl):
+        // reconstructing the rest pose would shade a leaf where it is not drawn.
+        if material.terrain_index < 0 {
+            let pivot = instance.model[3].xyz;
+            p0 += wind_offset(p0, pivot, material.wind_bend, material.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
+            p1 += wind_offset(p1, pivot, material.wind_bend, material.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
+            p2 += wind_offset(p2, pivot, material.wind_bend, material.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
+        }
     }
 
     // Camera-relative, as the visibility pass rasterised them (depth_tie.wgsl `depth_tie_clip`): a world position
@@ -2561,7 +2588,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // (`VertexPaintComponent::baked_light`, slot word 16 bit 16): 0.5 is the texture as painted, 1 twice as bright.
     var baked = false;
     var baked_light = vec3<f32>(0.0);
-    if material.terrain_index < 0 {
+    // Grass has no paint, and its instance lies past the paint table.
+    if material.terrain_index < 0 && !is_grass {
         paint_slot = vertex_paint_slot(instance_id);
         if paint_slot != 0u {
             baked = ((vertex_paint[paint_slot + 16u] >> 16u) & 1u) != 0u;
@@ -2839,6 +2867,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
     surface.albedo *= interior_shade;
+    if is_grass {
+        surface.albedo *= grass_tint;
+    }
     // Foliage remembered alive (`VertexPaintPool::green`, header word 7): withered leaf colour is
     // pulled to a living green at the leaf's own brightness.
     if (material.flags & 2u) != 0u {
@@ -2894,6 +2925,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         surface.occlusion *= material_occlusion;
         // Phase TSUSHIMA-F1: the *material-scale* half, kept separately.
         micro_occlusion = material_occlusion;
+    }
+    // A blade in a sward sits in the others' shade, darkest at the root (grass casts no shadow; this is its share).
+    if is_grass {
+        let blade_occlusion = mix(1.0 - grass_root_ao, 1.0, sqrt(saturate(uv.y)));
+        surface.occlusion *= blade_occlusion;
+        micro_occlusion = blade_occlusion;
     }
 
     var normal_variance = 0.0;

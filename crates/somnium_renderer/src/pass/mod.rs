@@ -17,6 +17,8 @@ pub mod editor_glow;
 pub mod gizmo;
 pub mod grain;
 pub mod grid;
+pub mod cover_census;
+pub mod grass;
 pub mod gtao;
 pub mod hiz;
 pub mod ibl;

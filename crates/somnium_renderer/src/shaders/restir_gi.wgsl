@@ -5,6 +5,7 @@
 // hoists every `enable` above everything.
 //!include "rt_hit.wgsl"
 //!include "global_pool.wgsl"
+//!include "grass_pool.wgsl"
 //!include "brdf.wgsl"
 //!include "sampling.wgsl"
 //!include "atmosphere.wgsl"
@@ -570,13 +571,11 @@ fn gi_primary_surface(coord: vec2<i32>, dims: vec2<u32>) -> GiSurface {
         return s;
     }
     let inst = instances[vis.x - 1u];
-    let base = inst.index_offset + vis.y * 3u;
-    let v0 = vertices[inst.vertex_offset + indices[base + 0u]];
-    let v1 = vertices[inst.vertex_offset + indices[base + 1u]];
-    let v2 = vertices[inst.vertex_offset + indices[base + 2u]];
-    let p0 = (inst.model * vec4<f32>(v0.pos_x, v0.pos_y, v0.pos_z, 1.0)).xyz;
-    let p1 = (inst.model * vec4<f32>(v1.pos_x, v1.pos_y, v1.pos_z, 1.0)).xyz;
-    let p2 = (inst.model * vec4<f32>(v2.pos_x, v2.pos_y, v2.pos_z, 1.0)).xyz;
+    // A mesh's triangle, or a grass blade's (grass_pool.wgsl).
+    let corners = vis_triangle_world(inst, vis.y);
+    let p0 = corners[0];
+    let p1 = corners[1];
+    let p2 = corners[2];
     // Geometric, not interpolated: this normal is used to push ray origins off
     // the surface, and a shading normal can point into the geometry it came
     // from on a low-poly silhouette.

@@ -193,6 +193,11 @@ impl Shaders {
             "water_spectrum.wgsl",
             "wind.wgsl",
             "preview_studio.wgsl",
+            "grass_blade.wgsl",
+            "grass_pool.wgsl",
+            "grass_gen.wgsl",
+            "grass_vis.wgsl",
+            "cover_census.wgsl",
         );
         // SAFETY: this is a checked-in Somnium-authored artifact produced by
         // the pinned Slang compiler. `tools/slangcook/run.py --check` recooks
@@ -450,6 +455,9 @@ mod tests {
             // 7 Nov 2026: snow lying on surfaces (its own uniform at group 1 binding 34; off unless a look turns it on).
             "snow.wgsl",
             "standing_water.wgsl",
+            // 19 Nov 2026: GPU grass blades rebuilt from the pool (no bindings of their own).
+            "grass_pool.wgsl",
+            "grass_blade.wgsl",
         ];
         expected.sort_unstable();
         assert_eq!(
@@ -482,6 +490,10 @@ mod tests {
             "terrain_splat_core.wgsl",
             // The bounce light shapes spot cones like the raster does (17 Oct 2026); a few lines, no heavy modules.
             "spot_cookie.wgsl",
+            // A grass blade's normal (19 Nov 2026): the blade and its wind, pure functions.
+            "grass_pool.wgsl",
+            "grass_blade.wgsl",
+            "wind.wgsl",
         ];
         gi.sort_unstable();
         assert_eq!(
@@ -498,6 +510,9 @@ mod tests {
             "sampling.wgsl",
             "atmosphere.wgsl",
             "terrain_splat_core.wgsl",
+            "grass_pool.wgsl",
+            "grass_blade.wgsl",
+            "wind.wgsl",
         ];
         extra.sort_unstable();
         assert_eq!(

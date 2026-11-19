@@ -528,6 +528,8 @@ pub struct SomniumRenderer {
     /// Phase DOOM-B. Counts pixels per prospective shading bin. Public so the
     /// editor can toggle it and read the table; default off (`SOMNIUM_CENSUS=1`).
     pub census_pass: crate::pass::census::CensusPass,
+    /// The ground's bare share near the eye, for the GPU grass proof (`SOMNIUM_COVER_CENSUS=1`; else `None`).
+    pub cover_census: Option<crate::pass::cover_census::CoverCensus>,
     /// Phase DOOM-C. Routes tiles to per-bin shading pipelines. Public for the
     /// Post FX toggle and the Terrain aerial-split field.
     pub classify_pass: crate::pass::classify::ClassifyPass,
@@ -644,6 +646,9 @@ pub struct SomniumRenderer {
     /// False until a pyramid has been built from real geometry. Occlusion
     /// culling is held off until then — see the note at the cull dispatch.
     hiz_ready: bool,
+    /// GPU grass (`pass/grass.rs`), built once from the project's habitat table (`ensure_grass`).
+    pub grass: Option<crate::pass::grass::GrassPass>,
+    grass_tried: bool,
     /// `SOMNIUM_CULL_STATS=1` reads the indirect args back after each cull
     /// phase and logs how many draws survived. Off by default: the readback
     /// stalls the pipeline waiting on the GPU.
@@ -1248,6 +1253,8 @@ impl SomniumRenderer {
 
         let census_pass =
             crate::pass::census::CensusPass::new(&ctx.device, &shaders, &global_pool.layout);
+        let cover_census =
+            crate::pass::cover_census::CoverCensus::new(&ctx.device, &shaders, &global_pool.layout);
         let classify_pass =
             crate::pass::classify::ClassifyPass::new(&ctx.device, &shaders, &global_pool.layout);
         let skin_scatter_pass = crate::pass::skin_scatter::SkinScatterPass::new(
@@ -1804,6 +1811,8 @@ impl SomniumRenderer {
             decals: Vec::new(),
             hiz_pass,
             hiz_ready: false,
+            grass: None,
+            grass_tried: false,
             cull_stats: std::env::var("SOMNIUM_CULL_STATS").is_ok_and(|v| v == "1"),
             cull_stats_buffers: None,
             occlusion_off: std::env::var("SOMNIUM_NO_OCCLUSION").is_ok_and(|v| v == "1"),
@@ -1858,6 +1867,7 @@ impl SomniumRenderer {
             foliage_submission: crate::profiler::FoliageCounters::default(),
             timing: crate::timing::TimingRun::from_env(),
             census_pass,
+            cover_census,
             classify_pass,
             // 150 m: DOOM-B put 63.9% of Coastal ground inside 100 m and 54.9%
             // of the overview between 100 and 400 m, so a split in that gap is
@@ -4364,6 +4374,42 @@ impl SomniumRenderer {
         self.camera_cut_requested = true;
     }
 
+    /// GPU grass (`pass/grass.rs`): built once, from the project's habitat table
+    /// (`<project>/data/foliage/grass_habitats.json`, or `SOMNIUM_GRASS_TABLE`), unless `SOMNIUM_GPU_GRASS=0`.
+    /// A project without the table (TSF, the samples) never builds it. Call between frames: it adds a material.
+    pub fn ensure_grass(&mut self, ctx: &crate::context::RenderContext, project_root: Option<&std::path::Path>) {
+        if self.grass_tried {
+            return;
+        }
+        self.grass_tried = true;
+        if !crate::pass::grass::enabled() {
+            return;
+        }
+        let Some(path) = crate::pass::grass::table_path(project_root) else { return };
+        let Ok(text) = std::fs::read_to_string(&path) else { return };
+        match crate::pass::grass::HabitatTable::parse(&text) {
+            Ok(table) => {
+                self.grass = crate::pass::grass::GrassPass::new(
+                    &ctx.device,
+                    &ctx.queue,
+                    &self.shaders,
+                    &self.global_pool.layout,
+                    &mut self.geometry,
+                    &mut self.materials_pool,
+                    table,
+                );
+            }
+            Err(error) => tracing::warn!("GPU grass: {} not read: {error}", path.display()),
+        }
+    }
+
+    /// Which habitat set terrain `terrain_id` grows: its ground layer set ("" the project's own).
+    pub fn grass_terrain_set(&mut self, terrain_id: u32, set: &str) {
+        if let Some(grass) = self.grass.as_mut() {
+            grass.set_terrain_set(terrain_id, set);
+        }
+    }
+
     /// Mutable access to a terrain (sculpting, painting, raycasts).
     pub fn terrain_mut(&mut self, terrain_id: u32) -> Option<&mut crate::terrain::TerrainData> {
         self.terrains.get_mut(terrain_id as usize)
@@ -4520,8 +4566,7 @@ impl SomniumRenderer {
         // consumers share this bind group, so refresh it before any pass or
         // temporary texture-hiding group is recorded. Growth is monotonic.
         if self.global_pool.material_buffer.size() != self.materials_pool.buffer.size() {
-            self.global_pool.material_buffer = self.materials_pool.buffer.clone();
-            self.global_pool.update_textures(&ctx.device);
+            self.global_pool.set_material_buffer(&ctx.device, &self.materials_pool.buffer);
         }
 
         // ── Phase DOOM-F: dynamic resolution ─────────────────────────────────
@@ -5025,6 +5070,10 @@ impl SomniumRenderer {
         // so the newest available count is what a timing run records.
         self.census_pass.collect();
         self.census_pass.after_submit();
+        if let Some(cover) = self.cover_census.as_mut() {
+            cover.collect();
+            cover.after_submit();
+        }
 
         // Phase DOOM-A. After `after_submit`, because that is what polls the
         // device and lets an earlier frame's readback callback fire — sampling
@@ -5890,6 +5939,23 @@ impl SomniumRenderer {
             });
         }
         crate::pass::transparent::sort_back_to_front(&mut transparent_draws);
+        // GPU grass (`pass/grass.rs`): this frame's tiles, and one instance past the frame's own naming the blades'
+        // span (instance batches start after it). The pyramid it culls against is built later this frame.
+        let grass_instance = match self.grass.as_mut() {
+            Some(grass) => {
+                let (hiz_size, hiz_mips) = (self.hiz_pass.size(), self.hiz_pass.mip_count());
+                let pixel_angle = 2.0 / (self.proj_matrix.y_axis.y.abs().max(1e-6) * hiz_size.1.max(1) as f32);
+                let hiz = (self.hiz_ready && !self.occlusion_off).then_some((hiz_size, hiz_mips));
+                grass.prepare(&ctx.device, &ctx.queue, &self.terrains, self.camera_pos, self.view_proj_rel,
+                              pixel_angle, hiz);
+                grass.instance()
+            }
+            None => None,
+        };
+        let grass_index = grass_instance.map(|instance| self.instances.add_instance(instance));
+        if let Some(grass) = self.grass.as_mut() {
+            grass.set_instance_index(&ctx.queue, grass_index);
+        }
         // Instance batches keep their instances past the frame's own (`instance_batch.rs`).
         self.instance_batches.flush(&ctx.device, &ctx.queue, &self.shaders);
         let mut batches_live = self.gpu_driven && !self.instance_batches.is_empty();
@@ -6331,6 +6397,23 @@ impl SomniumRenderer {
         // geometry. wgpu zero-fills a new texture; zero is infinitely far under
         // reversed-Z, which occludes nothing, but stale is still stale.
         self.hiz_ready = true;
+
+        // ── 6.95 GPU grass (`pass/grass.rs`) ─────────────────────────────────
+        // Laid out and culled against the final pyramid just built, then drawn into the same visibility buffer and
+        // depth. Not in the pyramid itself: next frame's phase 1 culls against what grass stands among, not grass.
+        if let Some(grass) = self.grass.as_ref() {
+            self.profiler.begin(&mut encoder, "Grass");
+            grass.record(
+                &ctx.device,
+                &mut encoder,
+                &self.geometry.vertex_buffer,
+                &self.hiz_pass.view,
+                &self.global_pool.bind_group,
+                &self.vis_pass.view,
+                &self.vis_pass.depth_view,
+            );
+            self.profiler.end(&mut encoder);
+        }
 
         // The Phase 25A-1 terrain depth prepass stood here. It is gone with
         // 25A-2: terrain is drawn by the visibility pass above, which fills the
@@ -6929,6 +7012,18 @@ impl SomniumRenderer {
         self.census_pass
             .record(&mut encoder, &ctx.queue, &self.global_pool.lean_bind_group);
         self.profiler.end(&mut encoder);
+        if let Some(cover) = self.cover_census.as_mut() {
+            cover.record(
+                &ctx.device,
+                &mut encoder,
+                &ctx.queue,
+                &self.global_pool.lean_bind_group,
+                &self.vis_pass.view,
+                &self.vis_pass.depth_view,
+                (self.render_width, self.render_height),
+                self.camera_pos,
+            );
+        }
 
         // ── 6.99 Tile classification (Phase DOOM-C) ──────────────────────────
         //

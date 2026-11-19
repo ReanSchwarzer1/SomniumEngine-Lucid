@@ -1,6 +1,7 @@
 //!include "spot_cookie.wgsl"
 //!include "rt_hit.wgsl"
 //!include "global_pool.wgsl"
+//!include "grass_pool.wgsl"
 //!include "brdf.wgsl"
 //!include "sampling.wgsl"
 //!include "terrain_splat_core.wgsl"
@@ -287,15 +288,35 @@ fn pt_primary(coord: vec2<i32>, origin: vec3<f32>, ndc: vec2<f32>, textured: boo
     var out: RtHit;
     let inst = instances[vis.x - 1u];
     let mat = materials[inst.material_id];
-    let base = inst.index_offset + vis.y * 3u;
-    let v0 = vertices[inst.vertex_offset + indices[base + 0u]];
-    let v1 = vertices[inst.vertex_offset + indices[base + 1u]];
-    let v2 = vertices[inst.vertex_offset + indices[base + 2u]];
-    var p0 = (inst.model * vec4<f32>(v0.pos_x, v0.pos_y, v0.pos_z, 1.0)).xyz;
-    var p1 = (inst.model * vec4<f32>(v1.pos_x, v1.pos_y, v1.pos_z, 1.0)).xyz;
-    var p2 = (inst.model * vec4<f32>(v2.pos_x, v2.pos_y, v2.pos_z, 1.0)).xyz;
+    var v0: Vertex;
+    var v1: Vertex;
+    var v2: Vertex;
+    var p0: vec3<f32>;
+    var p1: vec3<f32>;
+    var p2: vec3<f32>;
+    let is_grass = grass_material(mat);
+    var grass_tint = vec3<f32>(1.0);
+    if is_grass {
+        // A grass blade's triangle, wind included (grass_pool.wgsl); world space, as the identity model leaves it.
+        let blade = grass_pool_tri(inst.vertex_offset, vis.y, mat, view.wind_time.x);
+        v0 = blade.v[0];
+        v1 = blade.v[1];
+        v2 = blade.v[2];
+        p0 = vec3<f32>(v0.pos_x, v0.pos_y, v0.pos_z);
+        p1 = vec3<f32>(v1.pos_x, v1.pos_y, v1.pos_z);
+        p2 = vec3<f32>(v2.pos_x, v2.pos_y, v2.pos_z);
+        grass_tint = blade.colour;
+    } else {
+        let base = inst.index_offset + vis.y * 3u;
+        v0 = vertices[inst.vertex_offset + indices[base + 0u]];
+        v1 = vertices[inst.vertex_offset + indices[base + 1u]];
+        v2 = vertices[inst.vertex_offset + indices[base + 2u]];
+        p0 = (inst.model * vec4<f32>(v0.pos_x, v0.pos_y, v0.pos_z, 1.0)).xyz;
+        p1 = (inst.model * vec4<f32>(v1.pos_x, v1.pos_y, v1.pos_z, 1.0)).xyz;
+        p2 = (inst.model * vec4<f32>(v2.pos_x, v2.pos_y, v2.pos_z, 1.0)).xyz;
+    }
     // The triangle as the visibility pass drew it, wind included (shading.wgsl does the same).
-    if mat.terrain_index < 0 {
+    if mat.terrain_index < 0 && !is_grass {
         let pivot = inst.model[3].xyz;
         p0 += wind_offset(p0, pivot, mat.wind_bend, mat.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
         p1 += wind_offset(p1, pivot, mat.wind_bend, mat.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
@@ -328,7 +349,7 @@ fn pt_primary(coord: vec2<i32>, origin: vec3<f32>, ndc: vec2<f32>, textured: boo
     out.roughness = clamp(mat.roughness, 0.04, 1.0);
     out.metallic = clamp(mat.metallic, 0.0, 1.0);
     out.terrain_index = mat.terrain_index;
-    out.albedo = mat.base_color.rgb;
+    out.albedo = mat.base_color.rgb * grass_tint;
     if !textured {
         return out;
     }
