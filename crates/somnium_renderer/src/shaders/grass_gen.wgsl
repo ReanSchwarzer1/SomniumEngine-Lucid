@@ -367,6 +367,10 @@ fn grow(cell: u32, tile: GrassTile, k: u32, rank: f32) -> Grown {
     // habitat's mean height is under 16 cm, a kept candidate near the eye is a tiller: 5 leaves from one root within
     // 8 m (class 0's 15 vertices), 3 within 24 m (class 1's 9), one blade beyond. A tussock or a seed head stays a blade.
     let h_mean = 0.5 * (hab.h_min + hab.h_max);
+    // How far past the feet a short sward is seen as a sward, not as leaves (fr_gt_9, 20 Nov 03:22: the lawn's 10-30 m
+    // band stayed 58% bare with tillers, where the cover model said 2%: a short leaf leaning in a grazing view shows
+    // the eye almost no height).
+    let far_short = smoothstep(6.0, 10.0, d) * select(0.0, 1.0, h_mean < 0.16);
     let tiller = h_mean < 0.16 && !tussock && state < c_green + c_dead && lod_class < 2u;
     let leaves = select(1.0, select(3.0, 5.0, lod_class == 0u), tiller);
     // Coverage floor: from 1.7 m the bare share goes as exp(-0.375 x density x leaves x width x height x distance), the
@@ -377,6 +381,8 @@ fn grow(cell: u32, tile: GrassTile, k: u32, rank: f32) -> Grown {
     var widen_cover = mix(1.0, clamp(4.0 / max(cover * params.lod.x, 1e-3), 1.0, 4.0), smoothstep(2.0, 6.0, d));
     if tiller {
         widen_cover = clamp(4.0 / max(cover * clamp(d, 1.5, params.lod.x), 1e-3), 1.0, 2.0);
+        // From 8 m a tiller's leaves widen fully: the model counts a leaf's whole side, a grazing view sees under half.
+        widen_cover = mix(widen_cover, 4.0, far_short);
     }
     g.width = width * s * widen * widen_cover;
     g.facing = c_face + (unit(h5) - 0.5) * 3.7699;
@@ -390,6 +396,8 @@ fn grow(cell: u32, tile: GrassTile, k: u32, rank: f32) -> Grown {
     } else {
         g.lean = mix(hab.lean_min, hab.lean_max, unit(hash(h6)) * unit(hash(h6)));
     }
+    // From 8 m a short sward's leaves stand up (at most 0.5 rad): lying over, they show a grazing view almost nothing.
+    g.lean = min(g.lean, mix(1.48, 0.5, far_short));
     g.colour = colour;
     g.bend = mix(hab.bend_min, hab.bend_max, unit(hash(h5 ^ 0x5bd1e995u)));
     g.stiffness = clamp(hab.stiffness + 0.3 * (unit(hash(h4 ^ 0x2c1b3c6du)) - 0.5), 0.0, 1.0);
