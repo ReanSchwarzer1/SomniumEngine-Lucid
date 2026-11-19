@@ -137,6 +137,12 @@ const GROUND_BLEND_OPEN: f32 = 0.25;
 /// captures (SOMNIUM_GROUND_BLEND_EDGES, _RAGGED, _JOINTS, _UPRIGHT, as SOMNIUM_GROUND_BLEND_OPENS).
 const GROUND_BLEND_EDGE: [f32; 4] = [0.12, 1.0, 0.3, 0.33];
 
+/// How the band's ground is filtered (`ground_blend.wgsl` `GroundBlendList::foot.x`): 1 with the ground's own texture
+/// footprint at the fold point, as the ground beside the foot is filtered; 0 with the fold's, the wall's pixel laid on
+/// the ground, which let the gravel's stones through sharper than the soil beside it shows them (20 Nov). A proof
+/// tries both by pair of captures (SOMNIUM_GROUND_BLEND_FOOTPRINTS=0,1).
+const GROUND_BLEND_FOOTPRINT: f32 = 1.0;
+
 /// `SOMNIUM_SHADING_DEBUG_CYCLE=0,2,3`: the shading debug view for this pair of captures (proof stills, as
 /// SOMNIUM_GROUND_BLEND_OPENS), the list wrapping round; `None` when it is unset.
 fn debug_cycle_view() -> Option<f32> {
@@ -5831,7 +5837,7 @@ impl SomniumRenderer {
         }
         // Meshes blending into the ground (ground_blend.wgsl): the live terrains' rectangles, heights and indices.
         // ponytail: a terrain's model is a translation (Sunscar's tiles); a turned or scaled one needs its inverse.
-        const HEAD: usize = 8;
+        const HEAD: usize = 12;
         let mut ground = [0.0f32; crate::pass::shading::GROUND_BLEND_FLOATS];
         let mut count = 0;
         for &(id, model) in &self.terrain_queue {
@@ -5906,6 +5912,10 @@ impl SomniumRenderer {
         for (i, values) in EDGES.iter().enumerate() {
             ground[4 + i] = values[pair % values.len()];
         }
+        static FOOTPRINTS: std::sync::LazyLock<Vec<f32>> = std::sync::LazyLock::new(|| {
+            env_floats("SOMNIUM_GROUND_BLEND_FOOTPRINTS").unwrap_or_else(|| vec![GROUND_BLEND_FOOTPRINT])
+        });
+        ground[8] = FOOTPRINTS[pair % FOOTPRINTS.len()];
         self.shading_pass.set_ground_blend(&ctx.queue, &ground);
 
         self.profiler.cpu_end();

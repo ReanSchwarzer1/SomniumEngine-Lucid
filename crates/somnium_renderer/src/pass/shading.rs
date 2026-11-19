@@ -176,8 +176,8 @@ impl Drop for WorkerGuard {
     }
 }
 
-/// Floats in ground_blend.wgsl's `GroundBlendList`: a header of two vectors and 32 terrains of three vectors each.
-pub const GROUND_BLEND_FLOATS: usize = 8 + 32 * 12;
+/// Floats in ground_blend.wgsl's `GroundBlendList`: a header of three vectors and 32 terrains of three vectors each.
+pub const GROUND_BLEND_FLOATS: usize = 12 + 32 * 12;
 
 pub struct ShadingPass {
     /// The fullscreen pipeline for `spec`. `None` until the first frame's `ensure_pipeline`, so startup does not wait

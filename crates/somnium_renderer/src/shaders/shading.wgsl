@@ -3180,6 +3180,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // made of. Both are true, but stacking two full-strength darkenings on
         // the same pixels would read as a painted-on shadow.
         surface.albedo = surface.albedo * mix(vec3(1.0), vec3(0.88, 0.97, 0.78), sheltered);
+        ground_blend_debug = vec3<f32>(sheltered,
+            log2(max(max(length(world_ddx), length(world_ddy)), 1.0e-5) * 1000.0) / 10.0, f32(tm_idx) / 64.0);
 
         surface.occlusion = surface.occlusion * sky_vis;
         baked_sky_vis = sky_vis;
@@ -4047,6 +4049,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // blue 1 where its ground point shows on screen and lends it its light.
     if dbg > 37.5 && dbg < 38.5 {
         return vec4<f32>(ground_blend_w, ground_blend_open, ground_blend_seen, 1.0);
+    }
+    // 39: the band against the ground beside it (ground_blend.wgsl `ground_blend_debug`): red the sheltered share of
+    // the ground's tint, green the texture footprint's longer side (log2 mm / 10), blue the terrain's index / 64.
+    if dbg > 38.5 && dbg < 39.5 {
+        return vec4<f32>(ground_blend_debug, 1.0);
     }
 
     // Phase 24AB: lighting debug views (24–31). 0–23 remain the existing
