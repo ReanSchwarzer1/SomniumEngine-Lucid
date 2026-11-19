@@ -270,6 +270,15 @@ pub(crate) fn load(
                 ));
             }
         }
+        // The impostor is the project's too (sunscar-foliage-render, 19 Nov 2026: left as written, it opened against the
+        // process's working directory, and a launch from anywhere but the project root lost every impostor). One the
+        // project cannot hold, as an absolute path written before, is left as it was; a missing one keeps full
+        // geometry, as before.
+        if let Some(impostor) = &mut entry.impostor
+            && let Ok(path) = project.resolve(&impostor.source)
+        {
+            impostor.source = path;
+        }
         entry.source = project.resolve(&entry.source)?;
         if !entry.source.is_file() {
             return Err(format!(
