@@ -775,6 +775,8 @@ pub struct HelloGame {
     cutaways: somnium_core::cutaway::Cutaways,
     /// Levels of detail not drawn this frame (somnium_core::lod_group).
     lods: somnium_core::lod_group::Lods,
+    /// What the scene clock hides this frame in play (`somnium.ShownByHour`: shutters by night, fronts by day).
+    hours: somnium_core::shown_by_hour::Hours,
     /// Foliage verdicts for the mesh loop, found once a frame per parent (somnium_core::foliage_visibility).
     imported_draws: somnium_core::foliage_visibility::ImportedDraws,
     interactions: authoring_demo::InteractionDemo,
@@ -911,6 +913,7 @@ impl HelloGame {
             cutaways: Default::default(),
             imported_draws: Default::default(),
             lods: Default::default(),
+            hours: Default::default(),
             interactions: Default::default(),
             work_demo: Default::default(),
             combat: Default::default(),
@@ -2841,6 +2844,10 @@ impl GameApp for HelloGame {
                 somnium_core::cutaway::viewer(ctx.world).unwrap_or(draw_eye),
             );
             self.lods.update(ctx.world, draw_eye);
+            self.hours.update(
+                ctx.world,
+                ctx.simulation.state != SimulationState::Editing || ctx.config.player_mode,
+            );
             self.imported_draws.begin_frame();
 
             // Phase 11.5A-2: Use WorldTransform for rendering instead of Transform::to_matrix().
@@ -2893,7 +2900,7 @@ impl GameApp for HelloGame {
                         unsafe { archetype.column(mat_col).get::<MaterialComponent>(row) };
                     let entity = archetype.entities()[row];
                     // The level test first: most of a region's parts are levels not drawn this frame.
-                    if self.lods.is_hidden(entity) {
+                    if self.lods.is_hidden(entity) || self.hours.is_hidden(entity) {
                         continue;
                     }
                     let Some(casts_shadow) =

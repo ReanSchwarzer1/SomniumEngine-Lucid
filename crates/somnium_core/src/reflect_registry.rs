@@ -728,6 +728,7 @@ pub fn component_registry() -> TypeRegistry {
     crate::isometric_camera::register(&mut registry);
     crate::cutaway::register(&mut registry);
     crate::lod_group::register(&mut registry);
+    crate::shown_by_hour::register(&mut registry);
     crate::cell_streaming::register(&mut registry);
     crate::prop_set::register(&mut registry);
     registry.register(sky_schema());

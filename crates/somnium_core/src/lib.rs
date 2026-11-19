@@ -137,6 +137,7 @@ pub mod protagonist_switch;
 /// Roofs and upper floors that open for the camera while the viewer is inside (Rimeborn, 18 Oct 2026).
 pub mod cutaway;
 pub mod lod_group;
+pub mod shown_by_hour;
 pub mod cell_streaming;
 pub mod ground_cover;
 /// Phase CONTROL-N: weather and the wetness it leaves.
