@@ -2383,6 +2383,9 @@ impl GameApp for HelloGame {
         somnium_core::propagate_transforms(ctx.world);
         // After the transforms, so a flame that just streamed in is lit where it stands.
         let eye = ctx.renderer.as_ref().map(|renderer| renderer.camera_pos);
+        if let (Some(renderer), Some(render_ctx)) = (ctx.renderer.as_mut(), ctx.render_ctx) {
+            self.fires.upload_books(renderer, render_ctx);
+        }
         self.fires.update(ctx.world, self.lamps.night(), ctx.time.elapsed().as_secs_f32(), ctx.config.project_root.as_deref(), eye);
         let (view_mat, eye) = self
             .combat

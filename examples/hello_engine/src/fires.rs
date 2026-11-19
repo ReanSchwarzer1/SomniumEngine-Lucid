@@ -74,6 +74,10 @@ pub struct Fires {
     spots: HashSet<(i32, i32, i32)>,
     /// Each kind's book and its atlas, read once the project is known.
     books: Option<HashMap<FlameKind, (Arc<FlameBook>, AssetId)>>,
+    /// Each kind's atlas as the shell uploaded it: its bindless slot.
+    slots: HashMap<FlameKind, i32>,
+    /// The project, for the atlases' files.
+    project: Option<std::path::PathBuf>,
     /// Lights a book drives this frame: their output over the lamp's, and how far the light stands from its rest.
     drive: HashMap<Entity, (f32, Vec3)>,
 }
@@ -148,14 +152,14 @@ fn look(kind: FlameKind) -> Look {
             kelvin: 1700.0,
             range: 9.0,
             coal_k: 0.0,
-            smoke: Some((9.0, 3.0, 0.1, 0.9, 0.8, 0.05, 0.7, 40)),
+            smoke: Some((14.0, 3.0, 0.12, 1.0, 0.8, 0.05, 0.35, 50)),
             sparks: Some((1.2, 1.0, 1.1, 0.5, 6)),
         },
         FlameKind::Brazier => Look {
             kelvin: 1750.0,
             range: 10.0,
             coal_k: 1150.0,
-            smoke: Some((5.0, 6.0, 0.25, 1.6, 0.45, 0.25, 0.45, 40)),
+            smoke: Some((9.0, 6.0, 0.3, 1.8, 0.45, 0.22, 0.14, 60)),
             sparks: Some((2.5, 1.6, 1.0, 0.5, 10)),
         },
         // A hearth's smoke goes up its flue: short-lived, it never leaves the chimney.
@@ -163,7 +167,7 @@ fn look(kind: FlameKind) -> Look {
             kelvin: 1800.0,
             range: 9.0,
             coal_k: 1120.0,
-            smoke: Some((2.0, 1.2, 0.2, 0.5, 0.35, 0.2, 0.35, 8)),
+            smoke: Some((3.0, 1.2, 0.2, 0.5, 0.35, 0.2, 0.15, 8)),
             sparks: Some((0.8, 1.0, 0.8, 0.4, 4)),
         },
         // Under the bellows the bed is the fire: little smoke, sparks in showers when it is worked.
@@ -171,20 +175,41 @@ fn look(kind: FlameKind) -> Look {
             kelvin: 1900.0,
             range: 9.0,
             coal_k: 1380.0,
-            smoke: Some((2.0, 3.0, 0.2, 0.8, 0.35, 0.3, 0.25, 10)),
+            smoke: Some((3.0, 3.0, 0.25, 0.9, 0.35, 0.3, 0.12, 12)),
             sparks: Some((0.6, 0.8, 1.4, 0.6, 6)),
         },
         FlameKind::Bonfire => Look {
             kelvin: 1750.0,
             range: 25.0,
             coal_k: 1150.0,
-            smoke: Some((4.0, 10.0, 0.8, 4.0, 1.4, 0.3, 0.4, 60)),
+            smoke: Some((7.0, 10.0, 1.0, 4.5, 1.4, 0.28, 0.16, 80)),
             sparks: Some((12.0, 2.2, 2.0, 0.6, 40)),
         },
     }
 }
 
 impl Fires {
+    /// Upload each book's atlas once (`assets/fire/<kind>.png`, its bytes linear): the card draws from its own slot,
+    /// not through the asset database, whose ids are relative to the content root and whose scan a short launch may
+    /// not have finished. Call before `update`, with the renderer.
+    pub fn upload_books(&mut self, renderer: &mut somnium_renderer::SomniumRenderer, ctx: &somnium_renderer::context::RenderContext) {
+        let (Some(books), Some(project)) = (self.books.as_ref(), self.project.as_ref()) else { return };
+        for (kind, (book, _)) in books {
+            if self.slots.contains_key(kind) {
+                continue;
+            }
+            let slot = match somnium_asset::material::load_material_texture(project.join(&book.texture)) {
+                Ok(texture) => renderer.upload_material_texture(ctx, &texture.data, texture.width, texture.height, false),
+                Err(error) => {
+                    tracing::warn!(%error, kind = kind.name(), "fire: a book's atlas did not load");
+                    -1
+                }
+            };
+            tracing::info!(kind = kind.name(), slot, "fire: a book's atlas");
+            self.slots.insert(*kind, slot);
+        }
+    }
+
     /// A light's output over its lamp's this frame, and how far from where it stands it shines (its book's frame).
     #[must_use]
     pub fn drive(&self, light: Entity) -> (f32, Vec3) {
@@ -207,6 +232,7 @@ impl Fires {
                 .collect();
             tracing::info!(books = books.len(), "fire: the kinds' simulated books");
             self.books = Some(books);
+            self.project = Some(project.to_path_buf());
         }
         // What left: its cell unloaded or the scene closed. What was made for it goes too.
         let mut gone = Vec::new();
@@ -258,9 +284,15 @@ impl Fires {
                         .filter(|&(_, d)| d <= OWN_LIGHT)
                         .min_by(|a, b| a.1.total_cmp(&b.1))
                         .map(|(light, _)| light);
-                    let book = self.books.as_ref().and_then(|books| books.get(&flame.kind)).cloned();
+                    // A kind burns from its book once its atlas is on the GPU; until then (or with none) as on 13 Nov.
+                    let book = self
+                        .books
+                        .as_ref()
+                        .and_then(|books| books.get(&flame.kind))
+                        .cloned()
+                        .zip(self.slots.get(&flame.kind).copied().filter(|slot| *slot >= 0));
                     let fire = match book {
-                        Some((book, asset)) => burn_book(world, carrier, model, flame, spot, own, book, asset),
+                        Some(((book, asset), slot)) => burn_book(world, carrier, model, flame, spot, own, book, asset, slot),
                         None => burn(world, carrier, model, flame, spot, own, false),
                     };
                     self.burning.push(fire);
@@ -407,6 +439,7 @@ fn burn_book(
     own: Option<Entity>,
     book: Arc<FlameBook>,
     asset: AssetId,
+    slot: i32,
 ) -> Burning {
     let kind = flame.kind;
     let lk = look(kind);
@@ -432,8 +465,9 @@ fn burn_book(
     let peak = book.peak_cd_m2 * (lumens / (4.0 * std::f32::consts::PI)) / (book.intensity_cd * scale * scale).max(1e-6);
     let mut made = Vec::new();
     let mut emitters = Vec::new();
+    // The atlas is the shell's own upload (`slot`); `asset` stays for the editor's view of the emitter.
+    let _ = asset;
     let card = ParticleEmitter {
-        texture: asset,
         max_particles: 0,
         spawn_rate: 0.0,
         card: Some(FlameCard {
@@ -451,6 +485,7 @@ fn burn_book(
             fade: 0.0,
             mean_rel: (book.intensity_cd / (book.peak_cd_m2 * book.card_m[0] * book.card_m[1]).max(1.0e-6)).min(1.0),
             power: 1.0,
+            slot,
         }),
         ..Default::default()
     };

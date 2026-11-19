@@ -169,6 +169,9 @@ pub struct FlameCard {
     pub mean_rel: f32,
     /// The book's power at this frame over its mean (the shell's): a far card's flicker.
     pub power: f32,
+    /// The atlas's bindless slot when the shell uploaded it itself (-1: the emitter's `texture`, through the asset
+    /// database). The app's per-frame texture pass never writes this one.
+    pub slot: i32,
 }
 
 /// A bed of embers: lumps with a dark crust and cracks glowing at `hot_k`, each breathing slowly.
@@ -380,6 +383,7 @@ mod tests {
             fade: 1.0,
             mean_rel: 0.2,
             power: 1.0,
+            slot: -1,
         };
         let e = world.spawn((
             Transform::from_translation(glam::Vec3::new(1.0, 0.9, 2.0)),
@@ -562,7 +566,8 @@ pub(crate) fn simulate_particles_reflected(
         if let Some(card) = emitter.card.as_mut() {
             card.clock += dt;
             let card = *card;
-            if card.fade > 0.0 && emitter.texture_slot >= 0 && card.frames > 0 {
+            let slot = if card.slot >= 0 { card.slot } else { emitter.texture_slot };
+            if card.fade > 0.0 && slot >= 0 && card.frames > 0 {
                 let f = (card.clock * card.fps).max(0.0);
                 let frame = (f.floor() as u64 % u64::from(card.frames)) as f32;
                 gpu_particles.push(GpuParticle {
@@ -573,7 +578,7 @@ pub(crate) fn simulate_particles_reflected(
                     aspect: (card.size[1] / card.size[0].max(1e-4)).clamp(0.01, 100.0),
                     uv_rect: [frame, f.fract(), card.columns.max(1) as f32, card.rows.max(1) as f32],
                     rotation: 0.0,
-                    texture_index: emitter.texture_slot,
+                    texture_index: slot,
                     flags: 2 | (1 << 5) | (u32::from(card.small) << 9),
                     flutter: 0.0,
                     extra: [card.mean_rel, card.power, 0.0, 0.0],

@@ -255,14 +255,22 @@ struct Fragment {
         // slowly, the rim cooler and ashen; emission at the blackbody's own luminance, opaque over the pan's floor.
         let radius = length(in.local_uv * 2. - 1.);
         let hot = in.colour.x; let fade = clamp(in.colour.y, 0., 1.); let seed = in.colour.z; let clock = in.colour.w;
-        let q = in.uv / .035 + seed * 17.;
+        // Two sizes of lump (wood breaks into coals of every size), warped so no cell edge runs straight.
+        let warp = vec2(flame_noise(in.uv * 31. + seed), flame_noise(in.uv * 31. + seed + 7.3)) - .5;
+        let q = in.uv / .022 + seed * 17. + warp * 1.4;
         let c = coal_cells(q);
-        let crack = 1. - smoothstep(0., .1, c.y - c.x);
-        let breath = 1. + .035 * sin(clock * .45 * 6.2831853 + c.z * 6.2831853) + .02 * sin(clock * 1.7 + c.z * 40.);
-        var temperature = mix(mix(880., hot - 90., pow(c.z, 1.5)) * breath, hot, crack);
-        temperature -= 160. * smoothstep(.55, 1., radius);
-        let crust = smoothstep(.35, .8, flame_noise(q * 2.3 + seed)) * (1. - crack) * (1. - .7 * c.z);
-        let emissivity = mix(.9, .08, crust);
+        let c2 = coal_cells(q * 2.3 + 5.1);
+        // A gap glows only where the lumps on either side are hot enough: about a third of the gaps, unevenly.
+        let gap = 1. - smoothstep(0., .07 + .05 * flame_noise(q * 3.), c.y - c.x);
+        let gap_hot = smoothstep(.45, .8, flame_noise(q * .7 + seed * 3.)) * gap;
+        let breath = 1. + .05 * sin(clock * .45 * 6.2831853 + c.z * 6.2831853) + .03 * sin(clock * 1.7 + c.z * 40.);
+        // Most lumps are black-crusted (750-950 K, barely glowing); a few are hot right through.
+        let heat = pow(c.z, 3.) * .8 + .2 * c2.z;
+        var temperature = mix(780., hot - 60., heat) * breath;
+        temperature = mix(temperature, hot + 30., gap_hot);
+        temperature -= 220. * smoothstep(.5, 1., radius);
+        let crust = smoothstep(.25, .75, flame_noise(q * 2.3 + seed)) * (1. - gap_hot) * (1. - .8 * heat);
+        let emissivity = mix(.9, .05, crust);
         let coverage = (1. - smoothstep(.86, 1., radius)) * soft_depth(in.position, in.view_depth, .03);
         let rgb = blackbody_rgb(temperature) * (emissivity * blackbody_cd(temperature) * fade * fire_eye());
         out.colour = vec4(rgb * coverage, coverage);
@@ -305,6 +313,12 @@ struct Fragment {
         let core = (1. - smoothstep(0., half * .55 + .001, abs(x))) * (1. - smoothstep(.15, .75, hh));
         let hot = mix(vec3(1., .5, .26), vec3(1.45, 1.4, 1.55), core);
         sprite = vec4(hot * (.75 + .5 * n2), edge);
+    } else if (in.flags & 8u) != 0u {
+        // Lit smoke with no texture (Sunscar's fire, 20 Nov): a billow broken by noise, so a column reads as wisps,
+        // never a stack of round balls; each puff's own rotation turns its pattern.
+        let d = distance(in.local_uv, vec2(.5));
+        let n = flame_noise(in.local_uv * 3.1) * .55 + flame_noise(in.local_uv * 6.7 + 3.3) * .3 + flame_noise(in.local_uv * 13.1 + 1.7) * .15;
+        sprite.a = (1. - smoothstep(.12, .5, d)) * smoothstep(.3, .75, n + (.5 - d) * .6);
     } else {
         sprite.a = 1. - smoothstep(.2,.5,distance(in.local_uv,vec2(.5)));
     }
