@@ -1620,6 +1620,15 @@ struct FloatingWindow {
     reported: bool,
 }
 
+
+/// `SOMNIUM_SUN_WRITE_AB=1` (cost): the sun's Transform written every frame, as before 19 Nov 2026, in the frame=120,
+/// 360, ... blocks of a run with SOMNIUM_PROFILE_EVERY=120, and only when it turns between them.
+fn sun_write_ab_old(frame: u64) -> bool {
+    static AB: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("SOMNIUM_SUN_WRITE_AB").as_deref() == Ok("1"));
+    *AB && (frame + 60) / 120 % 2 == 1
+}
+
 impl FloatingWindow {
     /// The window's size in the units the widget tree lays out in.
     ///
@@ -8534,7 +8543,19 @@ impl<G: GameApp> Engine<G> {
                 .is_some_and(|light| light.light_type == LightType::Directional)
         });
         if let Some(sun) = sun {
-            if let Some(transform) = self.world.get_mut::<Transform>(sun) {
+            // Written only when the sun has turned by more than a fiftieth of a degree (a quarter of a second at
+            // Sunscar's clock; never while the clock stands): a Transform touched each frame made
+            // propagate_transforms recompute every entity's world matrix each frame (19 Nov 2026: 2.6 ms of the main
+            // thread at Monargent's piazza). `SOMNIUM_SUN_WRITE_AB=1` writes it every frame in the frame=120, 360,
+            // ... profile blocks, as before, for a cost A/B in one launch.
+            let every_frame = sun_write_ab_old(self.time.frame_count());
+            let turned = self
+                .world
+                .get::<Transform>(sun)
+                .is_some_and(|t| t.rotation.angle_between(state.rotation) > 0.02f32.to_radians());
+            if (every_frame || turned)
+                && let Some(transform) = self.world.get_mut::<Transform>(sun)
+            {
                 transform.rotation = state.rotation;
             }
             if let Some(light) = self.world.get_mut::<LightComponent>(sun) {
