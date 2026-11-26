@@ -250,7 +250,9 @@ impl<G: GameApp> Engine<G> {
         }
         self.cell_streamer.gate.set_limit(readers);
         let now = std::time::Instant::now();
-        let wanted = load.len();
+        // A cell that failed for good is never read again, so it is not waiting: counted as queued it kept the
+        // settled signal (and every still) waiting on it forever.
+        let wanted = load.iter().filter(|index| !self.cell_streamer.failed.contains_key(index)).count();
         let mut started = 0;
         for index in load {
             if self.cell_streamer.reading.len() >= readers {
@@ -261,7 +263,7 @@ impl<G: GameApp> Engine<G> {
                 started += 1;
             }
         }
-        self.cell_streamer.queued = wanted - started;
+        self.cell_streamer.queued = wanted.saturating_sub(started);
         let streamer = &self.cell_streamer;
         holds.mark_ready(&streamer.cells, |index| streamer.settled(index));
         self.world.put_cache(holds);
