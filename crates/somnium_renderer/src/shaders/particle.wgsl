@@ -60,6 +60,7 @@ struct Out {
     @location(6) @interpolate(flat) uv_rect: vec4<f32>,
     @location(7) @interpolate(flat) flutter: f32,
     @location(8) view_dir: vec3<f32>,
+    @location(9) world: vec3<f32>,
 }
 // A flame tongue's turbulence (bit 4).
 fn flame_hash(p: vec2<f32>) -> f32 { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
@@ -83,6 +84,7 @@ fn flame_noise(p: vec2<f32>) -> f32 {
     let corner = p.position + right*offset.x + up*offset.y;
     out.position = pview.view_proj * vec4(corner,1.);
     out.view_dir = corner - pview.camera_pos;
+    out.world = corner;
     out.uv = p.uv_rect.xy + uv*p.uv_rect.zw;
     out.local_uv = uv; out.colour = p.color; out.tip = p.tip_tint;
     out.uv_rect = p.uv_rect; out.flutter = p.flutter;
@@ -145,7 +147,7 @@ struct Fragment {
             // The sun where the cascades and the clouds let it through; the sky and the land all round as the fill
             // (a scattering puff sees the whole sphere; the cube scaled as the surfaces' IBL is). So spray at a low
             // sun no longer glows in a shaded lane, and smoke at night is lit by the night sky, not black.
-            let world = pview.camera_pos + in.view_dir;
+            let world = in.world;
             var seen = sun_seen(world, length(in.view_dir));
             if cloud_shadow_params.w > 0.0 {
                 let cuv = (world.xz - cloud_shadow_params.xy) / max(cloud_shadow_params.z, 1.0) * 0.5 + 0.5;

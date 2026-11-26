@@ -92,6 +92,12 @@ struct VOut {
     /// Its radiance, and how much of the picture behind it covers.
     @location(1) radiance: vec3<f32>,
     @location(2) cover: f32,
+    /// Along the streak, -1..1 over the whole quad (its round caps included).
+    @location(3) along: f32,
+    /// The share of the quad's length that is the streak's straight middle; the rest is its two round caps.
+    @location(4) @interpolate(flat) middle: f32,
+    /// 1 for a flake (a soft round fleck), 0 for a drop.
+    @location(5) @interpolate(flat) flake: f32,
 }
 
 @vertex
@@ -162,7 +168,7 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) drop: u3
     // flecks, as a quarter of it shows them.
     var shutter = pp.exposure;
     if pp.kind > 0.5 && pp.kind < 1.5 {
-        shutter = pp.exposure * 0.25;
+        shutter = pp.exposure * 0.12;
     }
     let travel = (velocity - pp.camera_velocity) * shutter;
     let tail = head - travel;
@@ -201,7 +207,9 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) drop: u3
     var radiance = vec3<f32>(0.0);
     if pp.kind < 0.5 {
         // Rain: what it refracts, and the light it throws forward.
-        radiance = 0.5 * (sky + land) + sun * hg(dot(toward, normalize(pp.sun_direction)), 0.8);
+        // Mostly the sky: a drop seen against dark ground shows the bright sky behind and above the eye, bent
+        // through it, and so a shower reads pale against a dark field (the lead's 27 Nov read of p4: too faint).
+        radiance = 0.8 * sky + 0.2 * land + sun * hg(dot(toward, normalize(pp.sun_direction)), 0.8);
     } else {
         // Snow and hail: white, lit from above and by what light gets through them.
         radiance = 0.85 * (sky + sun * (0.25 + 0.5 * max(dot(toward, normalize(pp.sun_direction)), 0.0)) / PRECIP_PI);
@@ -232,6 +240,9 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) drop: u3
     out.across = side;
     out.radiance = radiance * pp.tint * glint;
     out.cover = cover;
+    out.along = end * 2.0 - 1.0;
+    out.middle = length_m / (length_m + width);
+    out.flake = select(0.0, 1.0, pp.kind > 0.5 && pp.kind < 1.5);
     return out;
 }
 
@@ -243,8 +254,19 @@ struct FOut {
 
 @fragment
 fn fs_main(in: VOut) -> FOut {
-    // Round across its width: densest down the middle.
-    let cover = min(in.cover * (1.0 - in.across * in.across) * 1.5, 1.0);
+    // A capsule: round across its width and at both ends, densest down the middle (the quad's hard ends drew snow
+    // as small white rectangles; sunscar-particles, 27 Nov). A flake is softer still: a round fleck with no edge.
+    let cap = max(abs(in.along) - in.middle, 0.0) / max(1.0 - in.middle, 1e-4);
+    let r2 = in.across * in.across + cap * cap;
+    var body = max(1.0 - r2, 0.0);
+    if in.flake > 0.5 {
+        body = body * body;
+    }
+    // The shape after the clamp: a far drop that stands for many covers fully, and its edge must still fall away.
+    let cover = min(in.cover * 1.5, 1.0) * body;
+    if cover <= 0.0 {
+        discard;
+    }
     var out: FOut;
     out.colour = vec4<f32>(in.radiance * cover, cover);
     out.reactive = vec4<f32>(clamp(cover * 4.0, 0.0, 1.0), 0.0, 0.0, 1.0);
