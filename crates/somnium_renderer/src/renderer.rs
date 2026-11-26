@@ -629,6 +629,8 @@ pub struct SomniumRenderer {
     /// `None`, the default, draws the disc as always. The clock's latitude and north offset (degrees) place the
     /// celestial pole.
     pub sun_wreck: Option<(u32, f32, f32)>,
+    /// The five shards' span on the sky, degrees (`TimeOfDay.sun_wreck_span_deg`; 2 the 12 Nov design).
+    pub sun_wreck_span_deg: f32,
     /// Phase CONTROL-O: deferred decals, binned through the same froxel grid
     /// as the local lights.
     pub decal_grid: crate::pass::decal::DecalGrid,
@@ -1807,6 +1809,7 @@ impl SomniumRenderer {
             sky_eye: crate::SkyEyeParams::default(),
             planet: crate::PlanetParams::default(),
             sun_wreck: None,
+            sun_wreck_span_deg: 2.0,
             decal_grid,
             decals: Vec::new(),
             hiz_pass,
@@ -5623,7 +5626,7 @@ impl SomniumRenderer {
                 self.sun_wreck.map_or(0.0, |(form, ..)| form.min(2) as f32),
                 f32::from(u8::from(self.sun_wreck.is_some())),
                 self.sun_wreck.map_or(0.0, |(_, _, north)| north.to_radians()),
-                0.0,
+                self.sun_wreck_span_deg,
             ],
         };
         ctx.queue.write_buffer(

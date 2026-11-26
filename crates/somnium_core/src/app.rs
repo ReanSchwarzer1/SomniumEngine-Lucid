@@ -8494,6 +8494,7 @@ impl<G: GameApp> Engine<G> {
             #[allow(clippy::cast_sign_loss)]
             let wreck = (form >= 0).then(|| (form.min(2) as u32, tod.latitude, tod.north_offset));
             r.sun_wreck = wreck;
+            r.sun_wreck_span_deg = tod.sun_wreck_span_deg;
             // The light is the form's disc, so the shadows' penumbra follows it: the cut sun a degree wide (1.75 cm a
             // metre), the five shards' Heart 0.55 degrees, the whole and the true-size sun 0.53.
             r.sun_angular_radius = match wreck {

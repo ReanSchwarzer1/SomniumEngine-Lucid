@@ -1241,6 +1241,7 @@ fn time_of_day_schema() -> ComponentSchema {
             night_halo_road { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Night Sky", display_name: "Halo Road" },
             night_thread { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Night Sky", display_name: "Thread" },
             sun_wreck { min: -1, max: 2, group: "Sun", display_name: "Broken Sun (-1 whole, 0 cut, 1 shards, 2 bars)" },
+            sun_wreck_span_deg { min: 0.5, soft_max: 12.0, step: 0.1, precision: 1, unit: "deg", group: "Sun", display_name: "Shards' Span" },
         }
     }
 }

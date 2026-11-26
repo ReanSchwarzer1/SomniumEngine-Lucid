@@ -212,7 +212,11 @@ impl SkyPlanetComponent {
         // The phase angle at the planet, between the sun and us: the sun is so far that the planet sees it where we do.
         let alpha = (-sun_dir.normalize_or(glam::Vec3::Y).dot(toward)).clamp(-1.0, 1.0).acos();
         let lambert = (alpha.sin() + (std::f32::consts::PI - alpha) * alpha.cos()) / std::f32::consts::PI;
-        let full = sun_above_air * (self.albedo * radius * radius);
+        // ponytail: its light on the world is the 12 degree planet's at most (the night was tuned under that one, 12 Nov):
+        // drawn larger so it is seen (the developer, 26 Nov: "toooo small for the player to notice"), it lights the
+        // land no more. A field if a brighter night under a larger planet is ever wanted.
+        let lit = radius.min(6.0_f32.to_radians());
+        let full = sun_above_air * (self.albedo * lit * lit);
         let light_above_air = full * PLANET_TINT * lambert.max(0.0);
         somnium_renderer::PlanetParams {
             direction: toward,
