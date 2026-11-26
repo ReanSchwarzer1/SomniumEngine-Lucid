@@ -290,7 +290,9 @@ impl PrecipitationPass {
         self.clock = (self.clock + dt).rem_euclid(3600.0);
         let camera_velocity = match self.last_camera {
             // A cut is not a velocity.
-            Some(last) if dt > 1e-4 && last.distance(camera_pos) < 30.0 => (camera_pos - last) / dt,
+            // Capped at a run: a slide down a scree slope or a carried camera drew every streak as a fan toward where it went
+            // (sunscar-particles, 26 Nov: the first stills on a slope).
+            Some(last) if dt > 1e-4 && last.distance(camera_pos) < 30.0 => ((camera_pos - last) / dt).clamp_length_max(6.0),
             _ => Vec3::ZERO,
         };
         self.last_camera = Some(camera_pos);
