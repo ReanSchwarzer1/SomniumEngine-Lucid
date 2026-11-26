@@ -7654,6 +7654,7 @@ impl SomniumRenderer {
                 &self.ibl_pass.sampler,
                 &self.cloud_pass.shadow_view,
                 &self.cloud_pass.shadow_params,
+                &self.vis_pass.depth_view,
             );
             // The way the eye looks: the middle of the picture, unprojected (reversed depth: 1 near, 0 infinity).
             let inverse = self.view_proj_unjittered_rel.inverse();

@@ -14,6 +14,8 @@
 struct PrecipParams {
     /// Camera-relative, unjittered.
     view_proj: mat4x4<f32>,
+    /// Its inverse: a pixel's depth back to where it is, camera-relative.
+    inverse_view_proj: mat4x4<f32>,
     camera_pos: vec3<f32>,
     /// Radians a pixel spans.
     pixel_angle: f32,
@@ -40,6 +42,12 @@ struct PrecipParams {
     tint: vec3<f32>,
     /// A scale on how much of the picture the drops cover (1 as physics gives it).
     opacity: f32,
+    /// Drops in the near, middle and far box (three and nine times the near one, hollow), and the splashes' strength.
+    layers: vec4<f32>,
+    /// What one drawn drop of each box stands for, and splashes a square metre a second.
+    folds: vec4<f32>,
+    /// x: 1 when the eye is under a roof (what the picture cannot show above is taken as covered).
+    extra: vec4<f32>,
     /// Lightning and lamps: xyz where, w 1 if lit; rgb candela.
     flash_pos: array<vec4<f32>, 4>,
     flash_color: array<vec4<f32>, 4>,
@@ -51,6 +59,7 @@ struct PrecipParams {
 @group(0) @binding(3) var cloud_shadow_tex: texture_2d<f32>;
 /// centre x, z, half-extent, strength (`CloudPass::shadow_params`).
 @group(0) @binding(4) var<uniform> cloud_shadow_params: vec4<f32>;
+@group(0) @binding(5) var scene_depth: texture_depth_2d;
 
 const PRECIP_PI: f32 = 3.14159265;
 /// The thinnest a streak is drawn, pixels.
@@ -94,6 +103,19 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) drop: u3
 
     let h = hash3(drop);
     let k = hash3(drop ^ 0x9E3779B9u);
+    // Its box: the near one, or a hollow one three or nine times as large round it (sunscar-particles, 26 Nov).
+    var layer = 0u;
+    var scale = 1.0;
+    var fold = pp.folds.x;
+    if f32(drop) >= pp.layers.x + pp.layers.y {
+        layer = 2u;
+        scale = 9.0;
+        fold = pp.folds.z;
+    } else if f32(drop) >= pp.layers.x {
+        layer = 1u;
+        scale = 3.0;
+        fold = pp.folds.y;
+    }
     // Most drops are small and a few are large (Marshall and Palmer); a larger drop falls faster.
     let big = k.x * k.x;
     let diameter = pp.size * mix(0.5, 2.2, big);
@@ -101,17 +123,48 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) drop: u3
     // Its wander: a velocity for its streak, and that velocity's own integral for where it is, which stays within a
     // metre of its fall. (The two were once one sum multiplied by the clock: snow drifted faster every second.)
     let wa = vec3<f32>(pp.time * 1.3 + k.y * 40.0, pp.time * 0.9 + k.z * 40.0, pp.time * 1.1 + k.y * 23.0);
-    let velocity = fall + pp.wander * vec3<f32>(sin(wa.x), 0.3 * sin(wa.y), cos(wa.z));
-    let strayed = pp.wander * vec3<f32>(-cos(wa.x) / 1.3, -0.3 * cos(wa.y) / 0.9, sin(wa.z) / 1.1);
+    var velocity = fall + pp.wander * vec3<f32>(sin(wa.x), 0.3 * sin(wa.y), cos(wa.z));
+    var strayed = pp.wander * vec3<f32>(-cos(wa.x) / 1.3, -0.3 * cos(wa.y) / 0.9, sin(wa.z) / 1.1);
+    // Gusts: the wind's share of the fall swells and slackens, mostly together, so the slant breathes.
+    let gust_w = 0.7 + 0.3 * k.z;
+    let gust_a = pp.time * gust_w + k.y * 1.2;
+    let wind_xz = vec3<f32>(fall.x, 0.0, fall.z) * 0.35;
+    velocity += wind_xz * sin(gust_a);
+    strayed += -wind_xz * cos(gust_a) / gust_w;
+    // A flake flutters: a small fast spiral on its slow wander, and it glints as it turns.
+    var glint = 1.0;
+    if pp.kind > 0.5 && pp.kind < 1.5 {
+        let fw = 9.0 + 9.0 * k.x;
+        let fa = pp.time * fw + k.z * 31.0;
+        let fr = 0.025 + 0.03 * k.y;
+        velocity += fr * fw * vec3<f32>(cos(fa), 0.0, -sin(fa));
+        strayed += fr * vec3<f32>(sin(fa), 0.0, cos(fa));
+        glint = 0.7 + 0.45 * max(sin(fa * 0.5 + k.x * 7.0), 0.0);
+    }
 
     // Where it is: its own start, carried by its fall, wrapped into the box round the eye.
-    let box = pp.extent * 2.0;
+    let box = pp.extent * 2.0 * scale;
     let u = fract(h + (fall * pp.time + strayed) / box - pp.centre / box + 0.5) - 0.5;
     let head = pp.centre + u * box - pp.camera_pos;
-    let fade = smoothstep(0.0, 0.15, 1.0 - 2.0 * max(max(abs(u.x), abs(u.y)), abs(u.z)));
+    var fade = smoothstep(0.0, 0.15, 1.0 - 2.0 * max(max(abs(u.x), abs(u.y)), abs(u.z)));
+    if layer > 0u {
+        // Hollow: inside the box within it the smaller box's drops are already falling.
+        let inner = abs(u * 2.0 * scale);
+        if all(inner < vec3<f32>(scale / 3.0)) {
+            fade = 0.0;
+        }
+    }
+    // Under a roof or a canopy no drop falls: the picture's depth says so where it shows what is above.
+    fade *= open_above(head);
 
     // The streak: from where it was when the shutter opened to where it is.
-    let travel = (velocity - pp.camera_velocity) * pp.exposure;
+    // Snow in a wind drawn over a film's whole shutter is a field of long dashes (the p3 stills): flakes are seen as
+    // flecks, as a quarter of it shows them.
+    var shutter = pp.exposure;
+    if pp.kind > 0.5 && pp.kind < 1.5 {
+        shutter = pp.exposure * 0.25;
+    }
+    let travel = (velocity - pp.camera_velocity) * shutter;
     let tail = head - travel;
     let here = mix(head, tail, end);
     let distance = max(length(here), 0.05);
@@ -133,7 +186,7 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) drop: u3
 
     // How much of the picture behind a point on the streak the drop covers: the share of the exposure it is over
     // that point, thinned again where it is drawn wider than it is.
-    let cover = clamp(diameter / (length_m + diameter), 0.0, 1.0) * (diameter / width) * fade * pp.opacity;
+    let cover = min(clamp(diameter / (length_m + diameter), 0.0, 1.0) * (diameter / width) * fold, 1.0) * fade;
 
     // Its light. The sky and land all round it (a drop is a lens; a flake is lit by them), the sun where the clouds
     // let it through, and lightning.
@@ -169,8 +222,15 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) drop: u3
 
     var out: VOut;
     out.clip = pp.view_proj * vec4<f32>(at, 1.0);
+    // A streak that reaches the eye's own plane projects to a line across the whole picture (the fans of the first
+    // stills): such a drop is too near to see. Collapse it off the picture.
+    let w_head = (pp.view_proj * vec4<f32>(head, 1.0)).w;
+    let w_tail = (pp.view_proj * vec4<f32>(tail, 1.0)).w;
+    if min(w_head, w_tail) < 0.3 {
+        out.clip = vec4<f32>(4.0, 4.0, 0.5, 1.0);
+    }
     out.across = side;
-    out.radiance = radiance * pp.tint;
+    out.radiance = radiance * pp.tint * glint;
     out.cover = cover;
     return out;
 }
@@ -187,6 +247,135 @@ fn fs_main(in: VOut) -> FOut {
     let cover = min(in.cover * (1.0 - in.across * in.across) * 1.5, 1.0);
     var out: FOut;
     out.colour = vec4<f32>(in.radiance * cover, cover);
+    out.reactive = vec4<f32>(clamp(cover * 4.0, 0.0, 1.0), 0.0, 0.0, 1.0);
+    return out;
+}
+
+// ---- Under cover, and the splashes (sunscar-particles, 26 Nov 2026) ----
+
+/// Where a camera-relative point falls in the depth picture: pixel, and its own depth (reversed: 1 near, 0 far). w < 0
+/// when it is off the picture or behind the eye.
+fn to_screen(p: vec3<f32>) -> vec4<f32> {
+    let c = pp.view_proj * vec4<f32>(p, 1.0);
+    if c.w <= 1e-4 {
+        return vec4<f32>(0.0, 0.0, 0.0, -1.0);
+    }
+    let ndc = c.xyz / c.w;
+    if abs(ndc.x) > 1.0 || abs(ndc.y) > 1.0 {
+        return vec4<f32>(0.0, 0.0, 0.0, -1.0);
+    }
+    let dims = vec2<f32>(textureDimensions(scene_depth));
+    return vec4<f32>((ndc.x * 0.5 + 0.5) * dims.x, (0.5 - ndc.y * 0.5) * dims.y, ndc.z, 1.0);
+}
+
+/// 1 if nothing the picture shows lies over a point (camera-relative), 0 if a roof or a canopy does: steps up from it
+/// and asks whether the scene stands in front of a step, near it. Off the picture it is open, unless the eye itself
+/// is under a roof. (A screen-space guess: a post in front of a step can hide a drop that should fall.)
+fn open_above(p: vec3<f32>) -> f32 {
+    let steps = array<f32, 5>(0.5, 1.2, 2.5, 5.0, 10.0);
+    let dims = vec2<i32>(textureDimensions(scene_depth));
+    for (var i = 0; i < 5; i = i + 1) {
+        let q = to_screen(p + vec3<f32>(0.0, steps[i], 0.0));
+        if q.w < 0.0 {
+            if pp.extra.x > 0.5 {
+                return 0.0;
+            }
+            continue;
+        }
+        let pix = clamp(vec2<i32>(q.xy), vec2<i32>(0), dims - vec2<i32>(1));
+        let d = textureLoad(scene_depth, pix, 0);
+        // Reversed depth is 1 / distance: the scene in front of the step, by more than 2% and less than four times.
+        if d > q.z * 1.02 && d < q.z * 4.0 {
+            return 0.0;
+        }
+    }
+    return 1.0;
+}
+
+@vertex
+fn vs_splash(@builtin(vertex_index) vertex: u32) -> @builtin(position) vec4<f32> {
+    let xy = vec2<f32>(f32((vertex << 1u) & 2u), f32(vertex & 2u));
+    return vec4<f32>(xy * 2.0 - 1.0, 0.0, 1.0);
+}
+
+fn cell_hash(c: vec2<i32>, lane: u32, slot: u32) -> vec3<f32> {
+    return hash3(pcg((bitcast<u32>(c.x) * 73856093u) ^ (bitcast<u32>(c.y) * 19349663u) ^ (lane * 83492791u)) ^ (slot * 2654435761u));
+}
+
+/// Rain splashing on what is open to the sky: on every surface that faces up within 25 m, a grid of 11 cm cells, each
+/// with two splashes in turn at its own moments (as often as the rain lands on it). A splash is a bright dot that
+/// opens into a ring in a tenth of a second, lit by the sky as the drops are. Where a splash is smaller than a pixel it
+/// is folded into the pixel's share, so far ground fizzes faintly rather than sparkles.
+@fragment
+fn fs_splash(@builtin(position) frag: vec4<f32>) -> FOut {
+    let pix = vec2<i32>(frag.xy);
+    let d = textureLoad(scene_depth, pix, 0);
+    let dims = vec2<f32>(textureDimensions(scene_depth));
+    let ndc = vec2<f32>(frag.x / dims.x * 2.0 - 1.0, 1.0 - frag.y / dims.y * 2.0);
+    let hp = pp.inverse_view_proj * vec4<f32>(ndc, max(d, 1e-7), 1.0);
+    let p = hp.xyz / hp.w;
+    // Derivatives first, while every pixel still runs.
+    var n = cross(dpdy(p), dpdx(p));
+    var out: FOut;
+    out.colour = vec4<f32>(0.0);
+    out.reactive = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    let dist = length(p);
+    let nl = length(n);
+    if d <= 0.0 || dist > 25.0 || nl < 1e-9 {
+        return out;
+    }
+    n = n / nl;
+    if dot(n, p) > 0.0 {
+        n = -n;
+    }
+    let up = n.y;
+    if up < 0.7 {
+        return out;
+    }
+    let open = open_above(p);
+    if open <= 0.0 {
+        return out;
+    }
+
+    let cell = 0.11;
+    let life = 0.11;
+    let world = (p.xz + pp.camera_pos.xz) / cell;
+    let c = vec2<i32>(floor(world));
+    let f = world - floor(world);
+    // How often one lane of a cell splashes: half of what lands on a cell, never so often that two overlap.
+    let period = max(life * 1.3, 2.0 / max(pp.folds.w * cell * cell, 1e-3));
+    // A pixel's footprint on the ground, metres.
+    let foot = max(pp.pixel_angle * dist / max(up, 0.2), 0.002);
+    var light = 0.0;
+    for (var lane = 0u; lane < 2u; lane = lane + 1u) {
+        let r = cell_hash(c, lane, 0u);
+        let tt = pp.time / period + r.x;
+        let slot = u32(floor(tt));
+        let tau = fract(tt) * period;
+        if tau < life {
+            let q = cell_hash(c, lane, slot + 1u);
+            let centre = 0.25 + 0.5 * q.xy;
+            let at = (f - centre) * cell;
+            let age = tau / life;
+            let radius = 0.02 * mix(0.5, 1.4, q.z) * sqrt(age);
+            let w = max(foot, 0.003);
+            let rr = length(at);
+            let ring = 1.0 - smoothstep(0.0, w, abs(rr - radius));
+            let dot_ = (1.0 - smoothstep(0.0, radius * 0.4 + w, rr)) * (1.0 - age);
+            // Smaller than a pixel: the mark's area over the pixel's.
+            let thin = min(1.0, 0.004 / w);
+            // Mostly the bright crown at the start, a faint ring after: a still catches a fleck, not a doily.
+            light += (0.25 * ring + dot_) * (1.0 - age) * thin * mix(0.3, 1.0, q.y);
+        }
+    }
+    let near = 1.0 - smoothstep(14.0, 25.0, dist);
+    let cover = clamp(0.5 * light * pp.layers.w * near * open * smoothstep(0.7, 0.85, up), 0.0, 1.0);
+    if cover <= 0.0 {
+        return out;
+    }
+    let sky = textureSampleLevel(env_cube, env_sampler, vec3<f32>(0.0, 1.0, 0.0), 6.0).rgb;
+    let radiance = 0.9 * sky * pp.tint;
+    out.colour = vec4<f32>(radiance * cover, cover * 0.25);
     out.reactive = vec4<f32>(clamp(cover * 4.0, 0.0, 1.0), 0.0, 0.0, 1.0);
     return out;
 }
