@@ -413,6 +413,40 @@ mod tests {
         }
     }
 
+    /// The light's switches, all set, leave every module that validated still valid (naga, no GPU): each value lands
+    /// as a well-formed WGSL literal, and GTAO's half floats are a storage format (sunscar-engine, 26 Nov 2026).
+    #[test]
+    fn the_light_switches_keep_every_shader_valid() {
+        let switched = crate::light_switches::LightSwitches {
+            mie_scale: 25.0,
+            mie_g: 0.7,
+            gi_hit_sky: 0.5,
+            gtao_rgba16f: true,
+            env_cube: 1024,
+        };
+        let valid = |text: &str| {
+            naga::front::wgsl::parse_str(text).is_ok_and(|module| {
+                naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                    .validate(&module)
+                    .is_ok()
+            })
+        };
+        let shaders = Shaders::new();
+        let ids: Vec<_> = shaders.system.lock().unwrap().registry().ids().collect();
+        let mut checked = Vec::new();
+        for id in ids {
+            let name = shaders.system.lock().unwrap().registry().name(id).unwrap();
+            let text = shaders.source(name, Defines::NONE).unwrap();
+            let tuned = switched.tune(name, &text);
+            if tuned.as_ref() == text.as_str() || !valid(&text) {
+                continue;
+            }
+            assert!(valid(&tuned), "{name} no longer validates with the light switches set");
+            checked.push(name);
+        }
+        assert!(checked.contains(&"gtao.wgsl") && checked.len() >= 5, "switched and checked: {checked:?}");
+    }
+
     #[test]
     fn slang_and_wgsl_have_one_registry_answer() {
         let shaders = Shaders::new();
