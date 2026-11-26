@@ -3740,7 +3740,7 @@ impl SomniumRenderer {
                 for (k, &placement) in batch.placements.iter().enumerate() {
                     let model = placement * part.local;
                     let radius = half.map_or(f32::MAX, |half| model.transform_vector3(half).length());
-                    if radius >= TLAS_MIN_RADIUS {
+                    if radius >= tlas_min_radius() {
                         traced.push(crate::instance_batch::TracedCopy {
                             slot: u32::try_from(slots.len() + k).unwrap_or(u32::MAX),
                             vertex_offset: part.vertex_offset,
@@ -3807,7 +3807,7 @@ impl SomniumRenderer {
                 for (k, &placement) in batch.placements.iter().enumerate() {
                     let model = placement * part.local;
                     let radius = half.map_or(f32::MAX, |half| model.transform_vector3(half).length());
-                    if radius >= TLAS_MIN_RADIUS {
+                    if radius >= tlas_min_radius() {
                         traced.push(crate::instance_batch::TracedCopy {
                             slot: u32::try_from(start + k).unwrap_or(u32::MAX),
                             vertex_offset: part.vertex_offset,
@@ -6471,7 +6471,7 @@ impl SomniumRenderer {
                 let (min, max) = (glam::Vec3::from(min), glam::Vec3::from(max));
                 let radius = cmd.transform.transform_vector3((max - min) * 0.5).length();
                 let centre = cmd.transform.transform_point3((min + max) * 0.5);
-                if radius < TLAS_MIN_RADIUS || centre.distance(self.camera_pos) - radius > POSED_RT_REACH {
+                if radius < tlas_min_radius() || centre.distance(self.camera_pos) - radius > POSED_RT_REACH {
                     continue;
                 }
                 if self.rt_posed.insert(cmd.vertex_offset) {
@@ -6533,7 +6533,7 @@ impl SomniumRenderer {
                             return None;
                         }
                     }
-                    (radius >= TLAS_MIN_RADIUS).then(|| {
+                    (radius >= tlas_min_radius()).then(|| {
                         (
                             u32::try_from(i).unwrap_or(0),
                             cmd.vertex_offset,
@@ -8302,7 +8302,7 @@ impl SomniumRenderer {
         }
         let Some((min, max)) = self.geometry.mesh_aabb(cmd.vertex_offset) else { return false };
         let half = (glam::Vec3::from(max) - glam::Vec3::from(min)) * 0.5;
-        if cmd.transform.transform_vector3(half).length() < TLAS_MIN_RADIUS {
+        if cmd.transform.transform_vector3(half).length() < tlas_min_radius() {
             return false;
         }
         self.trace_reach.get(&cmd.vertex_offset).is_none_or(|&reach| {
@@ -8978,7 +8978,21 @@ fn mix_shadow_caster_revision(hash: &mut u64, command: &DrawCommand) {
 }
 
 /// World-space bounding radius below which a draw stays out of the TLAS (metres).
-const TLAS_MIN_RADIUS: f32 = 1.0;
+/// Instances under this world radius stay out of the ray-traced set; their shadows come from the cascades
+/// (`rays_shade_opaque` keeps the same test). `SOMNIUM_TLAS_MIN_RADIUS=<metres>` raises it where a street of many small
+/// meshes costs the trace (the city's new street, 2 ms, sunscar-engine 26 Nov 2026); 1.0 m unless set.
+fn tlas_min_radius() -> f32 {
+    static RADIUS: std::sync::LazyLock<f32> = std::sync::LazyLock::new(|| {
+        let radius = std::env::var("SOMNIUM_TLAS_MIN_RADIUS")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .filter(|r| r.is_finite() && *r >= 0.0)
+            .unwrap_or(1.0);
+        tracing::info!(radius, "ray-traced set: instances under this world radius stay out");
+        radius
+    });
+    *RADIUS
+}
 /// With the traced sun, the cascades skip casters lower than this (`flat_caster`); grass blades stand above it.
 const FLAT_CASTER_M: f32 = 0.12;
 
