@@ -802,6 +802,16 @@ impl<G: GameApp> Engine<G> {
             ui.set_palette_places(
                 self.editing.places.iter().map(|p| (p.name.clone(), p.group.clone(), p.built)).collect(),
             );
+            // The game's presets (Sunscar's weather) go in beside them, where the Authoring panel can run them.
+            if self.config.authoring_enabled {
+                ui.set_palette_presets(
+                    crate::authoring::game_registration()
+                        .presets
+                        .iter()
+                        .map(|p| (p.id.to_owned(), p.label.to_owned(), p.category.to_owned()))
+                        .collect(),
+                );
+            }
             self.editing.places_shown = true;
         }
         let Some(mut drop) = self.editing.place_drop else {
