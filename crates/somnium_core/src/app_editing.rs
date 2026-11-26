@@ -802,6 +802,16 @@ impl<G: GameApp> Engine<G> {
             ui.set_palette_places(
                 self.editing.places.iter().map(|p| (p.name.clone(), p.group.clone(), p.built)).collect(),
             );
+            // The game's presets (Sunscar's weather) go in beside them, where the Authoring panel can run them.
+            if self.config.authoring_enabled {
+                ui.set_palette_presets(
+                    crate::authoring::game_registration()
+                        .presets
+                        .iter()
+                        .map(|p| (p.id.to_owned(), p.label.to_owned(), p.category.to_owned()))
+                        .collect(),
+                );
+            }
             self.editing.places_shown = true;
         }
         let Some(mut drop) = self.editing.place_drop else {
@@ -3013,12 +3023,30 @@ impl<G: GameApp> Engine<G> {
         Some(card)
     }
 
+    /// What the engine's shortcut dispatcher does with a key press, before the UI sees it: the command it claims, or
+    /// `None` when the key goes on to the UI and the game. A player build has no editor shortcuts; the game takes the
+    /// bare keys while it owns the keyboard (a play session, or the viewport flying); a text box with the focus
+    /// takes every key but Ctrl+S (`shortcut_action_with_focus`).
+    pub(super) fn editor_shortcut_for_key(
+        &self,
+        code: winit::keyboard::KeyCode,
+    ) -> Option<somnium_ui::commands::CommandAction> {
+        if self.config.player_mode {
+            return None;
+        }
+        let game_owns_keyboard = self.play_session_active
+            || self.ui_manager.as_ref().is_some_and(somnium_ui::UiManager::viewport_camera_active);
+        let text_focus = self.ui_manager.as_ref().is_some_and(somnium_ui::UiManager::has_text_focus);
+        super::shortcut_action_with_focus(code, self.shortcut_modifiers, game_owns_keyboard, text_focus)
+    }
+
     /// `SOMNIUM_EDITOR_SCRIPT`: scripted editor input for proof captures in a background window, inert unless set.
     /// Steps are `<frame>:<action>`, separated by `;`: `pick=<x>,<y>` (a click at that fraction of the window),
     /// `select=<name part>` (the first entity whose name contains it), `cmd=<command id>`, `save`, `close`, `splash`,
     /// `gpu_error`, `panic` (a crash on the main thread), `native_crash` (an access violation),
     /// `eye=<x>,<z>,<yaw>,<pitch>` (the editor camera 1.7 m over the loaded ground at scene x, z), and `hour=<h>` (the
-    /// scene's Time of Day set to that hour: the editor's clock stands still, so one launch can shoot a day).
+    /// scene's Time of Day set to that hour: the editor's clock stands still, so one launch can shoot a day), and
+    /// `type=<text>` (typed into the box with the keyboard focus, all in one frame).
     pub(super) fn run_editor_script(&mut self) {
         static SCRIPT: std::sync::LazyLock<Vec<(u64, String)>> = std::sync::LazyLock::new(|| {
             std::env::var("SOMNIUM_EDITOR_SCRIPT")
@@ -3192,6 +3220,23 @@ impl<G: GameApp> Engine<G> {
                     if !ran {
                         warn!(id, "editor script: no such command, or it is disabled");
                     }
+                }
+                // Typing into the focused box (open it first, e.g. `cmd=editor.search.commands`, a frame or two
+                // before, since a box takes the focus on the frame after). Each character meets the decision a key
+                // press meets in the dispatcher (`editor_shortcut_for_key`): a key a shortcut would take is lost
+                // here as it is there, and the log names it.
+                Some(("type", text)) => {
+                    let mut typed = String::new();
+                    for c in text.chars() {
+                        if let Some(action) = super::key_code_for_char(c).and_then(|code| self.editor_shortcut_for_key(code)) {
+                            warn!(character = %c, ?action, "editor script: a shortcut took the key");
+                            continue;
+                        }
+                        if self.ui_manager.as_mut().is_some_and(|ui| ui.type_into_focus(&c.to_string())) {
+                            typed.push(c);
+                        }
+                    }
+                    info!(asked = text, typed = %typed, "editor script: typed into the focused box");
                 }
                 None if action == "save" => self.handle_editor_event(EditorEvent::SaveScene),
                 // The title bar's X: with unsaved edits, the editor asks before it closes.

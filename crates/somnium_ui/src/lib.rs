@@ -1152,6 +1152,8 @@ pub struct UiManager {
     palette_entities: Vec<(u32, String)>,
     /// The open scene's places for the palette's "Go to" rows: name, kind, and whether it is built yet.
     palette_places: Vec<(String, String, bool)>,
+    /// The game's presets (id, label, category) as Command Palette rows: Sunscar's weather and its events, any game's.
+    palette_presets: Vec<(String, String, String)>,
     /// Stable dynamic palette ids mapped to their current targets.
     palette_targets: std::collections::HashMap<String, PaletteTarget>,
     /// Persisted palette learning state.
@@ -1703,6 +1705,8 @@ enum PaletteTarget {
     Entity(u32),
     /// A place of the open scene, by its row.
     Place(usize),
+    /// A game preset by its id, run as the Authoring panel's Create runs it (one undoable step).
+    Preset(String),
     Asset(std::path::PathBuf),
     Help(u8),
     Drawer,
@@ -1715,6 +1719,13 @@ impl UiManager {
     /// shows no rows.
     pub fn set_palette_places(&mut self, places: Vec<(String, String, bool)>) {
         self.palette_places = places;
+    }
+
+    /// The game's presets for the Command Palette: each an id, a label and a category ("Weather"). A row reads
+    /// "Weather: Rain"; choosing it asks the host to run the preset exactly as the Authoring panel's Create does
+    /// (an `authoring.execute` request, so it is undoable). An empty list shows no rows.
+    pub fn set_palette_presets(&mut self, presets: Vec<(String, String, String)>) {
+        self.palette_presets = presets;
     }
 
     fn allocate_property_gesture(&mut self) -> GestureId {
@@ -2043,6 +2054,7 @@ impl UiManager {
             outliner_rows: Vec::new(),
             palette_entities: Vec::new(),
             palette_places: Vec::new(),
+            palette_presets: Vec::new(),
             palette_targets: std::collections::HashMap::new(),
             command_history: crate::commands::CommandHistory::load(),
             inspector_handles: layout.inspector_handles,
@@ -4671,6 +4683,24 @@ impl UiManager {
             targets.insert(key, PaletteTarget::Place(i));
         }
 
+        // The game's presets: "Weather: Rain", "Weather: Event: a dust wall from ahead". Until now they were only in
+        // the Authoring panel's Create list.
+        for (id, label, category) in &self.palette_presets {
+            let key = format!("preset:{id}");
+            let title = if category.is_empty() { label.clone() } else { format!("{category}: {label}") };
+            let icon = if category.eq_ignore_ascii_case("weather") {
+                crate::icons::IconId::Weather
+            } else {
+                crate::icons::IconId::Prefab
+            };
+            items.push(
+                PaletteItem::new(&key, title, "Game preset (undoable)", Cat::Panel)
+                    .with_recency(self.command_history.recency(&key))
+                    .with_icon(icon),
+            );
+            targets.insert(key, PaletteTarget::Preset(id.clone()));
+        }
+
         // Assets in the current Content Drawer folder.
         for (_, entry) in &self.content_entries {
             if entry.is_dir {
@@ -5887,6 +5917,10 @@ impl UiManager {
                         ))
                 }
                 Some(PaletteTarget::Place(place)) => self.editor_events.push_back(EditorEvent::GoToPlace(place)),
+                Some(PaletteTarget::Preset(preset)) => self.editor_events.push_back(EditorEvent::AuthoringRequest {
+                    method: "authoring.execute".into(),
+                    params: serde_json::json!({"action": "preset", "id": preset, "args": {}}),
+                }),
                 Some(PaletteTarget::Help(page)) => self.toggle_help(Some(page)),
                 Some(PaletteTarget::Drawer) => self.toggle_drawer(),
                 Some(PaletteTarget::AddComponent(component)) => {
@@ -7560,6 +7594,12 @@ impl UiManager {
     /// Returns true if a text-input widget (TextBox or NumericField) has keyboard focus.
     pub fn has_text_focus(&self) -> bool {
         self.native_ui.has_text_focus()
+    }
+
+    /// Text typed into the box with the keyboard focus, as a key press's text reaches it (the editor script's
+    /// `type=` step); false when no text box has the focus.
+    pub fn type_into_focus(&mut self, text: &str) -> bool {
+        self.native_ui.type_into_focus(text)
     }
 
     /// Whether a right-drag over the viewport is currently flying the camera.
