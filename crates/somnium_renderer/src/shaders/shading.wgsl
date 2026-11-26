@@ -2420,9 +2420,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let north = light.sun_form.z;
             let pole = vec3<f32>(sin(north) * cos(latitude), sin(latitude), cos(north) * cos(latitude));
             let beside = light.sun_above.rgb * view_extinction_rgb(ray_dir.y);
-            // In its last ten degrees the disc is kept at least twenty times the sky beside it (`low_sun_lift`).
+            // In its last ten degrees the disc is kept at least twenty times the sky beside it (`low_sun_lift`), and at
+            // any height at least four times it: a wide span of shards (`sun_wreck_span_deg`) spreads the sun so thin
+            // that they would read grey on the blue (sunscar-weather, 27 Nov).
             let low_sun = 1.0 - smoothstep(0.03, 0.17, sun_dir.y);
-            let floor_lum = 20.0 * dot(sky, vec3<f32>(0.2126, 0.7152, 0.0722)) * low_sun;
+            let floor_lum = max(20.0 * low_sun, 4.0) * dot(sky, vec3<f32>(0.2126, 0.7152, 0.0722));
             detail += fragmented_sun(ray_dir, sun_dir, light.sun_angular_radius, light.color, beside, pole,
                 view.time, i32(light.sun_form.x), floor_lum, light.sun_form.w);
             // The wreck's debris ring across the sky: lit by the sun from below the horizon at dusk, cut by the
