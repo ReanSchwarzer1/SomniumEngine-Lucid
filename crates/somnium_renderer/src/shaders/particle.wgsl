@@ -27,6 +27,27 @@ struct GpuParticle {
 @group(0) @binding(2) var sprite_sampler: sampler;
 @group(1) @binding(4) var textures: binding_array<texture_2d<f32>>;
 @group(1) @binding(6) var<storage, read> sun: ParticleSun;
+// The light round a lit sprite (Sunscar, 27 Nov 2026): the sun's shadow cascades, the sky's light cube and the
+// clouds' ground shadow, as the water and the rain bind them. `sky_on.x` is 0 until the renderer binds the real
+// ones (the pass's own tests), and then the old fill holds.
+@group(2) @binding(0) var shadow_atlas: texture_depth_2d;
+@group(2) @binding(1) var shadow_sampler: sampler_comparison;
+@group(2) @binding(2) var env_cube: texture_cube<f32>;
+@group(2) @binding(3) var env_sampler: sampler;
+@group(2) @binding(4) var cloud_shadow_tex: texture_2d<f32>;
+@group(2) @binding(5) var<uniform> cloud_shadow_params: vec4<f32>;
+@group(2) @binding(6) var<uniform> sky_on: vec4<f32>;
+// How much of the sun reaches a point: one tap of its cascade (smoke is soft; a 3x3 filter buys nothing here).
+fn sun_seen(world: vec3<f32>, depth: f32) -> f32 {
+    var c = 3u;
+    if depth < sun.cascade_splits.x { c = 0u; } else if depth < sun.cascade_splits.y { c = 1u; } else if depth < sun.cascade_splits.z { c = 2u; }
+    let clip = sun.view_proj[c] * vec4<f32>(world, 1.0);
+    let ndc = clip.xyz / clip.w;
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if any(uv < vec2<f32>(0.0)) || any(uv > vec2<f32>(1.0)) || ndc.z > 1.0 || ndc.z < 0.0 { return 1.0; }
+    let offsets = array<vec2<f32>, 4>(vec2(0.0, 0.0), vec2(0.5, 0.0), vec2(0.0, 0.5), vec2(0.5, 0.5));
+    return textureSampleCompareLevel(shadow_atlas, shadow_sampler, uv * 0.5 + offsets[c], ndc.z);
+}
 const UV: array<vec2<f32>,6> = array<vec2<f32>,6>(vec2(0.,1.),vec2(1.,1.),vec2(1.,0.),vec2(0.,1.),vec2(1.,0.),vec2(0.,0.));
 struct Out {
     @builtin(position) position: vec4<f32>,
@@ -120,7 +141,22 @@ struct Fragment {
         let g = 0.5;
         let denom = 1. + g*g - 2.*g*dot(v, l);
         let phase = (1. - g*g) / (12.566371 * max(denom * sqrt(max(denom, 1e-6)), 1e-6));
-        rgb *= sun.color * phase + sun.color * (0.08 * sun.ibl_intensity);
+        if sky_on.x > 0.5 {
+            // The sun where the cascades and the clouds let it through; the sky and the land all round as the fill
+            // (a scattering puff sees the whole sphere; the cube scaled as the surfaces' IBL is). So spray at a low
+            // sun no longer glows in a shaded lane, and smoke at night is lit by the night sky, not black.
+            let world = pview.camera_pos + in.view_dir;
+            var seen = sun_seen(world, length(in.view_dir));
+            if cloud_shadow_params.w > 0.0 {
+                let cuv = (world.xz - cloud_shadow_params.xy) / max(cloud_shadow_params.z, 1.0) * 0.5 + 0.5;
+                seen *= textureSampleLevel(cloud_shadow_tex, env_sampler, cuv, 0.0).r;
+            }
+            let up = textureSampleLevel(env_cube, env_sampler, vec3<f32>(0.0, 1.0, 0.0), 6.0).rgb;
+            let down = textureSampleLevel(env_cube, env_sampler, vec3<f32>(0.0, -1.0, 0.0), 6.0).rgb;
+            rgb *= sun.color * (phase * seen) + 0.5 * (up + down) * sun.ibl_intensity;
+        } else {
+            rgb *= sun.color * phase + sun.color * (0.08 * sun.ibl_intensity);
+        }
     }
     var out: Fragment;
     out.colour = vec4(rgb,select(alpha,0.,(in.flags & 1u) != 0u));
