@@ -216,6 +216,13 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) drop: u3
 
     var out: VOut;
     out.clip = pp.view_proj * vec4<f32>(at, 1.0);
+    // A streak that reaches the eye's own plane projects to a line across the whole picture (the fans of the first
+    // stills): such a drop is too near to see. Collapse it off the picture.
+    let w_head = (pp.view_proj * vec4<f32>(head, 1.0)).w;
+    let w_tail = (pp.view_proj * vec4<f32>(tail, 1.0)).w;
+    if min(w_head, w_tail) < 0.3 {
+        out.clip = vec4<f32>(4.0, 4.0, 0.5, 1.0);
+    }
     out.across = side;
     out.radiance = radiance * pp.tint * glint;
     out.cover = cover;
@@ -344,18 +351,19 @@ fn fs_splash(@builtin(position) frag: vec4<f32>) -> FOut {
             let centre = 0.25 + 0.5 * q.xy;
             let at = (f - centre) * cell;
             let age = tau / life;
-            let radius = 0.028 * mix(0.6, 1.4, q.z) * sqrt(age);
+            let radius = 0.02 * mix(0.5, 1.4, q.z) * sqrt(age);
             let w = max(foot, 0.003);
             let rr = length(at);
             let ring = 1.0 - smoothstep(0.0, w, abs(rr - radius));
             let dot_ = (1.0 - smoothstep(0.0, radius * 0.4 + w, rr)) * (1.0 - age);
             // Smaller than a pixel: the mark's area over the pixel's.
             let thin = min(1.0, 0.004 / w);
-            light += (0.6 * ring + dot_) * (1.0 - age) * thin;
+            // Mostly the bright crown at the start, a faint ring after: a still catches a fleck, not a doily.
+            light += (0.25 * ring + dot_) * (1.0 - age) * thin * mix(0.3, 1.0, q.y);
         }
     }
     let near = 1.0 - smoothstep(14.0, 25.0, dist);
-    let cover = clamp(light * pp.layers.w * near * open * smoothstep(0.7, 0.85, up), 0.0, 1.0);
+    let cover = clamp(0.5 * light * pp.layers.w * near * open * smoothstep(0.7, 0.85, up), 0.0, 1.0);
     if cover <= 0.0 {
         return out;
     }
