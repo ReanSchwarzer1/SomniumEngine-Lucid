@@ -7562,6 +7562,12 @@ impl UiManager {
         self.native_ui.has_text_focus()
     }
 
+    /// Text typed into the box with the keyboard focus, as a key press's text reaches it (the editor script's
+    /// `type=` step); false when no text box has the focus.
+    pub fn type_into_focus(&mut self, text: &str) -> bool {
+        self.native_ui.type_into_focus(text)
+    }
+
     /// Whether a right-drag over the viewport is currently flying the camera.
     ///
     /// The engine's own shortcut dispatcher runs *before* the UI is consulted,

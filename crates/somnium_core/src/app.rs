@@ -137,6 +137,42 @@ fn shortcut_action_for(
     Some(action)
 }
 
+/// The same decision with the UI's keyboard focus in it: while a text box (a search box, the command palette, a
+/// Details field) has the focus it gets every key. A bare `S`, `R` or `T` is a letter there, not the Scale, Rotate
+/// or Terrain tool, Delete takes a character and not the selection, and Ctrl+D is not Duplicate. Only Ctrl+S still
+/// saves. The UI's own dispatcher keeps the same rule (`has_text_focus`); this one runs first and every arm of it
+/// returns, so a key it claimed never reached the box: typing "sunscar" in the palette gave "unca" (20 Nov report).
+fn shortcut_action_with_focus(
+    code: winit::keyboard::KeyCode,
+    modifiers: somnium_ui::message::Modifiers,
+    game_owns_keyboard: bool,
+    text_focus: bool,
+) -> Option<somnium_ui::commands::CommandAction> {
+    shortcut_action_for(code, modifiers, game_owns_keyboard)
+        .filter(|&action| !text_focus || matches!(action, somnium_ui::commands::CommandAction::SaveScene))
+}
+
+/// The key a typed character comes from on a US layout, for the editor script's `type=` step: letters and digits
+/// (a capital is judged as its bare key), space; anything else has no shortcut and is simply typed.
+fn key_code_for_char(c: char) -> Option<winit::keyboard::KeyCode> {
+    use winit::keyboard::KeyCode as K;
+    const LETTERS: [K; 26] = [
+        K::KeyA, K::KeyB, K::KeyC, K::KeyD, K::KeyE, K::KeyF, K::KeyG, K::KeyH, K::KeyI, K::KeyJ, K::KeyK, K::KeyL,
+        K::KeyM, K::KeyN, K::KeyO, K::KeyP, K::KeyQ, K::KeyR, K::KeyS, K::KeyT, K::KeyU, K::KeyV, K::KeyW, K::KeyX,
+        K::KeyY, K::KeyZ,
+    ];
+    const DIGITS: [K; 10] = [
+        K::Digit0, K::Digit1, K::Digit2, K::Digit3, K::Digit4, K::Digit5, K::Digit6, K::Digit7, K::Digit8, K::Digit9,
+    ];
+    match c {
+        'a'..='z' => Some(LETTERS[c as usize - 'a' as usize]),
+        'A'..='Z' => Some(LETTERS[c as usize - 'A' as usize]),
+        '0'..='9' => Some(DIGITS[c as usize - '0' as usize]),
+        ' ' => Some(K::Space),
+        _ => None,
+    }
+}
+
 fn shortcut_preserves_game_key(action: somnium_ui::commands::CommandAction) -> bool {
     matches!(action, somnium_ui::commands::CommandAction::SaveScene)
 }
@@ -277,6 +313,45 @@ mod shortcut_input_tests {
                 "{key:?} is a fly-cam key and must fall through while flying"
             );
         }
+    }
+
+    /// The developer's report of 20 Nov, as a test: Ctrl+P's place search (and most search boxes) missed key
+    /// presses. The keys a bare shortcut owns never reached a focused box. With the focus in a text box, every key
+    /// is the box's; only Ctrl+S still saves.
+    #[test]
+    fn a_focused_text_box_keeps_every_key_but_save() {
+        use super::{key_code_for_char, shortcut_action_with_focus};
+        let none = Modifiers::default();
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        // Grounded: without the focus these keys are shortcuts, or the test measures nothing.
+        assert_eq!(
+            shortcut_action_with_focus(KeyCode::KeyS, none, false, false),
+            Some(CommandAction::SetGizmoMode(2))
+        );
+        assert_eq!(
+            shortcut_action_with_focus(KeyCode::KeyD, ctrl, false, false),
+            Some(CommandAction::DuplicateSelected)
+        );
+        // Typing "sunscar": no letter is taken, and neither is Delete or Ctrl+D.
+        for c in "sunscar trees 0123456789".chars() {
+            let key = key_code_for_char(c).expect("a letter, digit or space has a key");
+            assert_eq!(
+                shortcut_action_with_focus(key, none, false, true),
+                None,
+                "{c:?} must reach the focused box"
+            );
+        }
+        for key in [KeyCode::Delete, KeyCode::Backspace, KeyCode::End, KeyCode::Home] {
+            assert_eq!(shortcut_action_with_focus(key, none, false, true), None, "{key:?} is the box's");
+        }
+        assert_eq!(shortcut_action_with_focus(KeyCode::KeyD, ctrl, false, true), None);
+        assert_eq!(
+            shortcut_action_with_focus(KeyCode::KeyS, ctrl, false, true),
+            Some(CommandAction::SaveScene)
+        );
     }
 }
 
@@ -4490,11 +4565,9 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
         //
         // `play_session_active` is read from the engine's own flag rather than
         // the UI's, so the rule still holds in a headless or UI-less run.
-        let game_owns_keyboard = self.play_session_active
-            || self
-                .ui_manager
-                .as_ref()
-                .is_some_and(somnium_ui::UiManager::viewport_camera_active);
+        // The whole decision, the text box's focus in it, is `editor_shortcut_for_key` (the editor script's `type=`
+        // step asks the same one).
+        let text_focus = self.ui_manager.as_ref().is_some_and(somnium_ui::UiManager::has_text_focus);
         if let WindowEvent::KeyboardInput { event: key_ev, .. } = &event {
             if key_ev.state == winit::event::ElementState::Pressed && !key_ev.repeat {
                 use winit::keyboard::PhysicalKey;
@@ -4503,11 +4576,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                         self.cancel_persona_stroke();
                         return;
                     }
-                    let action = if self.config.player_mode {
-                        None
-                    } else {
-                        shortcut_action_for(code, self.shortcut_modifiers, game_owns_keyboard)
-                    };
+                    let action = self.editor_shortcut_for_key(code);
                     use somnium_ui::commands::CommandAction as A;
                     match action {
                         Some(A::NewScene) => {
@@ -4567,8 +4636,9 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
         }
 
         // ── 2. Other shortcuts (non-Ctrl) ──────────────────────────────────────
+        // A text box with the focus keeps these too: `[`, `-` or `1` is a character there, not the terrain brush.
         if let WindowEvent::KeyboardInput { event: key_ev, .. } = &event {
-            if key_ev.state == winit::event::ElementState::Pressed && !key_ev.repeat {
+            if key_ev.state == winit::event::ElementState::Pressed && !key_ev.repeat && !text_focus {
                 use winit::keyboard::{KeyCode as WKC, PhysicalKey};
                 if let PhysicalKey::Code(code) = key_ev.physical_key {
                     match code {
