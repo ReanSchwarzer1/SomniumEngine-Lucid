@@ -202,6 +202,29 @@ impl<G: GameApp> Engine<G> {
             component.streamed_entities = entities;
         }
         self.set_cell_status(owner, status);
+        self.log_cell_counts(loaded, pending);
+    }
+
+    /// The settled signal (sunscar-engine, 26 Nov 2026): a log line of the cells loaded, being read and waiting for a
+    /// reader whenever those change (at most two a second, and always when the last one comes in or the first one
+    /// starts), and the frame capture told how many are still coming (`SOMNIUM_CAPTURE_SETTLED`).
+    fn log_cell_counts(&mut self, loaded: u32, reading: u32) {
+        let queued = u32::try_from(self.cell_streamer.queued).unwrap_or(u32::MAX);
+        somnium_renderer::capture::set_cells_waiting(reading as usize + queued as usize);
+        let counts = (loaded, reading, queued);
+        let settled = |c: (u32, u32, u32)| c.1 == 0 && c.2 == 0;
+        let now = std::time::Instant::now();
+        let due = match self.cell_streamer.logged {
+            None => true,
+            Some((last, at)) => {
+                last != counts && (settled(last) != settled(counts) || now.duration_since(at).as_millis() >= 500)
+            }
+        };
+        if due {
+            let tail = if settled(counts) { " (settled)" } else { "" };
+            tracing::info!(loaded, reading, queued, "cells: {loaded} loaded, {reading} reading, {queued} queued{tail}");
+            self.cell_streamer.logged = Some((counts, now));
+        }
     }
 
     /// Unload what the view has left and start readers (up to `readers`) for what it has reached, nearest first. The
@@ -227,14 +250,18 @@ impl<G: GameApp> Engine<G> {
         }
         self.cell_streamer.gate.set_limit(readers);
         let now = std::time::Instant::now();
+        let wanted = load.len();
+        let mut started = 0;
         for index in load {
             if self.cell_streamer.reading.len() >= readers {
                 break;
             }
             if self.cell_streamer.may_read(index, now) {
                 self.start_cell_read(index);
+                started += 1;
             }
         }
+        self.cell_streamer.queued = wanted - started;
         let streamer = &self.cell_streamer;
         holds.mark_ready(&streamer.cells, |index| streamer.settled(index));
         self.world.put_cache(holds);

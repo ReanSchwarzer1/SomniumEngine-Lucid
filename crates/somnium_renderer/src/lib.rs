@@ -28,6 +28,7 @@ pub mod indirect;
 pub mod instance;
 pub mod instance_batch;
 pub mod jobs;
+pub mod light_switches;
 pub mod material;
 pub mod meshlet;
 pub mod pass;

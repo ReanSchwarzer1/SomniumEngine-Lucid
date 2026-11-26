@@ -240,9 +240,13 @@ impl Shaders {
             .lock()
             .expect("shader system poisoned")
             .source(key)
-            .map(|text| match salt() {
-                Some(salt) => format!("{text}\n// salt {salt}\n"),
-                None => text.to_string(),
+            .map(|text| {
+                // The light's switches (`light_switches.rs`): the text as it was unless one is set.
+                let text = crate::light_switches::get().tune(name, text);
+                match salt() {
+                    Some(salt) => format!("{text}\n// salt {salt}\n"),
+                    None => text.into_owned(),
+                }
             })
     }
 
@@ -282,7 +286,8 @@ impl Shaders {
         name: &str,
         defines: Defines,
     ) -> Result<wgpu::ShaderModule, ShaderError> {
-        if salt().is_some() {
+        // A switched light composes through `source` (as a salt does), so the registry's cached text is not used.
+        if salt().is_some() || crate::light_switches::get().changes_shaders() {
             return Ok(device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(name),
                 source: wgpu::ShaderSource::Wgsl(self.source(name, defines)?.into()),
@@ -367,6 +372,10 @@ impl Shaders {
             hash.update(registry.raw_source(id).unwrap_or_default());
         }
         hash.update(salt().unwrap_or_default());
+        let switches = crate::light_switches::get();
+        if switches.changes_shaders() {
+            hash.update(switches.summary());
+        }
         hash.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
     }
 }

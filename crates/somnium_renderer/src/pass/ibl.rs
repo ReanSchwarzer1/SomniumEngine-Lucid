@@ -14,8 +14,10 @@
 //! Regeneration is cheap but not free, so it runs at startup and only again
 //! when the sun direction or colour actually changes.
 
-/// Cubemap face resolution.
-const CUBE_SIZE: u32 = 256;
+/// Cubemap face resolution: 256 unless `SOMNIUM_ENV_CUBE` says otherwise (`light_switches.rs`).
+fn cube_size() -> u32 {
+    crate::light_switches::get().env_cube
+}
 /// Mip levels; mip `i` is prefiltered for roughness `i / (MIP_COUNT - 1)`.
 const MIP_COUNT: u32 = 6;
 
@@ -183,8 +185,8 @@ impl IblPass {
         let cubemap = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Environment Cubemap"),
             size: wgpu::Extent3d {
-                width: CUBE_SIZE,
-                height: CUBE_SIZE,
+                width: cube_size(),
+                height: cube_size(),
                 depth_or_array_layers: 6,
             },
             mip_level_count: MIP_COUNT,
@@ -703,7 +705,7 @@ impl IblPass {
     fn make_moving(&self, device: &wgpu::Device) -> MovingSky {
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Environment Cubemap (moving sun)"),
-            size: wgpu::Extent3d { width: CUBE_SIZE, height: CUBE_SIZE, depth_or_array_layers: 6 },
+            size: wgpu::Extent3d { width: cube_size(), height: cube_size(), depth_or_array_layers: 6 },
             mip_level_count: MIP_COUNT,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -775,7 +777,7 @@ impl IblPass {
         let p = GenParams {
             face,
             roughness,
-            _src_size: CUBE_SIZE as f32,
+            _src_size: cube_size() as f32,
             overcast,
             sun_direction: [sun_direction.x, sun_direction.y, sun_direction.z, 0.0],
             // Phase 24A: `.w` carries the sky-dome luminance scale. The sky
