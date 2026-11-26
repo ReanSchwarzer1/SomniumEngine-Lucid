@@ -1,8 +1,9 @@
 //! Rain, snow and hail near the eye (Sunscar weather, 11 Nov 2026): `precipitation.wgsl`'s field of drops.
 //!
-//! A game sets [`PrecipitationPass::settings`]; the default draws nothing and costs nothing. Far rain is not this
-//! pass's: beyond a few metres a drop is thinner than a pixel and almost transparent, and what the eye sees there is
-//! the air's haze (the fog) and, at a distance, the shaft under the cloud (a storm body in the cloud march).
+//! A game sets [`PrecipitationPass::settings`]; the default draws nothing and costs nothing. With a `density` the drops
+//! fill three nested boxes out to about forty metres, each far drop standing for many, so near streaks pass in front
+//! of fainter far ones; beyond that the air's haze (the fog) and the shaft under the cloud carry it. Rain also splashes
+//! on open ground and roofs, from the scene's depth (sunscar-particles, 26 Nov).
 
 use glam::Vec3;
 
@@ -43,6 +44,14 @@ pub struct PrecipitationSettings {
     pub tint: Vec3,
     /// A scale on how much the drops cover (1 as physics gives it).
     pub opacity: f32,
+    /// Drops a cubic metre as physics gives them. 0 draws the one box of `extent` as before; above 0 the drops are
+    /// shared among three nested boxes (`extent`, three and nine times it), so the rain has depth: each drawn drop in
+    /// a far box stands for the ones left out (sunscar-particles, 26 Nov).
+    pub density: f32,
+    /// Splashes where the rain meets open ground and roofs, 0..1 (rain only).
+    pub splash: f32,
+    /// 1 when the eye is under a roof: what the picture cannot show above a drop or a splash is taken as covered.
+    pub sheltered: f32,
 }
 
 impl Default for PrecipitationSettings {
@@ -58,6 +67,9 @@ impl Default for PrecipitationSettings {
             exposure: 1.0 / 48.0,
             tint: Vec3::ONE,
             opacity: 1.0,
+            density: 0.0,
+            splash: 0.0,
+            sheltered: 0.0,
         }
     }
 }
@@ -66,6 +78,7 @@ impl Default for PrecipitationSettings {
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct Params {
     view_proj: [[f32; 4]; 4],
+    inverse_view_proj: [[f32; 4]; 4],
     camera_pos: [f32; 3],
     pixel_angle: f32,
     centre: [f32; 3],
@@ -82,6 +95,12 @@ struct Params {
     size: f32,
     tint: [f32; 3],
     opacity: f32,
+    /// Drops in the near, middle and far box, and the splashes' strength.
+    layers: [f32; 4],
+    /// What a drawn drop of each box stands for, and splashes a square metre a second.
+    folds: [f32; 4],
+    /// Sheltered, unused x3.
+    extra: [f32; 4],
     flash_pos: [[f32; 4]; 4],
     flash_color: [[f32; 4]; 4],
 }
@@ -91,6 +110,7 @@ pub struct PrecipitationPass {
     /// Lightning and lamps that light the drops this frame: where, and candela by colour (the first four count).
     pub flashes: Vec<(Vec3, Vec3)>,
     pipeline: wgpu::RenderPipeline,
+    splash_pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     params: wgpu::Buffer,
     bind_group: Option<wgpu::BindGroup>,
@@ -115,23 +135,30 @@ impl PrecipitationPass {
         };
         let texture = |binding, view_dimension| wgpu::BindGroupLayoutEntry {
             binding,
-            visibility: wgpu::ShaderStages::VERTEX,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
             ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension, multisampled: false },
             count: None,
         };
         let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("Precipitation BGL"),
             entries: &[
-                uniform(0, wgpu::ShaderStages::VERTEX),
+                uniform(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
                 texture(1, wgpu::TextureViewDimension::Cube),
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
                 texture(3, wgpu::TextureViewDimension::D2),
-                uniform(4, wgpu::ShaderStages::VERTEX),
+                uniform(4, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                // The scene's depth: what covers a drop from the sky, and where the splashes land.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
             ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -139,15 +166,8 @@ impl PrecipitationPass {
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Precipitation"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_main"), buffers: &[], compilation_options: Default::default() },
-            fragment: Some(wgpu::FragmentState {
-                module: &module,
-                entry_point: Some("fs_main"),
-                // As the sprites: over the scene, and into FSR's reactive mask.
-                targets: &[
+        // As the sprites: over the scene, and into FSR's reactive mask.
+        let targets = [
                     Some(wgpu::ColorTargetState {
                         format: crate::pass::postprocess::HDR_FORMAT,
                         blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
@@ -161,7 +181,15 @@ impl PrecipitationPass {
                         }),
                         write_mask: wgpu::ColorWrites::RED,
                     }),
-                ],
+                ];
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Precipitation"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_main"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_main"),
+                targets: &targets,
                 compilation_options: Default::default(),
             }),
             primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
@@ -177,10 +205,28 @@ impl PrecipitationPass {
             multiview_mask: None,
             cache: None,
         });
+        // The splashes: one triangle over the picture, reading the depth (so no depth attachment of its own).
+        let splash_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Precipitation splashes"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_splash"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_splash"),
+                targets: &targets,
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         Self {
             settings: PrecipitationSettings::default(),
             flashes: Vec::new(),
             pipeline,
+            splash_pipeline,
             layout,
             params: device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Precipitation Params"),
@@ -203,10 +249,9 @@ impl PrecipitationPass {
         env_sampler: &wgpu::Sampler,
         cloud_shadow: &wgpu::TextureView,
         cloud_shadow_params: &wgpu::Buffer,
+        depth: &wgpu::TextureView,
     ) {
-        if self.bind_group.is_some() {
-            return;
-        }
+        // Rebuilt every frame: the depth view is remade when the picture's size changes (one small bind group).
         self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Precipitation BG"),
             layout: &self.layout,
@@ -216,6 +261,7 @@ impl PrecipitationPass {
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(env_sampler) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(cloud_shadow) },
                 wgpu::BindGroupEntry { binding: 4, resource: cloud_shadow_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(depth) },
             ],
         }));
     }
@@ -253,6 +299,22 @@ impl PrecipitationPass {
             return;
         };
         let count = s.count.min(MAX_DROPS);
+        // The three boxes: half the drops near, the rest in two hollow boxes three and nine times as large. Each drawn
+        // drop stands for the share of the physical ones its box holds (at most 64, past that the far rain thins).
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (layers, folds) = if s.density > 0.0 {
+            let n0 = (count as f32 * 0.5).floor();
+            let n1 = (count as f32 * 0.3).floor();
+            let n2 = count as f32 - n0 - n1;
+            let e = s.extent.max(Vec3::splat(0.5));
+            let v0 = 8.0 * e.x * e.y * e.z;
+            let fold = |wanted: f32, n: f32| (wanted / n.max(1.0)).clamp(1.0, 64.0) * s.opacity.max(0.0);
+            ([n0, n1, n2], [fold(s.density * v0, n0), fold(s.density * v0 * 26.0, n1), fold(s.density * v0 * 26.0 * 27.0, n2)])
+        } else {
+            ([count as f32, 0.0, 0.0], [s.opacity.max(0.0); 3])
+        };
+        // Splashes a square metre a second: what lands, as the drops fall (Marshall and Palmer's count by their speed).
+        let flux = if s.density > 0.0 { s.density * (-s.velocity.y).max(0.5) } else { 400.0 };
         let ahead = Vec3::new(look.x, 0.0, look.z).normalize_or_zero();
         let mut flash_pos = [[0.0; 4]; 4];
         let mut flash_color = [[0.0; 4]; 4];
@@ -270,6 +332,7 @@ impl PrecipitationPass {
             0,
             bytemuck::bytes_of(&Params {
                 view_proj: view_proj.to_cols_array_2d(),
+                inverse_view_proj: view_proj.inverse().to_cols_array_2d(),
                 camera_pos: camera_pos.to_array(),
                 pixel_angle: 2.0 * tan_half_fov_y / height,
                 centre: (camera_pos + ahead * (s.extent.x.min(s.extent.z) * s.lead.clamp(0.0, 1.0))).to_array(),
@@ -290,10 +353,39 @@ impl PrecipitationPass {
                 size: s.size.max(1e-4),
                 tint: s.tint.to_array(),
                 opacity: s.opacity.max(0.0),
+                layers: [layers[0], layers[1], layers[2], if matches!(s.falling, Falling::Rain) { s.splash.clamp(0.0, 1.0) } else { 0.0 }],
+                folds: [folds[0], folds[1], folds[2], flux],
+                extra: [s.sheltered.clamp(0.0, 1.0), 0.0, 0.0, 0.0],
                 flash_pos,
                 flash_color,
             }),
         );
+        if matches!(s.falling, Falling::Rain) && s.splash > 0.0 {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Precipitation splashes"),
+                multiview_mask: None,
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: hdr,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: reactive,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    }),
+                ],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.splash_pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("Precipitation"),
             multiview_mask: None,
@@ -327,8 +419,8 @@ mod tests {
 
     #[test]
     fn the_uniform_matches_the_shaders_layout() {
-        // A mat4, eight vec3 + f32 rows, two arrays of four vec4.
-        assert_eq!(std::mem::size_of::<Params>(), 64 + 8 * 16 + 2 * 64);
+        // Two mat4, eight vec3 + f32 rows, three vec4, two arrays of four vec4.
+        assert_eq!(std::mem::size_of::<Params>(), 2 * 64 + 8 * 16 + 3 * 16 + 2 * 64);
     }
 
     #[test]
