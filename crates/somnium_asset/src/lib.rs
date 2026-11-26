@@ -5,6 +5,8 @@
 //! without ever seeing `gltf::` crate types directly.
 
 pub mod animated;
+mod atomic_write;
+pub use atomic_write::write_atomic;
 pub mod cook;
 pub mod database;
 /// MORROWIND-M item 3: what references what, across a whole project.
