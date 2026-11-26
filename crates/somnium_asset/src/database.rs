@@ -404,7 +404,8 @@ impl AssetDb {
         scan_dir(&root, &root, &old, &mut next, &mut records)?;
         let _ = fs::create_dir_all(&state_dir);
         if let Ok(bytes) = serde_json::to_vec_pretty(&next) {
-            let _ = fs::write(&index_path, bytes);
+            // Written whole: the index is shared by hard-linked game folders and copies, and rewritten by tests.
+            let _ = crate::write_atomic(&index_path, &bytes);
         }
         records.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
         let by_id = records
