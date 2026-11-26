@@ -181,7 +181,11 @@ struct ManifestFile {
     cells: Vec<CellEntry>,
 }
 
-/// Read a manifest; cell files come back resolved against its folder.
+/// Read a manifest; cell files come back resolved against its folder. One bad entry does not cost the others (27 Nov
+/// 2026: a compose listed the 167 far tiles twice, the whole manifest was refused, and the play world was sky only for
+/// 32 minutes). An entry whose cell file is listed already, and a stand-in that cannot stand for its cell, are left
+/// out with one error line, `cells: manifest <path>: skipped <n> of <m> entries`, and the rest load. Launch checks
+/// count that line: reword it only with the sessions told.
 pub fn read_manifest(path: &Path) -> Result<Vec<CellEntry>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let file: ManifestFile = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -189,33 +193,74 @@ pub fn read_manifest(path: &Path) -> Result<Vec<CellEntry>, String> {
         return Err(format!("{}: manifest version {} is not 1", path.display(), file.version));
     }
     let folder = path.parent().unwrap_or(Path::new("."));
-    let mut cells: Vec<CellEntry> = file
-        .cells
-        .into_iter()
-        .map(|cell| CellEntry {
+    let listed = file.cells.len();
+    let mut cells: Vec<CellEntry> = Vec::with_capacity(listed);
+    let mut index = std::collections::HashMap::<PathBuf, usize>::new();
+    let (mut repeats, mut problems) = (0_usize, Vec::<String>::new());
+    for cell in file.cells {
+        let cell = CellEntry {
             file: folder.join(&cell.file),
             stands_for: cell.stands_for.as_ref().map(|other| folder.join(other)),
             ..cell
-        })
-        .collect();
-    link_stand_ins(&mut cells).map_err(|e| format!("{}: {e}", path.display()))?;
+        };
+        match index.get(&cell.file) {
+            // The same entry again: nothing is lost by leaving it out.
+            Some(&first) if cells[first] == cell => repeats += 1,
+            // The same cell file with other bounds or another partner: the first entry stands.
+            Some(_) => problems.push(format!("{} is listed again with other values", cell.file.display())),
+            None => {
+                index.insert(cell.file.clone(), cells.len());
+                cells.push(cell);
+            }
+        }
+    }
+    problems.extend(link_stand_ins(&mut cells));
+    let skipped = repeats + problems.len();
+    if skipped > 0 {
+        tracing::error!(
+            "cells: manifest {}: skipped {skipped} of {listed} entries ({repeats} exact repeats), the rest load{}",
+            path.display(),
+            problems.first().map(|first| format!("; first: {first}")).unwrap_or_default()
+        );
+    }
     Ok(cells)
 }
 
 /// Point each stand-in at its partner and back. One stand-in per cell; a stand-in stands for a cell that is not one.
-fn link_stand_ins(cells: &mut [CellEntry]) -> Result<(), String> {
-    let index: std::collections::HashMap<PathBuf, usize> =
-        cells.iter().enumerate().map(|(i, cell)| (cell.file.clone(), i)).collect();
-    for i in 0..cells.len() {
-        let Some(other) = cells[i].stands_for.clone() else { continue };
-        let p = *index.get(&other).ok_or_else(|| format!("{} stands for {}, not in the manifest", cells[i].file.display(), other.display()))?;
-        if p == i || cells[p].stands_for.is_some() || cells[p].stand_in.is_some() {
-            return Err(format!("{}: a cell has one stand-in, and a stand-in stands for a plain cell", other.display()));
+/// A stand-in that breaks this (its cell missing, a stand-in itself, or stood in for already) is removed, and why comes
+/// back, one line each: the rest link as if it had never been listed.
+fn link_stand_ins(cells: &mut Vec<CellEntry>) -> Vec<String> {
+    let mut problems = Vec::new();
+    loop {
+        for cell in cells.iter_mut() {
+            cell.partner = None;
+            cell.stand_in = None;
         }
-        cells[i].partner = Some(p);
-        cells[p].stand_in = Some(i);
+        let index: std::collections::HashMap<PathBuf, usize> =
+            cells.iter().enumerate().map(|(i, cell)| (cell.file.clone(), i)).collect();
+        let mut out = Vec::new();
+        for i in 0..cells.len() {
+            let Some(other) = cells[i].stands_for.clone() else { continue };
+            let why = match index.get(&other) {
+                None => "is not in the manifest",
+                Some(&p) if p == i || cells[p].stands_for.is_some() => "is a stand-in itself",
+                Some(&p) if cells[p].stand_in.is_some() => "has a stand-in already",
+                Some(&p) => {
+                    cells[i].partner = Some(p);
+                    cells[p].stand_in = Some(i);
+                    continue;
+                }
+            };
+            problems.push(format!("{} stands for {}, which {why}", cells[i].file.display(), other.display()));
+            out.push(i);
+        }
+        if out.is_empty() {
+            return problems;
+        }
+        for i in out.into_iter().rev() {
+            cells.remove(i);
+        }
     }
-    Ok(())
 }
 
 /// Distance in XZ from `point` to a cell's bounds (0 inside).
@@ -864,7 +909,7 @@ mod tests {
         let mut cells = vec![cell([0.0, 0.0], [1000.0, 1000.0], Some(800.0)), cell([0.0, 0.0], [1000.0, 1000.0], Some(6000.0))];
         cells[1].file = PathBuf::from("far.json");
         cells[1].stands_for = Some(PathBuf::from("c.json"));
-        link_stand_ins(&mut cells).expect("linked");
+        assert!(link_stand_ins(&mut cells).is_empty(), "linked");
         assert_eq!((cells[0].stand_in, cells[1].partner), (Some(1), Some(0)));
         let plan_at = |x: f32, resident: &[usize], installed: &[usize]| {
             plan_many(&cells, [x, 500.0], 600.0, 100.0, &[], |i| resident.contains(&i), |i| installed.contains(&i))
@@ -881,9 +926,41 @@ mod tests {
         assert_eq!(plan_at(-950.0, &[0, 1], &[0, 1]), (vec![], vec![0]), "the proxy is in: the tile goes");
         // Past the proxy's own reach and margin, nothing.
         assert_eq!(plan_at(-6200.0, &[1], &[1]), (vec![], vec![1]));
-        // A stand-in for a cell that is not in the manifest is refused.
+        // A stand-in for a cell that is not in the manifest is left out, and why comes back; its tile stays.
         cells[1].stands_for = Some(PathBuf::from("nowhere.json"));
-        assert!(link_stand_ins(&mut cells).is_err());
+        let problems = link_stand_ins(&mut cells);
+        assert_eq!((problems.len(), cells.len(), cells[0].stand_in), (1, 1, None));
+    }
+
+    #[test]
+    fn one_bad_entry_does_not_empty_the_world() {
+        // 27 Nov 2026: a compose listed the far tiles twice, and the whole manifest was refused (sky only, 32 minutes).
+        let folder = std::env::temp_dir().join(format!("cell_streaming_bad_{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("world.cells.json");
+        let tile = r#"{"file": "t.json", "min": [0, 0], "max": [1000, 1000], "reach": 800}"#;
+        let far = r#"{"file": "far.json", "min": [0, 0], "max": [1000, 1000], "reach": 6000, "stands_for": "t.json"}"#;
+        let far2 = r#"{"file": "far2.json", "min": [0, 0], "max": [1000, 1000], "reach": 6000, "stands_for": "t.json"}"#;
+        let lost = r#"{"file": "lost.json", "min": [0, 0], "max": [10, 10], "stands_for": "nowhere.json"}"#;
+        let again = r#"{"file": "t.json", "min": [5, 5], "max": [9, 9]}"#;
+        let plain = r#"{"file": "p.json", "min": [0, 0], "max": [256, 256]}"#;
+        let body = [tile, far, far, far2, lost, again, plain].join(", ");
+        std::fs::write(&path, format!(r#"{{"version": 1, "cells": [{body}]}}"#)).unwrap();
+        let cells = read_manifest(&path).expect("the rest load");
+        let names: Vec<String> =
+            cells.iter().map(|cell| cell.file.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["t.json", "far.json", "p.json"], "the repeat, the second stand-in, the lost one, the clash go");
+        assert_eq!((cells[0].stand_in, cells[1].partner, cells[2].stand_in), (Some(1), Some(0), None));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&folder);
+    }
+
+    #[test]
+    fn a_world_with_no_cells_says_so_in_the_log() {
+        // Launch checks count this line (land_play.sh, launch_proof.ps1): reword it only with the sessions told. Three
+        // ways to no cells: the manifest's path, its reading, an empty list.
+        let streaming = include_str!("app_cell_streaming.rs");
+        assert_eq!(streaming.matches("tracing::error!(\"cells: manifest gives no cells: ").count(), 3);
     }
 
     #[test]

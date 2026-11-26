@@ -48,7 +48,12 @@ impl<G: GameApp> Engine<G> {
         let manifest = match self.imported_source_path(&settings.manifest) {
             Ok(path) => path,
             Err(error) => {
-                self.set_cell_status(owner, format!("Manifest: {error}"));
+                let status = format!("Manifest: {error}");
+                // Loud once, not every frame: the world has no cells (sky only), and launch checks count this line.
+                if self.world.get::<CellStreamingComponent>(owner).is_some_and(|c| c.status != status) {
+                    tracing::error!("cells: manifest gives no cells: {status}");
+                }
+                self.set_cell_status(owner, status);
                 return;
             }
         };
@@ -57,8 +62,15 @@ impl<G: GameApp> Engine<G> {
             self.reset_cell_streaming();
             self.cell_streamer.key = key;
             match cells::read_manifest(&manifest) {
-                Ok(list) => self.cell_streamer.cells = list,
+                Ok(list) => {
+                    if list.is_empty() {
+                        tracing::error!("cells: manifest gives no cells: {} lists none", manifest.display());
+                    }
+                    self.cell_streamer.cells = list;
+                }
                 Err(error) => {
+                    // The world stays empty (sky only): said once, as the key is set; launch checks count this line.
+                    tracing::error!("cells: manifest gives no cells: {error}");
                     self.set_cell_status(owner, error);
                     return;
                 }
