@@ -158,7 +158,13 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) drop: u3
     fade *= open_above(head);
 
     // The streak: from where it was when the shutter opened to where it is.
-    let travel = (velocity - pp.camera_velocity) * pp.exposure;
+    // Snow in a wind drawn over a film's whole shutter is a field of long dashes (the p3 stills): flakes are seen as
+    // flecks, as a quarter of it shows them.
+    var shutter = pp.exposure;
+    if pp.kind > 0.5 && pp.kind < 1.5 {
+        shutter = pp.exposure * 0.25;
+    }
+    let travel = (velocity - pp.camera_velocity) * shutter;
     let tail = head - travel;
     let here = mix(head, tail, end);
     let distance = max(length(here), 0.05);
