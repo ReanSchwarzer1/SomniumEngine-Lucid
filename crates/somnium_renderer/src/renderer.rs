@@ -7628,6 +7628,15 @@ impl SomniumRenderer {
         // Sprite particles render after TAA and mark FSR reactivity, inside HDR
         // exposure/bloom. Each view has independent upload buffers.
         self.profiler.begin(&mut encoder, "Particles");
+        self.particle_pass.bind_sky(
+            &ctx.device,
+            &self.shadow_resources.atlas_depth_view,
+            &self.shadow_resources.comparison_sampler,
+            &self.ibl_pass.cube_view,
+            &self.ibl_pass.sampler,
+            &self.cloud_pass.shadow_view,
+            &self.cloud_pass.shadow_params,
+        );
         self.particle_pass.record(
             &ctx.device,
             &ctx.queue,
