@@ -10312,6 +10312,8 @@ impl<G: GameApp> Engine<G> {
                         self.terrain_restore_queue.clone(),
                     )));
                 self.scene_dirty = true;
+                // The edit layer does not keep painted foliage: Save must say so, as it does for sculpting.
+                self.editing.terrain_touched = true;
             }
             return true;
         }
@@ -10338,6 +10340,7 @@ impl<G: GameApp> Engine<G> {
                     self.terrain_restore_queue.clone(),
                 )));
             self.scene_dirty = true;
+            self.editing.terrain_touched = true;
         }
         let total = terrain.painted_foliage.len();
         let entry_name = self.foliage_kind_name(brush.kind).to_owned();

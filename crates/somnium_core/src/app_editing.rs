@@ -247,7 +247,8 @@ pub(crate) struct EditingState {
     /// What the last scene load did with its layer, for one toast.
     summary: Option<String>,
     /// Terrain was sculpted or painted, which the layer does not hold.
-    terrain_touched: bool,
+    /// Terrain sculpted or foliage painted since the start: the edit layer keeps neither, so Save says so.
+    pub(super) terrain_touched: bool,
     /// The card and the state it describes.
     card: Option<(CardKey, String)>,
     /// The undo generation the edited set was last checked at.
@@ -1103,7 +1104,7 @@ impl<G: GameApp> Engine<G> {
                     format!("Saved {count} edited object{} to {file}", if count == 1 { "" } else { "s" })
                 };
                 if self.editing.terrain_touched {
-                    message.push_str(" (terrain sculpting is not kept there: File > Save Scene As keeps it)");
+                    message.push_str(" (terrain sculpting and foliage painting are not kept there: File > Save Scene As keeps them)");
                 }
                 self.toast(&message);
                 if let Some(ui) = self.ui_manager.as_mut() {
