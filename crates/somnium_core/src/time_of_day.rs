@@ -124,6 +124,9 @@ pub struct TimeOfDayComponent {
     /// cut into three or four pieces by drifting lanes); 1 five shards; 2 the true-size sun crossed by two bars, which
     /// take 30% of its light. Its debris ring lights the night. `SOMNIUM_SUN_FORM` overrides it.
     pub sun_wreck: i32,
+    /// How wide the five shards (form 1) spread on the sky, degrees: 2 was the 12 Nov design. The shards scale with it;
+    /// their light on the ground, the dust's glow round them and the shadows' softness stay as they are.
+    pub sun_wreck_span_deg: f32,
 }
 
 impl Component for TimeOfDayComponent {}
@@ -154,6 +157,7 @@ impl Default for TimeOfDayComponent {
             night_halo_road: 0.0,
             night_thread: 0.0,
             sun_wreck: -1,
+            sun_wreck_span_deg: 2.0,
         }
     }
 }

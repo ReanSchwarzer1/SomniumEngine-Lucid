@@ -137,7 +137,7 @@ struct DirectionalLight {
     planet_sun:         vec4<f32>,            // offset 432  the sun's light above the air (luminance), night, -, -
     // The sun seen through the Lid's wreck (TimeOfDay sun_wreck); sun_form.y 0 draws the whole disc as always.
     sun_above:          vec4<f32>,            // offset 448  the sun's light above the air (rgb lux), latitude (deg)
-    sun_form:           vec4<f32>,            // offset 464  form 0..2, on, -, -
+    sun_form:           vec4<f32>,            // offset 464  form 0..2, on, north, shards' span deg
 }
 
 struct GpuLocalLight {

@@ -2424,7 +2424,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let low_sun = 1.0 - smoothstep(0.03, 0.17, sun_dir.y);
             let floor_lum = 20.0 * dot(sky, vec3<f32>(0.2126, 0.7152, 0.0722)) * low_sun;
             detail += fragmented_sun(ray_dir, sun_dir, light.sun_angular_radius, light.color, beside, pole,
-                view.time, i32(light.sun_form.x), floor_lum);
+                view.time, i32(light.sun_form.x), floor_lum, light.sun_form.w);
             // The wreck's debris ring across the sky: lit by the sun from below the horizon at dusk, cut by the
             // world's shadow by night, outshone by day.
             ring = debris_ring(ray_dir, sun_dir, pole, beside, view.time);

@@ -119,9 +119,10 @@ fn low_sun_lift(disc: vec3<f32>, floor_lum: f32) -> f32 {
 
 /// The sun seen along `dir` through the Lid's wreck. `sun_dir` its centre; `radius` the form's disc, radians; `lux` its
 /// light on the ground per channel (the air's colour in it); `beside` its light above the air, dimmed by the air along
-/// this ray (the lanes are in space); `pole` the celestial pole; `time` seconds; `variant` 0..2. Radiance, cd/m2.
+/// this ray (the lanes are in space); `pole` the celestial pole; `time` seconds; `variant` 0..2; `span_deg` the five
+/// shards' span on the sky (0 or 2: the 12 Nov design's two degrees). Radiance, cd/m2.
 fn fragmented_sun(dir: vec3<f32>, sun_dir: vec3<f32>, radius: f32, lux: vec3<f32>, beside: vec3<f32>, pole: vec3<f32>,
-                  time: f32, variant: i32, floor_lum: f32) -> vec3<f32> {
+                  time: f32, variant: i32, floor_lum: f32, span_deg: f32) -> vec3<f32> {
     let c = dot(dir, sun_dir);
     // Nothing reaches past seven degrees.
     if c < 0.99254 {
@@ -141,9 +142,12 @@ fn fragmented_sun(dir: vec3<f32>, sun_dir: vec3<f32>, radius: f32, lux: vec3<f32
     if variant == 1 {
         // The shards keep sky_detail's sun (0.6 cd/m2 per lux for a 0.2667 degree disc) spread over their area, about
         // 1.9 times the Heart's, so the glare they throw is the whole sun's.
-        if r < 1.1 {
-            let shard = lux * (0.6 * 0.2667 * 0.2667 / (0.275 * 0.275 * 1.89));
-            light += shard * low_sun_lift(shard, floor_lum) * five_shards(p, t, px);
+        // At a larger span (`s` times the design's) the pieces cover s * s the sky, each dimmed by as much: the glare
+        // they throw is still the whole sun's.
+        let s = select(1.0, span_deg * 0.5, span_deg > 0.0);
+        if r < 1.1 * s {
+            let shard = lux * (0.6 * 0.2667 * 0.2667 / (0.275 * 0.275 * 1.89 * s * s));
+            light += shard * low_sun_lift(shard, floor_lum) * five_shards(p / s, t, px / s);
         }
         // The dust they shine through, a soft halo fading over a degree and a half.
         light += beside * 0.0006 * exp(-r / 1.5) * sun_hg(c, 0.95);
