@@ -226,6 +226,36 @@ impl EditorCamera {
     }
 }
 
+/// `SOMNIUM_PHYSICS_SYNC_AB=1` (cost): the shell's old physics sync (raw mutable columns, a change to everything) in
+/// the frame=120, 360, ... blocks of a run with SOMNIUM_PROFILE_EVERY=120, and the new one between, as
+/// SOMNIUM_SURFACES_AB=1 does for photoreal's surfaces: before and after in one launch (19 Nov 2026).
+fn physics_sync_ab_old(frame: u64) -> bool {
+    static AB: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("SOMNIUM_PHYSICS_SYNC_AB").as_deref() == Ok("1"));
+    *AB && (frame + 60) / 120 % 2 == 1
+}
+
+/// The physics sync as it was before 19 Nov 2026, for `SOMNIUM_PHYSICS_SYNC_AB`'s A blocks only.
+fn old_physics_sync(ctx: &mut EngineContext, required: &ComponentSet, playing_now: bool) {
+    for archetype in ctx.world.query_archetypes_mut(required, &ComponentSet::empty()) {
+        let t_col = archetype.column_index(ComponentId::of::<Transform>()).unwrap();
+        let b_col = archetype.column_index(ComponentId::of::<PhysicsBody>()).unwrap();
+        for row in 0..archetype.len() {
+            let body = unsafe { *archetype.column(b_col).get::<PhysicsBody>(row) };
+            let transform = unsafe { archetype.column_mut(t_col).get_mut::<Transform>(row) };
+            if playing_now {
+                transform.translation = ctx.physics.get_position(body.id);
+                transform.rotation = ctx.physics.get_rotation(body.id);
+            } else {
+                ctx.physics.set_position(body.id, transform.translation, false);
+                ctx.physics.set_rotation(body.id, transform.rotation, false);
+                ctx.physics.set_linear_velocity(body.id, Vec3::ZERO);
+                ctx.physics.set_angular_velocity(body.id, Vec3::ZERO);
+            }
+        }
+    }
+}
+
 fn play_session(ctx: &EngineContext) -> bool {
     ctx.simulation.state != SimulationState::Editing
 }
@@ -2220,14 +2250,21 @@ impl GameApp for HelloGame {
                 }
             }
         }
+        zone(&mut ctx.renderer, Some("Shell physics sync"));
         let required = ComponentSet::from_ids(vec![
             ComponentId::of::<Transform>(),
             ComponentId::of::<PhysicsBody>(),
         ]);
-        for archetype in ctx
-            .world
-            .query_archetypes_mut(&required, &ComponentSet::empty())
-        {
+        // Read through the shared query, and in play only a Transform the physics moved is written (`get_mut`, a
+        // change to Transform alone). Raw mutable columns (`query_archetypes_mut`) count as a change to everything:
+        // every frame they kept propagate_transforms from skipping and made it rebuild its order twice (Sunscar's
+        // piazza, 19 Nov 2026: the shell's update 8-10 ms of the main thread, its render hook 6).
+        let old_sync = physics_sync_ab_old(ctx.time.frame_count());
+        if old_sync {
+            old_physics_sync(ctx, &required, playing_now);
+        }
+        let mut moved = Vec::new();
+        for archetype in ctx.world.query_archetypes(&required, &ComponentSet::empty()).filter(|_| !old_sync) {
             let t_col = archetype
                 .column_index(ComponentId::of::<Transform>())
                 .unwrap();
@@ -2236,10 +2273,12 @@ impl GameApp for HelloGame {
                 .unwrap();
             for row in 0..archetype.len() {
                 let body = unsafe { *archetype.column(b_col).get::<PhysicsBody>(row) };
-                let transform = unsafe { archetype.column_mut(t_col).get_mut::<Transform>(row) };
+                let transform = unsafe { archetype.column(t_col).get::<Transform>(row) };
                 if playing_now {
-                    transform.translation = ctx.physics.get_position(body.id);
-                    transform.rotation = ctx.physics.get_rotation(body.id);
+                    let (position, rotation) = (ctx.physics.get_position(body.id), ctx.physics.get_rotation(body.id));
+                    if position != transform.translation || rotation != transform.rotation {
+                        moved.push((archetype.entities()[row], position, rotation));
+                    }
                 } else {
                     // Edit mode owns authored transforms. Physics preview must not
                     // move the designer's objects or invalidate every automation plan.
@@ -2251,6 +2290,13 @@ impl GameApp for HelloGame {
                 }
             }
         }
+        for (entity, position, rotation) in moved {
+            if let Some(transform) = ctx.world.get_mut::<Transform>(entity) {
+                transform.translation = position;
+                transform.rotation = rotation;
+            }
+        }
+        zone(&mut ctx.renderer, None);
         self.last_simulation_time = ctx.simulation.elapsed_seconds;
 
         // The scripted first-person character exists only during a play
@@ -2280,6 +2326,7 @@ impl GameApp for HelloGame {
             despawn_player(self, ctx);
         }
         self.was_playing = playing;
+        zone(&mut ctx.renderer, Some("Shell play hosts"));
         if playing {
             // A second place the game holds streamed (the protagonists' switch, a joint mission) thinks too.
             let held = somnium_core::cell_streaming::held_points(ctx.world);
@@ -2288,10 +2335,13 @@ impl GameApp for HelloGame {
             self.combat.update(ctx);
             self.life.update(ctx);
         }
+        zone(&mut ctx.renderer, None);
 
         // Propagate after physics/editor synchronization so render transforms
         // reflect Play, Pause, and Stop in the same frame.
+        zone(&mut ctx.renderer, Some("Shell transforms"));
         propagate_transforms(ctx.world);
+        zone(&mut ctx.renderer, None);
 
         // Flip a render switch mid-run, the way the Details panel does.
         //
@@ -2358,6 +2408,7 @@ impl GameApp for HelloGame {
         // Phase 14: create/destroy the voxel driver to match the ECS, then
         // stream chunks around the camera (async generation; finished meshes
         // are uploaded here, freed allocations recycled).
+        zone(&mut ctx.renderer, Some("Shell voxel"));
         self.sync_voxel_terrain(ctx);
         let eye = self
             .combat
@@ -2370,6 +2421,7 @@ impl GameApp for HelloGame {
         {
             vt.update(ctx.jobs, eye, renderer, render_ctx);
         }
+        zone(&mut ctx.renderer, None);
 
         // Handle mesh-creating IPC commands that require renderer access.
         // These arrive after the engine-level IPC loop (which handles non-mesh commands).
@@ -2380,9 +2432,13 @@ impl GameApp for HelloGame {
 
     fn on_render(&mut self, ctx: &mut EngineContext) {
         fracture_demo::Demo::sync(ctx.world);
+        zone(&mut ctx.renderer, Some("Shell render transforms"));
         somnium_core::propagate_transforms(ctx.world);
+        zone(&mut ctx.renderer, None);
         // After the transforms, so a flame that just streamed in is lit where it stands.
+        zone(&mut ctx.renderer, Some("Shell fires"));
         self.fires.update(ctx.world, self.lamps.night(), ctx.time.elapsed().as_secs_f32());
+        zone(&mut ctx.renderer, None);
         let (view_mat, eye) = self
             .combat
             .view(ctx.world)
@@ -3897,6 +3953,13 @@ mod profiler_zone_tests {
     /// SIM_LOD_PLAN step 0: the combat host's fixed step, the shell's fixed step and the skinned crowd each time
     /// their parts, every zone closed in the function that opens it. A source check because the profiler needs a
     /// GPU: a zone left open would nest every later scope of the frame under it.
+    /// The shell's update runs every frame: a raw mutable query there counts as a change to everything, so the
+    /// transform pass could never skip (19 Nov 2026).
+    #[test]
+    fn the_update_takes_no_change_everything_query() {
+        assert!(!body(include_str!("main.rs"), "fn on_update(&mut self, ctx").contains(".query_archetypes_mut("));
+    }
+
     #[test]
     fn the_simulation_zones_open_and_close_in_pairs() {
         let shell = r#"zone(&mut ctx.renderer, Some(""#;
@@ -3915,6 +3978,8 @@ mod profiler_zone_tests {
         );
         let host = zones(&body(include_str!("main.rs"), "fn on_fixed_update("), shell, shut);
         assert_eq!(host, ["Boats fixed", "Interactions tick"]);
+        let update = zones(&body(include_str!("main.rs"), "fn on_update(&mut self, ctx"), shell, shut);
+        assert_eq!(update, ["Shell physics sync", "Shell play hosts", "Shell transforms", "Shell voxel"]);
         let crowd = zones(
             &body(include_str!("skinned_crowd.rs"), "pub fn render("),
             r#"profiler.cpu_begin(""#,
