@@ -584,6 +584,11 @@ pub struct CellStreamer {
     /// Main-thread time spent uploading sources and installing cells, then the install's steps (spawning, the
     /// ground, the GPU state, the whole-world passes), for the first fill's log line.
     pub(crate) spent: [std::time::Duration; 6],
+    /// Cells the plan wants that no reader has started yet (the reader limit, a retry's pause). With `reading`,
+    /// what a settled still waits for (26 Nov 2026).
+    pub(crate) queued: usize,
+    /// The counts last written to the log (loaded, reading, queued), and when.
+    pub(crate) logged: Option<((u32, u32, u32), std::time::Instant)>,
 }
 
 /// The readers' turnstile: a cell's sources are read side by side, and this bounds how many are being read at once
