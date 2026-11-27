@@ -12333,14 +12333,31 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::Undo => {
+                // The name is read first: once undone, the step is on the redo side.
+                let step = self.undo_stack.next_undo_name().unwrap_or("").to_owned();
                 if self.undo_stack.undo(&mut self.world, &mut self.selection.primary) {
                     self.scene_dirty = true;
+                    if step.is_empty() {
+                        self.toast("Undid the last change.");
+                    } else {
+                        self.toast(&format!("Undid: {step}"));
+                    }
+                } else {
+                    self.toast("Nothing to undo.");
                 }
             }
 
             EditorEvent::Redo => {
+                let step = self.undo_stack.next_redo_name().unwrap_or("").to_owned();
                 if self.undo_stack.redo(&mut self.world, &mut self.selection.primary) {
                     self.scene_dirty = true;
+                    if step.is_empty() {
+                        self.toast("Redid the last change.");
+                    } else {
+                        self.toast(&format!("Redid: {step}"));
+                    }
+                } else {
+                    self.toast("Nothing to redo.");
                 }
             }
 
