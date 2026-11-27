@@ -164,7 +164,7 @@ impl Fires {
             if let Some(embers) = fire.embers
                 && let Some(emitter) = world.get_mut::<ParticleEmitter>(embers)
             {
-                emitter.velocity_bias = [wind[0] * 0.6, 0.0, wind[1] * 0.6];
+                emitter.velocity_bias = [wind[0] * 0.25, 0.0, wind[1] * 0.25];
             }
         }
     }
@@ -263,10 +263,12 @@ fn burn(
             additive: true,
             max_particles: 40,
             spawn_rate: 11.0,
-            lifetime: 2.4,
-            initial_speed: 1.1,
-            spread_angle: 0.55,
-            gravity: -0.35,
+            // Short-lived and thrown wide: at 2.4 s, 0.55 rad and 0.6 of the wind they streamed 30 m downwind as an
+            // even line of dots, like fireflies (p24, 28 Nov).
+            lifetime: 1.3,
+            initial_speed: 1.3,
+            spread_angle: 1.0,
+            gravity: -0.6,
             size_start: 0.024,
             size_end: 0.008,
             spawn_extents: [radius * 0.5, 0.0, radius * 0.5],
