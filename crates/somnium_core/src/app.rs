@@ -1471,6 +1471,8 @@ pub struct Engine<G: GameApp> {
     /// from its first load, a cell reader's included, for every entity that reuses the upload.
     pub(crate) flame_nodes:
         std::collections::HashMap<std::path::PathBuf, std::collections::HashMap<u32, std::sync::Arc<[crate::fire::Flame]>>>,
+    /// The level portals the eye stands in (`level_portal.rs`), so an entry is logged once.
+    portals: crate::level_portal::Portals,
 }
 
 /// One floating window's swapchain image, acquired before the frame that fills
@@ -2094,6 +2096,7 @@ impl<G: GameApp + 'static> Engine<G> {
             model_faults: crate::model_faults::ModelFaults::default(),
             model_notice: crate::model_faults::Notice::default(),
             flame_nodes: std::collections::HashMap::new(),
+            portals: crate::level_portal::Portals::default(),
         };
 
         engine.foliage_erase = crate::authoring_settings::BrushPreferences::load()
@@ -6129,6 +6132,13 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             );
             if let Some(r) = &mut self.renderer {
                 r.set_particles(gpu_particles);
+            }
+        }
+
+        // Level portals (`level_portal.rs`): while the game plays, the eye entering one is logged once per entry.
+        if self.play_session_active || self.config.player_mode {
+            if let Some(eye) = self.renderer.as_ref().map(|r| r.camera_pos) {
+                self.portals.update(&self.world, eye);
             }
         }
 
