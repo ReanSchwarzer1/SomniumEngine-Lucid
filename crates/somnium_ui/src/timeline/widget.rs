@@ -445,7 +445,7 @@ impl TimelineEditor {
             TimelineEditorMessage::Command(id) => {
                 let changed = match id.as_str() {
                     "editor.edit.undo" => self.surface.undo(),
-                    "editor.edit.redo" => self.surface.redo(),
+                    "editor.edit.redo" | "editor.edit.redo_alt" => self.surface.redo(),
                     _ => false,
                 };
                 if changed {

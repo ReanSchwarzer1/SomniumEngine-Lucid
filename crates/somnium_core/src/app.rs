@@ -12361,14 +12361,31 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::Undo => {
+                // The name is read first: once undone, the step is on the redo side.
+                let step = self.undo_stack.next_undo_name().unwrap_or("").to_owned();
                 if self.undo_stack.undo(&mut self.world, &mut self.selection.primary) {
                     self.scene_dirty = true;
+                    if step.is_empty() {
+                        self.toast("Undid the last change.");
+                    } else {
+                        self.toast(&format!("Undid: {step}"));
+                    }
+                } else {
+                    self.toast("Nothing to undo.");
                 }
             }
 
             EditorEvent::Redo => {
+                let step = self.undo_stack.next_redo_name().unwrap_or("").to_owned();
                 if self.undo_stack.redo(&mut self.world, &mut self.selection.primary) {
                     self.scene_dirty = true;
+                    if step.is_empty() {
+                        self.toast("Redid the last change.");
+                    } else {
+                        self.toast(&format!("Redid: {step}"));
+                    }
+                } else {
+                    self.toast("Nothing to redo.");
                 }
             }
 
@@ -12882,6 +12899,13 @@ impl<G: GameApp> Engine<G> {
                     }
                 });
                 let count = clipboard.root_count();
+                // Named for the original, read before the selection moves to the copy.
+                let original = self
+                    .selection
+                    .as_slice()
+                    .first()
+                    .and_then(|entity| self.world.get::<Name>(*entity))
+                    .map(|name| name.as_str().to_owned());
                 use crate::editor_commands::EditorCommand as _;
                 let mut command = crate::clipboard::PasteEntitiesCmd::new(clipboard, None);
                 command.execute(&mut self.world, &mut self.selection.primary);
@@ -12891,6 +12915,11 @@ impl<G: GameApp> Engine<G> {
                 self.after_selection_change();
                 self.scene_dirty = true;
                 info!("Duplicated {count} object(s) with their parts");
+                match original {
+                    Some(name) if count == 1 && !name.is_empty() => self.toast(&format!("Duplicated {name}.")),
+                    _ if count == 1 => self.toast("Duplicated 1 object."),
+                    _ => self.toast(&format!("Duplicated {count} objects.")),
+                }
             }
 
             EditorEvent::LoadScene(path) => self.load_scene_file(&path),
