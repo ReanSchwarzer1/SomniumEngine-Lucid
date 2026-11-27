@@ -7032,7 +7032,13 @@ impl<G: GameApp> Engine<G> {
         // A guard, not an early return: everything below this block —
         // thumbnail requests, preview jobs, external imports — has to keep
         // running on a frame where the inventory has nothing to do.
-        let due = self.asset_scan.is_none() && now >= self.next_asset_scan;
+        let due = inventory_poll_due(
+            self.config.player_mode,
+            self.asset_gate.published().is_some(),
+            self.asset_scan_stamp.is_some(),
+            self.asset_scan.is_some(),
+            now >= self.next_asset_scan,
+        );
         let changed = due && {
             let stamp = content_root_stamp(&self.config.content_root);
             let moved = self.asset_scan_stamp != Some(stamp);
@@ -13898,6 +13904,39 @@ fn content_root_stamp(root: &std::path::Path) -> (u64, u64) {
     let (mut count, mut newest) = (0_u64, 0_u64);
     fold(root, 2, &mut count, &mut newest);
     (count, newest)
+}
+
+/// Whether the asset inventory's poll walks the content root (`content_root_stamp`) on this frame. A game alone
+/// (`player_mode`) walks it until its first inventory is published, and after that only when an explicit invalidation
+/// clears the stamp: its files do not change under it. In Sunscar the walk read three folder levels of `assets\` on
+/// the frame thread every 350 ms for the whole game (editor-ux, 28 Nov 2026). The editor keeps polling. The first
+/// scan still runs in a game: its sounds and material textures are found through that inventory.
+fn inventory_poll_due(player_mode: bool, published: bool, stamp_known: bool, scan_running: bool, time_due: bool) -> bool {
+    !scan_running && time_due && !(player_mode && published && stamp_known)
+}
+
+#[cfg(test)]
+mod inventory_poll_tests {
+    use super::inventory_poll_due;
+
+    #[test]
+    fn a_game_stops_walking_the_content_root_once_its_inventory_is_published() {
+        // Before the first inventory: a game polls like the editor.
+        assert!(inventory_poll_due(true, false, false, false, true));
+        assert!(inventory_poll_due(true, false, true, false, true));
+        // Published, and the stamp known: a game no longer walks; the editor still does.
+        assert!(!inventory_poll_due(true, true, true, false, true));
+        assert!(inventory_poll_due(false, true, true, false, true));
+        // An explicit invalidation clears the stamp: one more walk, in a game too.
+        assert!(inventory_poll_due(true, true, false, false, true));
+    }
+
+    #[test]
+    fn nobody_walks_while_a_scan_runs_or_before_its_time() {
+        assert!(!inventory_poll_due(false, true, true, true, true));
+        assert!(!inventory_poll_due(false, true, true, false, false));
+        assert!(!inventory_poll_due(true, false, false, true, true));
+    }
 }
 
 fn camera_spawn_basis(
