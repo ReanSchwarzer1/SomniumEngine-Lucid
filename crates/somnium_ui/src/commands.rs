@@ -1103,7 +1103,7 @@ fn declarations() -> Vec<Command> {
             "Save Scene",
             "Scene",
             ctrl('S'),
-            "Save the current scene.",
+            "Save your edits to this scene (moved, added and removed objects). Sculpted or painted ground needs Save Scene As.",
             A::SaveScene,
             FILE,
             always

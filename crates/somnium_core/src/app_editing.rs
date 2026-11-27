@@ -1092,9 +1092,13 @@ impl<G: GameApp> Engine<G> {
         let (objects, plants) = (layer.entities.len(), layer.painted.len());
         match layer.write(&scene) {
             Ok(()) => {
-                self.scene_dirty = false;
-                self.autosave.saved();
-                crate::autosave::clear(&self.config.content_root);
+                // The edits file is written, but the ground is not: the scene stays unsaved until Save Scene As.
+                let ground_unsaved = self.editing.terrain_touched;
+                if !ground_unsaved {
+                    self.scene_dirty = false;
+                    self.autosave.saved();
+                    crate::autosave::clear(&self.config.content_root);
+                }
                 self.remember_recent_scene(&scene);
                 let file = scene_edits::layer_path(&scene);
                 let file = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
@@ -1106,8 +1110,8 @@ impl<G: GameApp> Engine<G> {
                     (0, _) => format!("Saved {plants_text} to {file}"),
                     _ => format!("Saved {objects_text} and {plants_text} to {file}"),
                 };
-                if self.editing.terrain_touched {
-                    message.push_str(" (terrain sculpting and foliage painting are not kept there: File > Save Scene As keeps them)");
+                if ground_unsaved {
+                    message.push_str(". The ground you sculpted or painted is NOT saved by Ctrl+S: use File > Save Scene As to keep it.");
                 }
                 self.toast(&message);
                 if let Some(ui) = self.ui_manager.as_mut() {
