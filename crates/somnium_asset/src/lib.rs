@@ -782,6 +782,14 @@ fn load_gltf_checked(path: &Path, parts: Option<&HashSet<usize>>) -> Result<Load
         }
     }
 
+    // 3b. One-sided pieces with open edges: a warning, once a file a run (see [`open_edges`]).
+    if open_edges_first_look(path) {
+        let pieces = one_sided_open_pieces(&document, &buffers, |material| {
+            material.and_then(|i| scene.materials.get(i)).is_none_or(drawn_one_side_opaque)
+        });
+        warn_open_pieces(path, &pieces);
+    }
+
     // 4. Scene graph → flat world-space nodes ----------------------------
     let gltf_scene = document
         .default_scene()
@@ -1095,6 +1103,252 @@ pub fn gltf_problems(path: &Path) -> Vec<String> {
         Ok(())
     };
     geometry().err().into_iter().collect()
+}
+
+// ─── Open edges on faces drawn on one side ──────────────────────────────────
+//
+// The developer, 27 Nov 2026: "the houses roofs dont contact the actual structure and there's always a thin line
+// visible". The cause (Sunscar's notes/OBSERVATION_FACTS_2026-11-27.md, section 1): a generator left a strip with no
+// underside, its material is drawn on one side only (glTF's default, which the renderer honours), and from below the
+// eye looks through the back of the tiles at the sky. Any one-sided opaque piece with open edges can show that, so the
+// importer names such pieces, once a file a run. A warning only: a cliff face or a rock whose foot is in the ground is
+// open on purpose, and nothing is refused or changed. `gltf_check --open-edges` lists the same for a folder, with no
+// window. `SOMNIUM_OPEN_EDGES=0` turns the warning off (its tracing target is `somnium_asset::open_edges`). A city
+// house of Sunscar's had 28 such pieces on 27 Nov (its roof tiles overlap, one-sided, with no underside), and every
+// house had some: the warning names where to look, it does not say each line shows.
+
+/// A piece of a glTF that is drawn on one side only and has open edges: where the sky can show through it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenPiece {
+    /// The node's name (the mesh's when the node has none), with `_<n>` after it for a mesh of several primitives, as
+    /// the scene's nodes are named.
+    pub name: String,
+    /// The material's name.
+    pub material: String,
+    /// Edges that only one triangle of the whole file uses, that triangle this piece's.
+    pub open_edges: usize,
+    /// The piece's triangles.
+    pub triangles: usize,
+}
+
+/// Above this many triangles a file is a ground sheet or a merged bank, not a built piece, and is not counted (a check
+/// of it would cost a streaming reader a quarter of a second).
+const OPEN_EDGES_MAX_TRIANGLES: usize = 1_000_000;
+
+/// The edges of a triangle list that only one triangle uses. Corners are welded at a tenth of a millimetre first, so a
+/// flat-shaded box, which repeats each corner once a face, is closed. A closed mesh has none; the rim of a sheet, a
+/// strip with no underside or a shell with a face missing has some. A triangle with two corners on one point, or one
+/// that names a vertex the list has not, is skipped.
+#[must_use]
+pub fn open_edges(positions: &[[f32; 3]], indices: &[u32]) -> usize {
+    let triangles: Vec<([u32; 3], u32)> = indices.chunks_exact(3).map(|t| ([t[0], t[1], t[2]], 0)).collect();
+    open_edge_owners(positions, &triangles).len()
+}
+
+/// For each edge that only one triangle uses ([`open_edges`]), that triangle's owner: `triangles` are three indices
+/// into `corners` and who owns them.
+fn open_edge_owners(corners: &[[f32; 3]], triangles: &[([u32; 3], u32)]) -> Vec<u32> {
+    let mut weld: HashMap<(i64, i64, i64), u32, std::hash::BuildHasherDefault<WeldHasher>> =
+        HashMap::with_capacity_and_hasher(corners.len(), Default::default());
+    let ids: Vec<u32> = corners
+        .iter()
+        .map(|p| {
+            // A corner that is no number welds to the origin: the importer refuses such a file before this is asked.
+            let [x, y, z] = p.map(|c| (f64::from(c) * 10_000.0).round() as i64);
+            let next = weld.len() as u32;
+            *weld.entry((x, y, z)).or_insert(next)
+        })
+        .collect();
+    let mut edges: Vec<(u64, u32)> = Vec::with_capacity(triangles.len() * 3);
+    for &(triangle, owner) in triangles {
+        let [Some(a), Some(b), Some(c)] = triangle.map(|i| ids.get(i as usize).copied()) else {
+            continue;
+        };
+        if a == b || b == c || c == a {
+            continue;
+        }
+        for (x, y) in [(a, b), (b, c), (c, a)] {
+            edges.push(((u64::from(x.min(y)) << 32) | u64::from(x.max(y)), owner));
+        }
+    }
+    edges.sort_unstable_by_key(|&(edge, _)| edge);
+    edges.chunk_by(|x, y| x.0 == y.0).filter(|run| run.len() == 1).map(|run| run[0].1).collect()
+}
+
+/// FxHash's multiply and rotate, for the weld's integer keys: the default SipHash costs several times as much, and
+/// nothing here needs its resistance to chosen keys.
+#[derive(Default)]
+struct WeldHasher(u64);
+
+impl std::hash::Hasher for WeldHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn write_i64(&mut self, value: i64) {
+        self.write_u64(value as u64);
+    }
+}
+
+/// Whether the renderer draws this material's faces from the front only and lets nothing through them: what can open
+/// a thin line to the sky. Far ground and foliage are left out (a far tile is a sheet by design; leaves are cut-outs).
+fn drawn_one_side_opaque(material: &LoadedMaterial) -> bool {
+    material.alpha_mode == AlphaMode::Opaque
+        && !material.double_sided
+        && !material.far_ground
+        && !material.foliage
+        && !material.foliage_card
+}
+
+/// Every piece of the default scene whose material `one_sided` says is drawn on one side only (`None`: a primitive
+/// with no material, which glTF draws one-sided) and which has open edges, most open first. The whole scene is welded
+/// in world space, every piece of every material in it: a generator writes one node a material, and where plaster
+/// meets its stone plinth the edge is closed, not open twice.
+fn one_sided_open_pieces(
+    document: &gltf::Document,
+    buffers: &[gltf::buffer::Data],
+    one_sided: impl Fn(Option<usize>) -> bool,
+) -> Vec<OpenPiece> {
+    struct Piece {
+        name: String,
+        material: String,
+        one_sided: bool,
+        triangles: usize,
+    }
+    let triangle_list = |p: &gltf::Primitive| p.mode() == gltf::mesh::Mode::Triangles;
+    let anything_one_sided = document
+        .meshes()
+        .flat_map(|mesh| mesh.primitives())
+        .any(|p| triangle_list(&p) && one_sided(p.material().index()));
+    let Some(scene) = document.default_scene().or_else(|| document.scenes().next()) else {
+        return Vec::new();
+    };
+    if !anything_one_sided {
+        return Vec::new();
+    }
+    let (mut pieces, mut corners, mut triangles) = (Vec::<Piece>::new(), Vec::<[f32; 3]>::new(), Vec::new());
+    let mut stack: Vec<(gltf::Node, Mat4)> = scene.nodes().map(|node| (node, Mat4::IDENTITY)).collect();
+    while let Some((node, parent)) = stack.pop() {
+        let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
+        if let Some(mesh) = node.mesh() {
+            let count = mesh.primitives().count();
+            let name = node.name().or(mesh.name()).unwrap_or("Node");
+            for (index, primitive) in mesh.primitives().enumerate().filter(|(_, p)| triangle_list(p)) {
+                let reader = primitive.reader(|buf| Some(&buffers[buf.index()]));
+                let (Some(positions), Some(indices)) = (reader.read_positions(), reader.read_indices()) else {
+                    continue;
+                };
+                let first = corners.len() as u32;
+                corners.extend(positions.map(|p| world.transform_point3(Vec3::from(p)).to_array()));
+                let own = corners.len() as u32 - first;
+                // An index past this piece's own corners would weld it to another's: it names nothing.
+                let at = |i: u32| if i < own { first + i } else { u32::MAX };
+                let owner = pieces.len() as u32;
+                let before = triangles.len();
+                let indices: Vec<u32> = indices.into_u32().collect();
+                triangles.extend(indices.chunks_exact(3).map(|t| ([at(t[0]), at(t[1]), at(t[2])], owner)));
+                if triangles.len() > OPEN_EDGES_MAX_TRIANGLES {
+                    return Vec::new();
+                }
+                pieces.push(Piece {
+                    name: if count == 1 { name.to_owned() } else { format!("{name}_{index}") },
+                    material: primitive.material().name().unwrap_or("(default material)").to_owned(),
+                    one_sided: one_sided(primitive.material().index()),
+                    triangles: triangles.len() - before,
+                });
+            }
+        }
+        stack.extend(node.children().map(|child| (child, world)));
+    }
+    let mut open = vec![0usize; pieces.len()];
+    for owner in open_edge_owners(&corners, &triangles) {
+        open[owner as usize] += 1;
+    }
+    let mut found: Vec<OpenPiece> = pieces
+        .into_iter()
+        .zip(open)
+        .filter(|(piece, open)| piece.one_sided && *open > 0)
+        .map(|(piece, open_edges)| OpenPiece {
+            name: piece.name,
+            material: piece.material,
+            open_edges,
+            triangles: piece.triangles,
+        })
+        .collect();
+    found.sort_by(|a, b| b.open_edges.cmp(&a.open_edges).then_with(|| a.name.cmp(&b.name)));
+    found
+}
+
+/// Whether this run has not looked at `path`'s open edges yet, and marks it looked at. Always false under
+/// `SOMNIUM_OPEN_EDGES=0`.
+fn open_edges_first_look(path: &Path) -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("SOMNIUM_OPEN_EDGES").is_ok_and(|v| v.trim() == "0"));
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<HashSet<std::path::PathBuf>>> =
+        std::sync::LazyLock::new(Default::default);
+    !*OFF && SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(path.to_path_buf())
+}
+
+/// One warning line for a file's one-sided pieces with open edges: the twelve most open by name, material and count.
+fn warn_open_pieces(path: &Path, pieces: &[OpenPiece]) {
+    const SHOWN: usize = 12;
+    if pieces.is_empty() {
+        return;
+    }
+    let edges: usize = pieces.iter().map(|p| p.open_edges).sum();
+    let mut list =
+        pieces.iter().take(SHOWN).map(|p| format!("{} ({}) {}", p.name, p.material, p.open_edges)).collect::<Vec<_>>();
+    if pieces.len() > SHOWN {
+        list.push(format!("and {} more", pieces.len() - SHOWN));
+    }
+    warn!(
+        target: "somnium_asset::open_edges",
+        file = %path.display(),
+        "One-sided pieces with open edges, where the sky can show through as a thin line (an underside, or the \
+         material doubleSided, closes it): {}; {} pieces, {edges} open edges",
+        list.join(", "),
+        pieces.len()
+    );
+}
+
+/// The pieces of the glTF at `path` that the importer warns of ([`open_edges`]), read without decoding an image: a
+/// material counts as one-sided when the file says opaque and not doubleSided, it is not far ground, and no cut-out
+/// mask lies beside its colour map (the importer makes such a material foliage). Most open first.
+///
+/// # Errors
+/// The file does not read as glTF, or its buffers do not match it.
+pub fn open_edge_pieces(path: &Path) -> Result<Vec<OpenPiece>, String> {
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("./"));
+    let gltf::Gltf { document, blob } = gltf::Gltf::open(path).map_err(|e| format!("glTF import failed: {e}"))?;
+    check_buffer_files(&document, base_dir, blob.as_deref())?;
+    let buffers =
+        gltf::import_buffers(&document, Some(base_dir), blob).map_err(|e| format!("glTF import failed: {e}"))?;
+    check_accessors(&document, &buffers)?;
+    let one_sided: Vec<bool> = document
+        .materials()
+        .map(|mat| {
+            let cutout = mat.pbr_metallic_roughness().base_color_texture().is_some_and(|t| {
+                match t.texture().source().source() {
+                    gltf::image::Source::Uri { uri, .. } => sidecar_alpha_path(base_dir, uri).is_some(),
+                    gltf::image::Source::View { .. } => false,
+                }
+            });
+            mat.alpha_mode() == gltf::material::AlphaMode::Opaque
+                && !mat.double_sided()
+                && material_extra(&mat, "somnium_far_ground") <= 0.5
+                && !cutout
+        })
+        .collect();
+    Ok(one_sided_open_pieces(&document, &buffers, |material| {
+        material.is_none_or(|i| one_sided.get(i).copied().unwrap_or(true))
+    }))
 }
 
 /// What is wrong with a glTF file before its geometry is read: missing; a buffer file shorter than the glTF declares
@@ -2145,6 +2399,133 @@ mod broken_file_tests {
         glb.extend(999u32.to_le_bytes());
         std::fs::write(dir.join("cut.glb"), &glb).unwrap();
         assert!(super::gltf_file_problems(&dir.join("cut.glb"))[0].contains("declares 999 bytes and has 12"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod open_edge_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::OpenPiece;
+
+    /// An 18 cm strip with no underside, as a roof's verge band hangs past its gable wall.
+    const STRIP: [[f32; 3]; 4] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.18], [0.0, 0.0, 0.18]];
+    const QUAD: [u32; 6] = [0, 1, 2, 2, 3, 0];
+
+    /// One node of a test glTF: its name, its triangles (into the file's one corner list), its material, where it stands.
+    struct Part<'a> {
+        node: &'a str,
+        indices: &'a [u32],
+        material: Option<usize>,
+        at: [f32; 3],
+    }
+
+    /// A glTF beside its .bin: `corners` once, then one mesh and one node for each part, with `materials`.
+    fn model(dir: &Path, name: &str, corners: &[[f32; 3]], parts: &[Part], materials: serde_json::Value) -> PathBuf {
+        let mut bin: Vec<u8> = corners.iter().flatten().flat_map(|c| c.to_le_bytes()).collect();
+        let lo: [f32; 3] = std::array::from_fn(|k| corners.iter().map(|c| c[k]).fold(f32::MAX, f32::min));
+        let hi: [f32; 3] = std::array::from_fn(|k| corners.iter().map(|c| c[k]).fold(f32::MIN, f32::max));
+        let mut views = vec![serde_json::json!({"buffer": 0, "byteOffset": 0, "byteLength": bin.len()})];
+        let mut accessors = vec![serde_json::json!(
+            {"bufferView": 0, "componentType": 5126, "count": corners.len(), "type": "VEC3", "min": lo, "max": hi})];
+        let (mut meshes, mut nodes) = (Vec::new(), Vec::new());
+        for (k, part) in parts.iter().enumerate() {
+            views.push(serde_json::json!({"buffer": 0, "byteOffset": bin.len(), "byteLength": part.indices.len() * 4}));
+            bin.extend(part.indices.iter().flat_map(|i| i.to_le_bytes()));
+            accessors.push(serde_json::json!(
+                {"bufferView": k + 1, "componentType": 5125, "count": part.indices.len(), "type": "SCALAR"}));
+            let mut primitive = serde_json::json!({"attributes": {"POSITION": 0}, "indices": k + 1});
+            if let Some(material) = part.material {
+                primitive["material"] = material.into();
+            }
+            meshes.push(serde_json::json!({"name": "mesh", "primitives": [primitive]}));
+            nodes.push(serde_json::json!({"name": part.node, "mesh": k, "translation": part.at}));
+        }
+        std::fs::write(dir.join(format!("{name}.bin")), &bin).unwrap();
+        let mut document = serde_json::json!({
+            "asset": {"version": "2.0"},
+            "buffers": [{"uri": format!("{name}.bin"), "byteLength": bin.len()}],
+            "bufferViews": views, "accessors": accessors, "meshes": meshes, "nodes": nodes,
+            "scenes": [{"nodes": (0..parts.len()).collect::<Vec<_>>()}], "scene": 0
+        });
+        if materials.as_array().is_some_and(|m| !m.is_empty()) {
+            document["materials"] = materials;
+        }
+        let path = dir.join(format!("{name}.gltf"));
+        std::fs::write(&path, document.to_string()).unwrap();
+        path
+    }
+
+    /// A glTF of one node, called `node`, taking the first of `materials` when there is one.
+    fn piece(dir: &Path, name: &str, node: &str, corners: &[[f32; 3]], indices: &[u32], materials: serde_json::Value) -> PathBuf {
+        let material = materials.as_array().is_some_and(|m| !m.is_empty()).then_some(0);
+        model(dir, name, corners, &[Part { node, indices, material, at: [0.0; 3] }], materials)
+    }
+
+    #[test]
+    fn a_closed_box_has_no_open_edges_and_a_strip_or_a_box_with_a_face_missing_has() {
+        let (vertices, indices) = super::generate_cube(1.0);
+        let corners: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+        assert_eq!(super::open_edges(&corners, &indices), 0, "each corner repeats once a face, and is welded");
+        assert_eq!(super::open_edges(&corners, &indices[..30]), 4, "a face missing leaves its four edges open");
+        assert_eq!(super::open_edges(&STRIP, &QUAD), 4, "a strip with no underside is open all round");
+        let split = [STRIP[0], STRIP[1], STRIP[2], [1.000_04, 0.0, 0.18], STRIP[3], [0.0, 0.000_03, 0.0]];
+        assert_eq!(super::open_edges(&split, &[0, 1, 2, 3, 4, 5]), 4, "corners a tenth of a millimetre apart are one");
+        assert_eq!(super::open_edges(&STRIP, &[0, 1, 2, 0, 0, 3, 2, 3, 9]), 3, "a flat triangle and a lost vertex are skipped");
+    }
+
+    #[test]
+    fn a_one_sided_piece_with_open_edges_is_named_and_still_loads_and_a_two_sided_or_closed_one_is_not() {
+        let dir = std::env::temp_dir().join(format!("somnium-open-edges-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let eave = piece(&dir, "eave", "roof_eave", &STRIP, &QUAD, serde_json::json!([]));
+        let named = OpenPiece { name: "roof_eave".into(), material: "(default material)".into(), open_edges: 4, triangles: 2 };
+        assert_eq!(super::open_edge_pieces(&eave).unwrap(), vec![named]);
+        assert!(super::load_gltf(&eave).is_ok(), "a warning only: the piece loads as before");
+        assert!(!super::open_edges_first_look(&eave), "the importer looked at it once this run, and warns no more");
+
+        let tiles = piece(&dir, "tiles", "roof_eave", &STRIP, &QUAD, serde_json::json!([{"name": "tiles", "doubleSided": true}]));
+        assert!(super::open_edge_pieces(&tiles).unwrap().is_empty(), "drawn on both sides, the strip shows no sky");
+        let glass = piece(&dir, "glass", "pane", &STRIP, &QUAD, serde_json::json!([{"name": "glass", "alphaMode": "BLEND"}]));
+        assert!(super::open_edge_pieces(&glass).unwrap().is_empty(), "a blended pane is seen through anyway");
+        let far = r#"[{"name": "far", "extras": {"somnium_far_ground": 1}}]"#;
+        let far = piece(&dir, "far", "tile", &STRIP, &QUAD, serde_json::from_str(far).unwrap());
+        assert!(super::open_edge_pieces(&far).unwrap().is_empty(), "far ground is a sheet by design");
+
+        let (vertices, indices) = super::generate_cube(1.0);
+        let corners: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+        let stone = || serde_json::json!([{"name": "stone"}]);
+        let block = piece(&dir, "block", "wall_block", &corners, &indices, stone());
+        assert!(super::open_edge_pieces(&block).unwrap().is_empty(), "a closed one-sided box is right");
+        let shell = piece(&dir, "shell", "wall_shell", &corners, &indices[..30], stone());
+        let shell = super::open_edge_pieces(&shell).unwrap();
+        assert_eq!((shell[0].name.as_str(), shell[0].material.as_str(), shell[0].open_edges), ("wall_shell", "stone", 4));
+        assert!(super::open_edges_first_look(&block) && !super::open_edges_first_look(&block), "once a file a run");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_seam_between_two_materials_or_two_nodes_is_closed_and_a_hole_is_named_on_the_piece_round_it() {
+        let dir = std::env::temp_dir().join(format!("somnium-open-seams-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (vertices, indices) = super::generate_cube(1.0);
+        let corners: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+        let materials = || serde_json::json!([{"name": "stone"}, {"name": "plaster"}]);
+        // Front, back, top and bottom in stone, the two sides in plaster: one node a material, as the generators write.
+        let wall = |node, indices, material| Part { node, indices, material: Some(material), at: [0.0; 3] };
+        let house = model(&dir, "house", &corners, &[wall("plinth", &indices[..24], 0), wall("render", &indices[24..], 1)], materials());
+        assert!(super::open_edge_pieces(&house).unwrap().is_empty(), "where plaster meets stone the box is closed");
+        let holed = model(&dir, "holed", &corners, &[wall("plinth", &indices[..24], 0), wall("render", &indices[24..30], 1)], materials());
+        let holed = super::open_edge_pieces(&holed).unwrap();
+        assert_eq!(holed.len(), 1, "the left side is gone: its four edges are open on the stone round it, {holed:?}");
+        assert_eq!((holed[0].name.as_str(), holed[0].material.as_str(), holed[0].open_edges, holed[0].triangles), ("plinth", "stone", 4, 8));
+
+        // Two strips, the second node a metre along: they share one edge, so each is open on three.
+        let strip = |node, x| Part { node, indices: &QUAD, material: None, at: [x, 0.0, 0.0] };
+        let eaves = model(&dir, "eaves", &STRIP, &[strip("eave_a", 0.0), strip("eave_b", 1.0)], serde_json::json!([]));
+        let open: Vec<(String, usize)> = super::open_edge_pieces(&eaves).unwrap().into_iter().map(|p| (p.name, p.open_edges)).collect();
+        assert_eq!(open, vec![("eave_a".into(), 3), ("eave_b".into(), 3)], "nodes are welded where they stand");
         let _ = std::fs::remove_dir_all(dir);
     }
 }
