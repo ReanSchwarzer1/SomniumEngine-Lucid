@@ -45,6 +45,39 @@ pub fn autosave_path(content_root: &Path, reason: AutosaveReason) -> PathBuf {
     content_root.join(AUTOSAVE_DIR).join(reason.file_name())
 }
 
+/// The note beside an autosave that names the scene it is a copy of (`autosave.scene` beside `autosave.somnium`):
+/// one line, the scene's path, or empty for a scene never saved to a file.
+///
+/// Without it an autosave cannot be matched to anything. Until 27 Nov 2026 recovery compared every autosave with a
+/// fixed `scene.somnium` that no project has, so an autosave left by any scene was offered at every start, for
+/// good (Sunscar's editor offered one from 20 Nov a week later).
+#[must_use]
+pub fn scene_note_path(autosave: &Path) -> PathBuf {
+    autosave.with_extension("scene")
+}
+
+/// Write the note naming the scene an autosave copies (see [`scene_note_path`]). A new file renamed over the old,
+/// so a hard-linked copy of the folder keeps its own.
+pub fn note_scene(autosave: &Path, scene: Option<&Path>) -> Result<(), String> {
+    let line = scene.map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    crate::save_game::atomic_write(&scene_note_path(autosave), line.as_bytes())
+}
+
+/// The scene a note names: `None` with no note (an older build's autosave, which is never offered), `Some(None)`
+/// for a scene never saved to a file.
+fn noted_scene(autosave: &Path) -> Option<Option<PathBuf>> {
+    let line = std::fs::read_to_string(scene_note_path(autosave)).ok()?;
+    let line = line.trim();
+    Some((!line.is_empty()).then(|| PathBuf::from(line)))
+}
+
+/// When the work a scene holds was last saved: its file or its edit layer (`<scene>.edits.json`, what Ctrl+S
+/// writes for a scene a generator owns), whichever is newer. `None` when neither exists.
+fn scene_saved_secs(scene: &Path) -> Option<u64> {
+    let layer = modified_secs(&crate::scene_edits::layer_path(scene));
+    modified_secs(scene).max(layer)
+}
+
 /// Tracks when the next interval autosave is due.
 ///
 /// Deliberately *not* a timer thread. Autosave has to serialise the world, so
@@ -124,6 +157,8 @@ pub struct Recovery {
     pub reason: AutosaveReason,
     /// Its modification time, seconds since the Unix epoch.
     pub saved_unix_secs: u64,
+    /// The scene it is a copy of; `None` for a scene never saved to a file.
+    pub scene: Option<PathBuf>,
 }
 
 /// Decide whether an autosave should be offered, given both timestamps.
@@ -146,20 +181,25 @@ pub fn should_offer(autosave_secs: u64, scene_secs: Option<u64>) -> bool {
 
 /// Look for a recoverable autosave beside `content_root`.
 ///
+/// Each autosave is held against the scene its note names ([`scene_note_path`]): offered only when it is newer
+/// than that scene's last save, file or edit layer. One with no note is never offered: nothing says what it copies.
+///
 /// The pre-Play snapshot wins a tie, because if both exist at the same second
 /// the one taken deliberately before a risky operation is the one worth having.
 #[must_use]
-pub fn find_recovery(content_root: &Path, scene_path: &Path) -> Option<Recovery> {
-    let scene_secs = modified_secs(scene_path);
+pub fn find_recovery(content_root: &Path) -> Option<Recovery> {
     [AutosaveReason::BeforePlay, AutosaveReason::Interval]
         .into_iter()
         .filter_map(|reason| {
             let path = autosave_path(content_root, reason);
             let saved_unix_secs = modified_secs(&path)?;
+            let scene = noted_scene(&path)?;
+            let scene_secs = scene.as_deref().and_then(scene_saved_secs);
             should_offer(saved_unix_secs, scene_secs).then_some(Recovery {
                 path,
                 reason,
                 saved_unix_secs,
+                scene,
             })
         })
         .max_by_key(|recovery| recovery.saved_unix_secs)
@@ -178,11 +218,13 @@ pub fn modified_secs(path: &Path) -> Option<u64> {
         .map(|elapsed| elapsed.as_secs())
 }
 
-/// Delete both autosaves. Called after a clean manual save, because at that
-/// moment there is nothing left to recover.
+/// Delete both autosaves and their notes. Called after a clean manual save, and when the editor that wrote them
+/// closes cleanly, because at either moment there is nothing left to recover.
 pub fn clear(content_root: &Path) {
     for reason in [AutosaveReason::Interval, AutosaveReason::BeforePlay] {
-        let _ = std::fs::remove_file(autosave_path(content_root, reason));
+        let path = autosave_path(content_root, reason);
+        let _ = std::fs::remove_file(scene_note_path(&path));
+        let _ = std::fs::remove_file(path);
     }
 }
 
@@ -288,19 +330,55 @@ mod tests {
         std::fs::write(&scene, b"{}").unwrap();
 
         // No autosaves yet.
-        assert_eq!(find_recovery(&root, &scene), None);
+        assert_eq!(find_recovery(&root), None);
 
         // One written after the scene is offered.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         let interval = autosave_path(&root, AutosaveReason::Interval);
         std::fs::write(&interval, b"{}").unwrap();
-        let found = find_recovery(&root, &scene).expect("an autosave newer than the scene");
+        note_scene(&interval, Some(&scene)).unwrap();
+        let found = find_recovery(&root).expect("an autosave newer than the scene");
         assert_eq!(found.path, interval);
         assert_eq!(found.reason, AutosaveReason::Interval);
+        assert_eq!(found.scene.as_deref(), Some(scene.as_path()));
 
-        // Clearing removes both.
+        // Clearing removes both, notes and all.
         clear(&root);
-        assert_eq!(find_recovery(&root, &scene), None);
+        assert_eq!(find_recovery(&root), None);
+        assert!(!scene_note_path(&interval).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// 27 Nov 2026, Sunscar's editor: an autosave from 20 Nov was offered at every start, because recovery held it
+    /// against a `scene.somnium` no project has. One with no note naming its scene is never offered, and one older
+    /// than the scene's edit layer (Ctrl+S on a generated world writes only the layer) is not either.
+    #[test]
+    fn an_autosave_is_held_against_the_scene_it_copies() {
+        let root = std::env::temp_dir().join(format!("somnium_autosave_{}_{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(AUTOSAVE_DIR)).unwrap();
+        let scene = root.join("world.scene.json");
+        std::fs::write(&scene, b"{}").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let before_play = autosave_path(&root, AutosaveReason::BeforePlay);
+        std::fs::write(&before_play, b"{}").unwrap();
+
+        // An older build's autosave: no note, no offer, however new it is.
+        assert_eq!(find_recovery(&root), None, "an autosave with no note is not offered");
+
+        // Noted, newer than the scene: offered.
+        note_scene(&before_play, Some(&scene)).unwrap();
+        assert!(find_recovery(&root).is_some());
+
+        // The layer saved after it: the work is in the layer, nothing to offer.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(crate::scene_edits::layer_path(&scene), b"{}").unwrap();
+        assert_eq!(find_recovery(&root), None, "older than the edit layer");
+
+        // A scene never saved to a file: the autosave is all there is.
+        note_scene(&before_play, None).unwrap();
+        let found = find_recovery(&root).expect("an unsaved scene's autosave");
+        assert_eq!(found.scene, None);
         let _ = std::fs::remove_dir_all(root);
     }
 }

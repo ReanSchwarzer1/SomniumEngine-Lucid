@@ -196,6 +196,8 @@ struct PlaceDrop {
     pitch: f32,
     /// The height it stands on now, once it is down.
     stood: Option<f32>,
+    /// The camera has been seen over the place: once it is somewhere else, it was moved off, and is not pulled back.
+    seen: bool,
     /// When it last moved: the look for something built there waits a moment for the streamer to start on the place.
     since: std::time::Instant,
     until: std::time::Instant,
@@ -667,6 +669,11 @@ impl<G: GameApp> Engine<G> {
         }
     }
 
+    /// The opened scene's file, if it has one (an autosave notes it as the scene it copies).
+    pub(super) fn open_scene_file(&self) -> Option<PathBuf> {
+        self.editing.scene.clone()
+    }
+
     /// Forget the old scene's edit state (a new scene, a map, a different file).
     pub(super) fn reset_editing(&mut self, scene: Option<PathBuf>) {
         let parts = std::mem::take(&mut self.editing.parts);
@@ -796,10 +803,20 @@ impl<G: GameApp> Engine<G> {
 
     /// Each frame: the palette is given the scene's places once it is there, and an eye waiting over a place whose
     /// ground had not loaded drops onto it when it comes.
+    ///
+    /// A scene with places opens at its first (Sunscar's is the Play start): until 27 Nov 2026 the editor opened
+    /// wherever the shell's demo map had left the camera, which in Sunscar was low over a river, the water mirroring
+    /// the bank across the lower half of the view (the final proof's first still).
     pub(super) fn settle_places(&mut self) {
+        let mut first_view = false;
         if !self.editing.places_shown
             && let Some(ui) = self.ui_manager.as_mut()
         {
+            // Not in a game, not in Play, and not when something asked for a view already (an editor script's pose).
+            first_view = !self.config.player_mode
+                && !self.play_session_active
+                && self.camera_pose_request.is_none()
+                && !self.editing.places.is_empty();
             ui.set_palette_places(
                 self.editing.places.iter().map(|p| (p.name.clone(), p.group.clone(), p.built)).collect(),
             );
@@ -815,9 +832,25 @@ impl<G: GameApp> Engine<G> {
             }
             self.editing.places_shown = true;
         }
+        if first_view {
+            self.go_to_place(0);
+        }
         let Some(mut drop) = self.editing.place_drop else {
             return;
         };
+        // Gone elsewhere since (flown off, a bookmark, F on a selection, a script's pose): the eye no longer waits
+        // over the place, and is not pulled back to it when the ground or the place's cells come in.
+        let off = |at: glam::Vec3| glam::Vec2::new(at.x - drop.x, at.z - drop.z).length() > 2.0;
+        let asked_elsewhere = self.camera_pose_request.is_some_and(|(at, _, _)| off(at));
+        let camera_off = self.renderer.as_ref().map(|r| off(r.camera_pos));
+        if camera_off == Some(false) {
+            drop.seen = true;
+        }
+        if asked_elsewhere || (drop.seen && camera_off == Some(true) && self.camera_pose_request.is_none()) {
+            self.editing.place_drop = None;
+            return;
+        }
+        self.editing.place_drop = Some(drop);
         let now = std::time::Instant::now();
         let eye = |height: f32| glam::Vec3::new(drop.x, height + crate::scene_places::EYE_HEIGHT, drop.z);
         match drop.stood {
@@ -891,6 +924,7 @@ impl<G: GameApp> Engine<G> {
             yaw,
             pitch,
             stood: None,
+            seen: false,
             since: now,
             until: now + std::time::Duration::from_secs(120),
         };
