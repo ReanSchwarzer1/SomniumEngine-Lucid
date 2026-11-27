@@ -3167,7 +3167,9 @@ impl<G: GameApp> Engine<G> {
         let game_owns_keyboard = self.play_session_active
             || self.ui_manager.as_ref().is_some_and(somnium_ui::UiManager::viewport_camera_active);
         let text_focus = self.ui_manager.as_ref().is_some_and(somnium_ui::UiManager::has_text_focus);
-        super::shortcut_action_with_focus(code, self.shortcut_modifiers, game_owns_keyboard, text_focus)
+        // The keys as he bound them in Preferences > Keyboard, not the declared defaults.
+        let bindings = self.ui_manager.as_ref().map(somnium_ui::UiManager::keybindings);
+        super::shortcut_action_live(code, self.shortcut_modifiers, game_owns_keyboard, text_focus, bindings)
     }
 
     /// `SOMNIUM_EDITOR_SCRIPT`: scripted editor input for proof captures in a background window, inert unless set.

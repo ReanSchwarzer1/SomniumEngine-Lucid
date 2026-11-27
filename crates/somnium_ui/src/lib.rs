@@ -7662,6 +7662,13 @@ impl UiManager {
         self.native_ui.type_into_focus(text)
     }
 
+    /// The keys in force: the developer's own bindings from Preferences > Keyboard over the declared defaults. The
+    /// engine's first key dispatcher asks this, so a key moved there is moved everywhere.
+    #[must_use]
+    pub fn keybindings(&self) -> &crate::commands::KeyBindings {
+        &self.keybindings
+    }
+
     /// Whether a right-drag over the viewport is currently flying the camera.
     ///
     /// The engine's own shortcut dispatcher runs *before* the UI is consulted,

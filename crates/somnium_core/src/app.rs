@@ -109,10 +109,25 @@ fn synchronize_path_trace_pause(
 /// runs **before** the UI is consulted and every arm of it returns, so a key it
 /// claims never reaches the game — which is why `game_owns_keyboard` has to be
 /// part of the decision rather than a check somewhere downstream.
+#[cfg(test)]
 fn shortcut_action_for(
     code: winit::keyboard::KeyCode,
     modifiers: somnium_ui::message::Modifiers,
     game_owns_keyboard: bool,
+) -> Option<somnium_ui::commands::CommandAction> {
+    shortcut_action_bound(code, modifiers, game_owns_keyboard, None)
+}
+
+/// [`shortcut_action_for`] with the keys as the developer bound them in Preferences > Keyboard. With `bindings` the
+/// chord is looked up the way the UI's own dispatcher does it (`KeyBindings::command_for`): a command he moved to
+/// another key runs from that key only, and one he unbound has no key. Without them the declared defaults apply.
+/// This dispatcher used to ask the registry for the DEFAULT chord, so Scale moved to G still scaled on S as well, and
+/// twelve keys (New, Save, Undo, Redo, Delete, Duplicate, the three gizmo tools, F5, F6, F8) ignored Preferences.
+fn shortcut_action_bound(
+    code: winit::keyboard::KeyCode,
+    modifiers: somnium_ui::message::Modifiers,
+    game_owns_keyboard: bool,
+    bindings: Option<&somnium_ui::commands::KeyBindings>,
 ) -> Option<somnium_ui::commands::CommandAction> {
     use somnium_ui::{commands::CommandAction as A, editor_event::LevelTool as L};
     let chord = somnium_ui::commands::Chord::from_winit(
@@ -122,7 +137,11 @@ fn shortcut_action_for(
         modifiers.alt,
         false,
     )?;
-    let action = somnium_ui::commands::registry().binding(chord)?.action;
+    let registry = somnium_ui::commands::registry();
+    let action = match bindings {
+        Some(bindings) => registry.get(bindings.command_for(chord)?)?.action,
+        None => registry.binding(chord)?.action,
+    };
     // While the game owns the keyboard — flying the viewport, or in a play
     // session — an unmodified shortcut stands down and the key falls through.
     // Modified chords are unaffected: `Ctrl+S` is unambiguous and should still
@@ -142,13 +161,25 @@ fn shortcut_action_for(
 /// or Terrain tool, Delete takes a character and not the selection, and Ctrl+D is not Duplicate. Only Ctrl+S still
 /// saves. The UI's own dispatcher keeps the same rule (`has_text_focus`); this one runs first and every arm of it
 /// returns, so a key it claimed never reached the box: typing "sunscar" in the palette gave "unca" (20 Nov report).
+#[cfg(test)]
 fn shortcut_action_with_focus(
     code: winit::keyboard::KeyCode,
     modifiers: somnium_ui::message::Modifiers,
     game_owns_keyboard: bool,
     text_focus: bool,
 ) -> Option<somnium_ui::commands::CommandAction> {
-    shortcut_action_for(code, modifiers, game_owns_keyboard)
+    shortcut_action_live(code, modifiers, game_owns_keyboard, text_focus, None)
+}
+
+/// [`shortcut_action_with_focus`] with the developer's own key bindings: what the running editor asks.
+fn shortcut_action_live(
+    code: winit::keyboard::KeyCode,
+    modifiers: somnium_ui::message::Modifiers,
+    game_owns_keyboard: bool,
+    text_focus: bool,
+    bindings: Option<&somnium_ui::commands::KeyBindings>,
+) -> Option<somnium_ui::commands::CommandAction> {
+    shortcut_action_bound(code, modifiers, game_owns_keyboard, bindings)
         .filter(|&action| !text_focus || matches!(action, somnium_ui::commands::CommandAction::SaveScene))
 }
 
@@ -183,6 +214,32 @@ mod shortcut_input_tests {
     use somnium_ui::commands::CommandAction;
     use somnium_ui::message::Modifiers;
     use winit::keyboard::KeyCode;
+
+    /// A key the developer moved in Preferences > Keyboard is the only key of its command, here as in the UI's own
+    /// dispatcher: Scale moved from S to G scales on G and no longer on S, and an unbound Delete deletes nothing.
+    #[test]
+    fn the_first_dispatcher_honours_the_keys_bound_in_preferences() {
+        use somnium_ui::commands::{Chord, CommandKey, KeyBindings};
+        let none = Modifiers::default();
+        let scale = shortcut_action_for(KeyCode::KeyS, none, false);
+        assert!(scale.is_some(), "S is Scale by default");
+        let delete = shortcut_action_for(KeyCode::Delete, none, false);
+        assert!(delete.is_some(), "Delete deletes by default");
+
+        // With nothing changed, the live lookup and the declared defaults agree.
+        let untouched = KeyBindings::default();
+        assert_eq!(super::shortcut_action_bound(KeyCode::KeyS, none, false, Some(&untouched)), scale);
+        assert_eq!(super::shortcut_action_bound(KeyCode::Delete, none, false, Some(&untouched)), delete);
+
+        let mut bound = KeyBindings::default();
+        bound.bind("editor.gizmo.scale", Some(Chord::press(CommandKey::Letter('G'))));
+        bound.bind("editor.edit.delete", None);
+        assert_eq!(super::shortcut_action_bound(KeyCode::KeyG, none, false, Some(&bound)), scale, "G scales now");
+        assert_eq!(super::shortcut_action_bound(KeyCode::KeyS, none, false, Some(&bound)), None, "S no longer does");
+        assert_eq!(super::shortcut_action_bound(KeyCode::Delete, none, false, Some(&bound)), None, "Delete is unbound");
+        // The rules of the default lookup still hold for a moved key: it stands down while the game owns the keyboard.
+        assert_eq!(super::shortcut_action_bound(KeyCode::KeyG, none, true, Some(&bound)), None);
+    }
 
     #[test]
     fn save_keeps_the_physical_s_transition_for_viewport_flight() {
