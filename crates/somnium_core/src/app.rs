@@ -6927,6 +6927,9 @@ impl<G: GameApp> Engine<G> {
             self.asset_scan = None;
             match result {
                 Ok((snapshot, index)) => {
+                    if let Some(ui) = self.ui_manager.as_mut() {
+                        ui.set_content_scan_error(None);
+                    }
                     if let Some(published) = self.asset_gate.stage(snapshot) {
                         if let Some(ui) = self.ui_manager.as_mut() {
                             ui.set_asset_snapshot(published);
@@ -6934,8 +6937,24 @@ impl<G: GameApp> Engine<G> {
                         }
                     }
                 }
-                Err(error) => warn!(?error, "asset inventory scan failed"),
+                Err(error) => {
+                    warn!(?error, "asset inventory scan failed");
+                    // Said in the drawer, and tried again in a while even if nothing on disk moves: the drawer,
+                    // search and the pickers must not stay without their inventory for the rest of the session.
+                    let said = format!("{error:?}");
+                    let said = said.trim_matches('"').replace("\\\\", "\\");
+                    if let Some(ui) = self.ui_manager.as_mut() {
+                        ui.set_content_scan_error(Some(said));
+                    }
+                    self.asset_scan_stamp = None;
+                    self.next_asset_scan = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                }
             }
+        }
+
+        // The drawer shows folders from the disk until the first inventory is in: it must know where they are.
+        if let Some(ui) = self.ui_manager.as_mut() {
+            ui.set_content_root(&self.config.content_root);
         }
 
         let now = std::time::Instant::now();
@@ -6970,7 +6989,13 @@ impl<G: GameApp> Engine<G> {
                 .submit("Asset inventory", JobPriority::Background, move |ctx| {
                     ctx.check_cancelled()
                         .map_err(|error| format!("{error:?}"))?;
+                    let started = std::time::Instant::now();
                     let snapshot = somnium_asset::database::AssetDb::scan(root)?;
+                    let seconds = started.elapsed().as_secs_f32();
+                    if seconds >= 2.0 {
+                        // A slow read is the time the drawer, search and the pickers wait: worth a line.
+                        info!(files = snapshot.records().len(), seconds, "asset inventory: the project's files were read");
+                    }
                     ctx.set_progress(0.8);
                     // On the job, not on the frame: this opens every scene,
                     // prefab, material and document in the project.

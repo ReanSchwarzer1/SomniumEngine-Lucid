@@ -1425,6 +1425,12 @@ pub struct UiManager {
     project_root: Option<std::path::PathBuf>,
     /// The tiles that currently exist, in the order they were built.
     content_entries: Vec<(NodeHandle, crate::metaphor::ContentEntry)>,
+    /// The project's content folder, told by the app before the first inventory of it has been read.
+    content_root: Option<std::path::PathBuf>,
+    /// False until an inventory has been published. Until then the drawer lists folders straight from the disk.
+    content_indexed: bool,
+    /// Why the last read of the project's files failed, when it did.
+    content_scan_error: Option<String>,
     /// Every entry the last query returned, whether or not it has a tile.
     ///
     /// MORROWIND-M. This is the list the drawer *shows*; `content_entries` is
@@ -2252,6 +2258,9 @@ impl UiManager {
             help_page: 0,
             project_root: None,
             content_entries: Vec::new(),
+            content_root: None,
+            content_indexed: false,
+            content_scan_error: None,
             content_all: Vec::new(),
             content_window: None,
             dependency_index: somnium_asset::depend::DependencyIndex::default(),
@@ -6422,6 +6431,14 @@ impl UiManager {
     /// Every entry point that changes folder goes through here so back/forward
     /// cannot drift out of step with what is on screen.
     pub fn navigate_content(&mut self, path: String) {
+        // The drawer names a folder from the content folder down. A whole path (right-click a folder > Open gave
+        // one) matched nothing and opened "Nothing Here": it becomes the drawer's own name here, for every caller.
+        let whole = std::path::Path::new(&path);
+        let path = if whole.is_absolute() {
+            self.content_relative(whole).unwrap_or(path)
+        } else {
+            path
+        };
         self.persona.prefs.visit(&path);
         self.content_history.push(path.clone());
         self.content_path = path;
@@ -6567,7 +6584,53 @@ impl UiManager {
         self.asset_db.get(id)
     }
 
+    /// The app says where the project's content lives, before the first inventory of it has been read.
+    ///
+    /// The inventory of a large project takes minutes to read. Until it is published the drawer lists the chosen
+    /// folder straight from the disk, so a full project never opens on "Nothing Here".
+    pub fn set_content_root(&mut self, root: &std::path::Path) {
+        if self.content_root.as_deref() == Some(root) {
+            return;
+        }
+        self.content_root = Some(root.to_path_buf());
+        if !self.content_indexed {
+            self.refresh_content_list();
+        }
+    }
+
+    /// The last read of the project's files failed (`Some`), or a later one went through (`None`).
+    pub fn set_content_scan_error(&mut self, error: Option<String>) {
+        if self.content_scan_error == error {
+            return;
+        }
+        if let Some(error) = &error {
+            self.push_toast(&format!("The project's files could not be read ({error}). Trying again."));
+        }
+        self.content_scan_error = error;
+        self.refresh_content_footer();
+    }
+
+    /// The content folder: the app's word until an inventory is published, then the inventory's own root.
+    fn content_root_path(&self) -> Option<std::path::PathBuf> {
+        if self.content_indexed {
+            Some(self.asset_db.root().to_path_buf())
+        } else {
+            self.content_root.clone()
+        }
+    }
+
+    /// A folder's path as the drawer names it: from the content folder down.
+    fn content_relative(&self, path: &std::path::Path) -> Option<String> {
+        let root = self.content_root_path()?;
+        path.strip_prefix(&root)
+            .ok()
+            .map(|relative| relative.to_string_lossy().into_owned())
+    }
+
     pub fn set_asset_snapshot(&mut self, snapshot: somnium_asset::database::AssetDbSnapshot) {
+        self.content_root = Some(snapshot.root().to_path_buf());
+        self.content_indexed = true;
+        self.content_scan_error = None;
         self.asset_db = snapshot;
         self.refresh_content_list();
         self.refresh_asset_pickers();
@@ -7299,18 +7362,28 @@ impl UiManager {
                 somnium_asset::database::AssetKind::Material.bit()
             }
         };
-        let mut entries: Vec<crate::metaphor::ContentEntry> = self
-            .asset_db
-            .query(&somnium_asset::database::AssetQuery {
-                parent: self.content_path.clone(),
-                text: self.content_filter.clone(),
-                kind_mask,
-                sort: self.content_sort,
-                descending: self.content_sort_descending,
+        let mut entries: Vec<crate::metaphor::ContentEntry> = if self.content_indexed {
+            self.asset_db
+                .query(&somnium_asset::database::AssetQuery {
+                    parent: self.content_path.clone(),
+                    text: self.content_filter.clone(),
+                    kind_mask,
+                    sort: self.content_sort,
+                    descending: self.content_sort_descending,
+                })
+                .into_iter()
+                .map(Into::into)
+                .collect()
+        } else {
+            // The inventory has not been read yet: the chosen folder as the disk has it, by name. The sort
+            // order, the previews and the tooltips come with the inventory.
+            self.content_root.as_deref().map_or_else(Vec::new, |root| {
+                crate::metaphor::list_folder(root, &self.content_path, &self.content_filter)
+                    .into_iter()
+                    .filter(|entry| self.content_kind.accepts(entry))
+                    .collect()
             })
-            .into_iter()
-            .map(Into::into)
-            .collect();
+        };
         if self.show_engine_content && self.content_path.is_empty() {
             entries.extend(
                 crate::metaphor::virtual_engine_content(&self.content_filter)
@@ -7337,23 +7410,37 @@ impl UiManager {
         }
         let normalise = |p: &str| p.replace('\\', "/").trim_matches('/').to_string();
         let current = normalise(&self.content_path);
+        // The inventory names folders in lower case and a tile click names them as the disk does.
+        let current_key = current.to_ascii_lowercase();
         let mut rows: Vec<(String, String, usize)> = Vec::new();
         let mut stack: Vec<(String, usize)> = vec![(String::new(), 0)];
         while let Some((parent, depth)) = stack.pop() {
-            let folders = self.asset_db.query(&somnium_asset::database::AssetQuery {
-                parent: parent.clone(),
-                text: String::new(),
-                kind_mask: somnium_asset::database::AssetKind::Folder.bit(),
-                sort: somnium_asset::database::AssetSort::Name,
-                descending: false,
-            });
+            // From the inventory once it is read, and from the disk until then.
+            let folders: Vec<(String, String)> = if self.content_indexed {
+                self.asset_db
+                    .query(&somnium_asset::database::AssetQuery {
+                        parent: parent.clone(),
+                        text: String::new(),
+                        kind_mask: somnium_asset::database::AssetKind::Folder.bit(),
+                        sort: somnium_asset::database::AssetSort::Name,
+                        descending: false,
+                    })
+                    .into_iter()
+                    .map(|folder| (folder.relative_path, folder.name))
+                    .collect()
+            } else {
+                self.content_root
+                    .as_deref()
+                    .map_or_else(Vec::new, |root| crate::metaphor::list_child_folders(root, &parent))
+            };
             // Depth-first, in name order: push children reversed so the first pops first.
             let at = rows.iter().position(|(p, _, _)| normalise(p) == normalise(&parent)).map_or(rows.len(), |i| i + 1);
             let mut children = Vec::new();
-            for folder in folders {
-                let relative = normalise(&folder.relative_path);
-                let open = current == relative || current.starts_with(&format!("{relative}/"));
-                children.push((relative.clone(), folder.name.clone(), depth));
+            for (relative, name) in folders {
+                let relative = normalise(&relative);
+                let key = relative.to_ascii_lowercase();
+                let open = current_key == key || current_key.starts_with(&format!("{key}/"));
+                children.push((relative.clone(), name, depth));
                 if open && depth < 8 {
                     stack.push((relative, depth + 1));
                 }
@@ -7367,7 +7454,7 @@ impl UiManager {
         let mut all = vec![(String::new(), "Content".to_string(), 0usize)];
         all.extend(rows.into_iter().map(|(rel, name, depth)| (rel, name, depth + 1)));
         for (relative, name, depth) in all {
-            let chosen = relative == current;
+            let chosen = relative.eq_ignore_ascii_case(&current);
             let button = self.native_ui.add_node(
                 ButtonBuilder::new(
                     WidgetBuilder::new()
@@ -7393,7 +7480,9 @@ impl UiManager {
                 .build(),
                 button,
             );
-            let open = chosen || current.starts_with(&format!("{relative}/")) || relative.is_empty();
+            let open = chosen
+                || current_key.starts_with(&format!("{}/", relative.to_ascii_lowercase()))
+                || relative.is_empty();
             self.native_ui.add_node(
                 crate::widgets::image::ImageBuilder::new(
                     WidgetBuilder::new().with_vertical_alignment(crate::types::VerticalAlignment::Center),
@@ -7443,6 +7532,12 @@ impl UiManager {
                 }
             }
             n => text.push_str(&format!(" · {n} selected")),
+        }
+        // Said where the count is read: until the inventory is in, search and the previews know nothing yet.
+        if let Some(error) = &self.content_scan_error {
+            text.push_str(&format!(" · The project's files could not be read ({error}). Trying again."));
+        } else if !self.content_indexed && self.content_root.is_some() {
+            text.push_str(" · Still reading the project's files: search and previews follow.");
         }
         self.native_ui.send(TextMessage::set_text(footer, text));
     }
@@ -7504,10 +7599,13 @@ impl UiManager {
         // different copy — offering "import a model" to someone who mistyped a
         // search would be the wrong advice.
         if self.content_all.is_empty() {
-            let state = if self.content_filter.is_empty() {
-                crate::metaphor::empty::CONTENT
-            } else {
+            let state = if !self.content_filter.is_empty() {
                 crate::metaphor::empty::CONTENT_FILTERED
+            } else if !self.content_indexed && self.content_root.is_none() {
+                // Nothing has been read yet, so nothing is known to be missing.
+                crate::metaphor::empty::CONTENT_READING
+            } else {
+                crate::metaphor::empty::CONTENT
             };
             // The height still gets set, to the nought rows an empty folder
             // is: the canvas does not clip, so the empty state is visible
@@ -10060,16 +10158,12 @@ impl UiManager {
                     .cloned()
                 {
                     if entry.is_dir {
-                        let root = self.asset_db.root().to_path_buf();
                         // Through `navigate_content` so the move lands in
                         // history. Setting `content_path` directly is what would
                         // leave Back pointing at a folder the user never left.
-                        match entry.path.strip_prefix(&root) {
-                            Ok(rel) => {
-                                let rel = rel.to_string_lossy().into_owned();
-                                self.navigate_content(rel);
-                            }
-                            Err(_) => self.refresh_content_list(),
+                        match self.content_relative(&entry.path) {
+                            Some(rel) => self.navigate_content(rel),
+                            None => self.refresh_content_list(),
                         }
                     } else if entry.is_engine {
                         if let Some(kind) = match entry.name.as_str() {
@@ -10961,6 +11055,7 @@ mod elysium_tests {
             empty::OUTLINER,
             empty::DETAILS,
             empty::CONTENT,
+            empty::CONTENT_READING,
             empty::CONTENT_FILTERED,
             empty::LOG,
         ] {
