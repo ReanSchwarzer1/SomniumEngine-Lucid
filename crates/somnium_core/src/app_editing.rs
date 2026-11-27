@@ -643,9 +643,10 @@ fn unit_cube() -> TriangleBvh {
     TriangleBvh::build(&corners, &indices)
 }
 
-/// The nearest terrain hit along a unit ray.
+/// The nearest terrain hit along a unit ray, with the ground's own slope as its normal.
 fn terrain_hit(renderer: &SomniumRenderer, terrains: &[u32], origin: glam::Vec3, direction: glam::Vec3, max: f32) -> Option<Hit> {
     let mut best: Option<Hit> = None;
+    let mut best_at: Option<(u32, glam::Vec3)> = None;
     for &id in terrains {
         let Some(terrain) = renderer.terrain(id) else {
             continue;
@@ -656,9 +657,55 @@ fn terrain_hit(renderer: &SomniumRenderer, terrains: &[u32], origin: glam::Vec3,
         let distance = (point - origin).dot(direction);
         if (0.0..=max).contains(&distance) && best.is_none_or(|b| distance < b.distance) {
             best = Some(Hit { distance, normal: glam::Vec3::Y });
+            best_at = Some((id, point));
+        }
+    }
+    // Once, for the hit that won: four more rays would be waste for the ones that lost.
+    if let (Some(hit), Some((id, point))) = (best.as_mut(), best_at) {
+        if let Some(terrain) = renderer.terrain(id) {
+            hit.normal = slope_normal(|from| terrain.raycast(from, glam::Vec3::NEG_Y), point);
         }
     }
     best
+}
+
+/// The ground's normal at `point`, from its heights a step to each side. `ground` gives the ground's point straight
+/// under a place above it.
+///
+/// The terrain's ray gives a point and no normal, and every terrain hit used to say "straight up". So Align to
+/// Surface and Shift while carrying tilted a thing on a roof and never on a hillside.
+fn slope_normal(ground: impl Fn(glam::Vec3) -> Option<glam::Vec3>, point: glam::Vec3) -> glam::Vec3 {
+    const STEP: f32 = 0.5;
+    const LIFT: f32 = 4.0;
+    // A side with no ground under it (the terrain's edge) counts as level with the point.
+    let height = |dx: f32, dz: f32| ground(point + glam::Vec3::new(dx, LIFT, dz)).map_or(point.y, |under| under.y);
+    let (east, west) = (height(STEP, 0.0), height(-STEP, 0.0));
+    let (south, north) = (height(0.0, STEP), height(0.0, -STEP));
+    glam::Vec3::new(west - east, 2.0 * STEP, north - south)
+        .try_normalize()
+        .unwrap_or(glam::Vec3::Y)
+}
+
+#[cfg(test)]
+mod slope_normal_tests {
+    use super::slope_normal;
+
+    #[test]
+    fn the_ground_s_normal_leans_with_the_slope_and_is_up_on_the_flat() {
+        // The gym's ground: flat west of x = 64, a steady 15 degree rise to the east of it.
+        let gym = |from: glam::Vec3| Some(glam::Vec3::new(from.x, 0.268 * (from.x - 64.0).max(0.0), from.z));
+        let flat = slope_normal(gym, glam::Vec3::new(30.0, 0.0, 40.0));
+        assert!((flat - glam::Vec3::Y).length() < 1e-4, "{flat:?}");
+
+        let slope = slope_normal(gym, glam::Vec3::new(70.0, 0.268 * 6.0, 40.0));
+        let degrees = slope.angle_between(glam::Vec3::Y).to_degrees();
+        assert!((degrees - 15.0).abs() < 0.2, "a 15 degree slope, got {degrees}");
+        assert!(slope.x < 0.0 && slope.z.abs() < 1e-4, "it leans back down the slope, to the west: {slope:?}");
+
+        // No ground at all to either side (the terrain's edge): up, and never a NaN.
+        let edge = slope_normal(|_| None, glam::Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(edge, glam::Vec3::Y);
+    }
 }
 
 impl<G: GameApp> Engine<G> {

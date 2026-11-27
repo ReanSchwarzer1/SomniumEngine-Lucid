@@ -121,7 +121,7 @@ fn shortcut_action_for(
 /// [`shortcut_action_for`] with the keys as the developer bound them in Preferences > Keyboard. With `bindings` the
 /// chord is looked up the way the UI's own dispatcher does it (`KeyBindings::command_for`): a command he moved to
 /// another key runs from that key only, and one he unbound has no key. Without them the declared defaults apply.
-/// This dispatcher used to ask the registry for the DEFAULT chord, so Scale moved to G still scaled on S as well, and
+/// This dispatcher used to ask the registry for the DEFAULT chord, so Scale moved to K still scaled on S as well, and
 /// twelve keys (New, Save, Undo, Redo, Delete, Duplicate, the three gizmo tools, F5, F6, F8) ignored Preferences.
 fn shortcut_action_bound(
     code: winit::keyboard::KeyCode,
@@ -216,7 +216,8 @@ mod shortcut_input_tests {
     use winit::keyboard::KeyCode;
 
     /// A key the developer moved in Preferences > Keyboard is the only key of its command, here as in the UI's own
-    /// dispatcher: Scale moved from S to G scales on G and no longer on S, and an unbound Delete deletes nothing.
+    /// dispatcher: Scale moved from S to K scales on K and no longer on S, and an unbound Delete deletes nothing.
+    /// (K, because no command has it. G was free when this was written and is Move on the Ground now.)
     #[test]
     fn the_first_dispatcher_honours_the_keys_bound_in_preferences() {
         use somnium_ui::commands::{Chord, CommandKey, KeyBindings};
@@ -232,13 +233,13 @@ mod shortcut_input_tests {
         assert_eq!(super::shortcut_action_bound(KeyCode::Delete, none, false, Some(&untouched)), delete);
 
         let mut bound = KeyBindings::default();
-        bound.bind("editor.gizmo.scale", Some(Chord::press(CommandKey::Letter('G'))));
+        bound.bind("editor.gizmo.scale", Some(Chord::press(CommandKey::Letter('K'))));
         bound.bind("editor.edit.delete", None);
-        assert_eq!(super::shortcut_action_bound(KeyCode::KeyG, none, false, Some(&bound)), scale, "G scales now");
+        assert_eq!(super::shortcut_action_bound(KeyCode::KeyK, none, false, Some(&bound)), scale, "K scales now");
         assert_eq!(super::shortcut_action_bound(KeyCode::KeyS, none, false, Some(&bound)), None, "S no longer does");
         assert_eq!(super::shortcut_action_bound(KeyCode::Delete, none, false, Some(&bound)), None, "Delete is unbound");
         // The rules of the default lookup still hold for a moved key: it stands down while the game owns the keyboard.
-        assert_eq!(super::shortcut_action_bound(KeyCode::KeyG, none, true, Some(&bound)), None);
+        assert_eq!(super::shortcut_action_bound(KeyCode::KeyK, none, true, Some(&bound)), None);
     }
 
     #[test]
