@@ -231,10 +231,12 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) drop: u3
         // Dust: a matte grain, lit by the sky and the sun, brightest toward the sun (it throws light forward like
         // haze); its colour is the tint, the soil's.
         let mu = dot(toward, normalize(pp.sun_direction));
-        radiance = 0.9 * (0.7 * sky + 0.3 * land) / PRECIP_PI + sun * (0.2 / PRECIP_PI + 0.5 * hg(mu, 0.6));
+        radiance = 0.9 * (0.65 * sky + 0.35 * land) + sun * (0.2 / PRECIP_PI + 0.5 * hg(mu, 0.6));
     } else {
-        // Snow and hail: white, lit from above and by what light gets through them.
-        radiance = 0.85 * (sky + sun * (0.25 + 0.5 * max(dot(toward, normalize(pp.sun_direction)), 0.0)) / PRECIP_PI);
+        // Snow and hail: white, lit by the sky above and the land below as they are (a white thing under a grey sky
+        // is about as bright as the sky: in a white-out the flakes were dark dashes while the sky's light was divided
+        // by pi; sunscar-particles, 27 Nov), and by the sun through them.
+        radiance = 0.85 * (0.65 * sky + 0.35 * land + sun * (0.25 + 0.5 * max(dot(toward, normalize(pp.sun_direction)), 0.0)) / PRECIP_PI);
     }
     for (var i = 0; i < 4; i = i + 1) {
         if pp.flash_pos[i].w > 0.5 {
