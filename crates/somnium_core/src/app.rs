@@ -3610,6 +3610,13 @@ impl<G: GameApp> Engine<G> {
         {
             return;
         }
+        // Carrying (Move on the Ground) hides the gizmo: the thing follows the mouse, not a handle.
+        if self.carrying() {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.clear_gizmo();
+            }
+            return;
+        }
         // A part of a merged model is handled at the middle of its mesh, not at the model's origin.
         let anchor = gizmo_anchor(&self.world, self.selection.primary).map(|origin| {
             self.selection
@@ -4612,6 +4619,10 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                         self.cancel_persona_stroke();
                         return;
                     }
+                    // Carrying: Esc puts it back and Enter puts it down, before the UI's own Esc chain.
+                    if !text_focus && self.carry_key(code) {
+                        return;
+                    }
                     let action = self.editor_shortcut_for_key(code);
                     use somnium_ui::commands::CommandAction as A;
                     match action {
@@ -4752,6 +4763,11 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             _ => false,
         };
         if ui_consumed {
+            return;
+        }
+
+        // Carrying (Move on the Ground): the viewport's left button puts it down and the wheel turns it.
+        if !self.play_session_active && self.carry_mouse_event(&event) {
             return;
         }
 
@@ -4908,19 +4924,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                     if band.is_dragged() {
                         self.apply_marquee(band);
                     } else {
-                        // Ctrl toggles the clicked object in the selection and
-                        // Shift adds it, the way the Outliner's rows do; either
-                        // on empty space keeps what is selected.
-                        let toggle = self.shortcut_modifiers.command();
-                        let add = self.shortcut_modifiers.shift;
-                        let hit = if toggle || add {
-                            self.click_pick_object()
-                        } else {
-                            self.click_pick()
-                        };
-                        self.selection.click(hit, toggle, add);
-                        self.after_selection_change();
-                        self.reveal_selection_in_outliner(true);
+                        self.viewport_click();
                     }
                     gizmo_consumed = true;
                 }
@@ -5276,6 +5280,8 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 r.set_gizmo_world_pos(handle.unwrap_or(new_t.translation));
             }
         }
+        // Move on the Ground: the carried things follow the cursor over the surface under it.
+        self.update_carry();
 
         let scene_request = {
             // Computed before the context borrows the world, because the
@@ -11268,6 +11274,43 @@ impl<G: GameApp> Engine<G> {
     fn handle_editor_event_inner(&mut self, ev: EditorEvent) {
         use somnium_ui::{CreateKind, FoliageBrushField as FB, TerrainToolField as TT};
 
+        // A carry in hand (Move on the Ground) is put back, as Esc does, before a tool key, an edit of the objects or
+        // a scene change; Undo and Redo only put it back.
+        if self.carrying() {
+            use somnium_ui::editor_event::LevelTool as L;
+            // Saving, Play and closing take what is seen: the thing is put down first, as its one undo step.
+            if matches!(
+                ev,
+                EditorEvent::SaveScene
+                    | EditorEvent::LevelTool(L::SaveSceneAs)
+                    | EditorEvent::AfterSave(_)
+                    | EditorEvent::PlaySimulation
+                    | EditorEvent::CloseWindow
+                    | EditorEvent::Quit { .. }
+            ) {
+                self.put_down_carry();
+            }
+            let ends = matches!(
+                ev,
+                EditorEvent::SetGizmoMode(_)
+                    | EditorEvent::ToggleTerrainEdit
+                    | EditorEvent::ToggleFoliagePaint
+                    | EditorEvent::DeleteSelected
+                    | EditorEvent::DuplicateSelected
+                    | EditorEvent::PasteClipboard
+                    | EditorEvent::NewScene
+                    | EditorEvent::LoadScene(_)
+                    | EditorEvent::Undo
+                    | EditorEvent::Redo
+            ) || matches!(ev, EditorEvent::LevelTool(tool) if tool != L::Carry);
+            if ends {
+                self.cancel_carry();
+                if matches!(ev, EditorEvent::Undo | EditorEvent::Redo) {
+                    return;
+                }
+            }
+        }
+
         match ev {
             EditorEvent::AuthoringRequest { method, params } => {
                 let result = self.authoring_request(&method, params);
@@ -11962,6 +12005,7 @@ impl<G: GameApp> Engine<G> {
                     L::CheckMeshes => self.check_meshes(),
                     L::SelectSameAsset => self.select_same_asset(),
                     L::MakeObject => self.make_painted_object(),
+                    L::Carry => self.toggle_carry(),
                 }
             }
 

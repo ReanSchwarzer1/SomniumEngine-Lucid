@@ -3595,6 +3595,27 @@ impl UiManager {
         self.push_toast("The editor has changed. Help > What's New lists what you can do now.");
     }
 
+    /// Put a line in the status bar without raising a toast: a tool's running state, said once when it changes.
+    pub fn set_status_text(&mut self, text: &str) {
+        self.native_ui
+            .send(TextMessage::set_text(self.status_text, text.to_string()));
+    }
+
+    /// Run the command a press of `code` with these modifiers runs through the remappable bindings, under the same
+    /// guards as a real press (a text box with the focus, the game owning the keyboard). The editor script's `key=`
+    /// step. False when no enabled command takes the key.
+    pub fn run_key_command(&mut self, code: winit::keyboard::KeyCode, command: bool, shift: bool, alt: bool) -> bool {
+        if self.native_ui.has_text_focus() {
+            return false;
+        }
+        let Some(chord) = crate::commands::Chord::from_winit(code, command, shift, alt, false)
+            .filter(|chord| !self.game_owns_keyboard() || chord.has_modifier())
+        else {
+            return false;
+        };
+        self.keybindings.command_for(chord).is_some_and(|id| self.run_command_id(id))
+    }
+
     /// Dismiss the oldest sticky toast, reporting whether there was one.
     ///
     /// The boolean matters: `Esc` must fall through to the rest of the chain
