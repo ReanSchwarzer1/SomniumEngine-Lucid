@@ -11,6 +11,8 @@ Newest first. Each line is something you can do now that you could not do before
 - **A read that fails is said.** The line under the folders says why, and the editor tries again by itself.
 - **The editor opens each model and picture once.** It keeps what it found, so later reads of the project do not open them again.
 - **Right-click a folder > Open opens that folder.** Before, it showed "Nothing Here".
+- **Align to Surface (Shift+End) tilts a thing to a hillside.** Before, it tilted to a roof or a rock and never to the ground itself.
+- **A key you move in Preferences > Keyboard is moved everywhere.** Before, the view still ran the old key as well: Scale moved to another key went on scaling on S.
 
 ## 27 November 2026, afternoon
 
