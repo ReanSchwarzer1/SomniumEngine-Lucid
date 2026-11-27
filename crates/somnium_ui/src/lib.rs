@@ -60,7 +60,7 @@ use crate::editor::inspector_gen::GeneratedComponentPanel;
 use crate::editor::property_editors::PropertyEditorKind;
 use crate::editor::{
     content::{build_content_drawer, build_create_popup},
-    help::{build_help_overlay, fill_help_body},
+    help::{build_help_overlay, fill_help_body, fill_help_markdown},
     inspector::{build_generated_details, build_inspector},
     shell::build_editor_layout,
 };
@@ -1409,6 +1409,8 @@ pub struct UiManager {
     help_menu_open: bool,
     tooltip_since: Option<(NodeHandle, std::time::Instant)>,
     help_page: u8,
+    /// The open project's folder, for its editor guide. None with no project open.
+    project_root: Option<std::path::PathBuf>,
     /// The tiles that currently exist, in the order they were built.
     content_entries: Vec<(NodeHandle, crate::metaphor::ContentEntry)>,
     /// Every entry the last query returned, whether or not it has a tile.
@@ -2229,6 +2231,7 @@ impl UiManager {
             help_menu_open: false,
             tooltip_since: None,
             help_page: 0,
+            project_root: None,
             content_entries: Vec::new(),
             content_all: Vec::new(),
             content_window: None,
@@ -4169,7 +4172,12 @@ impl UiManager {
 
     fn set_help_page(&mut self, page: u8) {
         self.help_page = page;
-        fill_help_body(&mut self.native_ui, self.help_body, self.font_id, page);
+        if page == crate::metaphor::PROJECT_GUIDE_PAGE {
+            let text = crate::metaphor::project_guide_text(self.project_root.as_deref());
+            fill_help_markdown(&mut self.native_ui, self.help_body, self.font_id, &text);
+        } else {
+            fill_help_body(&mut self.native_ui, self.help_body, self.font_id, page);
+        }
         let toc = self.help_toc.clone();
         for (handle, id) in toc {
             self.native_ui
@@ -5808,8 +5816,14 @@ impl UiManager {
         true
     }
 
+    /// Tell the editor which folder the open project lives in, so Help can offer the project's own guide.
+    pub fn set_project_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.project_root = root;
+    }
+
     fn command_context(&self) -> crate::commands::EditorCtx {
         crate::commands::EditorCtx {
+            has_project_guide: crate::metaphor::project_guide_path(self.project_root.as_deref()).is_some(),
             has_selection: self
                 .last_outliner_state
                 .as_ref()

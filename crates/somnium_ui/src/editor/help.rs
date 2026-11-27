@@ -35,6 +35,22 @@ use crate::{
 use crate::editor::parts::*;
 
 pub(crate) fn fill_help_body(ui: &mut UserInterface, parent: NodeHandle, font_id: u8, page: u8) {
+    fill_help_blocks(ui, parent, font_id, page, crate::metaphor::help_blocks(page));
+}
+
+/// A page whose Markdown is not compiled in (the open project's guide), drawn the way the built-in pages are.
+pub(crate) fn fill_help_markdown(ui: &mut UserInterface, parent: NodeHandle, font_id: u8, markdown: &str) {
+    let blocks = crate::metaphor::parse_help_markdown(markdown);
+    fill_help_blocks(ui, parent, font_id, crate::metaphor::PROJECT_GUIDE_PAGE, blocks);
+}
+
+fn fill_help_blocks(
+    ui: &mut UserInterface,
+    parent: NodeHandle,
+    font_id: u8,
+    page: u8,
+    blocks: Vec<crate::metaphor::HelpBlock>,
+) {
     ui.clear_children(parent);
     if page == 4 {
         // About: Lucid's lock-up, drawn from the logo's own files.
@@ -47,7 +63,7 @@ pub(crate) fn fill_help_body(ui: &mut UserInterface, parent: NodeHandle, font_id
         .build();
         ui.add_node(lockup, parent);
     }
-    for block in crate::metaphor::help_blocks(page) {
+    for block in blocks {
         match block {
             crate::metaphor::HelpBlock::Heading(text) => {
                 let n = TextBuilder::new(WidgetBuilder::new().with_margin(Thickness {

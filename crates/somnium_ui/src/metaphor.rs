@@ -20,6 +20,10 @@ pub const HELP_WHATS_NEW: &str = include_str!("../../../docs/editor/whats_new.md
 /// The id of the What's New page. Ids are stable; `help_order` says where each one sits in the list.
 pub const WHATS_NEW_PAGE: u8 = 12;
 
+/// The id of the page that shows the open project's own guide. It is read from disk when opened, so it has no
+/// text here and no title in the list.
+pub const PROJECT_GUIDE_PAGE: u8 = 255;
+
 pub fn help_page(id: u8) -> &'static str {
     match id {
         12 => HELP_WHATS_NEW,
@@ -106,6 +110,32 @@ pub fn write_seen_hash(file: &Path, hash: &str) -> std::io::Result<()> {
     let partial = file.with_extension("json.partial");
     std::fs::write(&partial, seen_hash_file(hash))?;
     std::fs::rename(&partial, file)
+}
+
+/// The file a project keeps its own editor guide in, at the project folder's top level.
+pub const PROJECT_GUIDE_FILE: &str = "EDITOR_GUIDE.md";
+
+/// The most of the guide that is read.
+const PROJECT_GUIDE_LIMIT: u64 = 512 * 1024;
+
+/// The open project's guide, when the project has one.
+pub fn project_guide_path(root: Option<&Path>) -> Option<PathBuf> {
+    let file = root?.join(PROJECT_GUIDE_FILE);
+    file.is_file().then_some(file)
+}
+
+/// The guide's Markdown, read now, or a plain sentence when it cannot be read.
+pub fn project_guide_text(root: Option<&Path>) -> String {
+    use std::io::Read;
+    let Some(file) = project_guide_path(root) else {
+        return format!("This project has no {PROJECT_GUIDE_FILE}.");
+    };
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(&file).and_then(|f| f.take(PROJECT_GUIDE_LIMIT).read_to_end(&mut bytes));
+    match read {
+        Ok(_) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(_) => format!("The {PROJECT_GUIDE_FILE} of this project could not be read."),
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -460,6 +490,29 @@ mod tests {
         write_seen_hash(&file, &hash).unwrap();
         assert_eq!(parse_seen_hash(&fs::read(&file).unwrap()), Some(hash));
         assert!(!file.with_extension("json.partial").exists());
+        let _ = fs::remove_dir_all(&folder);
+    }
+
+    #[test]
+    fn the_project_guide_is_read_fresh_capped_and_absent_without_a_file() {
+        let folder = std::env::temp_dir().join(format!("somnium_guide_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&folder);
+        fs::create_dir_all(&folder).unwrap();
+        assert_eq!(project_guide_path(None), None);
+        assert_eq!(project_guide_path(Some(&folder)), None);
+        assert!(project_guide_text(Some(&folder)).contains("no EDITOR_GUIDE.md"));
+        let file = folder.join(PROJECT_GUIDE_FILE);
+        fs::write(&file, "# Guide\n\n- one\n").unwrap();
+        assert_eq!(project_guide_path(Some(&folder)), Some(file.clone()));
+        assert_eq!(project_guide_text(Some(&folder)), "# Guide\n\n- one\n");
+        fs::write(&file, "# Guide\n\n- two\n").unwrap();
+        assert_eq!(project_guide_text(Some(&folder)), "# Guide\n\n- two\n", "read from disk each time");
+        fs::write(&file, vec![b'a'; PROJECT_GUIDE_LIMIT as usize + 100]).unwrap();
+        assert_eq!(project_guide_text(Some(&folder)).len(), PROJECT_GUIDE_LIMIT as usize);
+        // A folder named like the guide is not a guide.
+        fs::remove_file(&file).unwrap();
+        fs::create_dir(&file).unwrap();
+        assert_eq!(project_guide_path(Some(&folder)), None);
         let _ = fs::remove_dir_all(&folder);
     }
 

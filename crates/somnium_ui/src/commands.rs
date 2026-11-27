@@ -233,6 +233,8 @@ pub struct EditorCtx {
     pub has_clipboard: bool,
     /// A painted copy (a tree, a shrub) is picked, its card showing, with no entity selected.
     pub has_picked_copy: bool,
+    /// The open project's folder holds an EDITOR_GUIDE.md.
+    pub has_project_guide: bool,
 }
 
 /// Application menu that owns a command row.
@@ -445,6 +447,14 @@ fn clipboard(ctx: &EditorCtx) -> Enablement {
         Enablement::Enabled
     } else {
         Enablement::Disabled("Copy something first")
+    }
+}
+
+fn project_guide(ctx: &EditorCtx) -> Enablement {
+    if ctx.has_project_guide {
+        Enablement::Enabled
+    } else {
+        Enablement::Disabled("This project has no EDITOR_GUIDE.md")
     }
 }
 
@@ -1531,6 +1541,16 @@ fn declarations() -> Vec<Command> {
             always
         ),
         command!(
+            "editor.help.project_guide",
+            "This Project's Guide",
+            "Help",
+            None,
+            "Show the guide this project keeps for its own editor use.",
+            A::OpenHelp(crate::metaphor::PROJECT_GUIDE_PAGE),
+            HELP,
+            project_guide
+        ),
+        command!(
             "editor.script.reload",
             "Reload Scripts",
             "Script",
@@ -2602,6 +2622,7 @@ pub fn icon_for(id: &str) -> crate::icons::IconId {
         "editor.help.index" => I::HelpCircle,
         "editor.help.shortcuts" => I::Keyboard,
         "editor.help.about" => I::Info,
+        "editor.help.project_guide" => I::Docs,
         "editor.script.reload" => I::Refresh,
         "editor.simulation.play" => I::Play,
         "editor.simulation.pause" => I::Pause,
@@ -2979,6 +3000,40 @@ mod tests {
         let picked = EditorCtx { has_picked_copy: true, ..EditorCtx::default() };
         assert!(delete.enabled(&picked).is_enabled() && make.enabled(&picked).is_enabled());
         assert!(!delete.enabled(&EditorCtx::default()).is_enabled() && !make.enabled(&EditorCtx::default()).is_enabled());
+    }
+
+    /// What's New leads the Help menu and opens its page; the project guide is greyed out, with the reason, until
+    /// the project has one.
+    #[test]
+    fn help_menu_leads_with_whats_new_and_guards_the_project_guide() {
+        let ids: Vec<_> = registry()
+            .menu(Menu::Help)
+            .into_iter()
+            .map(|command| command.id)
+            .collect();
+        assert_eq!(ids.first(), Some(&"editor.help.whats_new"));
+        assert!(ids.contains(&"editor.help.project_guide"));
+        let whats_new = *registry().get("editor.help.whats_new").unwrap();
+        assert_eq!(whats_new.label, "What's New");
+        assert_eq!(whats_new.default_binding, None);
+        assert_eq!(
+            whats_new.action,
+            CommandAction::OpenHelp(crate::metaphor::WHATS_NEW_PAGE)
+        );
+        let guide = *registry().get("editor.help.project_guide").unwrap();
+        assert_eq!(
+            guide.enabled(&EditorCtx::default()),
+            Enablement::Disabled("This project has no EDITOR_GUIDE.md")
+        );
+        let with_guide = EditorCtx {
+            has_project_guide: true,
+            ..EditorCtx::default()
+        };
+        assert!(guide.enabled(&with_guide).is_enabled());
+        assert_eq!(
+            guide.action,
+            CommandAction::OpenHelp(crate::metaphor::PROJECT_GUIDE_PAGE)
+        );
     }
 
     #[test]

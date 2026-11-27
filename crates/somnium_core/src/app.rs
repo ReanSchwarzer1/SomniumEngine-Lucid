@@ -4452,6 +4452,10 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                     }
                     self.handle_editor_event(EditorEvent::PlaySimulation);
                 } else {
+                    // Help > This Project's Guide looks for EDITOR_GUIDE.md in this folder.
+                    if let Some(ui) = self.ui_manager.as_mut() {
+                        ui.set_project_root(self.config.project_root.clone());
+                    }
                     // Recent Projects gains this project, or, with none open, the welcome screen shows.
                     self.welcome_at_startup();
                 }
