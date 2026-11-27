@@ -1138,6 +1138,18 @@ fn declarations() -> Vec<Command> {
             EDIT,
             redo
         ),
+        // The second way to Redo that most editors have. No surface: the Edit menu and the
+        // toolbar already show Redo once.
+        command!(
+            "editor.edit.redo_alt",
+            "Redo (Ctrl+Shift+Z)",
+            "Edit",
+            Some(Chord::press(CommandKey::Letter('Z')).ctrl().shift()),
+            "Redo the most recently undone change, with the other common shortcut.",
+            A::Redo,
+            &[],
+            redo
+        ),
         command!(
             "editor.edit.delete",
             "Delete",
@@ -2795,6 +2807,30 @@ mod tests {
             assert_eq!(set.action, CommandAction::SetBookmark(slot));
             assert_eq!(recall.action, CommandAction::RecallBookmark(slot));
         }
+    }
+
+    /// Ctrl+Shift+Z is a second way to redo, and Ctrl+Z still only undoes.
+    #[test]
+    fn ctrl_shift_z_redoes_as_well_as_ctrl_y() {
+        let registry = registry();
+        let redo = |chord| registry.binding(chord).map(|command| command.action);
+        assert_eq!(
+            redo(Chord::press(CommandKey::Letter('Z')).ctrl().shift()),
+            Some(CommandAction::Redo)
+        );
+        assert_eq!(
+            redo(Chord::press(CommandKey::Letter('Y')).ctrl()),
+            Some(CommandAction::Redo)
+        );
+        assert_eq!(
+            redo(Chord::press(CommandKey::Letter('Z')).ctrl()),
+            Some(CommandAction::Undo)
+        );
+        // The same lookup the UI's own dispatcher uses.
+        assert_eq!(
+            KeyBindings::default().command_for(Chord::press(CommandKey::Letter('Z')).ctrl().shift()),
+            Some("editor.edit.redo_alt")
+        );
     }
 
     /// An override is what dispatch consults; the declaration is the fallback.
