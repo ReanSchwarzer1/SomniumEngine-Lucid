@@ -630,6 +630,16 @@ const TERRAIN_LAYER_SHORT: [&str; 32] = [
     "Crust",
 ];
 
+/// A ground slot's label in the paint palettes: what the selected terrain's own ground set calls it (`names`, slot by
+/// slot, "" where nothing names one), with its number; else the engine's built-in short name, which a project's set
+/// need not follow (Sunscar's slot 3 is "sunbleached chalk", not "Snow").
+fn terrain_layer_label(names: &[String], slot: usize) -> String {
+    match names.get(slot).map(|n| n.trim()).filter(|n| !n.is_empty()) {
+        Some(name) => format!("{slot}: {name}"),
+        None => TERRAIN_LAYER_SHORT.get(slot).copied().unwrap_or("?").to_owned(),
+    }
+}
+
 const TERRAIN_BRUSH_NAMES: [&str; 6] = ["Raise", "Lower", "Smooth", "Flatten", "Noise", "Paint"];
 
 pub type LightInspectorValues = [f32; 11];
@@ -1154,6 +1164,8 @@ pub struct UiManager {
     palette_places: Vec<(String, String, bool)>,
     /// The game's presets (id, label, category) as Command Palette rows: Sunscar's weather and its events, any game's.
     palette_presets: Vec<(String, String, String)>,
+    /// What the selected terrain's ground set calls each slot ("" where nothing names one), for the paint palette.
+    terrain_layer_names: Vec<String>,
     /// Stable dynamic palette ids mapped to their current targets.
     palette_targets: std::collections::HashMap<String, PaletteTarget>,
     /// Persisted palette learning state.
@@ -1723,6 +1735,12 @@ impl UiManager {
         self.palette_places = places;
     }
 
+    /// What the selected terrain's ground set calls each slot (slot by slot, "" where nothing names one; empty with
+    /// no terrain selected): the Terrain Tools palette shows these in place of the engine's built-in names.
+    pub fn set_terrain_layer_names(&mut self, names: Vec<String>) {
+        self.terrain_layer_names = names;
+    }
+
     /// The game's presets for the Command Palette: each an id, a label and a category ("Weather"). A row reads
     /// "Weather: Rain"; choosing it asks the host to run the preset exactly as the Authoring panel's Create does
     /// (an `authoring.execute` request, so it is undoable). An empty list shows no rows.
@@ -2057,6 +2075,7 @@ impl UiManager {
             palette_entities: Vec::new(),
             palette_places: Vec::new(),
             palette_presets: Vec::new(),
+            terrain_layer_names: Vec::new(),
             palette_targets: std::collections::HashMap::new(),
             command_history: crate::commands::CommandHistory::load(),
             inspector_handles: layout.inspector_handles,
@@ -8668,7 +8687,7 @@ impl UiManager {
                 for (i, label) in h.terrain_palette_labels.iter().enumerate() {
                     self.native_ui.send(TextMessage::set_text(
                         *label,
-                        TERRAIN_LAYER_SHORT[i].to_string(),
+                        terrain_layer_label(&self.terrain_layer_names, i),
                     ));
                 }
                 for (i, &btn) in h.terrain_palette.iter().enumerate() {

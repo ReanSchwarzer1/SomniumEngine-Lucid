@@ -24,6 +24,9 @@ pub struct ToolContext {
     pub operation: usize,
     pub layer: usize,
     pub layer_count: usize,
+    /// What the selected terrain's ground set calls each slot, slot by slot ("" where nothing names one): the layer
+    /// list shows these in place of the engine's built-in names.
+    pub layer_names: Vec<String>,
     /// Why Vertex Paint cannot run on the selection, if it cannot.
     pub paint_reason: Option<String>,
     /// Vertex Paint radius, strength, falloff.
@@ -375,10 +378,8 @@ impl ToolPanel {
         ));
         ui.set_visibility(self.layer, state.operation == 5 && state.layer_count > 0);
         // Unsupported unloaded palette entries cannot be selected.
-        let labels: Vec<_> = TERRAIN_LAYER_SHORT
-            .iter()
-            .take(state.layer_count)
-            .map(|s| s.to_string())
+        let labels: Vec<_> = (0..state.layer_count.min(TERRAIN_LAYER_SHORT.len()))
+            .map(|slot| terrain_layer_label(&state.layer_names, slot))
             .collect();
         for handle in [
             self.layer,
@@ -453,6 +454,15 @@ impl ToolPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// 27 Nov 2026: the paint palettes named Sunscar's slots by the engine's roster (its chalk read "Snow"). A slot
+    /// the ground set names shows that name and its number; one it does not shows the engine's.
+    #[test]
+    fn a_ground_set_names_its_own_slots() {
+        let names = vec![String::new(), String::new(), String::new(), " sunbleached chalk ".into()];
+        assert_eq!(terrain_layer_label(&names, 3), "3: sunbleached chalk");
+        assert_eq!(terrain_layer_label(&names, 0), "Grass", "unnamed: the engine's name");
+        assert_eq!(terrain_layer_label(&[], 31), "Crust", "no set names at all");
+    }
     #[test]
     fn context_switches_keep_the_same_widgets_and_explain_ineligible_targets() {
         let mut ui = UserInterface::new(280.0, 600.0);
