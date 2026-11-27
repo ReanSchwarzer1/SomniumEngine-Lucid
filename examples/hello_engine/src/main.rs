@@ -1960,7 +1960,9 @@ impl GameApp for HelloGame {
             EngineEvent::KeyInput { key, state } => {
                 let pressed = *state == InputState::Pressed;
                 match key {
-                    KeyCode::Escape if pressed => ctx.exit(),
+                    // Esc quits a player's game only. In the editor it closed the whole window with no prompt
+                    // whenever nothing was unsaved, a key pressed to dismiss a menu or a box (editor audit, 26 Nov).
+                    KeyCode::Escape if pressed && ctx.config.player_mode => ctx.exit(),
                     KeyCode::KeyW if !self.camera.is_rmb_down && pressed => {
                         if let Some(r) = &mut ctx.renderer {
                             r.set_gizmo_mode(somnium_renderer::GizmoMode::Translate);

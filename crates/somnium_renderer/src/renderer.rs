@@ -5963,7 +5963,9 @@ impl SomniumRenderer {
                 let (hiz_size, hiz_mips) = (self.hiz_pass.size(), self.hiz_pass.mip_count());
                 let pixel_angle = 2.0 / (self.proj_matrix.y_axis.y.abs().max(1e-6) * hiz_size.1.max(1) as f32);
                 let hiz = (self.hiz_ready && !self.occlusion_off).then_some((hiz_size, hiz_mips));
-                let on = !crate::pass::grass::ab_off(self.profiler.frame_index());
+                // View > Pipeline > GPU Grass (the toggle `SOMNIUM_GPU_GRASS` seeds) turns the blades off and the
+                // kinds they replace draw again, as the A/B does.
+                let on = self.debug_toggles.is_on("gpu_grass") && !crate::pass::grass::ab_off(self.profiler.frame_index());
                 grass.prepare(&ctx.device, &ctx.queue, &self.terrains, self.camera_pos, self.view_proj_rel,
                               pixel_angle, hiz, on);
                 grass.instance()

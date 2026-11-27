@@ -4083,7 +4083,10 @@ fn copy_content(from: &std::path::Path, to: &std::path::Path) -> std::io::Result
     }
 }
 
-/// Send a file or folder to the Recycle Bin through the shell, so it can be restored. Nothing is ever erased here.
+/// Send a file or folder to the Recycle Bin through the shell, so it can be restored. The bin refuses what is
+/// larger than its share of the drive, and the shell then erases it for good: with FOF_NOCONFIRMATION alone it
+/// did so without a word (a 56 GB tree was lost that way on this machine). FOF_WANTNUKEWARNING makes the shell
+/// ask first; No keeps the file, and this reports that the bin did not take it.
 #[cfg(target_os = "windows")]
 fn move_to_recycle_bin(path: &std::path::Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
@@ -4108,6 +4111,7 @@ fn move_to_recycle_bin(path: &std::path::Path) -> Result<(), String> {
     const FOF_NOCONFIRMATION: u16 = 0x0010;
     const FOF_ALLOWUNDO: u16 = 0x0040;
     const FOF_NOERRORUI: u16 = 0x0400;
+    const FOF_WANTNUKEWARNING: u16 = 0x4000;
     if !path.exists() {
         return Err("that file is no longer there".to_string());
     }
@@ -4119,7 +4123,7 @@ fn move_to_recycle_bin(path: &std::path::Path) -> Result<(), String> {
         func: FO_DELETE,
         from: from.as_ptr(),
         to: std::ptr::null(),
-        flags: FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI,
+        flags: FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING | FOF_SILENT | FOF_NOERRORUI,
         aborted: 0,
         mappings: std::ptr::null_mut(),
         title: std::ptr::null(),
@@ -10308,6 +10312,8 @@ impl<G: GameApp> Engine<G> {
                         self.terrain_restore_queue.clone(),
                     )));
                 self.scene_dirty = true;
+                // The edit layer does not keep painted foliage: Save must say so, as it does for sculpting.
+                self.editing.terrain_touched = true;
             }
             return true;
         }
@@ -10334,6 +10340,7 @@ impl<G: GameApp> Engine<G> {
                     self.terrain_restore_queue.clone(),
                 )));
             self.scene_dirty = true;
+            self.editing.terrain_touched = true;
         }
         let total = terrain.painted_foliage.len();
         let entry_name = self.foliage_kind_name(brush.kind).to_owned();

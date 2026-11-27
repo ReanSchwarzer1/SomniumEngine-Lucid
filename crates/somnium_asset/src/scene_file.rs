@@ -238,7 +238,9 @@ pub fn write(
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
     }
-    std::fs::write(path, encode(header, body)).map_err(|error| error.to_string())
+    // A new file renamed over the old (`write_atomic`): Save As and the autosave never leave half a scene, and a
+    // scene hard-linked into another game folder or test copy is replaced here only.
+    crate::write_atomic(path, &encode(header, body))
 }
 
 /// Seconds since the Unix epoch, or zero if the clock is before it.
