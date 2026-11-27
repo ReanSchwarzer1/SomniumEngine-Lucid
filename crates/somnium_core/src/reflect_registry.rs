@@ -1667,7 +1667,7 @@ mod tests {
     #[test]
     fn every_built_in_schema_registers_without_a_clash() {
         let registry = component_registry();
-        assert_eq!(registry.len(), 55);
+        assert_eq!(registry.len(), 56);
         let names: Vec<_> = registry.iter().map(|s| s.stable_id.as_str()).collect();
         assert_eq!(
             names,
@@ -1691,6 +1691,7 @@ mod tests {
                 "somnium.Interactable",
                 "somnium.IsometricCamera",
                 "somnium.Lamp",
+                "somnium.LevelPortal",
                 "somnium.Light",
                 "somnium.LightFlicker",
                 "somnium.LodGroup",
