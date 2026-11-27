@@ -11,6 +11,7 @@ Newest first. Each line is something you can do now that you could not do before
 - **F frames a thing by its size:** a house from afar, a pebble up close.
 - **Ctrl+click adds or removes a thing from the selection in the view. Shift+click adds.** Either on empty ground keeps the selection.
 - **Paste (Ctrl+V) puts the copy where the original stands,** selected, instead of inside whatever was selected. Duplicate (Ctrl+D) says what it copied.
+- **The ground layers have their real names.** With a terrain selected, the paint tools list the layers by the names of that region's own set.
 - **Help > What's New** is this page. **Help > This Project's Guide** shows the project's own guide.
 
 ## 27 November 2026, morning
