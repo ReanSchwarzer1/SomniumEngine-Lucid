@@ -31,6 +31,8 @@ struct Burning {
     /// The emitters that stop when the lamp is out.
     emitters: Vec<Entity>,
     smoke: Option<Entity>,
+    /// An open fire's embers, which drift with the wind as its smoke does.
+    embers: Option<Entity>,
     /// The light it burns with.
     light: Option<Entity>,
     lit: Option<bool>,
@@ -159,6 +161,11 @@ impl Fires {
                 let drift = if drift.length() < 0.25 { drift.try_normalize().unwrap_or(glam::Vec2::X) * 0.25 } else { drift };
                 emitter.velocity_bias = [drift.x, 0.0, drift.y];
             }
+            if let Some(embers) = fire.embers
+                && let Some(emitter) = world.get_mut::<ParticleEmitter>(embers)
+            {
+                emitter.velocity_bias = [wind[0] * 0.6, 0.0, wind[1] * 0.6];
+            }
         }
     }
 }
@@ -182,6 +189,7 @@ fn burn(
     let seed = salt(at);
     let mut made = Vec::new();
     let mut emitters = Vec::new();
+    let mut embers = None;
     let mut child = |world: &mut World, name: &str, rise: f32, emitter: Option<ParticleEmitter>, light: Option<(LightComponent, LampComponent)>| {
         let local = Transform::from_translation(flame.base + Vec3::Y * (rise / scale));
         let world_matrix = WorldTransform(model * Mat4::from_translation(local.translation));
@@ -248,22 +256,31 @@ fn burn(
         emitters.push(child(world, "fire: coals", 0.02, Some(coals), None));
         // No glow sprite over the fire: it read as a soft orb hanging over the brazier (13 Nov 12:32, beside real
         // photographs); the smoke and the fire's own light carry it.
+        // Embers the eye can see (27 Nov; 2.5 a second of 1.4 cm sparks were not seen in any still): a steady
+        // spitting of hot motes that rise on the draught, cool from yellow-white to red and go out, and drift with the
+        // wind as the smoke does (the update above).
         let sparks = ParticleEmitter {
             additive: true,
-            max_particles: 10,
-            spawn_rate: 2.5,
-            lifetime: 1.6,
-            initial_speed: 0.8,
-            spread_angle: 0.5,
-            gravity: -0.2,
-            size_start: 0.014,
-            size_end: 0.005,
-            spawn_extents: [radius * 0.4, 0.0, radius * 0.4],
-            color_over_life: ramp(&[(0.0, [6.0, 2.4, 0.5, 1.0]), (1.0, [3.0, 0.8, 0.1, 0.0])]),
+            max_particles: 40,
+            spawn_rate: 11.0,
+            lifetime: 2.4,
+            initial_speed: 1.1,
+            spread_angle: 0.55,
+            gravity: -0.35,
+            size_start: 0.024,
+            size_end: 0.008,
+            spawn_extents: [radius * 0.5, 0.0, radius * 0.5],
+            color_over_life: ramp(&[
+                (0.0, [9.0, 5.0, 1.4, 1.0]),
+                (0.35, [7.0, 2.4, 0.4, 1.0]),
+                (1.0, [2.5, 0.4, 0.05, 0.0]),
+            ]),
             spawn_accum: seed,
             ..Default::default()
         };
-        emitters.push(child(world, "fire: sparks", height * 0.4, Some(sparks), None));
+        let sparks = child(world, "fire: sparks", height * 0.4, Some(sparks), None);
+        emitters.push(sparks);
+        embers = Some(sparks);
         // A column of grey-brown smoke, lit by the sun and the sky: it rises, widens, thins and leans with the wind.
         let smoke = ParticleEmitter {
             lit: true,
@@ -322,6 +339,29 @@ fn burn(
             ..Default::default()
         };
         emitters.push(child(world, "fire: flame", width * aspect * 0.5, Some(tongues), None));
+        // The lantern's glass and the eye's glare round it (27 Nov: the Lamp Stair's lamps read as "tiny ticks by day
+        // and dim orange points at night" from 20 m, where a 5 cm flame is two pixels). A real lamp at night is seen as
+        // its lit glass, not its wick: a few soft warm discs about the flame, growing and fading out of step, so the
+        // head of the lamp glows and wavers with the flame. Not on open fires: over a brazier it read as an orb.
+        let glow = ParticleEmitter {
+            additive: true,
+            max_particles: 4,
+            spawn_rate: 5.0,
+            lifetime: 0.7,
+            initial_speed: 0.0,
+            spread_angle: 0.0,
+            gravity: 0.0,
+            size_start: 0.16,
+            size_end: 0.42,
+            color_over_life: ramp(&[
+                (0.0, [1.5, 0.75, 0.25, 0.0]),
+                (0.2, [1.5, 0.75, 0.25, 0.3]),
+                (1.0, [1.0, 0.4, 0.1, 0.0]),
+            ]),
+            spawn_accum: seed,
+            ..Default::default()
+        };
+        emitters.push(child(world, "fire: glow", height * 0.6, Some(glow), None));
         None
     };
     // A flame with no light of its own gets a small one, lit and put out as a lamp is and wavering with it; the
@@ -333,5 +373,5 @@ fn burn(
         let lamp = LampComponent { switched: true, flicker: if open { 0.45 } else { 0.15 } };
         Some(child(world, "fire: light", height * 0.6, None, Some((light, lamp))))
     });
-    Burning { carrier, spot, made, emitters, smoke, light, lit: None, open }
+    Burning { carrier, spot, made, emitters, smoke, embers, light, lit: None, open }
 }
