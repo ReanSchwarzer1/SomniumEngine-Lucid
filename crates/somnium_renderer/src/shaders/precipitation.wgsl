@@ -33,7 +33,7 @@ struct PrecipParams {
     camera_velocity: vec3<f32>,
     wander: f32,
     sun_direction: vec3<f32>,
-    /// 0 rain, 1 snow, 2 hail.
+    /// 0 rain, 1 snow, 2 hail, 3 dust.
     kind: f32,
     /// The sun's illuminance by colour, lux, before any cloud shadow.
     sun_light: vec3<f32>,
@@ -46,7 +46,8 @@ struct PrecipParams {
     layers: vec4<f32>,
     /// What one drawn drop of each box stands for, and splashes a square metre a second.
     folds: vec4<f32>,
-    /// x: 1 when the eye is under a roof (what the picture cannot show above is taken as covered).
+    /// x: 1 when the eye is under a roof (what the picture cannot show above is taken as covered); y: 1 when the
+    /// drops are drawn through sprites; z, w: this kind's first sprite layer and how many it has.
     extra: vec4<f32>,
     /// Lightning and lamps: xyz where, w 1 if lit; rgb candela.
     flash_pos: array<vec4<f32>, 4>,
@@ -60,6 +61,9 @@ struct PrecipParams {
 /// centre x, z, half-extent, strength (`CloudPass::shadow_params`).
 @group(0) @binding(4) var<uniform> cloud_shadow_params: vec4<f32>;
 @group(0) @binding(5) var scene_depth: texture_depth_2d;
+/// The drops' shapes (`PrecipitationPass::load_sprites`): white, the shape in the alpha; one layer per shape.
+@group(0) @binding(6) var sprites: texture_2d_array<f32>;
+@group(0) @binding(7) var sprite_sampler: sampler;
 
 const PRECIP_PI: f32 = 3.14159265;
 /// The thinnest a streak is drawn, pixels.
@@ -98,6 +102,8 @@ struct VOut {
     @location(4) @interpolate(flat) middle: f32,
     /// 1 for a flake (a soft round fleck), 0 for a drop.
     @location(5) @interpolate(flat) flake: f32,
+    /// Its sprite layer, and 1 or -1: a flake's shape is mirrored on half the flakes.
+    @location(6) @interpolate(flat) sprite: vec2<f32>,
 }
 
 @vertex
@@ -147,6 +153,14 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) drop: u3
         strayed += fr * vec3<f32>(sin(fa), 0.0, cos(fa));
         glint = 0.7 + 0.45 * max(sin(fa * 0.5 + k.x * 7.0), 0.0);
     }
+    if pp.kind > 2.5 {
+        // A grain on the wind rises and sinks on the eddies, more than it falls (sunscar-particles, 27 Nov).
+        let ew = 1.5 + 2.0 * k.z;
+        let ea = pp.time * ew + k.x * 17.0;
+        let er = 0.15 + 0.25 * k.y;
+        velocity.y += er * ew * cos(ea);
+        strayed.y += er * sin(ea);
+    }
 
     // Where it is: its own start, carried by its fall, wrapped into the box round the eye.
     let box = pp.extent * 2.0 * scale;
@@ -169,6 +183,9 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) drop: u3
     var shutter = pp.exposure;
     if pp.kind > 0.5 && pp.kind < 1.5 {
         shutter = pp.exposure * 0.12;
+    } else if pp.kind > 2.5 {
+        // Grains are seen as short dashes along the wind, not threads.
+        shutter = pp.exposure * 0.35;
     }
     let travel = (velocity - pp.camera_velocity) * shutter;
     let tail = head - travel;
@@ -210,6 +227,11 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) drop: u3
         // Mostly the sky: a drop seen against dark ground shows the bright sky behind and above the eye, bent
         // through it, and so a shower reads pale against a dark field (the lead's 27 Nov read of p4: too faint).
         radiance = 0.8 * sky + 0.2 * land + sun * hg(dot(toward, normalize(pp.sun_direction)), 0.8);
+    } else if pp.kind > 2.5 {
+        // Dust: a matte grain, lit by the sky and the sun, brightest toward the sun (it throws light forward like
+        // haze); its colour is the tint, the soil's.
+        let mu = dot(toward, normalize(pp.sun_direction));
+        radiance = 0.9 * (0.7 * sky + 0.3 * land) / PRECIP_PI + sun * (0.2 / PRECIP_PI + 0.5 * hg(mu, 0.6));
     } else {
         // Snow and hail: white, lit from above and by what light gets through them.
         radiance = 0.85 * (sky + sun * (0.25 + 0.5 * max(dot(toward, normalize(pp.sun_direction)), 0.0)) / PRECIP_PI);
@@ -242,7 +264,9 @@ fn vs_main(@builtin(vertex_index) vertex: u32, @builtin(instance_index) drop: u3
     out.cover = cover;
     out.along = end * 2.0 - 1.0;
     out.middle = length_m / (length_m + width);
-    out.flake = select(0.0, 1.0, pp.kind > 0.5 && pp.kind < 1.5);
+    out.flake = select(0.0, 1.0, (pp.kind > 0.5 && pp.kind < 1.5) || pp.kind > 2.5);
+    let pick = hash3(drop * 7u + 3u);
+    out.sprite = vec2<f32>(pp.extra.z + min(floor(pick.x * pp.extra.w), max(pp.extra.w - 1.0, 0.0)), select(1.0, -1.0, pick.y < 0.5));
     return out;
 }
 
@@ -262,6 +286,11 @@ fn fs_main(in: VOut) -> FOut {
     if in.flake > 0.5 {
         body = body * body;
     }
+    // A sprite, where the game gave some: the shape across and along the quad, its brightness the cover (a streak's
+    // beads and thinning, a flake's lobes). Sampled before any branch on the drop, as derivatives need.
+    let uv = vec2<f32>(in.across * in.sprite.y * 0.5 + 0.5, 0.5 - in.along * 0.5);
+    let shape = textureSample(sprites, sprite_sampler, uv, i32(in.sprite.x)).a;
+    body = select(body, shape, pp.extra.y > 0.5);
     // The shape after the clamp: a far drop that stands for many covers fully, and its edge must still fall away.
     let cover = min(in.cover * 1.5, 1.0) * body;
     if cover <= 0.0 {

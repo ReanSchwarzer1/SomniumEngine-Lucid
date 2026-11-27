@@ -508,6 +508,15 @@ pub struct TerrainData {
     /// offset supplies the difference. Allocated on first use and never
     /// rewritten — at most 5 LODs × 16 masks exist.
     index_blocks: HashMap<(u8, u8), (u32, u32)>,
+    /// The tile's hole mask, one byte per quad (row-major, Z-major), 128 and over a hole; none for most tiles
+    /// ([`Self::set_holes`], the sidecar's `{path}.holes.png`).
+    pub holes: Option<std::sync::Arc<[u8]>>,
+    /// Per chunk: whether it holds a hole quad (it then draws at its finest level from its own lists).
+    hole_chunks: Vec<bool>,
+    /// A hole chunk's own index lists, by `(chunk, edge_mask)`: its finest level without the hole quads.
+    hole_blocks: HashMap<(usize, u8), (u32, u32)>,
+    /// Index spans of hole lists a new mask replaced, released by the next [`Self::ensure_index_blocks`].
+    stale_hole_blocks: Vec<u32>,
     /// See [`TerrainData::stream_geometry`]; 0 keeps the geometry resident.
     pub geometry_stream_distance: f32,
 
@@ -962,6 +971,10 @@ impl TerrainData {
             virtual_texture_cache_mib: 64,
             virtual_texture_frame: 0,
             index_blocks: HashMap::new(),
+            holes: None,
+            hole_chunks: Vec::new(),
+            hole_blocks: HashMap::new(),
+            stale_hole_blocks: Vec::new(),
             geometry_stream_distance: 0.0,
             chunk_vertex_capacity: verts_per_chunk,
             texture_ids: TerrainTextureIds::default(),
@@ -1252,6 +1265,9 @@ impl TerrainData {
             }
         }
         for (_, (offset, _)) in self.index_blocks.drain() {
+            pool.release_indices(offset);
+        }
+        for offset in self.hole_blocks.drain().map(|(_, (offset, _))| offset).chain(self.stale_hole_blocks.drain(..)) {
             pool.release_indices(offset);
         }
     }
@@ -1697,7 +1713,8 @@ impl TerrainData {
                 .min(self.desc.total_vertices_z()),
         );
         let world = self.desc.world_size();
-        let samples = collider::resample(n, world, |x, z| self.world_height_at(x, z));
+        // A sample by a hole is Jolt's no-collision value (`HeightFieldShapeConstants::cNoCollisionValue`, FLT_MAX).
+        let samples = collider::resample(n, world, |x, z| if self.collider_hole(x, z) { f32::MAX } else { self.world_height_at(x, z) });
         (samples, n, collider::heightfield_scale(world, n))
     }
 
@@ -1758,6 +1775,12 @@ impl TerrainData {
                 chunk.lod = 0;
             }
         });
+        // A chunk holding a hole stays at its finest level, where its hole is cut from the quads (`set_holes`).
+        for (chunk, &hole) in self.chunks.iter_mut().zip(&self.hole_chunks) {
+            if hole {
+                chunk.lod = 0;
+            }
+        }
 
         // 2. Relax until adjacent chunks differ by at most one level.
         let at = |chunks: &[TerrainChunk], x: i64, z: i64| -> Option<u8> {
@@ -1972,6 +1995,39 @@ impl TerrainData {
             self.index_blocks
                 .insert(key, (offset, indices.len() as u32));
         }
+        // A chunk holding a hole draws, and is traced, from its own lists without the hole quads: its finest level
+        // with the frame's stitch, and unstitched for its BLAS.
+        for offset in self.stale_hole_blocks.drain(..) {
+            pool.release_indices(offset);
+        }
+        let Some(holes) = self.holes.clone() else { return };
+        let quads_x = self.desc.total_vertices_x().saturating_sub(1);
+        for i in 0..self.chunks.len() {
+            if !self.hole_chunks.get(i).copied().unwrap_or(false) {
+                continue;
+            }
+            let (grid, edge) = (self.chunks[i].grid_pos, self.chunks[i].edge_mask);
+            for mask in [0u8, edge] {
+                if self.hole_blocks.contains_key(&(i, mask)) {
+                    continue;
+                }
+                let indices = mesh::without_holes(
+                    &mesh::build_lod_indices(cells, 0, mask),
+                    cells,
+                    [grid[0] * cells, grid[1] * cells],
+                    quads_x,
+                    &holes,
+                );
+                if indices.is_empty() {
+                    continue; // all hole: the chunk draws nothing
+                }
+                let Some(offset) = pool.reserve_indices(indices.len() as u32) else {
+                    continue;
+                };
+                pool.write_indices(queue, offset, &indices);
+                self.hole_blocks.insert((i, mask), (offset, indices.len() as u32));
+            }
+        }
     }
 
     /// Read-only lookup of the `(index_offset, index_count)` for a `(lod, mask)`.
@@ -1983,6 +2039,77 @@ impl TerrainData {
     /// full detail, no edge stitching, identical for every chunk.
     pub fn rt_index_block(&self) -> Option<(u32, u32)> {
         self.index_block(0, 0)
+    }
+
+    /// The `(index_offset, index_count)` chunk `i` draws with this frame: its own list if it holds a hole, else the
+    /// shared one for its level and stitch.
+    pub fn chunk_index_block(&self, i: usize) -> Option<(u32, u32)> {
+        let chunk = self.chunks.get(i)?;
+        if self.hole_chunks.get(i).copied().unwrap_or(false) {
+            return self.hole_blocks.get(&(i, chunk.edge_mask)).copied();
+        }
+        self.index_block(chunk.lod, chunk.edge_mask)
+    }
+
+    /// The geometry the BLAS of the chunk at `vertex_offset` is built from: its own unstitched list if it holds a
+    /// hole (none when it is all hole), else [`Self::rt_index_block`].
+    pub fn rt_index_block_for(&self, vertex_offset: u32) -> Option<(u32, u32)> {
+        match self.chunks.iter().position(|c| c.vertex_offset == vertex_offset) {
+            Some(i) if self.hole_chunks.get(i).copied().unwrap_or(false) => self.hole_blocks.get(&(i, 0)).copied(),
+            _ => self.rt_index_block(),
+        }
+    }
+
+    /// Take a tile's hole mask (one byte per quad, [`TerrainSidecar::holes`]), or none: a mask of the wrong size or
+    /// with no hole in it is none. Chunks holding a hole draw at their finest level from their own index lists with
+    /// the hole quads left out ([`Self::ensure_index_blocks`]); painted copies standing in a hole are dropped; the
+    /// collider and the ground cover leave holes open ([`Self::heightfield`], [`Self::is_hole_at`]).
+    pub fn set_holes(&mut self, holes: Option<Vec<u8>>) {
+        let qx = self.desc.total_vertices_x().saturating_sub(1);
+        let qz = self.desc.total_vertices_z().saturating_sub(1);
+        let holes = holes.filter(|h| h.len() == (qx * qz) as usize && h.iter().any(|&v| v >= 128));
+        let replaced: Vec<u32> = self.hole_blocks.drain().map(|(_, (offset, _))| offset).collect();
+        self.stale_hole_blocks.extend(replaced);
+        let cells = self.desc.chunk_cells;
+        self.hole_chunks = self
+            .chunks
+            .iter()
+            .map(|chunk| {
+                holes.as_ref().is_some_and(|h| {
+                    let (x0, z0) = (chunk.grid_pos[0] * cells, chunk.grid_pos[1] * cells);
+                    (z0..(z0 + cells).min(qz)).any(|z| (x0..(x0 + cells).min(qx)).any(|x| h[(z * qx + x) as usize] >= 128))
+                })
+            })
+            .collect();
+        self.holes = holes.map(Into::into);
+        if self.holes.is_some() {
+            let painted = std::mem::take(&mut self.painted_foliage);
+            let kept: Vec<_> = painted.into_iter().filter(|c| !self.is_hole_at(c.position.x, c.position.z)).collect();
+            self.painted_foliage = kept;
+        }
+        for (chunk, &hole) in self.chunks.iter_mut().zip(&self.hole_chunks) {
+            if hole {
+                chunk.dirty = true;
+            }
+        }
+    }
+
+    /// Whether the terrain-local point `(x, z)` is over a hole quad: no ground there.
+    #[must_use]
+    pub fn is_hole_at(&self, local_x: f32, local_z: f32) -> bool {
+        let Some(holes) = self.holes.as_deref() else { return false };
+        let qx = i64::from(self.desc.total_vertices_x().saturating_sub(1));
+        let qz = i64::from(self.desc.total_vertices_z().saturating_sub(1));
+        quad_hole(holes, qx, qz, self.desc.cell_size, local_x, local_z)
+    }
+
+    /// Whether a collider sample at the terrain-local point `(x, z)` takes no collision: only where every quad that
+    /// meets it is a hole ([`hole_all_round`]).
+    fn collider_hole(&self, local_x: f32, local_z: f32) -> bool {
+        let Some(holes) = self.holes.as_deref() else { return false };
+        let qx = i64::from(self.desc.total_vertices_x().saturating_sub(1));
+        let qz = i64::from(self.desc.total_vertices_z().saturating_sub(1));
+        hole_all_round(holes, qx, qz, self.desc.cell_size, local_x, local_z)
     }
 
     /// Vertices in one chunk's grid — what a chunk BLAS is sized for.
@@ -2092,6 +2219,7 @@ impl TerrainData {
         self.heightmap = sidecar.heights;
         self.splatmap.data = sidecar.splat;
         self.painted_foliage = sidecar.foliage;
+        self.set_holes(sidecar.holes);
         self.macro_dirty = true;
         self.horizon_dirty = true;
         for chunk in &mut self.chunks {
@@ -2123,7 +2251,7 @@ impl TerrainData {
         model: glam::Mat4,
         geometry_distance: f32,
     ) -> Result<(), String> {
-        let TerrainSidecar { heights, splat, foliage, dims, baked, strata, .. } = sidecar;
+        let TerrainSidecar { heights, splat, foliage, dims, baked, strata, holes, .. } = sidecar;
         let [tx, tz, sw, sh] = dims;
         if dims != self.sidecar_dims()
             || heights.len() != (tx * tz) as usize
@@ -2134,6 +2262,8 @@ impl TerrainData {
         self.heightmap = heights;
         self.splatmap.data = splat;
         self.painted_foliage = foliage;
+        // The tile's holes, or none: a slot that took a tile with holes and then one without must not keep them.
+        self.set_holes(holes);
         // The tile's strata datum, or none: a slot that took a tile with one and then one without must not keep it.
         self.strata_ready = match (&self.strata_gpu, strata) {
             (Some((texture, _)), Some(grid)) => {
@@ -2281,6 +2411,8 @@ pub struct TerrainSidecar {
     pub canopy: Option<horizon::Canopy>,
     /// The strata datum beside it (`{path}.strata`, [`STRATA_SIZE`] square), if there is one.
     pub strata: Option<Vec<f32>>,
+    /// The hole mask beside it (`{path}.holes.png`, one byte per quad), if there is one ([`TerrainData::set_holes`]).
+    pub holes: Option<Vec<u8>>,
 }
 
 impl TerrainSidecar {
@@ -2351,7 +2483,20 @@ pub fn read_sidecar(path: &str, expected: [u32; 4]) -> Result<TerrainSidecar, St
         baked: None,
         canopy: read_canopy(path),
         strata: read_strata(path),
+        holes: read_holes(path, expected),
     })
+}
+
+/// sunscar-terrain's hole mask beside a sidecar (`{path}.holes.png`: 8-bit, one pixel per quad, 128 and over a hole;
+/// the game's design/engine/TERRAIN_HOLES_AND_PORTALS.md), if there is one of the tile's quad size.
+fn read_holes(path: &str, dims: [u32; 4]) -> Option<Vec<u8>> {
+    let image = image::open(format!("{path}.holes.png")).ok()?.to_luma8();
+    let (qx, qz) = (dims[0].saturating_sub(1), dims[1].saturating_sub(1));
+    if image.width() != qx || image.height() != qz {
+        tracing::warn!("{path}.holes.png: not {qx} x {qz} (a pixel per quad); the tile has no holes");
+        return None;
+    }
+    Some(image.into_raw())
 }
 
 /// foliage-render's canopy bake beside a sidecar (`{path}.canopy.png`: RGBA8 over the tile's own 1000 m, alpha the
@@ -2374,6 +2519,54 @@ fn lod_distance(camera: glam::Vec3, lo: glam::Vec3, hi: glam::Vec3) -> f32 {
     let outside = (lo - camera).max(camera - hi).max(glam::Vec3::ZERO).length();
     let half = (hi.x - lo.x).max(hi.z - lo.z) * 0.5;
     camera.distance((lo + hi) * 0.5).min(outside + half).max(0.01)
+}
+
+/// Whether the quad under the terrain-local point `(x, z)` is a hole in `holes` (`qx` x `qz` quads of `cell` metres,
+/// row by row from the least z, 128 or more a hole). Outside the grid: no.
+fn quad_hole(holes: &[u8], qx: i64, qz: i64, cell: f32, x: f32, z: f32) -> bool {
+    let (ix, iz) = ((x / cell).floor() as i64, (z / cell).floor() as i64);
+    (0..qx).contains(&ix) && (0..qz).contains(&iz) && holes[(iz * qx + ix) as usize] >= 128
+}
+
+/// Whether every quad that meets the point `(x, z)` is a hole: there a collider sample takes Jolt's no-collision value,
+/// which takes out every triangle that uses it. Asked of each quad round the point, so the collision hole never
+/// reaches past the drawn one (sunscar-terrain, 19 Nov 2026): a hole two quads wide or more collides where it is drawn,
+/// and a strip one quad wide keeps its ground (the mouth mesh stands over it either way).
+fn hole_all_round(holes: &[u8], qx: i64, qz: i64, cell: f32, x: f32, z: f32) -> bool {
+    let h = cell * 0.5;
+    [-h, h].iter().all(|&dx| [-h, h].iter().all(|&dz| quad_hole(holes, qx, qz, cell, x + dx, z + dz)))
+}
+
+#[cfg(test)]
+mod hole_collider_tests {
+    use super::hole_all_round;
+
+    /// 8 x 8 quads of 2 m: a 3 x 3 hole at quads 2..5 and a hole one quad wide at (7, 0).
+    #[test]
+    fn the_collision_hole_never_reaches_past_the_drawn_one() {
+        let mut holes = vec![0u8; 64];
+        for z in 2..5 {
+            for x in 2..5 {
+                holes[z * 8 + x] = 255;
+            }
+        }
+        holes[7] = 255;
+        let at = |vx: i64, vz: i64| hole_all_round(&holes, 8, 8, 2.0, vx as f32 * 2.0, vz as f32 * 2.0);
+        assert!(at(3, 3) && at(4, 4) && at(3, 4) && at(4, 3), "inside the block every vertex is a hole");
+        assert!(!at(2, 2) && !at(5, 5) && !at(2, 3) && !at(5, 3), "the rim's vertices touch ground: they keep collision");
+        assert!(!at(7, 0) && !at(8, 1), "a strip one quad wide keeps its ground");
+        for vz in 0..=8i64 {
+            for vx in 0..=8i64 {
+                if !at(vx, vz) {
+                    continue;
+                }
+                for (dx, dz) in [(-1, -1), (0, -1), (-1, 0), (0, 0)] {
+                    let (x, z) = (vx + dx, vz + dz);
+                    assert!(holes[(z * 8 + x) as usize] >= 128, "vertex ({vx}, {vz}) takes out ground at quad ({x}, {z})");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

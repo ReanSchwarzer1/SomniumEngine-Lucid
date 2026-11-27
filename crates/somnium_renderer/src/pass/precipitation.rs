@@ -20,7 +20,13 @@ pub enum Falling {
     Snow,
     /// A fast white stone.
     Hail,
+    /// Grains on a dry wind: soft pale motes driven near level, lit like snow and tinted by the soil
+    /// (sunscar-particles, 27 Nov 2026).
+    Dust,
 }
+
+/// The side of one sprite layer, pixels.
+pub const SPRITE_SIZE: u32 = 128;
 
 /// The field of drops round the eye.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -99,7 +105,7 @@ struct Params {
     layers: [f32; 4],
     /// What a drawn drop of each box stands for, and splashes a square metre a second.
     folds: [f32; 4],
-    /// Sheltered, unused x3.
+    /// Sheltered; 1 when the drops are drawn through sprites; the kind's first sprite layer and how many it has.
     extra: [f32; 4],
     flash_pos: [[f32; 4]; 4],
     flash_color: [[f32; 4]; 4],
@@ -113,6 +119,13 @@ pub struct PrecipitationPass {
     splash_pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     params: wgpu::Buffer,
+    /// The drops' shapes: a texture array of `SPRITE_SIZE` layers with their mips (one white layer until a game loads
+    /// some), its sampler, each kind's first layer and count (rain, snow, hail, dust), and the pixels still to upload.
+    sprite_texture: wgpu::Texture,
+    sprite_view: wgpu::TextureView,
+    sprite_sampler: wgpu::Sampler,
+    sprite_kinds: [(u32, u32); 4],
+    sprite_upload: Option<(u32, Vec<u8>)>,
     bind_group: Option<wgpu::BindGroup>,
     /// The eye and the renderer's clock a frame ago, for the eye's velocity and the frame's length.
     last_camera: Option<Vec3>,
@@ -157,6 +170,14 @@ impl PrecipitationPass {
                     binding: 5,
                     visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                // The drops' shapes, and their own sampler (trilinear, clamped).
+                texture(6, wgpu::TextureViewDimension::D2Array),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -222,7 +243,20 @@ impl PrecipitationPass {
             multiview_mask: None,
             cache: None,
         });
+        let (sprite_texture, sprite_view) = sprite_array(device, 1, 1);
+        let sprite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Precipitation sprites"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
         Self {
+            sprite_texture,
+            sprite_view,
+            sprite_sampler,
+            sprite_kinds: [(0, 0); 4],
+            sprite_upload: None,
             settings: PrecipitationSettings::default(),
             flashes: Vec::new(),
             pipeline,
@@ -239,6 +273,39 @@ impl PrecipitationPass {
             last_time: 0.0,
             clock: 0.0,
         }
+    }
+
+    /// The drops' shapes from a PNG: a column of `SPRITE_SIZE`-square layers, white where the shape is (its alpha, or
+    /// its brightness where it has none). `kinds` is each kind's first layer and count: rain, snow, hail, dust; a kind
+    /// with none keeps its drawn shape. Uploaded with the next frame (sunscar-particles, 27 Nov 2026).
+    ///
+    /// # Errors
+    /// When the file cannot be read or is not a column of whole layers.
+    pub fn load_sprites(&mut self, device: &wgpu::Device, path: &std::path::Path, kinds: [(u32, u32); 4]) -> Result<(), String> {
+        let image = image::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let has_alpha = image.color().has_alpha();
+        let rgba = image.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        if w != SPRITE_SIZE || h == 0 || h % SPRITE_SIZE != 0 {
+            return Err(format!("{}: {w} x {h} is not a column of {SPRITE_SIZE}-pixel layers", path.display()));
+        }
+        let layers = h / SPRITE_SIZE;
+        if kinds.iter().any(|&(first, n)| first + n > layers) {
+            return Err(format!("{}: {layers} layers, fewer than the kinds name", path.display()));
+        }
+        // White, the shape in the alpha.
+        let pixels: Vec<u8> = rgba
+            .pixels()
+            .flat_map(|p| {
+                let a = if has_alpha { p[3] } else { ((u32::from(p[0]) * 3 + u32::from(p[1]) * 6 + u32::from(p[2])) / 10) as u8 };
+                [255, 255, 255, a]
+            })
+            .collect();
+        (self.sprite_texture, self.sprite_view) = sprite_array(device, layers, SPRITE_SIZE.ilog2() + 1);
+        self.sprite_kinds = kinds;
+        self.sprite_upload = Some((layers, pixels));
+        self.bind_group = None;
+        Ok(())
     }
 
     /// Bind the sky light's cube and the clouds' ground shadow. Built once.
@@ -262,6 +329,8 @@ impl PrecipitationPass {
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(cloud_shadow) },
                 wgpu::BindGroupEntry { binding: 4, resource: cloud_shadow_params.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(depth) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.sprite_view) },
+                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.sprite_sampler) },
             ],
         }));
     }
@@ -284,6 +353,9 @@ impl PrecipitationPass {
         sun_light: Vec3,
         time: f32,
     ) {
+        if let Some((layers, pixels)) = self.sprite_upload.take() {
+            upload_sprites(queue, &self.sprite_texture, layers, &pixels);
+        }
         let dt = (time - self.last_time).clamp(0.0, 0.25);
         self.last_time = time;
         // The clock runs whether or not anything falls, so rain that starts again is not where it stopped.
@@ -350,6 +422,7 @@ impl PrecipitationPass {
                     Falling::Rain => 0.0,
                     Falling::Snow => 1.0,
                     Falling::Hail => 2.0,
+                    Falling::Dust => 3.0,
                 },
                 sun_light: sun_light.to_array(),
                 size: s.size.max(1e-4),
@@ -357,7 +430,15 @@ impl PrecipitationPass {
                 opacity: s.opacity.max(0.0),
                 layers: [layers[0], layers[1], layers[2], if matches!(s.falling, Falling::Rain) { s.splash.clamp(0.0, 1.0) } else { 0.0 }],
                 folds: [folds[0], folds[1], folds[2], flux],
-                extra: [s.sheltered.clamp(0.0, 1.0), 0.0, 0.0, 0.0],
+                extra: {
+                    let (first, n) = self.sprite_kinds[match s.falling {
+                        Falling::Rain => 0,
+                        Falling::Snow => 1,
+                        Falling::Hail => 2,
+                        Falling::Dust => 3,
+                    }];
+                    [s.sheltered.clamp(0.0, 1.0), if n > 0 { 1.0 } else { 0.0 }, first as f32, n as f32]
+                },
                 flash_pos,
                 flash_color,
             }),
@@ -415,9 +496,77 @@ impl PrecipitationPass {
     }
 }
 
+/// A texture array for the drops' shapes; one white layer as the stand-in.
+fn sprite_array(device: &wgpu::Device, layers: u32, mips: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let side = if layers == 1 && mips == 1 { 1 } else { SPRITE_SIZE };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Precipitation sprites"),
+        size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: layers },
+        mip_level_count: mips,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    (texture, view)
+}
+
+/// Each layer and its mips, halved by a box filter down to one pixel.
+fn upload_sprites(queue: &wgpu::Queue, texture: &wgpu::Texture, layers: u32, pixels: &[u8]) {
+    let layer_bytes = (SPRITE_SIZE * SPRITE_SIZE * 4) as usize;
+    for layer in 0..layers {
+        let mut level = pixels[layer as usize * layer_bytes..(layer as usize + 1) * layer_bytes].to_vec();
+        let mut side = SPRITE_SIZE;
+        for mip in 0..texture.mip_level_count() {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: mip,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &level,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(side * 4), rows_per_image: Some(side) },
+                wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
+            );
+            if side == 1 {
+                break;
+            }
+            level = halve(&level, side);
+            side /= 2;
+        }
+    }
+}
+
+/// One mip down: each pixel the mean of the four above it.
+fn halve(level: &[u8], side: u32) -> Vec<u8> {
+    let (s, h) = (side as usize, side as usize / 2);
+    let mut out = vec![0_u8; h * h * 4];
+    for y in 0..h {
+        for x in 0..h {
+            for c in 0..4 {
+                let at = |dx: usize, dy: usize| u32::from(level[((2 * y + dy) * s + 2 * x + dx) * 4 + c]);
+                out[(y * h + x) * 4 + c] = ((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1) + 2) / 4) as u8;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mip_is_the_mean_of_four() {
+        let level: Vec<u8> = [0_u8, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255].to_vec();
+        assert_eq!(halve(&level, 2), vec![191, 191, 191, 191]);
+    }
 
     #[test]
     fn the_uniform_matches_the_shaders_layout() {
