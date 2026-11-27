@@ -233,6 +233,8 @@ pub struct EditorCtx {
     pub has_clipboard: bool,
     /// A painted copy (a tree, a shrub) is picked, its card showing, with no entity selected.
     pub has_picked_copy: bool,
+    /// The open project's folder holds an EDITOR_GUIDE.md.
+    pub has_project_guide: bool,
 }
 
 /// Application menu that owns a command row.
@@ -445,6 +447,14 @@ fn clipboard(ctx: &EditorCtx) -> Enablement {
         Enablement::Enabled
     } else {
         Enablement::Disabled("Copy something first")
+    }
+}
+
+fn project_guide(ctx: &EditorCtx) -> Enablement {
+    if ctx.has_project_guide {
+        Enablement::Enabled
+    } else {
+        Enablement::Disabled("This project has no EDITOR_GUIDE.md")
     }
 }
 
@@ -1103,7 +1113,7 @@ fn declarations() -> Vec<Command> {
             "Save Scene",
             "Scene",
             ctrl('S'),
-            "Save the current scene.",
+            "Save your edits to this scene (moved, added and removed objects). Sculpted or painted ground needs Save Scene As.",
             A::SaveScene,
             FILE,
             always
@@ -1136,6 +1146,18 @@ fn declarations() -> Vec<Command> {
             "Redo the most recently undone change.",
             A::Redo,
             EDIT,
+            redo
+        ),
+        // The second way to Redo that most editors have. No surface: the Edit menu and the
+        // toolbar already show Redo once.
+        command!(
+            "editor.edit.redo_alt",
+            "Redo (Ctrl+Shift+Z)",
+            "Edit",
+            Some(Chord::press(CommandKey::Letter('Z')).ctrl().shift()),
+            "Redo the most recently undone change, with the other common shortcut.",
+            A::Redo,
+            &[],
             redo
         ),
         command!(
@@ -1479,6 +1501,16 @@ fn declarations() -> Vec<Command> {
             always
         ),
         command!(
+            "editor.help.whats_new",
+            "What's New",
+            "Help",
+            None,
+            "List what you can do in the editor now that you could not before.",
+            A::OpenHelp(crate::metaphor::WHATS_NEW_PAGE),
+            HELP,
+            always
+        ),
+        command!(
             "editor.help.index",
             "Help Overlay",
             "Help",
@@ -1507,6 +1539,16 @@ fn declarations() -> Vec<Command> {
             A::OpenHelp(4),
             HELP,
             always
+        ),
+        command!(
+            "editor.help.project_guide",
+            "This Project's Guide",
+            "Help",
+            None,
+            "Show the guide this project keeps for its own editor use.",
+            A::OpenHelp(crate::metaphor::PROJECT_GUIDE_PAGE),
+            HELP,
+            project_guide
         ),
         command!(
             "editor.script.reload",
@@ -2576,9 +2618,11 @@ pub fn icon_for(id: &str) -> crate::icons::IconId {
         "editor.viewport.layout.split_horizontal" => I::PanelBottom,
         "editor.viewport.layout.quad" => I::GridView,
         "editor.search.commands" => I::Search,
+        "editor.help.whats_new" => I::Docs,
         "editor.help.index" => I::HelpCircle,
         "editor.help.shortcuts" => I::Keyboard,
         "editor.help.about" => I::Info,
+        "editor.help.project_guide" => I::Docs,
         "editor.script.reload" => I::Refresh,
         "editor.simulation.play" => I::Play,
         "editor.simulation.pause" => I::Pause,
@@ -2797,6 +2841,30 @@ mod tests {
         }
     }
 
+    /// Ctrl+Shift+Z is a second way to redo, and Ctrl+Z still only undoes.
+    #[test]
+    fn ctrl_shift_z_redoes_as_well_as_ctrl_y() {
+        let registry = registry();
+        let redo = |chord| registry.binding(chord).map(|command| command.action);
+        assert_eq!(
+            redo(Chord::press(CommandKey::Letter('Z')).ctrl().shift()),
+            Some(CommandAction::Redo)
+        );
+        assert_eq!(
+            redo(Chord::press(CommandKey::Letter('Y')).ctrl()),
+            Some(CommandAction::Redo)
+        );
+        assert_eq!(
+            redo(Chord::press(CommandKey::Letter('Z')).ctrl()),
+            Some(CommandAction::Undo)
+        );
+        // The same lookup the UI's own dispatcher uses.
+        assert_eq!(
+            KeyBindings::default().command_for(Chord::press(CommandKey::Letter('Z')).ctrl().shift()),
+            Some("editor.edit.redo_alt")
+        );
+    }
+
     /// An override is what dispatch consults; the declaration is the fallback.
     #[test]
     fn a_rebind_takes_effect_and_reset_puts_the_default_back() {
@@ -2932,6 +3000,40 @@ mod tests {
         let picked = EditorCtx { has_picked_copy: true, ..EditorCtx::default() };
         assert!(delete.enabled(&picked).is_enabled() && make.enabled(&picked).is_enabled());
         assert!(!delete.enabled(&EditorCtx::default()).is_enabled() && !make.enabled(&EditorCtx::default()).is_enabled());
+    }
+
+    /// What's New leads the Help menu and opens its page; the project guide is greyed out, with the reason, until
+    /// the project has one.
+    #[test]
+    fn help_menu_leads_with_whats_new_and_guards_the_project_guide() {
+        let ids: Vec<_> = registry()
+            .menu(Menu::Help)
+            .into_iter()
+            .map(|command| command.id)
+            .collect();
+        assert_eq!(ids.first(), Some(&"editor.help.whats_new"));
+        assert!(ids.contains(&"editor.help.project_guide"));
+        let whats_new = *registry().get("editor.help.whats_new").unwrap();
+        assert_eq!(whats_new.label, "What's New");
+        assert_eq!(whats_new.default_binding, None);
+        assert_eq!(
+            whats_new.action,
+            CommandAction::OpenHelp(crate::metaphor::WHATS_NEW_PAGE)
+        );
+        let guide = *registry().get("editor.help.project_guide").unwrap();
+        assert_eq!(
+            guide.enabled(&EditorCtx::default()),
+            Enablement::Disabled("This project has no EDITOR_GUIDE.md")
+        );
+        let with_guide = EditorCtx {
+            has_project_guide: true,
+            ..EditorCtx::default()
+        };
+        assert!(guide.enabled(&with_guide).is_enabled());
+        assert_eq!(
+            guide.action,
+            CommandAction::OpenHelp(crate::metaphor::PROJECT_GUIDE_PAGE)
+        );
     }
 
     #[test]

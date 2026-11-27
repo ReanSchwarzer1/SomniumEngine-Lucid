@@ -1121,6 +1121,18 @@ pub fn normalized_from_camera_speed(speed: f32) -> f32 {
     (s / MIN_CAMERA_SPEED).ln() / (MAX_CAMERA_SPEED / MIN_CAMERA_SPEED).ln()
 }
 
+/// The editor camera's vertical field of view in degrees, as the shell projects it; framing maths reads it from here.
+pub const EDITOR_CAMERA_FOV_Y_DEGREES: f32 = 45.0;
+
+/// How far from the middle of a subject the camera stands so that the sphere of `radius` round it fills about two
+/// thirds of the view height at the vertical field of view `fov_y` (radians), and never closer than half a metre
+/// outside the sphere.
+#[must_use]
+pub fn camera_focus_distance(radius: f32, fov_y: f32) -> f32 {
+    let half_height = (fov_y * 0.5).tan().max(1e-3);
+    (radius / (half_height * (2.0 / 3.0))).max(radius + 0.5)
+}
+
 // ─── Phase 15A1: Post-processing volume ─────────────────────────────────────
 
 /// Scene-wide post-processing settings, exposed as a selectable entity.
@@ -3097,6 +3109,19 @@ mod camera_speed_tests {
             assert!(s > prev, "not monotonic at {i}");
             prev = s;
         }
+    }
+
+    #[test]
+    fn a_big_box_is_framed_far_and_a_small_one_close_but_never_inside() {
+        let fov = EDITOR_CAMERA_FOV_Y_DEGREES.to_radians();
+        // A 20 m box: half its diagonal is about 17.3 m; a third of the view height left over around it.
+        let big = camera_focus_distance(17.32, fov);
+        assert!((55.0..70.0).contains(&big), "20 m box framed from {big}");
+        // A 0.3 m box: close, but clear of the surface by at least half a metre.
+        let small = camera_focus_distance(0.26, fov);
+        assert!(small >= 0.26 + 0.5 && small < 1.5, "0.3 m box framed from {small}");
+        // Bigger things are never framed nearer than smaller ones.
+        assert!(big > small);
     }
 }
 

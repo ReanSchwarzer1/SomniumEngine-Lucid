@@ -267,6 +267,18 @@ impl UndoStack {
         true
     }
 
+    /// The name of the step an undo would reverse now, or `None` when there is nothing to undo.
+    #[must_use]
+    pub fn next_undo_name(&self) -> Option<&str> {
+        self.executed.last().map(|command| command.description())
+    }
+
+    /// The name of the step a redo would apply now, or `None` when there is nothing to redo.
+    #[must_use]
+    pub fn next_redo_name(&self) -> Option<&str> {
+        self.redo_stack.last().map(|command| command.description())
+    }
+
     pub fn can_undo(&self) -> bool {
         !self.executed.is_empty()
     }
@@ -2464,6 +2476,37 @@ mod landscape_tests {
         let (names, position) = undo.history();
         assert_eq!(names.len(), 3, "{names:?}");
         assert_eq!(position, 2);
+    }
+
+    /// Undo and redo toast the name of the step they are about to move.
+    #[test]
+    fn the_next_undo_and_redo_names_follow_the_position() {
+        let mut world = World::new();
+        let mut selected = None;
+        let mut undo = UndoStack::new(8);
+        let entity = world.spawn((
+            Transform::default(),
+            Name::new("box"),
+            WorldTransform::identity(),
+        ));
+        assert_eq!(undo.next_undo_name(), None);
+        assert_eq!(undo.next_redo_name(), None);
+
+        undo.push(
+            Box::new(SetNameCmd::new(
+                entity.index(),
+                *world.get::<Name>(entity).unwrap(),
+                Name::new("one"),
+            )),
+            &mut world,
+            &mut selected,
+        );
+        assert_eq!(undo.next_undo_name(), Some("Rename Entity"));
+        assert_eq!(undo.next_redo_name(), None);
+
+        assert!(undo.undo(&mut world, &mut selected));
+        assert_eq!(undo.next_undo_name(), None);
+        assert_eq!(undo.next_redo_name(), Some("Rename Entity"));
     }
 
     /// Clicking a row jumps there, in either direction, and the world follows.

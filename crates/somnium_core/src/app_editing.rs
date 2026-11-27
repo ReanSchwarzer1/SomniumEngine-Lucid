@@ -436,6 +436,16 @@ fn world_bounds(world: &World, renderer: &SomniumRenderer, members: &[Entity]) -
     any.then_some((lo, hi))
 }
 
+/// The smallest radius `F` frames: a pebble is framed close, not from a house's distance.
+const FOCUS_MIN_RADIUS: f32 = 0.25;
+/// What `F` frames when the selection has no size at all (a light, an empty): a point has no extent to fill the view.
+const FOCUS_POINT_RADIUS: f32 = 2.0;
+
+/// The sphere round a world box: its middle, and half its diagonal, no less than `floor`.
+fn focus_sphere(min: glam::Vec3, max: glam::Vec3, floor: f32) -> (glam::Vec3, f32) {
+    ((min + max) * 0.5, ((max - min).length() * 0.5).max(floor))
+}
+
 fn name_of(world: &World, entity: Entity) -> String {
     world
         .get::<Name>(entity)
@@ -1134,22 +1144,29 @@ impl<G: GameApp> Engine<G> {
         let Some(layer) = self.editing.layer.as_ref() else {
             return;
         };
-        let count = layer.entities.len() + layer.painted.len();
+        let (objects, plants) = (layer.entities.len(), layer.painted.len());
         match layer.write(&scene) {
             Ok(()) => {
-                self.scene_dirty = false;
-                self.autosave.saved();
-                crate::autosave::clear(&self.config.content_root);
+                // The edits file is written, but the ground is not: the scene stays unsaved until Save Scene As.
+                let ground_unsaved = self.editing.terrain_touched;
+                if !ground_unsaved {
+                    self.scene_dirty = false;
+                    self.autosave.saved();
+                    crate::autosave::clear(&self.config.content_root);
+                }
                 self.remember_recent_scene(&scene);
                 let file = scene_edits::layer_path(&scene);
                 let file = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let mut message = if count == 0 {
-                    "Saved: no edits to this scene".to_owned()
-                } else {
-                    format!("Saved {count} edited object{} to {file}", if count == 1 { "" } else { "s" })
+                let objects_text = format!("{objects} edited object{}", if objects == 1 { "" } else { "s" });
+                let plants_text = format!("{plants} removed plant{}", if plants == 1 { "" } else { "s" });
+                let mut message = match (objects, plants) {
+                    (0, 0) => "Saved: no edits to this scene".to_owned(),
+                    (_, 0) => format!("Saved {objects_text} to {file}"),
+                    (0, _) => format!("Saved {plants_text} to {file}"),
+                    _ => format!("Saved {objects_text} and {plants_text} to {file}"),
                 };
-                if self.editing.terrain_touched {
-                    message.push_str(" (terrain sculpting and foliage painting are not kept there: File > Save Scene As keeps them)");
+                if ground_unsaved {
+                    message.push_str(". The ground you sculpted or painted is NOT saved by Ctrl+S: use File > Save Scene As to keep it.");
                 }
                 self.toast(&message);
                 if let Some(ui) = self.ui_manager.as_mut() {
@@ -1283,6 +1300,13 @@ impl<G: GameApp> Engine<G> {
             return None;
         }
         hit.map(|(_, entity)| entity)
+    }
+
+    /// [`Self::click_pick`] for a click that builds a selection (Ctrl or Shift held): always the whole object, never
+    /// the part of one that is already selected, so a Ctrl-click on a selected object takes that object out.
+    pub(super) fn click_pick_object(&mut self) -> Option<Entity> {
+        let hit = self.click_pick()?;
+        Some(self.object_of(hit))
     }
 
     /// The painted or ground-cover copy a world ray meets first, before the object hit at `object` and the ground
@@ -2626,6 +2650,36 @@ impl<G: GameApp> Engine<G> {
             .collect()
     }
 
+    /// The centre and radius of the sphere round the selection's real size: the world box of each selected object's
+    /// whole subtree (meshes included, as Drop to Ground measures it), and the origin points for what has no mesh
+    /// (a light, an empty). `None` with nothing selected or no renderer to measure with.
+    pub(super) fn selection_focus(&self) -> Option<(glam::Vec3, f32)> {
+        let renderer = self.renderer.as_ref()?;
+        let children = children_map(&self.world);
+        let mut lo = glam::Vec3::splat(f32::INFINITY);
+        let mut hi = glam::Vec3::splat(f32::NEG_INFINITY);
+        let mut sized = false;
+        for object in self.selected_objects() {
+            let members = subtree(&children, object);
+            let (a, b) = match world_bounds(&self.world, renderer, &members) {
+                Some(bounds) => {
+                    sized = true;
+                    bounds
+                }
+                None => {
+                    let points = designer::designer_focus_points(&self.world, object);
+                    let Some(first) = points.first().copied() else {
+                        continue;
+                    };
+                    points.iter().fold((first, first), |(a, b), point| (a.min(*point), b.max(*point)))
+                }
+            };
+            lo = lo.min(a);
+            hi = hi.max(b);
+        }
+        lo.cmple(hi).all().then(|| focus_sphere(lo, hi, if sized { FOCUS_MIN_RADIUS } else { FOCUS_POINT_RADIUS }))
+    }
+
     // ─── Ground ─────────────────────────────────────────────────────────────
 
     /// Live terrains, their models set for ray casts.
@@ -3668,6 +3722,18 @@ fn decal_slab_distance(world: &World, entity: Entity, origin: glam::Vec3, direct
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_house_and_a_pebble_are_framed_by_their_own_size() {
+        let (centre, house) = focus_sphere(glam::Vec3::new(-10.0, 0.0, -10.0), glam::Vec3::new(10.0, 8.0, 10.0), FOCUS_MIN_RADIUS);
+        assert_eq!(centre, glam::Vec3::new(0.0, 4.0, 0.0));
+        assert!((house - 15.0).abs() < 0.5, "house radius {house}");
+        let (_, pebble) = focus_sphere(glam::Vec3::ZERO, glam::Vec3::splat(0.1), FOCUS_MIN_RADIUS);
+        assert_eq!(pebble, FOCUS_MIN_RADIUS, "a tiny box is floored at a quarter of a metre, not two");
+        let fov = crate::EDITOR_CAMERA_FOV_Y_DEGREES.to_radians();
+        assert!(crate::camera_focus_distance(pebble, fov) < 1.5);
+        assert!(crate::camera_focus_distance(house, fov) > 40.0);
+    }
 
     #[test]
     fn a_painted_copy_taken_out_stays_out_on_its_own_ground_only() {

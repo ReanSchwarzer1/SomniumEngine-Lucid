@@ -60,7 +60,7 @@ use crate::editor::inspector_gen::GeneratedComponentPanel;
 use crate::editor::property_editors::PropertyEditorKind;
 use crate::editor::{
     content::{build_content_drawer, build_create_popup},
-    help::{build_help_overlay, fill_help_body},
+    help::{build_help_overlay, fill_help_body, fill_help_markdown},
     inspector::{build_generated_details, build_inspector},
     shell::build_editor_layout,
 };
@@ -1421,6 +1421,8 @@ pub struct UiManager {
     help_menu_open: bool,
     tooltip_since: Option<(NodeHandle, std::time::Instant)>,
     help_page: u8,
+    /// The open project's folder, for its editor guide. None with no project open.
+    project_root: Option<std::path::PathBuf>,
     /// The tiles that currently exist, in the order they were built.
     content_entries: Vec<(NodeHandle, crate::metaphor::ContentEntry)>,
     /// Every entry the last query returned, whether or not it has a tile.
@@ -2248,6 +2250,7 @@ impl UiManager {
             help_menu_open: false,
             tooltip_since: None,
             help_page: 0,
+            project_root: None,
             content_entries: Vec::new(),
             content_all: Vec::new(),
             content_window: None,
@@ -3566,6 +3569,32 @@ impl UiManager {
             .send(TextMessage::set_text(self.status_text, text.to_string()));
     }
 
+    /// Once the editor is up: tell the person, one time per change of the What's New text, that there is something to
+    /// read. The text's hash is kept in the per-user folder; no file there means a first run, which also tells them.
+    /// Scripted and screenshot runs stay quiet, and so do runs that cannot keep the hash (they would repeat it).
+    pub fn announce_whats_new(&mut self) {
+        if std::env::var_os("SOMNIUM_CAPTURE_UI_PNG").is_some()
+            || std::env::var_os("SOMNIUM_EDITOR_SCRIPT").is_some()
+        {
+            return;
+        }
+        let Some(file) = crate::metaphor::whats_new_seen_path() else {
+            return;
+        };
+        let current = crate::metaphor::whats_new_hash();
+        let stored = std::fs::read(&file)
+            .ok()
+            .and_then(|bytes| crate::metaphor::parse_seen_hash(&bytes));
+        if !crate::metaphor::whats_new_unseen(stored.as_deref(), &current) {
+            return;
+        }
+        if let Err(error) = crate::metaphor::write_seen_hash(&file, &current) {
+            eprintln!("Could not remember that What's New was shown: {error}");
+            return;
+        }
+        self.push_toast("The editor has changed. Help > What's New lists what you can do now.");
+    }
+
     /// Dismiss the oldest sticky toast, reporting whether there was one.
     ///
     /// The boolean matters: `Esc` must fall through to the rest of the chain
@@ -4162,7 +4191,12 @@ impl UiManager {
 
     fn set_help_page(&mut self, page: u8) {
         self.help_page = page;
-        fill_help_body(&mut self.native_ui, self.help_body, self.font_id, page);
+        if page == crate::metaphor::PROJECT_GUIDE_PAGE {
+            let text = crate::metaphor::project_guide_text(self.project_root.as_deref());
+            fill_help_markdown(&mut self.native_ui, self.help_body, self.font_id, &text);
+        } else {
+            fill_help_body(&mut self.native_ui, self.help_body, self.font_id, page);
+        }
         let toc = self.help_toc.clone();
         for (handle, id) in toc {
             self.native_ui
@@ -4758,13 +4792,14 @@ impl UiManager {
         }
 
         // Help pages, so a question is answerable from the same surface.
-        for (i, title) in crate::metaphor::help_titles().iter().enumerate() {
+        let help_titles = crate::metaphor::help_titles();
+        for &i in crate::metaphor::help_order() {
             let key = format!("help:page:{i}");
             items.push(
-                PaletteItem::new(&key, (*title).to_string(), "F1", Cat::Help)
+                PaletteItem::new(&key, help_titles[i as usize].to_string(), "F1", Cat::Help)
                     .with_recency(self.command_history.recency(&key)),
             );
-            targets.insert(key, PaletteTarget::Help(i as u8));
+            targets.insert(key, PaletteTarget::Help(i));
         }
 
         // Panels, so the palette can also be used to reach a surface.
@@ -5800,8 +5835,14 @@ impl UiManager {
         true
     }
 
+    /// Tell the editor which folder the open project lives in, so Help can offer the project's own guide.
+    pub fn set_project_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.project_root = root;
+    }
+
     fn command_context(&self) -> crate::commands::EditorCtx {
         crate::commands::EditorCtx {
+            has_project_guide: crate::metaphor::project_guide_path(self.project_root.as_deref()).is_some(),
             has_selection: self
                 .last_outliner_state
                 .as_ref()
@@ -11247,12 +11288,13 @@ mod dpi_tests {
     }
 }
 
-/// What "Save" in "Save changes?" sends: the save, then the action that asked. Quitting saves inside the quit, so a
-/// save that fails or is cancelled keeps the editor open.
+/// What "Save" in "Save changes?" sends: the save, then the action that asked. Quitting saves inside the quit and
+/// any other action is wrapped, so a save that fails or is cancelled keeps the editor and the scene open.
 fn events_after_save(action: Option<EditorEvent>) -> Vec<EditorEvent> {
     match action {
         Some(EditorEvent::Quit { .. }) => vec![EditorEvent::Quit { after_save: true }],
-        action => std::iter::once(EditorEvent::SaveScene).chain(action).collect(),
+        Some(action) => vec![EditorEvent::AfterSave(Box::new(action))],
+        None => vec![EditorEvent::SaveScene],
     }
 }
 
@@ -11267,9 +11309,12 @@ mod unsaved_prompt_tests {
     }
 
     #[test]
-    fn save_then_new_still_saves_then_runs_the_action() {
+    fn save_then_new_runs_the_action_only_after_a_save_that_held() {
         let events = events_after_save(Some(EditorEvent::NewScene));
-        assert!(matches!(events.as_slice(), [EditorEvent::SaveScene, EditorEvent::NewScene]));
+        assert!(matches!(
+            events.as_slice(),
+            [EditorEvent::AfterSave(action)] if matches!(**action, EditorEvent::NewScene)
+        ));
         assert!(matches!(events_after_save(None).as_slice(), [EditorEvent::SaveScene]));
     }
 }
