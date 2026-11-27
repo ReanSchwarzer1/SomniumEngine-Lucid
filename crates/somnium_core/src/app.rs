@@ -4878,8 +4878,17 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                     if band.is_dragged() {
                         self.apply_marquee(band);
                     } else {
-                        let hit = self.click_pick();
-                        self.selection.set_single(hit);
+                        // Ctrl toggles the clicked object in the selection and
+                        // Shift adds it, the way the Outliner's rows do; either
+                        // on empty space keeps what is selected.
+                        let toggle = self.shortcut_modifiers.command();
+                        let add = self.shortcut_modifiers.shift;
+                        let hit = if toggle || add {
+                            self.click_pick_object()
+                        } else {
+                            self.click_pick()
+                        };
+                        self.selection.click(hit, toggle, add);
                         self.after_selection_change();
                         self.reveal_selection_in_outliner(true);
                     }

@@ -1250,6 +1250,13 @@ impl<G: GameApp> Engine<G> {
         hit.map(|(_, entity)| entity)
     }
 
+    /// [`Self::click_pick`] for a click that builds a selection (Ctrl or Shift held): always the whole object, never
+    /// the part of one that is already selected, so a Ctrl-click on a selected object takes that object out.
+    pub(super) fn click_pick_object(&mut self) -> Option<Entity> {
+        let hit = self.click_pick()?;
+        Some(self.object_of(hit))
+    }
+
     /// The painted or ground-cover copy a world ray meets first, before the object hit at `object` and the ground
     /// (a copy behind a hill is not under the cursor). At most one of the two.
     fn pick_copies(&mut self, origin: glam::Vec3, direction: glam::Vec3, object: Option<f32>) -> (Option<PaintedPick>, Option<CoverPick>) {
