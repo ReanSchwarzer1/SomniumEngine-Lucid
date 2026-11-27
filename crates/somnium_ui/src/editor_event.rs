@@ -580,6 +580,9 @@ pub enum EditorEvent {
         /// Save before quitting.
         after_save: bool,
     },
+    /// The answer "Save" to "Save changes?" before New Scene or Open Scene: save, then run the action, but only when
+    /// the scene is saved afterwards (a save that fails, is refused or is cancelled keeps the scene open).
+    AfterSave(Box<EditorEvent>),
 
     // ── Phase 16-D: scripting ───────────────────────────────────────────
     /// Attach the `.luau` file at this path to the selected entity.

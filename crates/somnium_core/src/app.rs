@@ -8158,10 +8158,12 @@ impl<G: GameApp> Engine<G> {
         let Some(stroke) = self.terrain_stroke.take() else {
             return false;
         };
-        self.note_terrain_edit();
         let Some(region) = stroke.region else {
             return true;
         };
+        // The stroke changed the ground: the scene has unsaved work, and Ctrl+S cannot keep the ground.
+        self.note_terrain_edit();
+        self.scene_dirty = true;
         let Some(renderer) = self.renderer.as_ref() else {
             return true;
         };
@@ -13530,6 +13532,15 @@ impl<G: GameApp> Engine<G> {
 
             EditorEvent::CloseWindow => {
                 self.ui_wants_exit = true;
+            }
+
+            EditorEvent::AfterSave(action) => {
+                self.save_scene_edits();
+                if self.scene_dirty {
+                    self.toast("Not saved, so the scene stays open.");
+                    return;
+                }
+                self.handle_editor_event(*action);
             }
 
             EditorEvent::Quit { after_save } => {
