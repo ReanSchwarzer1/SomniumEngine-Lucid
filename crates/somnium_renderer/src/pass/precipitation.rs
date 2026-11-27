@@ -20,6 +20,9 @@ pub enum Falling {
     Snow,
     /// A fast white stone.
     Hail,
+    /// Grains on a dry wind: soft pale motes driven near level, lit like snow and tinted by the soil
+    /// (sunscar-particles, 27 Nov 2026).
+    Dust,
 }
 
 /// The field of drops round the eye.
@@ -350,6 +353,7 @@ impl PrecipitationPass {
                     Falling::Rain => 0.0,
                     Falling::Snow => 1.0,
                     Falling::Hail => 2.0,
+                    Falling::Dust => 3.0,
                 },
                 sun_light: sun_light.to_array(),
                 size: s.size.max(1e-4),
