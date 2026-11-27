@@ -11533,8 +11533,9 @@ impl<G: GameApp> Engine<G> {
                 if self.selection.is_empty() {
                     return;
                 }
+                // Recorded with each root's parent, so a paste lands beside the original.
                 self.entity_clipboard =
-                    crate::clipboard::EntityClipboard::copy(&self.world, self.selection.as_slice());
+                    crate::clipboard::EntityClipboard::duplicate(&self.world, self.selection.as_slice());
                 let count = self.entity_clipboard.root_count();
                 if let Some(ui) = self.ui_manager.as_mut() {
                     ui.push_toast(&format!("Copied {count}"));
@@ -11545,19 +11546,29 @@ impl<G: GameApp> Engine<G> {
                 if self.entity_clipboard.is_empty() {
                     return;
                 }
-                // Pasting with something selected pastes *into* it, which is
-                // what makes Copy/Paste usable for building a hierarchy rather
-                // than only for cloning one.
-                let parent = self.selection.primary;
+                // Not into whatever happens to be selected: each copy goes
+                // under the parent its original had (the scene root when that
+                // is gone), where the original stood, and becomes the selection.
                 use crate::editor_commands::EditorCommand as _;
                 let mut command =
-                    crate::clipboard::PasteEntitiesCmd::new(self.entity_clipboard.clone(), parent);
+                    crate::clipboard::PasteEntitiesCmd::new(self.entity_clipboard.clone(), None);
                 command.execute(&mut self.world, &mut self.selection.primary);
                 let roots = command.roots().to_vec();
                 self.undo_stack.push_silent(Box::new(command));
+                let message = match roots.as_slice() {
+                    [only] => {
+                        let name = self
+                            .world
+                            .get::<Name>(*only)
+                            .map_or_else(|| "object".to_owned(), |name| name.as_str().to_owned());
+                        format!("Pasted {name}.")
+                    }
+                    many => format!("Pasted {} objects.", many.len()),
+                };
                 self.selection.set_many(roots);
                 self.after_selection_change();
                 self.scene_dirty = true;
+                self.toast(&message);
             }
 
             EditorEvent::ToggleEntityFlag {
