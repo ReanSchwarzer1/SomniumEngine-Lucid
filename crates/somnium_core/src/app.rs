@@ -4457,6 +4457,10 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 }
                 if let Some(ui) = self.ui_manager.as_mut() {
                     ui.finish_splash();
+                    if !self.config.player_mode {
+                        // Once per change of the What's New text: one toast saying where to read it.
+                        ui.announce_whats_new();
+                    }
                 }
             }
             Err(err) => {

@@ -3547,6 +3547,32 @@ impl UiManager {
             .send(TextMessage::set_text(self.status_text, text.to_string()));
     }
 
+    /// Once the editor is up: tell the person, one time per change of the What's New text, that there is something to
+    /// read. The text's hash is kept in the per-user folder; no file there means a first run, which also tells them.
+    /// Scripted and screenshot runs stay quiet, and so do runs that cannot keep the hash (they would repeat it).
+    pub fn announce_whats_new(&mut self) {
+        if std::env::var_os("SOMNIUM_CAPTURE_UI_PNG").is_some()
+            || std::env::var_os("SOMNIUM_EDITOR_SCRIPT").is_some()
+        {
+            return;
+        }
+        let Some(file) = crate::metaphor::whats_new_seen_path() else {
+            return;
+        };
+        let current = crate::metaphor::whats_new_hash();
+        let stored = std::fs::read(&file)
+            .ok()
+            .and_then(|bytes| crate::metaphor::parse_seen_hash(&bytes));
+        if !crate::metaphor::whats_new_unseen(stored.as_deref(), &current) {
+            return;
+        }
+        if let Err(error) = crate::metaphor::write_seen_hash(&file, &current) {
+            eprintln!("Could not remember that What's New was shown: {error}");
+            return;
+        }
+        self.push_toast("The editor has changed. Help > What's New lists what you can do now.");
+    }
+
     /// Dismiss the oldest sticky toast, reporting whether there was one.
     ///
     /// The boolean matters: `Esc` must fall through to the rest of the chain
@@ -4739,13 +4765,14 @@ impl UiManager {
         }
 
         // Help pages, so a question is answerable from the same surface.
-        for (i, title) in crate::metaphor::help_titles().iter().enumerate() {
+        let help_titles = crate::metaphor::help_titles();
+        for &i in crate::metaphor::help_order() {
             let key = format!("help:page:{i}");
             items.push(
-                PaletteItem::new(&key, (*title).to_string(), "F1", Cat::Help)
+                PaletteItem::new(&key, help_titles[i as usize].to_string(), "F1", Cat::Help)
                     .with_recency(self.command_history.recency(&key)),
             );
-            targets.insert(key, PaletteTarget::Help(i as u8));
+            targets.insert(key, PaletteTarget::Help(i));
         }
 
         // Panels, so the palette can also be used to reach a surface.

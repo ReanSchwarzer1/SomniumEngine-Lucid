@@ -1491,6 +1491,16 @@ fn declarations() -> Vec<Command> {
             always
         ),
         command!(
+            "editor.help.whats_new",
+            "What's New",
+            "Help",
+            None,
+            "List what you can do in the editor now that you could not before.",
+            A::OpenHelp(crate::metaphor::WHATS_NEW_PAGE),
+            HELP,
+            always
+        ),
+        command!(
             "editor.help.index",
             "Help Overlay",
             "Help",
@@ -2588,6 +2598,7 @@ pub fn icon_for(id: &str) -> crate::icons::IconId {
         "editor.viewport.layout.split_horizontal" => I::PanelBottom,
         "editor.viewport.layout.quad" => I::GridView,
         "editor.search.commands" => I::Search,
+        "editor.help.whats_new" => I::Docs,
         "editor.help.index" => I::HelpCircle,
         "editor.help.shortcuts" => I::Keyboard,
         "editor.help.about" => I::Info,

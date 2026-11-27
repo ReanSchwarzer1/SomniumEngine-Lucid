@@ -15,9 +15,14 @@ pub const HELP_LIGHTING: &str = include_str!("../../../docs/editor/lighting.md")
 pub const HELP_MORROWIND: &str = include_str!("../../../docs/editor/morrowind.md");
 pub const HELP_SCRIPTING: &str = include_str!("../../../docs/editor/scripting.md");
 pub const HELP_STORY: &str = include_str!("../../../docs/editor/story.md");
+pub const HELP_WHATS_NEW: &str = include_str!("../../../docs/editor/whats_new.md");
+
+/// The id of the What's New page. Ids are stable; `help_order` says where each one sits in the list.
+pub const WHATS_NEW_PAGE: u8 = 12;
 
 pub fn help_page(id: u8) -> &'static str {
     match id {
+        12 => HELP_WHATS_NEW,
         1 => HELP_VIEWPORT,
         2 => HELP_SHORTCUTS,
         3 => HELP_DRAWER,
@@ -47,7 +52,60 @@ pub fn help_titles() -> &'static [&'static str] {
         "Scripting",
         "Designer Tools",
         "Story",
+        "What's New",
     ]
+}
+
+/// The page ids in the order the overlay lists them: What's New first, then the rest as before.
+pub fn help_order() -> &'static [u8] {
+    &[WHATS_NEW_PAGE, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+}
+
+/// FNV-1a, 64 bit, over the text with line ends normalised, so the same words give the same number on every
+/// machine and every checkout.
+pub fn text_hash(text: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in text.bytes().filter(|byte| *byte != b'\r') {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// The hash of the compiled-in What's New page, as it is stored.
+pub fn whats_new_hash() -> String {
+    format!("{:016x}", text_hash(HELP_WHATS_NEW))
+}
+
+/// Whether the person has not yet been told about this text. No stored value, or a different one, means not yet.
+pub fn whats_new_unseen(stored: Option<&str>, current: &str) -> bool {
+    stored != Some(current)
+}
+
+/// The hash held in a `whats_new_seen.json`, if the file reads.
+pub fn parse_seen_hash(bytes: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    value.get("hash")?.as_str().map(str::to_owned)
+}
+
+/// The text of a `whats_new_seen.json` that holds this hash.
+pub fn seen_hash_file(hash: &str) -> String {
+    serde_json::json!({ "hash": hash }).to_string()
+}
+
+/// Where the seen hash lives: the editor's per-user folder.
+pub fn whats_new_seen_path() -> Option<PathBuf> {
+    std::env::var_os("APPDATA").map(|p| PathBuf::from(p).join("SomniumEngine/whats_new_seen.json"))
+}
+
+/// Write beside the file and rename over it, so a crash never leaves half a file.
+pub fn write_seen_hash(file: &Path, hash: &str) -> std::io::Result<()> {
+    if let Some(folder) = file.parent() {
+        std::fs::create_dir_all(folder)?;
+    }
+    let partial = file.with_extension("json.partial");
+    std::fs::write(&partial, seen_hash_file(hash))?;
+    std::fs::rename(&partial, file)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -317,7 +375,9 @@ mod tests {
     fn help_pages_are_nonempty() {
         assert!(HELP_WELCOME.contains("Somnium"));
         assert!(HELP_SHORTCUTS.contains("Ctrl+Space"));
-        assert_eq!(help_titles().len(), 12);
+        assert_eq!(help_titles().len(), 13);
+        assert_eq!(help_page(WHATS_NEW_PAGE), HELP_WHATS_NEW);
+        assert_eq!(help_titles()[WHATS_NEW_PAGE as usize], "What's New");
         assert_eq!(help_page(11), HELP_STORY);
         assert!(HELP_STORY.contains("Game View") && HELP_STORY.contains("game metres"));
         assert_eq!(help_page(10), HELP_MORROWIND);
@@ -352,6 +412,55 @@ mod tests {
                 HelpBlock::Bullet("item".into()),
             ]
         );
+    }
+
+    #[test]
+    fn whats_new_is_the_first_page_and_reads_as_blocks() {
+        let order = help_order();
+        assert_eq!(order.len(), help_titles().len());
+        assert_eq!(order[0], WHATS_NEW_PAGE);
+        let mut sorted = order.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..help_titles().len() as u8).collect::<Vec<_>>());
+        let blocks = help_blocks(WHATS_NEW_PAGE);
+        assert_eq!(blocks[0], HelpBlock::Heading("What's new in the editor".into()));
+        assert!(blocks.iter().any(|block| matches!(block, HelpBlock::Bullet(_))));
+        assert!(!HELP_WHATS_NEW.contains('!'), "no exclamation marks");
+    }
+
+    #[test]
+    fn the_text_hash_is_stable_and_ignores_line_ends() {
+        // FNV-1a 64 of the empty text and of "a" are published values.
+        assert_eq!(text_hash(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(text_hash("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(text_hash("one\r\ntwo\r\n"), text_hash("one\ntwo\n"));
+        assert_ne!(text_hash("one"), text_hash("two"));
+        assert_eq!(whats_new_hash().len(), 16);
+        assert_eq!(whats_new_hash(), format!("{:016x}", text_hash(HELP_WHATS_NEW)));
+    }
+
+    #[test]
+    fn the_notice_shows_on_first_run_and_after_a_change_only() {
+        let now = whats_new_hash();
+        assert!(whats_new_unseen(None, &now), "no stored file is a first run");
+        assert!(whats_new_unseen(Some("0000000000000000"), &now));
+        assert!(!whats_new_unseen(Some(&now), &now));
+    }
+
+    #[test]
+    fn the_seen_file_round_trips_and_a_bad_one_reads_as_unseen() {
+        let hash = whats_new_hash();
+        assert_eq!(parse_seen_hash(seen_hash_file(&hash).as_bytes()), Some(hash.clone()));
+        assert_eq!(parse_seen_hash(b"not json"), None);
+        assert_eq!(parse_seen_hash(b"{}"), None);
+        let folder = std::env::temp_dir().join(format!("somnium_whats_new_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&folder);
+        let file = folder.join("nested").join("whats_new_seen.json");
+        write_seen_hash(&file, "aaaa").unwrap();
+        write_seen_hash(&file, &hash).unwrap();
+        assert_eq!(parse_seen_hash(&fs::read(&file).unwrap()), Some(hash));
+        assert!(!file.with_extension("json.partial").exists());
+        let _ = fs::remove_dir_all(&folder);
     }
 
     #[test]

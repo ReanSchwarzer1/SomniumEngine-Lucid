@@ -235,7 +235,9 @@ pub(crate) fn build_help_overlay(
             .build();
     let toc_stack_h = ui.add_node(toc_stack, toc_border_h);
     let mut help_toc = Vec::new();
-    for (i, title) in crate::metaphor::help_titles().iter().enumerate() {
+    let titles = crate::metaphor::help_titles();
+    for &i in crate::metaphor::help_order() {
+        let title = &titles[i as usize];
         let btn = ButtonBuilder::new(
             WidgetBuilder::new()
                 .with_height(28.0)
@@ -251,7 +253,7 @@ pub(crate) fn build_help_overlay(
             .with_color(theme::active().semantic.text.primary.bytes())
             .build();
         ui.add_node(lbl, bh);
-        help_toc.push((bh, i as u8));
+        help_toc.push((bh, i));
     }
 
     let scroll = ScrollViewerBuilder::new(
