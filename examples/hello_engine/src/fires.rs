@@ -217,14 +217,16 @@ fn burn(
             max_particles: 110,
             spawn_rate: 170.0,
             lifetime: 0.55,
-            initial_speed: 0.25,
-            spread_angle: 0.3,
+            // Thrown wider and fluttering harder, so the licks lean, cross and tear instead of standing in an even
+            // combed crown (the 13 Nov fault, still in p24).
+            initial_speed: 0.4,
+            spread_angle: 0.55,
             gravity: -1.6,
             size_start: lick,
-            size_end: lick * 0.25,
+            size_end: lick * 0.2,
             aspect: 1.7,
-            flutter: 0.2,
-            flutter_hz: 6.5,
+            flutter: 0.38,
+            flutter_hz: 5.0,
             tip_tint: Vec3::new(1.0, 0.3, 0.06),
             spawn_extents: [radius * 0.7, 0.0, radius * 0.7],
             color_over_life: ramp(&[
