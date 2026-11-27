@@ -9711,6 +9711,11 @@ impl UiManager {
                         ));
                     }
                     self.close_all_menus();
+                    // A click on a disabled row used to do nothing at all: say why, as the palette does.
+                    if let Some(message) = crate::commands::disabled_message(id, &self.command_context()) {
+                        self.push_toast(&message);
+                        continue;
+                    }
                     self.run_command_id(id);
                     continue;
                 }
