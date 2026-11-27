@@ -294,6 +294,8 @@ impl<G: GameApp> Engine<G> {
             return;
         }
         if self.ui_manager.as_ref().is_some_and(somnium_ui::UiManager::viewport_camera_active) {
+            // The camera is being flown: the thing waits, and is placed afresh when the button is let go.
+            carry.seen = None;
             self.editing.carry = Some(carry);
             return;
         }
@@ -303,8 +305,13 @@ impl<G: GameApp> Engine<G> {
 
     /// Put the carried things where the cursor says, unless nothing changed since the last time (or `force`).
     fn place_carry(&mut self, carry: &mut CarryState, force: bool) {
+        // Over a panel the pointer is the panel's: the thing waits where it is.
+        if !self.carry_pointer_in_view() {
+            return;
+        }
         let tilt = self.shortcut_modifiers.shift;
-        let ctrl = self.ui_manager.as_ref().is_some_and(somnium_ui::UiManager::command_modifier_held);
+        let ctrl = self.shortcut_modifiers.command()
+            || self.ui_manager.as_ref().is_some_and(somnium_ui::UiManager::command_modifier_held);
         let key = (self.cursor_pos, tilt, ctrl, carry.turns);
         if !force && carry.seen == Some(key) {
             return;
@@ -572,12 +579,23 @@ impl<G: GameApp> Engine<G> {
         }
         match event {
             WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                // A click on a panel, a menu or the toolbar is theirs, and the thing stays in hand.
+                if !self.carry_pointer_in_view() {
+                    return false;
+                }
                 self.put_down_carry();
                 true
             }
-            WindowEvent::MouseWheel { delta, .. } => self.carry_wheel(*delta),
+            WindowEvent::MouseWheel { delta, .. } => self.carry_pointer_in_view() && self.carry_wheel(*delta),
             _ => false,
         }
+    }
+
+    /// The pointer is over the 3D view itself, not a panel or a control floating on it (a script's pointer always is:
+    /// it is given in the window's own fractions).
+    fn carry_pointer_in_view(&self) -> bool {
+        self.editing.script_pointer
+            || self.ui_manager.as_ref().is_none_or(somnium_ui::UiManager::pointer_over_viewport)
     }
 
     /// Turn the carried things by whole notches of the wheel. False while the camera has the wheel.
@@ -626,6 +644,22 @@ mod tests {
         // +X turned a quarter about up is -Z.
         assert!(turned.abs_diff_eq(lead + glam::Vec2::new(0.0, -2.0), 1e-5));
         assert!((turned.distance(lead) - 2.0).abs() < 1e-5, "the crate left its distance from the stall");
+    }
+
+    /// A script names keys the way the guide writes them, and points in fractions of the window.
+    #[test]
+    fn a_script_names_its_keys_and_points() {
+        use winit::keyboard::KeyCode as K;
+        assert_eq!(script_key("g"), Some(K::KeyG));
+        assert_eq!(script_key("Esc"), Some(K::Escape));
+        assert_eq!(script_key(" enter "), Some(K::Enter));
+        assert_eq!(script_key("f2"), Some(K::F2));
+        assert_eq!(script_key("gg"), None);
+        assert_eq!(script_point("0.5, 0.25"), Some((0.5, 0.25)));
+        assert_eq!(script_point("0.5"), None);
+        assert_eq!(script_modifiers("ctrl+shift").map(|m| (m.ctrl, m.shift, m.alt)), Some((true, true, false)));
+        assert_eq!(script_modifiers("none").map(|m| (m.ctrl, m.shift, m.alt)), Some((false, false, false)));
+        assert!(script_modifiers("hyper").is_none());
     }
 
     /// One notch is the bar's snap angle, or 15 degrees when it is off; a touchpad's pixels add up to notches.

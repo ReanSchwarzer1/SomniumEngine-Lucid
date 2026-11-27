@@ -4921,19 +4921,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                     if band.is_dragged() {
                         self.apply_marquee(band);
                     } else {
-                        // Ctrl toggles the clicked object in the selection and
-                        // Shift adds it, the way the Outliner's rows do; either
-                        // on empty space keeps what is selected.
-                        let toggle = self.shortcut_modifiers.command();
-                        let add = self.shortcut_modifiers.shift;
-                        let hit = if toggle || add {
-                            self.click_pick_object()
-                        } else {
-                            self.click_pick()
-                        };
-                        self.selection.click(hit, toggle, add);
-                        self.after_selection_change();
-                        self.reveal_selection_in_outliner(true);
+                        self.viewport_click();
                     }
                     gizmo_consumed = true;
                 }
@@ -11280,6 +11268,18 @@ impl<G: GameApp> Engine<G> {
         // a scene change; Undo and Redo only put it back.
         if self.carrying() {
             use somnium_ui::editor_event::LevelTool as L;
+            // Saving, Play and closing take what is seen: the thing is put down first, as its one undo step.
+            if matches!(
+                ev,
+                EditorEvent::SaveScene
+                    | EditorEvent::SaveSceneAs
+                    | EditorEvent::AfterSave(_)
+                    | EditorEvent::Play
+                    | EditorEvent::CloseWindow
+                    | EditorEvent::Quit { .. }
+            ) {
+                self.put_down_carry();
+            }
             let ends = matches!(
                 ev,
                 EditorEvent::SetGizmoMode(_)

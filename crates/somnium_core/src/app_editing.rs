@@ -17,6 +17,62 @@ use std::sync::Arc;
 #[path = "app_carry.rs"]
 mod carry;
 
+/// `x,y` in an editor script step: fractions of the window.
+fn script_point(at: &str) -> Option<(f32, f32)> {
+    let (x, y) = at.split_once(',')?;
+    Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+}
+
+/// The modifiers an editor script's `mods=` step names: `ctrl`, `shift`, `alt` joined by `+`, or `none`.
+fn script_modifiers(held: &str) -> Option<somnium_ui::message::Modifiers> {
+    let mut modifiers = somnium_ui::message::Modifiers::default();
+    for word in held.split('+').map(str::trim).filter(|word| !word.is_empty() && *word != "none") {
+        match word {
+            "ctrl" => modifiers.ctrl = true,
+            "shift" => modifiers.shift = true,
+            "alt" => modifiers.alt = true,
+            _ => return None,
+        }
+    }
+    Some(modifiers)
+}
+
+/// A key by its name in an editor script: one character (`g`, `5`), or `esc`, `enter`, `delete`, `end`, `home`,
+/// `tab`, `space`, `f1` to `f12`.
+fn script_key(name: &str) -> Option<winit::keyboard::KeyCode> {
+    use winit::keyboard::KeyCode as K;
+    let name = name.trim().to_ascii_lowercase();
+    Some(match name.as_str() {
+        "esc" | "escape" => K::Escape,
+        "enter" => K::Enter,
+        "delete" | "del" => K::Delete,
+        "end" => K::End,
+        "home" => K::Home,
+        "tab" => K::Tab,
+        "space" => K::Space,
+        "f1" => K::F1,
+        "f2" => K::F2,
+        "f3" => K::F3,
+        "f4" => K::F4,
+        "f5" => K::F5,
+        "f6" => K::F6,
+        "f7" => K::F7,
+        "f8" => K::F8,
+        "f9" => K::F9,
+        "f10" => K::F10,
+        "f11" => K::F11,
+        "f12" => K::F12,
+        _ => {
+            let mut chars = name.chars();
+            let c = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            return super::key_code_for_char(c);
+        }
+    })
+}
+
 /// A click picks the part, not the object, when the object has more parts than this.
 const CONTAINER_PARTS: usize = 400;
 /// Find Floating Objects looks this far round the camera.
@@ -249,6 +305,8 @@ pub(crate) struct EditingState {
     place_drop: Option<PlaceDrop>,
     /// The editor script pressed the gizmo last frame: it lets go this frame.
     script_release: bool,
+    /// A script step has put the pointer somewhere in the window (`mouse=`, `click=`): it counts as over the 3D view.
+    script_pointer: bool,
     /// What the last scene load did with its layer, for one toast.
     summary: Option<String>,
     /// Terrain was sculpted or painted, which the layer does not hold.
@@ -1309,6 +1367,17 @@ impl<G: GameApp> Engine<G> {
 
     /// [`Self::click_pick`] for a click that builds a selection (Ctrl or Shift held): always the whole object, never
     /// the part of one that is already selected, so a Ctrl-click on a selected object takes that object out.
+    /// A plain click in the 3D view, where the pointer is: Ctrl toggles the clicked object in the selection and Shift
+    /// adds it, the way the Outliner's rows do; either on empty space keeps what is selected.
+    pub(super) fn viewport_click(&mut self) {
+        let toggle = self.shortcut_modifiers.command();
+        let add = self.shortcut_modifiers.shift;
+        let hit = if toggle || add { self.click_pick_object() } else { self.click_pick() };
+        self.selection.click(hit, toggle, add);
+        self.after_selection_change();
+        self.reveal_selection_in_outliner(true);
+    }
+
     pub(super) fn click_pick_object(&mut self) -> Option<Entity> {
         let hit = self.click_pick()?;
         Some(self.object_of(hit))
@@ -3196,15 +3265,29 @@ impl<G: GameApp> Engine<G> {
     /// `gpu_error`, `panic` (a crash on the main thread), `native_crash` (an access violation),
     /// `eye=<x>,<z>,<yaw>,<pitch>` (the editor camera 1.7 m over the loaded ground at scene x, z), and `hour=<h>` (the
     /// scene's Time of Day set to that hour: the editor's clock stands still, so one launch can shoot a day), and
-    /// `type=<text>` (typed into the box with the keyboard focus, all in one frame).
+    /// `type=<text>` (typed into the box with the keyboard focus, all in one frame). The pointer and the keys:
+    /// `mouse=<x>,<y>` (the pointer there, no button), `click=<x>,<y>` (a left click there), `mods=ctrl+shift|none`
+    /// (modifiers held from then on), `key=<name>` (`g`, `esc`, `enter`, `delete`, `end`, `f2`: the command bound to
+    /// it), `wheel=<notches>`. Pictures: `shot=<png>` (the scene alone) and `shotui=<png>` (the whole editor window),
+    /// any number in a run once the run's own capture has been written. `quit` closes without asking to save. A step
+    /// that is not `<frame>:<action>` is named in the log and left out.
     pub(super) fn run_editor_script(&mut self) {
         static SCRIPT: std::sync::LazyLock<Vec<(u64, String)>> = std::sync::LazyLock::new(|| {
             std::env::var("SOMNIUM_EDITOR_SCRIPT")
                 .unwrap_or_default()
                 .split(';')
                 .filter_map(|step| {
-                    let (frame, action) = step.trim().split_once(':')?;
-                    Some((frame.trim().parse().ok()?, action.trim().to_owned()))
+                    let step = step.trim();
+                    if step.is_empty() {
+                        return None;
+                    }
+                    let parsed = step
+                        .split_once(':')
+                        .and_then(|(frame, action)| Some((frame.trim().parse().ok()?, action.trim().to_owned())));
+                    if parsed.is_none() {
+                        warn!(step, "editor script: a step is not <frame>:<action> and was left out");
+                    }
+                    parsed
                 })
                 .collect()
         });
@@ -3410,6 +3493,76 @@ impl<G: GameApp> Engine<G> {
                         }));
                     }
                 }
+                // The pointer at that fraction of the window, no button pressed: what a carry (Move on the Ground)
+                // follows. A script's pointer counts as over the 3D view.
+                Some(("mouse", at)) => {
+                    let Some((x, y)) = script_point(at) else {
+                        warn!(action = %action, "editor script: mouse wants x,y fractions");
+                        continue;
+                    };
+                    let (width, height) = self.viewport_size();
+                    self.cursor_pos = (x * width, y * height);
+                    self.editing.script_pointer = true;
+                }
+                // A left click at that fraction of the window, with the modifiers a `mods=` step holds: it puts a
+                // carry down, and otherwise selects as a click in the view does (Ctrl toggles, Shift adds).
+                Some(("click", at)) => {
+                    let Some((x, y)) = script_point(at) else {
+                        warn!(action = %action, "editor script: click wants x,y fractions");
+                        continue;
+                    };
+                    let (width, height) = self.viewport_size();
+                    self.cursor_pos = (x * width, y * height);
+                    self.editing.script_pointer = true;
+                    if self.carrying() {
+                        self.put_down_carry();
+                    } else {
+                        self.viewport_click();
+                    }
+                    let primary = self.selection.primary.map_or_else(|| "nothing".to_owned(), |e| name_of(&self.world, e));
+                    info!(selected = self.selection.len(), primary = %primary, "editor script: clicked");
+                }
+                // The modifier keys held from here on: `mods=ctrl`, `mods=shift`, `mods=ctrl+shift`, `mods=none`.
+                Some(("mods", held)) => match script_modifiers(held) {
+                    Some(modifiers) => self.shortcut_modifiers = modifiers,
+                    None => warn!(action = %action, "editor script: mods wants ctrl, shift, alt (joined by +) or none"),
+                },
+                // A key press with the held modifiers. Esc and Enter go to a carry in hand first; any other key runs
+                // the command bound to it now (Preferences > Keyboard), as a press in the view does.
+                Some(("key", name)) => {
+                    let Some(code) = script_key(name) else {
+                        warn!(name, "editor script: no such key");
+                        continue;
+                    };
+                    if self.carry_key(code) {
+                        continue;
+                    }
+                    let held = self.shortcut_modifiers;
+                    let ran = self
+                        .ui_manager
+                        .as_mut()
+                        .is_some_and(|ui| ui.run_key_command(code, held.command(), held.shift, held.alt));
+                    if !ran {
+                        warn!(name, "editor script: no enabled command is bound to that key");
+                    }
+                }
+                // Wheel notches (away from you is positive): turns what a carry holds.
+                Some(("wheel", notches)) => match notches.trim().parse::<f32>() {
+                    Ok(n) if self.carry_wheel(winit::event::MouseScrollDelta::LineDelta(0.0, n)) => {}
+                    Ok(_) => warn!(action = %action, "editor script: nothing in hand takes the wheel"),
+                    Err(_) => warn!(action = %action, "editor script: wheel wants a number of notches"),
+                },
+                // A picture of the whole editor window at this frame (panels, toasts and menus with it), so one launch
+                // can take several. Refused while the run's own capture is still waiting for its frame.
+                Some(("shotui", path)) => {
+                    if let Some(renderer) = self.renderer.as_mut()
+                        && let Err(error) = renderer.request_authoring_capture(std::path::Path::new(path), true)
+                    {
+                        warn!(path, %error, "editor script: shotui not taken");
+                    }
+                }
+                // Close without the "Save changes?" question: the end of a scripted run that edited the scene.
+                None if action == "quit" => self.handle_editor_event(EditorEvent::Quit { after_save: false }),
                 _ => warn!(action = %action, "editor script: unknown step"),
             }
         }

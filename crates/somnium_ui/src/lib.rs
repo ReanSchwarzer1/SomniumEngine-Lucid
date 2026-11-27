@@ -3601,15 +3601,14 @@ impl UiManager {
             .send(TextMessage::set_text(self.status_text, text.to_string()));
     }
 
-    /// Run the command a press of `code` runs through the remappable bindings, with the modifiers held now, under the
-    /// same guards as a real press (a text box with the focus, the game owning the keyboard). The editor script's
-    /// `key=` step. False when no enabled command takes the key.
-    pub fn run_key_command(&mut self, code: winit::keyboard::KeyCode) -> bool {
+    /// Run the command a press of `code` with these modifiers runs through the remappable bindings, under the same
+    /// guards as a real press (a text box with the focus, the game owning the keyboard). The editor script's `key=`
+    /// step. False when no enabled command takes the key.
+    pub fn run_key_command(&mut self, code: winit::keyboard::KeyCode, command: bool, shift: bool, alt: bool) -> bool {
         if self.native_ui.has_text_focus() {
             return false;
         }
-        let modifiers = self.native_ui.modifiers();
-        let Some(chord) = crate::commands::Chord::from_winit(code, modifiers.command(), modifiers.shift, modifiers.alt, false)
+        let Some(chord) = crate::commands::Chord::from_winit(code, command, shift, alt, false)
             .filter(|chord| !self.game_owns_keyboard() || chord.has_modifier())
         else {
             return false;
