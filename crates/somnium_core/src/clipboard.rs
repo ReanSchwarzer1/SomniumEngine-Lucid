@@ -8,7 +8,7 @@
 //! destination one.
 
 use crate::editor_commands::{EditorCommand, EntitySnapshot};
-use crate::{Children, Parent};
+use crate::{Children, Parent, Transform};
 use somnium_ecs::{Entity, World};
 use std::collections::HashMap;
 
@@ -223,8 +223,34 @@ impl EditorCommand for PasteEntitiesCmd {
     fn execute(&mut self, world: &mut World, selected: &mut Option<Entity>) {
         self.spawned.clear();
         self.roots.clear();
-        let roots = self.clipboard.roots.clone();
+        let mut roots = self.clipboard.roots.clone();
         let parent = self.parent.filter(|parent| world.is_alive(*parent));
+        for node in &mut roots {
+            // A root's recorded parent counts only while it is still the same object (a handle can be reused by
+            // another scene). When it is gone the copy lands where the original stood in the world, not at the
+            // original's local offset from a parent that no longer exists.
+            let Some(home) = node.home else {
+                continue;
+            };
+            let same = world.is_alive(home)
+                && self
+                    .clipboard
+                    .external_ids
+                    .get(&home)
+                    .is_none_or(|id| world.persistent_id(home) == Some(*id));
+            if same {
+                continue;
+            }
+            node.home = None;
+            let stood = node.snapshot.wt.as_ref().map(|wt| wt.0.to_scale_rotation_translation());
+            if let Some((scale, rotation, translation)) = stood {
+                node.snapshot.transform = Some(Transform {
+                    translation,
+                    rotation,
+                    scale,
+                });
+            }
+        }
         for node in &roots {
             let home = node.home.filter(|home| world.is_alive(*home)).or(parent);
             let entity = self.spawn_node(world, node, home);
@@ -595,6 +621,44 @@ mod tests {
 
         command.undo(&mut world, &mut selected);
         assert_eq!(world.entity_count(), before);
+    }
+
+    /// A copy pasted with nothing to paste into goes under its original's parent, in the same place; when that
+    /// parent is gone it goes to the scene root, where the original stood in the world.
+    #[test]
+    fn a_paste_lands_where_the_original_stood_even_when_its_parent_is_gone() {
+        let mut world = World::new();
+        let room = world.spawn((
+            Name::new("room"),
+            Transform::from_translation(glam::Vec3::new(100.0, 0.0, 0.0)),
+            WorldTransform(glam::Mat4::from_translation(glam::Vec3::new(100.0, 0.0, 0.0))),
+            Children::empty(),
+        ));
+        let chest = world.spawn((
+            Name::new("chest"),
+            Transform::from_translation(glam::Vec3::new(1.0, 2.0, 3.0)),
+            WorldTransform(glam::Mat4::from_translation(glam::Vec3::new(101.0, 2.0, 3.0))),
+            Parent { entity: room },
+        ));
+        let clipboard = EntityClipboard::duplicate(&world, &[chest]);
+
+        let mut selected = None;
+        let mut beside = PasteEntitiesCmd::new(clipboard.clone(), None);
+        beside.execute(&mut world, &mut selected);
+        let copy = beside.roots()[0];
+        assert_eq!(world.get::<Parent>(copy).unwrap().entity, room);
+        assert_eq!(world.get::<Transform>(copy).unwrap().translation, glam::Vec3::new(1.0, 2.0, 3.0));
+
+        world.despawn(room);
+        let mut orphaned = PasteEntitiesCmd::new(clipboard, None);
+        orphaned.execute(&mut world, &mut selected);
+        let moved = orphaned.roots()[0];
+        assert!(world.get::<Parent>(moved).is_none(), "it goes to the scene root");
+        assert_eq!(
+            world.get::<Transform>(moved).unwrap().translation,
+            glam::Vec3::new(101.0, 2.0, 3.0),
+            "and keeps its world position"
+        );
     }
 
     /// Pasting is one gesture: one undo removes the whole subtree.

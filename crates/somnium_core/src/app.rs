@@ -3481,9 +3481,11 @@ impl<G: GameApp> Engine<G> {
     /// comes from how far apart they are, so `F` on one object and `F` on
     /// twelve both end up looking at the thing the user meant.
     fn focus_camera_on_selection(&mut self) {
-        // The minimum radius inside `focus_target` keeps a single point from
-        // putting the camera inside the object it was asked to look at.
-        let Some((centre, radius)) = self.focus_target() else {
+        // The sphere round the selection's real size (its meshes' world box);
+        // the origin points stand in when nothing can be measured, and their
+        // minimum radius keeps a single point from putting the camera inside
+        // the object it was asked to look at.
+        let Some((centre, radius)) = self.selection_focus().or_else(|| self.focus_target()) else {
             return;
         };
         // The editor camera belongs to the game layer, so this is a request
@@ -4895,8 +4897,17 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                     if band.is_dragged() {
                         self.apply_marquee(band);
                     } else {
-                        let hit = self.click_pick();
-                        self.selection.set_single(hit);
+                        // Ctrl toggles the clicked object in the selection and
+                        // Shift adds it, the way the Outliner's rows do; either
+                        // on empty space keeps what is selected.
+                        let toggle = self.shortcut_modifiers.command();
+                        let add = self.shortcut_modifiers.shift;
+                        let hit = if toggle || add {
+                            self.click_pick_object()
+                        } else {
+                            self.click_pick()
+                        };
+                        self.selection.click(hit, toggle, add);
                         self.after_selection_change();
                         self.reveal_selection_in_outliner(true);
                     }
@@ -11550,8 +11561,9 @@ impl<G: GameApp> Engine<G> {
                 if self.selection.is_empty() {
                     return;
                 }
+                // Recorded with each root's parent, so a paste lands beside the original.
                 self.entity_clipboard =
-                    crate::clipboard::EntityClipboard::copy(&self.world, self.selection.as_slice());
+                    crate::clipboard::EntityClipboard::duplicate(&self.world, self.selection.as_slice());
                 let count = self.entity_clipboard.root_count();
                 if let Some(ui) = self.ui_manager.as_mut() {
                     ui.push_toast(&format!("Copied {count}"));
@@ -11562,19 +11574,29 @@ impl<G: GameApp> Engine<G> {
                 if self.entity_clipboard.is_empty() {
                     return;
                 }
-                // Pasting with something selected pastes *into* it, which is
-                // what makes Copy/Paste usable for building a hierarchy rather
-                // than only for cloning one.
-                let parent = self.selection.primary;
+                // Not into whatever happens to be selected: each copy goes
+                // under the parent its original had (the scene root when that
+                // is gone), where the original stood, and becomes the selection.
                 use crate::editor_commands::EditorCommand as _;
                 let mut command =
-                    crate::clipboard::PasteEntitiesCmd::new(self.entity_clipboard.clone(), parent);
+                    crate::clipboard::PasteEntitiesCmd::new(self.entity_clipboard.clone(), None);
                 command.execute(&mut self.world, &mut self.selection.primary);
                 let roots = command.roots().to_vec();
                 self.undo_stack.push_silent(Box::new(command));
+                let message = match roots.as_slice() {
+                    [only] => {
+                        let name = self
+                            .world
+                            .get::<Name>(*only)
+                            .map_or_else(|| "object".to_owned(), |name| name.as_str().to_owned());
+                        format!("Pasted {name}.")
+                    }
+                    many => format!("Pasted {} objects.", many.len()),
+                };
                 self.selection.set_many(roots);
                 self.after_selection_change();
                 self.scene_dirty = true;
+                self.toast(&message);
             }
 
             EditorEvent::ToggleEntityFlag {
@@ -11716,7 +11738,10 @@ impl<G: GameApp> Engine<G> {
             EditorEvent::ViewPreset(index) => {
                 // A preset frames the selection when there is one and the
                 // origin otherwise, so "Top" always looks at something.
-                let (centre, radius) = self.focus_target().unwrap_or((glam::Vec3::ZERO, 20.0));
+                let (centre, radius) = self
+                    .selection_focus()
+                    .or_else(|| self.focus_target())
+                    .unwrap_or((glam::Vec3::ZERO, 20.0));
                 // The offset direction, from the subject toward the camera.
                 let direction = match index {
                     // Straight down is a degenerate yaw, so Top is nudged a
@@ -11727,7 +11752,8 @@ impl<G: GameApp> Engine<G> {
                     2 => glam::Vec3::X,
                     _ => glam::Vec3::new(0.6, 0.5, 0.6).normalize(),
                 };
-                let position = centre + direction * (radius * 3.0);
+                let fov_y = crate::EDITOR_CAMERA_FOV_Y_DEGREES.to_radians();
+                let position = centre + direction * crate::camera_focus_distance(radius, fov_y);
                 let look = (centre - position).normalize_or_zero();
                 self.camera_pose_request = Some((
                     position,

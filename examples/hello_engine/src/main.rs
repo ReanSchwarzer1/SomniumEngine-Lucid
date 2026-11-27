@@ -2217,7 +2217,8 @@ impl GameApp for HelloGame {
             } else {
                 direction
             };
-            self.camera.position = centre + direction * (radius * 3.0);
+            let fov_y = somnium_core::EDITOR_CAMERA_FOV_Y_DEGREES.to_radians();
+            self.camera.position = centre + direction * somnium_core::camera_focus_distance(radius, fov_y);
             let look = (centre - self.camera.position).normalize_or_zero();
             if look != Vec3::ZERO {
                 self.camera.yaw = look.z.atan2(look.x).to_degrees();

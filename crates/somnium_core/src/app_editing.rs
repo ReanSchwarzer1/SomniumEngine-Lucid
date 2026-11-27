@@ -425,6 +425,16 @@ fn world_bounds(world: &World, renderer: &SomniumRenderer, members: &[Entity]) -
     any.then_some((lo, hi))
 }
 
+/// The smallest radius `F` frames: a pebble is framed close, not from a house's distance.
+const FOCUS_MIN_RADIUS: f32 = 0.25;
+/// What `F` frames when the selection has no size at all (a light, an empty): a point has no extent to fill the view.
+const FOCUS_POINT_RADIUS: f32 = 2.0;
+
+/// The sphere round a world box: its middle, and half its diagonal, no less than `floor`.
+fn focus_sphere(min: glam::Vec3, max: glam::Vec3, floor: f32) -> (glam::Vec3, f32) {
+    ((min + max) * 0.5, ((max - min).length() * 0.5).max(floor))
+}
+
 fn name_of(world: &World, entity: Entity) -> String {
     world
         .get::<Name>(entity)
@@ -1279,6 +1289,13 @@ impl<G: GameApp> Engine<G> {
             return None;
         }
         hit.map(|(_, entity)| entity)
+    }
+
+    /// [`Self::click_pick`] for a click that builds a selection (Ctrl or Shift held): always the whole object, never
+    /// the part of one that is already selected, so a Ctrl-click on a selected object takes that object out.
+    pub(super) fn click_pick_object(&mut self) -> Option<Entity> {
+        let hit = self.click_pick()?;
+        Some(self.object_of(hit))
     }
 
     /// The painted or ground-cover copy a world ray meets first, before the object hit at `object` and the ground
@@ -2592,6 +2609,36 @@ impl<G: GameApp> Engine<G> {
             .collect()
     }
 
+    /// The centre and radius of the sphere round the selection's real size: the world box of each selected object's
+    /// whole subtree (meshes included, as Drop to Ground measures it), and the origin points for what has no mesh
+    /// (a light, an empty). `None` with nothing selected or no renderer to measure with.
+    pub(super) fn selection_focus(&self) -> Option<(glam::Vec3, f32)> {
+        let renderer = self.renderer.as_ref()?;
+        let children = children_map(&self.world);
+        let mut lo = glam::Vec3::splat(f32::INFINITY);
+        let mut hi = glam::Vec3::splat(f32::NEG_INFINITY);
+        let mut sized = false;
+        for object in self.selected_objects() {
+            let members = subtree(&children, object);
+            let (a, b) = match world_bounds(&self.world, renderer, &members) {
+                Some(bounds) => {
+                    sized = true;
+                    bounds
+                }
+                None => {
+                    let points = designer::designer_focus_points(&self.world, object);
+                    let Some(first) = points.first().copied() else {
+                        continue;
+                    };
+                    points.iter().fold((first, first), |(a, b), point| (a.min(*point), b.max(*point)))
+                }
+            };
+            lo = lo.min(a);
+            hi = hi.max(b);
+        }
+        lo.cmple(hi).all().then(|| focus_sphere(lo, hi, if sized { FOCUS_MIN_RADIUS } else { FOCUS_POINT_RADIUS }))
+    }
+
     // ─── Ground ─────────────────────────────────────────────────────────────
 
     /// Live terrains, their models set for ray casts.
@@ -3634,6 +3681,18 @@ fn decal_slab_distance(world: &World, entity: Entity, origin: glam::Vec3, direct
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_house_and_a_pebble_are_framed_by_their_own_size() {
+        let (centre, house) = focus_sphere(glam::Vec3::new(-10.0, 0.0, -10.0), glam::Vec3::new(10.0, 8.0, 10.0), FOCUS_MIN_RADIUS);
+        assert_eq!(centre, glam::Vec3::new(0.0, 4.0, 0.0));
+        assert!((house - 15.0).abs() < 0.5, "house radius {house}");
+        let (_, pebble) = focus_sphere(glam::Vec3::ZERO, glam::Vec3::splat(0.1), FOCUS_MIN_RADIUS);
+        assert_eq!(pebble, FOCUS_MIN_RADIUS, "a tiny box is floored at a quarter of a metre, not two");
+        let fov = crate::EDITOR_CAMERA_FOV_Y_DEGREES.to_radians();
+        assert!(crate::camera_focus_distance(pebble, fov) < 1.5);
+        assert!(crate::camera_focus_distance(house, fov) > 40.0);
+    }
 
     #[test]
     fn a_painted_copy_taken_out_stays_out_on_its_own_ground_only() {
