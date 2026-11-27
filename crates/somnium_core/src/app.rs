@@ -12871,6 +12871,13 @@ impl<G: GameApp> Engine<G> {
                     }
                 });
                 let count = clipboard.root_count();
+                // Named for the original, read before the selection moves to the copy.
+                let original = self
+                    .selection
+                    .as_slice()
+                    .first()
+                    .and_then(|entity| self.world.get::<Name>(*entity))
+                    .map(|name| name.as_str().to_owned());
                 use crate::editor_commands::EditorCommand as _;
                 let mut command = crate::clipboard::PasteEntitiesCmd::new(clipboard, None);
                 command.execute(&mut self.world, &mut self.selection.primary);
@@ -12880,6 +12887,11 @@ impl<G: GameApp> Engine<G> {
                 self.after_selection_change();
                 self.scene_dirty = true;
                 info!("Duplicated {count} object(s) with their parts");
+                match original {
+                    Some(name) if count == 1 && !name.is_empty() => self.toast(&format!("Duplicated {name}.")),
+                    _ if count == 1 => self.toast("Duplicated 1 object."),
+                    _ => self.toast(&format!("Duplicated {count} objects.")),
+                }
             }
 
             EditorEvent::LoadScene(path) => self.load_scene_file(&path),
