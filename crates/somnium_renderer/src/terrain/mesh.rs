@@ -86,6 +86,24 @@ pub fn build_chunk_vertices(
 /// Indices reference the full-resolution `(chunk_cells+1)²` vertex grid of a
 /// chunk; coarser LODs skip vertices with stride `1 << lod`. All chunks share
 /// the same topology, so the resulting buffers are cached terrain-wide.
+/// `indices` (triangles over a chunk's `(chunk_cells + 1)²` full-resolution vertices) without those over a hole
+/// quad: `holes` is the tile's quad mask, `quads_x` wide, 128 and over a hole, and the chunk's first quad is `origin`.
+/// A triangle belongs to the quad under its middle.
+pub fn without_holes(indices: &[u32], chunk_cells: u32, origin: [u32; 2], quads_x: u32, holes: &[u8]) -> Vec<u32> {
+    let vpr = chunk_cells + 1;
+    indices
+        .chunks_exact(3)
+        .filter(|tri| {
+            let (sx, sz) = tri.iter().fold((0u32, 0u32), |(sx, sz), &i| (sx + i % vpr, sz + i / vpr));
+            let x = origin[0] + (sx / 3).min(chunk_cells - 1);
+            let z = origin[1] + (sz / 3).min(chunk_cells - 1);
+            holes.get((z * quads_x + x) as usize).is_none_or(|&v| v < 128)
+        })
+        .flatten()
+        .copied()
+        .collect()
+}
+
 pub fn build_lod_indices(chunk_cells: u32, lod: u8, edge_mask: u8) -> Vec<u32> {
     let step = 1u32 << lod;
     let cells = chunk_cells >> lod;
@@ -154,6 +172,27 @@ pub fn build_lod_indices(chunk_cells: u32, lod: u8, edge_mask: u8) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hole quad takes out exactly its own two triangles, in the chunk that holds it, and nothing elsewhere.
+    #[test]
+    fn a_hole_quad_takes_out_its_two_triangles_only() {
+        let cells = 4;
+        let all = build_lod_indices(cells, 0, 0);
+        assert_eq!(all.len(), 4 * 4 * 2 * 3, "a 4 x 4 chunk at its finest level");
+        // A tile 8 quads wide; this chunk is its second along x (quads 4..8), and the hole is quad (5, 1).
+        let mut holes = vec![0u8; 8 * 8];
+        holes[8 + 5] = 255;
+        let cut = without_holes(&all, cells, [4, 0], 8, &holes);
+        assert_eq!(cut.len(), all.len() - 6, "two triangles gone");
+        let vpr = cells + 1;
+        for tri in cut.chunks_exact(3) {
+            let (sx, sz) = tri.iter().fold((0, 0), |(sx, sz), &i| (sx + i % vpr, sz + i / vpr));
+            assert!(!(sx / 3 == 1 && sz / 3 == 1), "no triangle over the hole's quad (1, 1) of the chunk");
+        }
+        // The chunk next door keeps all of its triangles, and no mask keeps everything.
+        assert_eq!(without_holes(&all, cells, [0, 0], 8, &holes).len(), all.len());
+        assert_eq!(without_holes(&all, cells, [4, 0], 8, &[]).len(), all.len());
+    }
 
     #[test]
     fn full_detail_triangle_count_matches_regular_grid() {

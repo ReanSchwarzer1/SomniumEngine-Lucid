@@ -1528,6 +1528,8 @@ pub struct Engine<G: GameApp> {
     /// from its first load, a cell reader's included, for every entity that reuses the upload.
     pub(crate) flame_nodes:
         std::collections::HashMap<std::path::PathBuf, std::collections::HashMap<u32, std::sync::Arc<[crate::fire::Flame]>>>,
+    /// The level portals the eye stands in (`level_portal.rs`), so an entry is logged once.
+    portals: crate::level_portal::Portals,
 }
 
 /// One floating window's swapchain image, acquired before the frame that fills
@@ -2151,6 +2153,7 @@ impl<G: GameApp + 'static> Engine<G> {
             model_faults: crate::model_faults::ModelFaults::default(),
             model_notice: crate::model_faults::Notice::default(),
             flame_nodes: std::collections::HashMap::new(),
+            portals: crate::level_portal::Portals::default(),
         };
 
         engine.foliage_erase = crate::authoring_settings::BrushPreferences::load()
@@ -3664,6 +3667,13 @@ impl<G: GameApp> Engine<G> {
         {
             return;
         }
+        // Carrying (Move on the Ground) hides the gizmo: the thing follows the mouse, not a handle.
+        if self.carrying() {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.clear_gizmo();
+            }
+            return;
+        }
         // A part of a merged model is handled at the middle of its mesh, not at the model's origin.
         let anchor = gizmo_anchor(&self.world, self.selection.primary).map(|origin| {
             self.selection
@@ -4666,6 +4676,10 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                         self.cancel_persona_stroke();
                         return;
                     }
+                    // Carrying: Esc puts it back and Enter puts it down, before the UI's own Esc chain.
+                    if !text_focus && self.carry_key(code) {
+                        return;
+                    }
                     let action = self.editor_shortcut_for_key(code);
                     use somnium_ui::commands::CommandAction as A;
                     match action {
@@ -4806,6 +4820,11 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             _ => false,
         };
         if ui_consumed {
+            return;
+        }
+
+        // Carrying (Move on the Ground): the viewport's left button puts it down and the wheel turns it.
+        if !self.play_session_active && self.carry_mouse_event(&event) {
             return;
         }
 
@@ -4962,19 +4981,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                     if band.is_dragged() {
                         self.apply_marquee(band);
                     } else {
-                        // Ctrl toggles the clicked object in the selection and
-                        // Shift adds it, the way the Outliner's rows do; either
-                        // on empty space keeps what is selected.
-                        let toggle = self.shortcut_modifiers.command();
-                        let add = self.shortcut_modifiers.shift;
-                        let hit = if toggle || add {
-                            self.click_pick_object()
-                        } else {
-                            self.click_pick()
-                        };
-                        self.selection.click(hit, toggle, add);
-                        self.after_selection_change();
-                        self.reveal_selection_in_outliner(true);
+                        self.viewport_click();
                     }
                     gizmo_consumed = true;
                 }
@@ -5330,6 +5337,8 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 r.set_gizmo_world_pos(handle.unwrap_or(new_t.translation));
             }
         }
+        // Move on the Ground: the carried things follow the cursor over the surface under it.
+        self.update_carry();
 
         let scene_request = {
             // Computed before the context borrows the world, because the
@@ -6212,6 +6221,13 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             }
         }
 
+        // Level portals (`level_portal.rs`): while the game plays, the eye entering one is logged once per entry.
+        if self.play_session_active || self.config.player_mode {
+            if let Some(eye) = self.renderer.as_ref().map(|r| r.camera_pos) {
+                self.portals.update(&self.world, eye);
+            }
+        }
+
         // ── Terrain editing + submission (Phase 14) ──────────────────────────
         self.apply_terrain_restores();
         if self.play_session_active {
@@ -6968,6 +6984,9 @@ impl<G: GameApp> Engine<G> {
             self.asset_scan = None;
             match result {
                 Ok((snapshot, index)) => {
+                    if let Some(ui) = self.ui_manager.as_mut() {
+                        ui.set_content_scan_error(None);
+                    }
                     if let Some(published) = self.asset_gate.stage(snapshot) {
                         if let Some(ui) = self.ui_manager.as_mut() {
                             ui.set_asset_snapshot(published);
@@ -6975,8 +6994,24 @@ impl<G: GameApp> Engine<G> {
                         }
                     }
                 }
-                Err(error) => warn!(?error, "asset inventory scan failed"),
+                Err(error) => {
+                    warn!(?error, "asset inventory scan failed");
+                    // Said in the drawer, and tried again in a while even if nothing on disk moves: the drawer,
+                    // search and the pickers must not stay without their inventory for the rest of the session.
+                    let said = format!("{error:?}");
+                    let said = said.trim_matches('"').replace("\\\\", "\\");
+                    if let Some(ui) = self.ui_manager.as_mut() {
+                        ui.set_content_scan_error(Some(said));
+                    }
+                    self.asset_scan_stamp = None;
+                    self.next_asset_scan = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                }
             }
+        }
+
+        // The drawer shows folders from the disk until the first inventory is in: it must know where they are.
+        if let Some(ui) = self.ui_manager.as_mut() {
+            ui.set_content_root(&self.config.content_root);
         }
 
         let now = std::time::Instant::now();
@@ -7011,7 +7046,13 @@ impl<G: GameApp> Engine<G> {
                 .submit("Asset inventory", JobPriority::Background, move |ctx| {
                     ctx.check_cancelled()
                         .map_err(|error| format!("{error:?}"))?;
+                    let started = std::time::Instant::now();
                     let snapshot = somnium_asset::database::AssetDb::scan(root)?;
+                    let seconds = started.elapsed().as_secs_f32();
+                    if seconds >= 2.0 {
+                        // A slow read is the time the drawer, search and the pickers wait: worth a line.
+                        info!(files = snapshot.records().len(), seconds, "asset inventory: the project's files were read");
+                    }
                     ctx.set_progress(0.8);
                     // On the job, not on the frame: this opens every scene,
                     // prefab, material and document in the project.
@@ -11315,6 +11356,43 @@ impl<G: GameApp> Engine<G> {
     fn handle_editor_event_inner(&mut self, ev: EditorEvent) {
         use somnium_ui::{CreateKind, FoliageBrushField as FB, TerrainToolField as TT};
 
+        // A carry in hand (Move on the Ground) is put back, as Esc does, before a tool key, an edit of the objects or
+        // a scene change; Undo and Redo only put it back.
+        if self.carrying() {
+            use somnium_ui::editor_event::LevelTool as L;
+            // Saving, Play and closing take what is seen: the thing is put down first, as its one undo step.
+            if matches!(
+                ev,
+                EditorEvent::SaveScene
+                    | EditorEvent::LevelTool(L::SaveSceneAs)
+                    | EditorEvent::AfterSave(_)
+                    | EditorEvent::PlaySimulation
+                    | EditorEvent::CloseWindow
+                    | EditorEvent::Quit { .. }
+            ) {
+                self.put_down_carry();
+            }
+            let ends = matches!(
+                ev,
+                EditorEvent::SetGizmoMode(_)
+                    | EditorEvent::ToggleTerrainEdit
+                    | EditorEvent::ToggleFoliagePaint
+                    | EditorEvent::DeleteSelected
+                    | EditorEvent::DuplicateSelected
+                    | EditorEvent::PasteClipboard
+                    | EditorEvent::NewScene
+                    | EditorEvent::LoadScene(_)
+                    | EditorEvent::Undo
+                    | EditorEvent::Redo
+            ) || matches!(ev, EditorEvent::LevelTool(tool) if tool != L::Carry);
+            if ends {
+                self.cancel_carry();
+                if matches!(ev, EditorEvent::Undo | EditorEvent::Redo) {
+                    return;
+                }
+            }
+        }
+
         match ev {
             EditorEvent::AuthoringRequest { method, params } => {
                 let result = self.authoring_request(&method, params);
@@ -12009,6 +12087,7 @@ impl<G: GameApp> Engine<G> {
                     L::CheckMeshes => self.check_meshes(),
                     L::SelectSameAsset => self.select_same_asset(),
                     L::MakeObject => self.make_painted_object(),
+                    L::Carry => self.toggle_carry(),
                 }
             }
 

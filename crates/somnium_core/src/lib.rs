@@ -92,6 +92,7 @@ pub mod reflect_registry;
 pub mod save_game;
 pub mod scatter_scene;
 pub mod fire;
+pub mod level_portal;
 mod model_faults;
 mod scene_delta;
 pub mod scene_edits;

@@ -1241,6 +1241,16 @@ fn declarations() -> Vec<Command> {
             selection
         ),
         command!(
+            "editor.level.carry",
+            "Move on the Ground",
+            "Level",
+            Some(Chord::press(CommandKey::Letter('G'))),
+            "Pick up the selected objects: they follow the mouse over the ground, floors and roofs. Click to put them down, Esc to put them back.",
+            A::LevelTool(L::Carry),
+            EDIT,
+            selection
+        ),
+        command!(
             "editor.level.find_floating",
             "Find Floating Objects",
             "Level",
@@ -2574,7 +2584,7 @@ pub fn icon_for(id: &str) -> crate::icons::IconId {
         "editor.file.welcome" => I::Home,
         "editor.file.save_thumbnail" => I::Screenshot,
         "editor.scene.save" | "editor.scene.save_as" => I::Save,
-        "editor.level.drop_to_ground" | "editor.level.align_to_surface" => I::Landscape,
+        "editor.level.drop_to_ground" | "editor.level.align_to_surface" | "editor.level.carry" => I::Landscape,
         "editor.level.find_floating" | "editor.level.find_in_outliner" => I::Search,
         "editor.level.hide" | "editor.level.end_isolation" => I::View,
         "editor.level.isolate" => I::Focus,

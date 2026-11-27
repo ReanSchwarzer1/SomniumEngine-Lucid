@@ -2,6 +2,16 @@
 
 Newest first. Each line is something you can do now that you could not do before.
 
+## 27 November 2026, evening
+
+- **G moves a thing over the ground.** Select it, press G, and it follows the pointer over whatever lies under it: the ground, a roof, a rock. Click or Enter puts it down. Esc puts it back where it was. The whole move is one undo step.
+- **While you carry it:** hold Shift and it tilts to the slope. Turn the mouse wheel and it turns, one snap step a notch. Hold Ctrl and its place snaps to the grid (or stops snapping, if Snap is already on).
+- **G carries several things at once:** select them, then press G.
+- **The Content Drawer shows its folders at once.** Before, it said "Nothing Here" until the whole project had been read, which takes minutes in a large world. Now the folders come straight from the disk, and the line under them says so while the project is still being read. Search and previews follow when the read is done.
+- **A read that fails is said.** The line under the folders says why, and the editor tries again by itself.
+- **The editor opens each model and picture once.** It keeps what it found, so later reads of the project do not open them again.
+- **Right-click a folder > Open opens that folder.** Before, it showed "Nothing Here".
+
 ## 27 November 2026, afternoon
 
 - **Saving is honest.** Ctrl+S says how many objects and removed plants it saved. If you sculpted or painted ground, it says that the ground is not kept and the scene stays marked unsaved until Save Scene As.

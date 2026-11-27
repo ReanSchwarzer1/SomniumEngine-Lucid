@@ -814,6 +814,8 @@ pub enum LevelTool {
     SelectLookedAt,
     /// Make the painted tree or shrub you clicked an object, to move, turn, delete and save like any prop.
     MakeObject,
+    /// Pick up the selection: it follows the mouse over whatever is under it until a click puts it down.
+    Carry,
 }
 
 /// Designer actions whose implementation belongs to the engine host.

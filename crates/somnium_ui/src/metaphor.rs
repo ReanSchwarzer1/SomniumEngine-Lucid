@@ -311,6 +311,81 @@ pub fn list_content(
     out
 }
 
+/// One folder of the project's content, read straight from the disk: what the drawer shows until the inventory of
+/// the whole project has been read. `relative` is the folder's path from the content folder down ("" is the
+/// content folder itself). Folders first, then files, each by name; hidden entries and `bc7` caches are left out.
+///
+/// One `read_dir` and no further access per entry: a folder of twenty thousand files must not hold the frame.
+pub fn list_folder(root: &Path, relative: &str, filter: &str) -> Vec<ContentEntry> {
+    let folder = if relative.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(relative)
+    };
+    let Ok(read) = std::fs::read_dir(&folder) else {
+        return Vec::new();
+    };
+    let needle = filter.trim().to_ascii_lowercase();
+    let mut out: Vec<ContentEntry> = read
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || name.eq_ignore_ascii_case("bc7") {
+                return None;
+            }
+            if !needle.is_empty() && !name.to_ascii_lowercase().contains(&needle) {
+                return None;
+            }
+            let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            let path = entry.path();
+            Some(ContentEntry {
+                icon: icon_for_path(&path, is_dir),
+                path,
+                name,
+                is_dir,
+                is_engine: false,
+                asset_id: None,
+                tooltip: String::new(),
+            })
+        })
+        .collect();
+    out.sort_by_cached_key(|entry| (!entry.is_dir, entry.name.to_ascii_lowercase()));
+    out
+}
+
+/// The folders directly inside `parent` (a path from the content folder down), by name, each as (its path from
+/// the content folder down, its name): the rows of the drawer's tree until the inventory has been read.
+pub fn list_child_folders(root: &Path, parent: &str) -> Vec<(String, String)> {
+    let parent = parent.replace('\\', "/");
+    let parent = parent.trim_matches('/');
+    let folder = if parent.is_empty() {
+        root.to_path_buf()
+    } else {
+        root.join(parent)
+    };
+    let Ok(read) = std::fs::read_dir(&folder) else {
+        return Vec::new();
+    };
+    let mut out: Vec<(String, String)> = read
+        .flatten()
+        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || name.eq_ignore_ascii_case("bc7") {
+                return None;
+            }
+            let relative = if parent.is_empty() {
+                name.clone()
+            } else {
+                format!("{parent}/{name}")
+            };
+            Some((relative, name))
+        })
+        .collect();
+    out.sort_by_cached_key(|(_, name)| name.to_ascii_lowercase());
+    out
+}
+
 /// Built-in entries are virtual and never require a filesystem query.
 pub fn virtual_engine_content(filter: &str) -> Vec<ContentEntry> {
     let filter = filter.to_ascii_lowercase();
@@ -541,6 +616,49 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_is_listed_from_the_disk_folders_first_and_by_name() {
+        // What the drawer shows before the project's inventory has been read.
+        let tmp = std::env::temp_dir().join(format!("somnium_content_disk_{}", std::process::id()));
+        let assets = tmp.join("assets");
+        let _ = fs::remove_dir_all(&tmp);
+        fs::create_dir_all(assets.join("rocks").join("Cliffs")).unwrap();
+        fs::create_dir_all(assets.join("Architecture")).unwrap();
+        fs::create_dir_all(assets.join("terrain").join("bc7")).unwrap();
+        fs::write(assets.join("zebra.gltf"), "x").unwrap();
+        fs::write(assets.join("Apple.png"), "x").unwrap();
+        fs::write(assets.join(".hidden"), "x").unwrap();
+        fs::write(assets.join("rocks").join("boulder.gltf"), "x").unwrap();
+
+        let top = list_folder(&assets, "", "");
+        let names: Vec<&str> = top.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Architecture", "rocks", "terrain", "Apple.png", "zebra.gltf"]);
+        assert!(top[0].is_dir && !top[3].is_dir);
+        assert_eq!(top[4].icon, IconId::Mesh);
+        assert!(top.iter().all(|e| e.asset_id.is_none() && !e.is_engine));
+
+        let rocks = list_folder(&assets, "rocks", "");
+        let names: Vec<&str> = rocks.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Cliffs", "boulder.gltf"]);
+        assert_eq!(rocks[1].path, assets.join("rocks").join("boulder.gltf"));
+
+        let filtered = list_folder(&assets, "", " ZEB ");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "zebra.gltf");
+
+        assert!(list_folder(&assets, "no_such_folder", "").is_empty());
+
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            list_child_folders(&assets, ""),
+            [pair("Architecture", "Architecture"), pair("rocks", "rocks"), pair("terrain", "terrain")]
+        );
+        assert_eq!(list_child_folders(&assets, "rocks"), [pair("rocks/Cliffs", "Cliffs")]);
+        assert_eq!(list_child_folders(&assets, "\\rocks\\"), [pair("rocks/Cliffs", "Cliffs")]);
+        assert!(list_child_folders(&assets, "terrain").is_empty(), "a bc7 cache is not a folder of content");
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn icon_for_gltf_is_mesh() {
         assert_eq!(
             icon_for_path(std::path::Path::new("foo.gltf"), false),
@@ -595,6 +713,15 @@ pub mod empty {
         headline: "Nothing Here",
         body: "This folder has no assets yet.",
         action: "Import a model from the File menu",
+    };
+
+    /// Before anything is known about the project's content: nothing has been read, so nothing is known to be
+    /// missing, and "import a model" would be the wrong advice.
+    pub const CONTENT_READING: EmptyState = EmptyState {
+        icon: IconId::Folder,
+        headline: "Reading the Project's Files",
+        body: "The list fills by itself in a moment.",
+        action: "Wait for the list",
     };
 
     /// Distinct from `CONTENT`: a filter that matches nothing is a different
