@@ -11272,9 +11272,9 @@ impl<G: GameApp> Engine<G> {
             if matches!(
                 ev,
                 EditorEvent::SaveScene
-                    | EditorEvent::SaveSceneAs
+                    | EditorEvent::LevelTool(L::SaveSceneAs)
                     | EditorEvent::AfterSave(_)
-                    | EditorEvent::Play
+                    | EditorEvent::PlaySimulation
                     | EditorEvent::CloseWindow
                     | EditorEvent::Quit { .. }
             ) {
