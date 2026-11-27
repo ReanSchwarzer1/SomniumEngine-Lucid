@@ -52,6 +52,7 @@ impl<G: GameApp> Engine<G> {
                 // Loud once, not every frame: the world has no cells (sky only), and launch checks count this line.
                 if self.world.get::<CellStreamingComponent>(owner).is_some_and(|c| c.status != status) {
                     tracing::error!("cells: manifest gives no cells: {status}");
+                    self.report_no_cells(&error);
                 }
                 self.set_cell_status(owner, status);
                 return;
@@ -65,12 +66,14 @@ impl<G: GameApp> Engine<G> {
                 Ok(list) => {
                     if list.is_empty() {
                         tracing::error!("cells: manifest gives no cells: {} lists none", manifest.display());
+                        self.report_no_cells(&format!("{} lists none", manifest.display()));
                     }
                     self.cell_streamer.cells = list;
                 }
                 Err(error) => {
                     // The world stays empty (sky only): said once, as the key is set; launch checks count this line.
                     tracing::error!("cells: manifest gives no cells: {error}");
+                    self.report_no_cells(&error);
                     self.set_cell_status(owner, error);
                     return;
                 }
@@ -777,11 +780,44 @@ impl<G: GameApp> Engine<G> {
         somnium_asset::share_decoded_images(0);
     }
 
+    /// The world gets no cells (sky only). The error line above is for launch checks; the author looks at the editor,
+    /// where nothing said it (26-27 Nov: a list naming 167 far tiles twice left the play world empty for 32 minutes
+    /// and nobody saw why). A toast and the Output Log, once per list: the callers run as the list is first read or its
+    /// path first fails. A player is not shown it; the log keeps it. `reason` names the file once.
+    fn report_no_cells(&mut self, reason: &str) {
+        if self.config.player_mode {
+            return;
+        }
+        let message = no_cells_message(reason);
+        if let Some(ui) = self.ui_manager.as_mut() {
+            ui.append_log(&format!("[cells] {message}"));
+            ui.push_toast(&message);
+        }
+    }
+
     fn set_cell_status(&mut self, owner: Entity, status: String) {
         if self.world.get::<CellStreamingComponent>(owner).is_some_and(|c| c.status != status)
             && let Some(component) = self.world.get_mut::<CellStreamingComponent>(owner)
         {
             component.status = status;
         }
+    }
+}
+
+/// What the editor says when a world gets no cells. Windows paths come back from canonicalising with the `\\?\`
+/// prefix; it is noise to a reader, so it goes.
+fn no_cells_message(reason: &str) -> String {
+    let reason = reason.replace("\\\\?\\", "");
+    format!("No world cells will load: {reason}. Mend the cell list, then open the scene again.")
+}
+
+#[cfg(test)]
+mod no_cells_tests {
+    #[test]
+    fn the_message_names_the_file_once_without_the_verbatim_prefix() {
+        let message = super::no_cells_message("\\\\?\\F:\\game\\scenes\\cells.json: EOF while parsing");
+        assert_eq!(message.matches("cells.json").count(), 1);
+        assert!(!message.contains("\\\\?\\"), "{message}");
+        assert!(message.starts_with("No world cells will load: F:\\game\\scenes\\cells.json: EOF"), "{message}");
     }
 }
