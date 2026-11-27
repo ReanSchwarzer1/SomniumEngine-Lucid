@@ -31,6 +31,73 @@ pub fn layer_path(scene: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Folder, beside the scene, that keeps the previous edits files.
+pub const BACKUP_FOLDER: &str = ".somnium_backups";
+/// How many previous edits files are kept for one edits file.
+pub const BACKUPS_KEPT: usize = 20;
+
+/// Where the backup of `layer` (an edits file) made at `seconds` (unix time) goes:
+/// `<folder of the layer>/.somnium_backups/<layer file name>.<seconds>.json`.
+#[must_use]
+pub fn backup_path(layer: &Path, seconds: u64) -> PathBuf {
+    let name = layer.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let folder = layer.parent().unwrap_or_else(|| Path::new(""));
+    folder.join(BACKUP_FOLDER).join(format!("{name}.{seconds}.json"))
+}
+
+/// The backups of `layer` in its backup folder, as (seconds, file), oldest first.
+fn backups_of(layer: &Path) -> Vec<(u64, PathBuf)> {
+    let name = layer.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let folder = backup_path(layer, 0).parent().map(Path::to_path_buf).unwrap_or_default();
+    let Ok(listing) = std::fs::read_dir(&folder) else { return Vec::new() };
+    let mut found: Vec<(u64, PathBuf)> = listing
+        .flatten()
+        .filter_map(|item| {
+            let file = item.file_name().to_string_lossy().into_owned();
+            let seconds = file.strip_prefix(name.as_str())?.strip_prefix('.')?.strip_suffix(".json")?;
+            Some((seconds.parse::<u64>().ok()?, item.path()))
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Remove the oldest backups of `layer` beyond the newest `keep`. Only files named like this layer's backups are
+/// touched. Failures are logged, never raised.
+pub fn prune_backups(layer: &Path, keep: usize) {
+    let found = backups_of(layer);
+    let surplus = found.len().saturating_sub(keep);
+    for (_, file) in found.into_iter().take(surplus) {
+        if let Err(error) = std::fs::remove_file(&file) {
+            tracing::warn!(file = %file.display(), %error, "could not remove an old edits backup");
+        }
+    }
+}
+
+/// Copy the edits file at `layer` into the backup folder unless `new_content` is what it already holds. Whatever
+/// goes wrong is logged: a backup must never stop a save.
+fn backup_before_write(layer: &Path, new_content: &[u8]) {
+    let Ok(old) = std::fs::read(layer) else { return };
+    if old == new_content {
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_default();
+    // Two saves in one second still make two backups, in order.
+    let seconds = backups_of(layer).last().map_or(now, |(newest, _)| now.max(newest + 1));
+    let target = backup_path(layer, seconds);
+    let result = target
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&target, &old));
+    match result {
+        Ok(()) => prune_backups(layer, BACKUPS_KEPT),
+        Err(error) => tracing::warn!(file = %target.display(), %error, "could not back up the edits file before saving"),
+    }
+}
+
 /// One scene's edits.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SceneEdits {
@@ -122,9 +189,10 @@ impl SceneEdits {
         }
         let mut sorted = self.clone();
         sorted.entities.sort_by(|a, b| a.id.cmp(&b.id));
-        let text = serde_json::to_string_pretty(&sorted).map_err(|error| error.to_string())?;
+        let text = serde_json::to_string_pretty(&sorted).map_err(|error| error.to_string())? + "\n";
+        backup_before_write(&path, text.as_bytes());
         let temporary = path.with_extension("json.writing");
-        std::fs::write(&temporary, text + "\n").map_err(|error| format!("{}: {error}", temporary.display()))?;
+        std::fs::write(&temporary, text).map_err(|error| format!("{}: {error}", temporary.display()))?;
         std::fs::rename(&temporary, &path).map_err(|error| format!("{}: {error}", path.display()))
     }
 
@@ -893,6 +961,60 @@ mod tests {
         edits.write(&scene_path).unwrap();
         assert_eq!(SceneEdits::read(&scene_path).unwrap(), Some(edits));
         assert!(!layer_path(&scene_path).with_extension("json.cleared").exists());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn twenty_two_saves_leave_twenty_backups_and_the_newest_is_the_previous_file() {
+        let (directory, scene_path) = temp_scene("backups");
+        let mut edits = SceneEdits::new(&scene_path);
+        let mut previous = String::new();
+        for step in 0..22 {
+            edits.painted.clear();
+            edits.painted.push(painted_edit(step as f32));
+            edits.write(&scene_path).unwrap();
+            if step == 21 {
+                previous = std::fs::read_to_string(layer_path(&scene_path)).unwrap();
+            }
+        }
+        // One more save with different content: the file it replaces is the newest backup.
+        edits.painted.push(painted_edit(100.0));
+        edits.write(&scene_path).unwrap();
+        let found = backups_of(&layer_path(&scene_path));
+        assert_eq!(found.len(), BACKUPS_KEPT);
+        assert_eq!(std::fs::read_to_string(&found.last().unwrap().1).unwrap(), previous);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn identical_content_makes_no_backup() {
+        let (directory, scene_path) = temp_scene("backups-same");
+        let mut edits = SceneEdits::new(&scene_path);
+        edits.painted.push(painted_edit(1.0));
+        edits.write(&scene_path).unwrap();
+        edits.write(&scene_path).unwrap();
+        assert!(backups_of(&layer_path(&scene_path)).is_empty());
+        edits.painted.push(painted_edit(2.0));
+        edits.write(&scene_path).unwrap();
+        assert_eq!(backups_of(&layer_path(&scene_path)).len(), 1);
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn pruning_touches_only_this_edits_files_backups() {
+        let (directory, scene_path) = temp_scene("backups-prune");
+        let layer = layer_path(&scene_path);
+        for seconds in 1..=5 {
+            let file = backup_path(&layer, seconds);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, "{}").unwrap();
+        }
+        let stranger = backup_path(&layer, 1).with_file_name("other.scene.json.edits.json.1.json");
+        std::fs::write(&stranger, "{}").unwrap();
+        prune_backups(&layer, 2);
+        let left: Vec<u64> = backups_of(&layer).into_iter().map(|(seconds, _)| seconds).collect();
+        assert_eq!(left, vec![4, 5]);
+        assert!(stranger.exists());
         let _ = std::fs::remove_dir_all(&directory);
     }
 
