@@ -36,7 +36,8 @@ struct GenParams {
     /// `.rgb` the glow's colour.
     night_tint: vec4<f32>,
     /// x: 1 lays the sky light's cloud cube over the sky (and `overcast` is 0). y: how far the air under the clouds
-    /// takes the light they let through (`haze_under_clouds`); zw unused.
+    /// takes the light they let through (`haze_under_clouds`); z the aerosols' factor (`atmosphere_aerosol`, which
+    /// `fs_sky` and `fs_prefilter` set from it); w unused.
     clouds: vec4<f32>,
     /// w 1: `sun_color` is the sun above the air (a running day clock, `Renderer::sky_above_air`) and the sky marches
     /// its own transmittance and the planet's shadow, so twilight exists; rgb is then the sun on the ground, for the
@@ -221,6 +222,7 @@ fn sky(ray_dir: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_sky(in: VOut) -> @location(0) vec4<f32> {
+    atmosphere_aerosol = params.clouds.z;
     return vec4(sky(cube_dir(params.face, in.uv)), 1.0);
 }
 
@@ -333,6 +335,7 @@ fn importance_sample_ggx(xi: vec2<f32>, n: vec3<f32>, roughness: f32) -> vec3<f3
 
 @fragment
 fn fs_prefilter(in: VOut) -> @location(0) vec4<f32> {
+    atmosphere_aerosol = params.clouds.z;
     let n = cube_dir(params.face, in.uv);
     // The split-sum approximation assumes the view direction equals the normal,
     // which is what makes a single prefiltered map usable from any angle.

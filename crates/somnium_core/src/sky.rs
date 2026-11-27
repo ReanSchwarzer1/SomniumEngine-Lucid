@@ -99,6 +99,11 @@ pub struct SkyComponent {
     /// Off by default: TAA has no motion vector for a sky pixel, so a pattern
     /// that moves every frame is shimmer rather than dithering.
     pub temporal_jitter: bool,
+    /// The air's aerosols (haze, dust, smoke): a factor on the atmosphere's Mie scattering and extinction, over the
+    /// engine's own (and `SOMNIUM_MIE_SCALE`'s). 1, the default and what a scene without the field reads, draws the
+    /// sky and the far air as they were; 2 is twice the haze. Read whether or not the cloud layer is on: a weather
+    /// sets it every frame (`Renderer::aerosol`, which steps the sky after it; Sunscar, 27 Nov 2026).
+    pub aerosol: f32,
 }
 
 impl Component for SkyComponent {}
@@ -282,6 +287,7 @@ impl Default for SkyComponent {
             seed: 1337,
             quality: 0,
             temporal_jitter: false,
+            aerosol: 1.0,
         }
     }
 }
@@ -475,6 +481,16 @@ mod tests {
         assert_eq!(s.light_steps, 1);
         assert!(s.max_distance >= 1.0);
         assert_eq!(s.seed, 0);
+    }
+
+    /// The aerosols' factor is 1 unless a scene or a weather says otherwise, and it is a saved, editable field (a scene
+    /// written before it reads the default).
+    #[test]
+    fn the_aerosols_default_to_the_engine_s_own() {
+        assert_eq!(SkyComponent::default().aerosol, 1.0);
+        let registry = crate::reflect_registry::editor_registry();
+        let schema = registry.by_name("somnium.Sky").expect("Sky is registered");
+        assert!(schema.field_by_name("aerosol").is_some(), "the Sky declares aerosol");
     }
 
     #[test]

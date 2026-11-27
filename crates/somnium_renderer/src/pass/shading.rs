@@ -1892,9 +1892,10 @@ impl ShadingPass {
 
     /// The height fog's flat top (valley fog) and the metres it fades over, for the fog `shading.wgsl` carries past
     /// the volume's range and lays over the sky. At or under the fog's base (zero, the default) there is no top, and
-    /// the sky and the far land are fogged as they always were: the sky not at all.
-    pub fn set_fog_top(&self, queue: &wgpu::Queue, top: f32, softness: f32) {
-        queue.write_buffer(&self.volumetric_range, 16, bytemuck::bytes_of(&[top, softness, 0.0, 0.0]));
+    /// the sky and the far land are fogged as they always were: the sky not at all. With them the aerosols' factor
+    /// (`Renderer::aerosol`, 1 as the constants are written), on the air's Mie extinction past the volume's range.
+    pub fn set_fog_top(&self, queue: &wgpu::Queue, top: f32, softness: f32, aerosol: f32) {
+        queue.write_buffer(&self.volumetric_range, 16, bytemuck::bytes_of(&[top, softness, aerosol, 0.0]));
     }
 
     pub fn set_lighting_extra(&self, queue: &wgpu::Queue, params: [f32; 4]) {
@@ -1905,6 +1906,16 @@ impl ShadingPass {
 #[cfg(test)]
 mod tests {
     use super::ShadingSpec;
+
+    /// `set_fog_top` writes the second vec4 of `VolumetricRange` (bytes 16..32), whose z the shader reads as the
+    /// aerosols' factor at the top of `fs_main`.
+    #[test]
+    fn the_factor_rides_the_volume_range_second_vec4() {
+        let text = crate::shaders::Shaders::new().source_or_panic("shading.wgsl");
+        let (b, size) = crate::shaders::wgsl_member_offset(&text, "VolumetricRange", "b");
+        assert_eq!((b, size), (16, 32));
+        assert_eq!(text.matches("atmosphere_aerosol = volumetric_range.b.z;").count(), 1);
+    }
 
     #[test]
     fn compact_spec_zeros_the_expensive_overrides() {

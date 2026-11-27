@@ -401,6 +401,15 @@ pub struct SomniumRenderer {
     /// The sun's light above the air (the directional light's own colour times its lux, before `sun::transmittance`),
     /// set by the game layer with the light; read only under `sky_above_air`.
     pub sun_above_air: glam::Vec3,
+    /// The aerosols' factor on the atmosphere's Mie scattering and extinction, on top of the shaders' constants (and of
+    /// `SOMNIUM_MIE_SCALE`, which `light_switches.rs` writes into them): 1, the default, draws the picture as it was.
+    /// The scene's Sky sets it every frame (`SkyComponent::aerosol`, from the game's weather). It reaches the LUTs, the
+    /// sky cube, the froxels and the aerial perspective in steps (`follow_aerosol`), so a slow ease rebuilds the LUTs
+    /// and the cube a few times, not every frame.
+    pub aerosol: f32,
+    /// The factor the LUTs, the cube and the passes hold now, and the one asked for at the last frame.
+    aerosol_held: f32,
+    aerosol_asked: f32,
     /// The snowline map's placement for snow.wgsl (x0, z0, 1 / cell, on; width, height, -, -), set by `set_snow_map`
     /// (all zero is none), and its project path as last asked for.
     pub snow_map_params: [f32; 8],
@@ -1740,6 +1749,9 @@ impl SomniumRenderer {
             sun_moving: false,
             sky_above_air: false,
             sun_above_air: glam::Vec3::ZERO,
+            aerosol: 1.0,
+            aerosol_held: 1.0,
+            aerosol_asked: 1.0,
             snow_map_params: [0.0; 8],
             snow_map_source: String::new(),
             surfaces_ab_was_off: false,
@@ -5513,8 +5525,15 @@ impl SomniumRenderer {
         // case. The sky is captured from the same procedural function the
         // background uses, keeping reflections consistent with what is drawn.
         // Phase 24C: the scattering LUTs the sky march reads. Built once —
-        // they depend on the atmosphere's composition, not on sun or camera.
-        self.atmosphere_pass.ensure_built(&ctx.device, &ctx.queue);
+        // they depend on the atmosphere's composition, not on sun or camera —
+        // and again when the aerosols' factor steps (`follow_aerosol`); the
+        // cube's key and the froxels and the shading pass take the same step.
+        let asked = self.aerosol;
+        self.aerosol_held = follow_aerosol(self.aerosol_held, asked, self.aerosol_asked);
+        self.aerosol_asked = asked;
+        self.atmosphere_pass.ensure_built(&ctx.device, &ctx.queue, self.aerosol_held);
+        self.ibl_pass.aerosol = self.aerosol_held;
+        self.volumetric_pass.aerosol = self.aerosol_held;
 
         let overcast = if self.cloud_pass.enabled {
             self.cloud_pass.settings.coverage
@@ -6857,7 +6876,12 @@ impl SomniumRenderer {
                 self.volumetric_pass.fog.height_falloff,
                 self.volumetric_pass.fog.base_height,
             );
-        self.shading_pass.set_fog_top(&ctx.queue, self.volumetric_pass.fog.top_height, self.volumetric_pass.fog.top_softness);
+        self.shading_pass.set_fog_top(
+            &ctx.queue,
+            self.volumetric_pass.fog.top_height,
+            self.volumetric_pass.fog.top_softness,
+            self.aerosol_held,
+        );
 
         // ── 6.9 Volumetric clouds (Phase CONTROL-M) ──────────────────────────
         //
@@ -9182,6 +9206,62 @@ fn preserve_alpha_coverage(levels: &mut [(u32, u32, Vec<u8>)]) {
         for texel in data.chunks_exact_mut(4) {
             texel[3] = (f32::from(texel[3]) * scale).round().clamp(0.0, 255.0) as u8;
         }
+    }
+}
+
+/// How far the asked aerosols' factor may run from the one held before the held one follows it: a hundredth of it.
+const AEROSOL_STEP: f32 = 0.01;
+
+/// The aerosols' factor the LUTs, the cube and the passes hold this frame (`Renderer::aerosol`): `held` until `asked`
+/// is a hundredth of it away (an ease then moves the sky in steps of a hundredth, each a LUT build and a cube), or
+/// until `asked` holds still for a frame (`last`, the frame before's), when it takes it exactly, so an ease ends on
+/// its value and a value set once is taken at once. Clamped to 0..1000, and 1 for one that is not a number.
+fn follow_aerosol(held: f32, asked: f32, last: f32) -> f32 {
+    let asked = if asked.is_finite() { asked.clamp(0.0, 1000.0) } else { 1.0 };
+    let last = if last.is_finite() { last.clamp(0.0, 1000.0) } else { 1.0 };
+    if asked == held {
+        return held;
+    }
+    if asked == last || (asked - held).abs() > AEROSOL_STEP * held.max(0.05) {
+        asked
+    } else {
+        held
+    }
+}
+
+#[cfg(test)]
+mod aerosol_tests {
+    use super::follow_aerosol;
+
+    /// The default is 1 and stays 1; a value set once is taken whole; an ease is followed in hundredths and ends on its
+    /// value exactly once it stops.
+    #[test]
+    fn the_factor_steps_through_an_ease_and_lands_on_its_end() {
+        assert_eq!(follow_aerosol(1.0, 1.0, 1.0), 1.0);
+        // Set once (or jumped to by a scripted picture): taken at once.
+        assert_eq!(follow_aerosol(1.0, 3.0, 1.0), 3.0);
+        // An ease from 1 to 2 over 600 frames: held between steps of a hundredth, never every frame.
+        let (mut held, mut last, mut steps) = (1.0_f32, 1.0_f32, 0);
+        for frame in 1..=600 {
+            let asked = 1.0 + frame as f32 / 600.0;
+            let next = follow_aerosol(held, asked, last);
+            if next != held {
+                assert!((next / held - 1.0).abs() > 0.009, "frame {frame}: a step of {held} to {next}");
+                steps += 1;
+            }
+            (held, last) = (next, asked);
+        }
+        assert!((60..=80).contains(&steps), "{steps} steps for 1 to 2");
+        assert!((held - 2.0).abs() <= 0.02 * 2.0);
+        // It stops: the next frame takes the end exactly.
+        held = follow_aerosol(held, 2.0, 2.0);
+        assert_eq!(held, 2.0);
+        // Back to the default in one still frame: the picture as it was.
+        assert_eq!(follow_aerosol(1.004, 1.0, 1.0), 1.0);
+        // Not a number, or out of range.
+        assert_eq!(follow_aerosol(1.0, f32::NAN, f32::NAN), 1.0);
+        assert_eq!(follow_aerosol(1.0, -2.0, -2.0), 0.0);
+        assert_eq!(follow_aerosol(1.0, 5000.0, 5000.0), 1000.0);
     }
 }
 

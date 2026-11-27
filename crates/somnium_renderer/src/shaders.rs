@@ -385,9 +385,76 @@ impl Shaders {
     }
 }
 
+/// The byte offset of `member` in the WGSL struct `name` of a composed module, and the struct's size, as naga lays
+/// them out: for tests that hold a Rust uniform to its shader.
+#[cfg(test)]
+pub(crate) fn wgsl_member_offset(text: &str, name: &str, member: &str) -> (u32, u32) {
+    let module = naga::front::wgsl::parse_str(text).unwrap_or_else(|e| panic!("{name}'s module does not parse: {e}"));
+    for (_, ty) in module.types.iter() {
+        if ty.name.as_deref() == Some(name)
+            && let naga::TypeInner::Struct { members, span } = &ty.inner
+        {
+            let m = members
+                .iter()
+                .find(|m| m.name.as_deref() == Some(member))
+                .unwrap_or_else(|| panic!("{name} has no member {member}"));
+            return (m.offset, *span);
+        }
+    }
+    panic!("no struct {name}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The aerosols' run-time factor (sunscar-engine, 27 Nov 2026): every Mie term in the shaders is times
+    /// `atmosphere_aerosol`, and every composed module that reaches one sets it from its own uniform at the top of
+    /// each entry point that does (the LUTs, the sky cube, the froxels, the aerial perspective). A module that only
+    /// samples the LUTs gets the factor through them. A new module that reads a Mie term fails here until it is
+    /// listed with its assignments.
+    #[test]
+    fn every_module_that_reads_mie_gets_the_factor() {
+        const MIE: [&str; 5] = ["atmosphere_extinction(", "raymarch_sky", "compute_transmittance(", "MIE_SCATTERING", "MIE_EXTINCTION"];
+        // The root, the assignment its entry points make, and how many make it.
+        let expected = [
+            ("atmosphere_lut.wgsl", "atmosphere_aerosol = lut_air.x;", 2),
+            ("ibl_gen.wgsl", "atmosphere_aerosol = params.clouds.z;", 2),
+            ("shading.wgsl", "atmosphere_aerosol = volumetric_range.b.z;", 1),
+            ("volumetric.wgsl", "atmosphere_aerosol = vol.aerosol;", 1),
+        ];
+        let shaders = Shaders::new();
+        let ids: Vec<_> = shaders.system.lock().unwrap().registry().ids().collect();
+        let mut readers = Vec::new();
+        for id in ids {
+            let (name, own) = {
+                let system = shaders.system.lock().unwrap();
+                let registry = system.registry();
+                (registry.name(id).unwrap(), registry.raw_source(id).unwrap_or_default().to_owned())
+            };
+            if name == "atmosphere.wgsl" || !MIE.iter().any(|m| own.contains(m)) {
+                continue;
+            }
+            readers.push(name);
+            let (_, assignment, entries) = expected
+                .iter()
+                .find(|(root, ..)| *root == name)
+                .unwrap_or_else(|| panic!("{name} reads a Mie term and is not listed with its factor"));
+            assert_eq!(own.matches(assignment).count(), *entries, "{name}: each entry point sets the factor");
+            // Every direct Mie constant is times the factor, the const lines aside.
+            for line in own.lines().filter(|l| l.contains("MIE_SCATTERING") || l.contains("MIE_EXTINCTION")) {
+                assert!(line.contains("* atmosphere_aerosol"), "{name}: `{}` misses the factor", line.trim());
+            }
+        }
+        readers.sort_unstable();
+        assert_eq!(readers, expected.iter().map(|(root, ..)| *root).collect::<Vec<_>>());
+        // In the shared module: the extinction and both sky marches carry it, and nothing else reads the constants.
+        let atmosphere = shaders.source_or_panic("atmosphere.wgsl");
+        assert_eq!(atmosphere.matches("var<private> atmosphere_aerosol: f32 = 1.0;").count(), 1);
+        assert_eq!(atmosphere.matches("vec3<f32>(MIE_EXTINCTION * atmosphere_aerosol) * d.y").count(), 1);
+        assert_eq!(atmosphere.matches("MIE_SCATTERING * atmosphere_aerosol * density.y").count(), 2);
+        assert_eq!(atmosphere.matches("MIE_SCATTERING").count() + atmosphere.matches("MIE_EXTINCTION").count(), 5);
+    }
 
     /// Every registered module composes.
     ///

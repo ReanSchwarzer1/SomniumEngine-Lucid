@@ -1,8 +1,11 @@
 //! Atmospheric scattering LUTs (Phase 24C).
 //!
 //! Builds the two tables Hillaire's model needs — transmittance and multiple
-//! scattering — once at startup. Neither depends on the sun or the camera, only
-//! on the atmosphere's own composition, so there is nothing to update per frame.
+//! scattering — at startup. Neither depends on the sun or the camera, only on
+//! the atmosphere's own composition, so there is nothing to update per frame;
+//! they are built again when that composition moves: the aerosols' factor
+//! (`Renderer::aerosol`, which the renderer steps, so a weather's slow ease
+//! does not rebuild them every frame).
 //!
 //! The sky itself is evaluated straight into the environment cubemap by the IBL
 //! pass, which means one sky feeds the background, the ambient light and the
@@ -21,7 +24,10 @@ pub struct AtmospherePass {
     transmittance_view: wgpu::TextureView,
     multiscatter_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
-    built: bool,
+    /// The aerosols' factor the LUTs hold, once built.
+    built: Option<f32>,
+    /// `lut_air` in `atmosphere_lut.wgsl`: x the aerosols' factor.
+    air_buffer: wgpu::Buffer,
     transmittance_pipeline: wgpu::RenderPipeline,
     multiscatter_pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
@@ -59,7 +65,23 @@ impl AtmospherePass {
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(AIR_PARAMS_SIZE),
+                    },
+                    count: None,
+                },
             ],
+        });
+        let air_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Atmosphere LUT air"),
+            size: AIR_PARAMS_SIZE,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -145,6 +167,10 @@ impl AtmospherePass {
                         binding: 1,
                         resource: wgpu::BindingResource::Sampler(&sampler),
                     },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: air_buffer.as_entire_binding(),
+                    },
                 ],
             })
         };
@@ -159,7 +185,8 @@ impl AtmospherePass {
             transmittance_view,
             multiscatter_view,
             sampler,
-            built: false,
+            built: None,
+            air_buffer,
             transmittance_pipeline: make_pipeline("fs_transmittance", "Atmosphere transmittance"),
             multiscatter_pipeline: make_pipeline("fs_multiscatter", "Atmosphere multiscatter"),
             layout,
@@ -185,13 +212,14 @@ impl AtmospherePass {
         &self.layout
     }
 
-    /// Build both LUTs. Does nothing after the first call — they depend only on
-    /// the atmosphere's composition, which does not change at runtime.
-    pub fn ensure_built(&mut self, device: &wgpu::Device, queue: &wgpu::Queue) {
-        if self.built {
-            return;
+    /// Build both LUTs for the aerosols' factor `aerosol` (1: the constants as written). Does nothing while they
+    /// hold that factor already: they depend only on the atmosphere's composition. True when they were built.
+    pub fn ensure_built(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, aerosol: f32) -> bool {
+        if self.built == Some(aerosol) {
+            return false;
         }
-        self.built = true;
+        self.built = Some(aerosol);
+        queue.write_buffer(&self.air_buffer, 0, bytemuck::bytes_of(&air_params(aerosol)));
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Atmosphere LUTs"),
@@ -237,5 +265,27 @@ impl AtmospherePass {
         // Submitted separately from the frame so the LUTs are ready before the
         // first environment cubemap is generated from them.
         queue.submit(Some(encoder.finish()));
+        true
+    }
+}
+
+/// `lut_air`'s size: one vec4.
+const AIR_PARAMS_SIZE: u64 = 16;
+
+/// `lut_air` as written: x the aerosols' factor, the rest zero.
+fn air_params(aerosol: f32) -> [f32; 4] {
+    [aerosol, 0.0, 0.0, 0.0]
+}
+
+#[cfg(test)]
+mod tests {
+    /// The LUT shader's `lut_air` is one vec4 at binding 2 with the factor in x, as the pass writes it.
+    #[test]
+    fn the_lut_takes_the_factor_in_its_own_uniform() {
+        let text = crate::shaders::Shaders::new().source_or_panic("atmosphere_lut.wgsl");
+        assert!(text.contains("@group(0) @binding(2) var<uniform> lut_air:  vec4<f32>;"));
+        assert_eq!(text.matches("atmosphere_aerosol = lut_air.x;").count(), 2, "both LUTs set the factor");
+        assert_eq!(std::mem::size_of_val(&super::air_params(1.0)) as u64, super::AIR_PARAMS_SIZE);
+        assert_eq!(super::air_params(2.5)[0], 2.5);
     }
 }

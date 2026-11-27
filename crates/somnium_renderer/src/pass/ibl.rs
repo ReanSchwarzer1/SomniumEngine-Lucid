@@ -37,8 +37,8 @@ const MOVING_QUICK_COS: f32 = 0.999_962;
 const MOVING_JUMP_COS: f32 = 0.996_194_7;
 
 /// What a cube was built for: the sun's direction, its colour, the overcast's bits and the sun on the ground (`GenParams`
-/// `sun_ground`); the night; the clouds' capture.
-type SunKey = ([f32; 3], [f32; 3], u32, [f32; 4], [[f32; 4]; 3]);
+/// `sun_ground`), the planet, the aerosols' factor's bits (`IblPass::aerosol`); the night; the clouds' capture.
+type SunKey = ([f32; 3], [f32; 3], u32, [f32; 4], [[f32; 4]; 3], u32);
 type SkyKey = (SunKey, NightSky, Option<u64>);
 
 /// Where a running clock's rebuild stands.
@@ -87,7 +87,8 @@ struct GenParams {
     night: [f32; 4],
     /// `NightSky::tint`, then padding.
     night_tint: [f32; 4],
-    /// x: 1 lays the clouds' capture over the sky (`set_cloud_capture`). y: `IblPass::clouds_under`.
+    /// x: 1 lays the clouds' capture over the sky (`set_cloud_capture`). y: `IblPass::clouds_under`. z: the aerosols'
+    /// factor (`IblPass::aerosol`).
     clouds: [f32; 4],
     /// The sun on the ground and 1 when `sun_color` is the sun above the air (`generate_if_needed`'s `ground_sun`);
     /// all zero is the sky as it always was.
@@ -154,6 +155,9 @@ pub struct IblPass {
     /// 2026). It rides the cube's next rebuild, which the clouds' own capture brings when the deck changes; 0, the
     /// default, is every sky but a closed deck.
     pub clouds_under: f32,
+    /// The aerosols' factor the sky is marched with (`Renderer::aerosol`, as the renderer steps it; the renderer sets
+    /// it each frame). Part of the cube's key: a new one rebuilds the cube (a running clock's in its next cycle).
+    pub aerosol: f32,
     prefilter_bind_group: wgpu::BindGroup,
     params_buffer: wgpu::Buffer,
 
@@ -469,6 +473,7 @@ impl IblPass {
             mip0_view,
             last_clouds: None,
             clouds_under: 0.0,
+            aerosol: 1.0,
             prefilter_bind_group,
             params_buffer,
             last_sun: None,
@@ -554,7 +559,8 @@ impl IblPass {
     ) -> bool {
         let overcast = if clouds.is_some() { 0.0 } else { overcast.clamp(0.0, 1.0) };
         let ground = ground_sun.map_or([0.0; 4], |g| [g.x, g.y, g.z, 1.0]);
-        let key = (sun_direction.to_array(), sun_color.to_array(), overcast.to_bits(), ground, planet);
+        let aerosol = self.aerosol;
+        let key = (sun_direction.to_array(), sun_color.to_array(), overcast.to_bits(), ground, planet, aerosol.to_bits());
         let toward = sun_direction.normalize_or(glam::Vec3::Y);
         if moving
             && self
@@ -584,7 +590,7 @@ impl IblPass {
 
         // Mip 0: capture the sky.
         for face in 0..6u32 {
-            self.write_params(queue, face, 0.0, dir, sun_color, overcast, clouds_on, ground, planet);
+            self.write_params(queue, face, 0.0, dir, sun_color, overcast, clouds_on, ground, planet, aerosol);
             self.run_face(device, queue, &self.face_mip_views[face as usize], true, &self.prefilter_bind_group);
         }
 
@@ -592,7 +598,7 @@ impl IblPass {
         for mip in 1..MIP_COUNT {
             let roughness = mip as f32 / (MIP_COUNT - 1) as f32;
             for face in 0..6u32 {
-                self.write_params(queue, face, roughness, dir, sun_color, overcast, clouds_on, ground, planet);
+                self.write_params(queue, face, roughness, dir, sun_color, overcast, clouds_on, ground, planet, aerosol);
                 let view = &self.face_mip_views[(mip * 6 + face) as usize];
                 self.run_face(device, queue, view, false, &self.prefilter_bind_group);
             }
@@ -653,7 +659,7 @@ impl IblPass {
     /// The cycle's next faces and mips of the second cube, for the sky it is being built for; the last of them starts
     /// the crossfade. Mip 0's faces come first: the prefilter reads them.
     fn build_jobs(&self, device: &wgpu::Device, queue: &wgpu::Queue, m: &mut MovingSky) {
-        let (MovingPhase::Building { mut job, per_frame, blend }, Some(((sun, color, overcast, ground, planet), _, clouds))) =
+        let (MovingPhase::Building { mut job, per_frame, blend }, Some(((sun, color, overcast, ground, planet, aerosol), _, clouds))) =
             (m.phase, m.key)
         else {
             return;
@@ -663,7 +669,18 @@ impl IblPass {
         for _ in 0..per_frame {
             let (mip, face) = (job / 6, job % 6);
             let roughness = mip as f32 / (MIP_COUNT - 1) as f32;
-            self.write_params(queue, face, roughness, dir, color.into(), f32::from_bits(overcast), clouds_on, ground, planet);
+            self.write_params(
+                queue,
+                face,
+                roughness,
+                dir,
+                color.into(),
+                f32::from_bits(overcast),
+                clouds_on,
+                ground,
+                planet,
+                f32::from_bits(aerosol),
+            );
             self.run_face(device, queue, &m.face_mip_views[job as usize], mip == 0, &m.prefilter_bind_group);
             job += 1;
             if job == MIP_COUNT * 6 {
@@ -773,6 +790,7 @@ impl IblPass {
         clouds: f32,
         ground: [f32; 4],
         planet: [[f32; 4]; 3],
+        aerosol: f32,
     ) {
         let p = GenParams {
             face,
@@ -800,7 +818,7 @@ impl IblPass {
             ],
             night: [self.night.glow.max(0.0), self.night.aurora, self.night.halo_road, self.night.thread],
             night_tint: [self.night.tint[0], self.night.tint[1], self.night.tint[2], 0.0],
-            clouds: [clouds, self.clouds_under.clamp(0.0, 1.0), 0.0, 0.0],
+            clouds: [clouds, self.clouds_under.clamp(0.0, 1.0), aerosol, 0.0],
             sun_ground: ground,
             planet,
         };
@@ -851,5 +869,23 @@ impl IblPass {
     /// Highest mip index, for mapping roughness to a mip in the shading pass.
     pub const fn max_mip() -> f32 {
         (MIP_COUNT - 1) as f32
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GenParams;
+
+    /// `GenParams` lies in Rust as naga lays it out in `ibl_gen.wgsl`, and the aerosols' factor rides `clouds.z`, which
+    /// both sky passes read into `atmosphere_aerosol`.
+    #[test]
+    fn gen_params_match_the_shader_and_carry_the_factor() {
+        let text = crate::shaders::Shaders::new().source_or_panic("ibl_gen.wgsl");
+        let (clouds, size) = crate::shaders::wgsl_member_offset(&text, "GenParams", "clouds");
+        assert_eq!(clouds as usize, std::mem::offset_of!(GenParams, clouds));
+        let (planet, _) = crate::shaders::wgsl_member_offset(&text, "GenParams", "planet");
+        assert_eq!(planet as usize, std::mem::offset_of!(GenParams, planet));
+        assert_eq!(size as usize, std::mem::size_of::<GenParams>());
+        assert_eq!(text.matches("atmosphere_aerosol = params.clouds.z;").count(), 2, "fs_sky and fs_prefilter");
     }
 }
