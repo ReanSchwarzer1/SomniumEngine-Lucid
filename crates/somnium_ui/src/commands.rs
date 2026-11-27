@@ -210,6 +210,14 @@ impl Enablement {
     }
 }
 
+/// What a click on a disabled menu row says (it used to do nothing at all): the command and why. `None` while the
+/// command may run, or for an id that is not a registry command.
+pub fn disabled_message(id: &str, ctx: &EditorCtx) -> Option<String> {
+    let command = registry().get(id)?;
+    let reason = command.enabled(ctx).reason()?;
+    Some(format!("{} is not available: {reason}", command.label))
+}
+
 /// State consulted by command enablement predicates.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EditorCtx {
@@ -2700,6 +2708,17 @@ pub fn sectioned(commands: Vec<Command>) -> Vec<(&'static str, Vec<Command>)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_disabled_menu_row_says_why_and_an_enabled_one_says_nothing() {
+        let undo = super::registry().get("editor.edit.undo").expect("undo is a command");
+        let message = super::disabled_message("editor.edit.undo", &super::EditorCtx::default()).expect("nothing to undo");
+        assert!(message.starts_with(&format!("{} is not available: ", undo.label)), "{message}");
+        assert!(message.len() > undo.label.len() + 20, "the reason is in it: {message}");
+        let can = super::EditorCtx { can_undo: true, ..super::EditorCtx::default() };
+        assert_eq!(super::disabled_message("editor.edit.undo", &can), None);
+        assert_eq!(super::disabled_message("no.such.command", &can), None);
+    }
+
     #[test]
     fn foliage_mode_and_f8_use_the_painter_command() {
         let command = registry().get("editor.foliage.edit").unwrap();
