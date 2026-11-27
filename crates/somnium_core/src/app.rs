@@ -13508,6 +13508,15 @@ impl<G: GameApp> Engine<G> {
                 self.ui_wants_exit = true;
             }
 
+            EditorEvent::AfterSave(action) => {
+                self.save_scene_edits();
+                if self.scene_dirty {
+                    self.toast("Not saved, so the scene stays open.");
+                    return;
+                }
+                self.handle_editor_event(*action);
+            }
+
             EditorEvent::Quit { after_save } => {
                 if after_save {
                     self.save_scene_edits();

@@ -11228,12 +11228,13 @@ mod dpi_tests {
     }
 }
 
-/// What "Save" in "Save changes?" sends: the save, then the action that asked. Quitting saves inside the quit, so a
-/// save that fails or is cancelled keeps the editor open.
+/// What "Save" in "Save changes?" sends: the save, then the action that asked. Quitting saves inside the quit and
+/// any other action is wrapped, so a save that fails or is cancelled keeps the editor and the scene open.
 fn events_after_save(action: Option<EditorEvent>) -> Vec<EditorEvent> {
     match action {
         Some(EditorEvent::Quit { .. }) => vec![EditorEvent::Quit { after_save: true }],
-        action => std::iter::once(EditorEvent::SaveScene).chain(action).collect(),
+        Some(action) => vec![EditorEvent::AfterSave(Box::new(action))],
+        None => vec![EditorEvent::SaveScene],
     }
 }
 
@@ -11248,9 +11249,12 @@ mod unsaved_prompt_tests {
     }
 
     #[test]
-    fn save_then_new_still_saves_then_runs_the_action() {
+    fn save_then_new_runs_the_action_only_after_a_save_that_held() {
         let events = events_after_save(Some(EditorEvent::NewScene));
-        assert!(matches!(events.as_slice(), [EditorEvent::SaveScene, EditorEvent::NewScene]));
+        assert!(matches!(
+            events.as_slice(),
+            [EditorEvent::AfterSave(action)] if matches!(**action, EditorEvent::NewScene)
+        ));
         assert!(matches!(events_after_save(None).as_slice(), [EditorEvent::SaveScene]));
     }
 }
