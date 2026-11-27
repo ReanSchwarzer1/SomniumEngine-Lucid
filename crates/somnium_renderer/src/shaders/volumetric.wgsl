@@ -103,7 +103,8 @@ struct VolumetricParams {
     /// 1: `sun_illuminance` is the sun above the air (a running day clock): the multiscatter table is read for a set
     /// sun as its light falls (`sample_multiscatter_twilight`).
     above_air: f32,
-    _cloud_pad1: f32,
+    /// The aerosols' factor (`atmosphere_aerosol`, set from it at the top of `main`).
+    aerosol: f32,
     _cloud_pad2: f32,
     /// The planet over the horizon: toward it, w 1 by night (the clouds' shadow field is then cast toward it); its
     /// light above the air (rgb, lux), w 1 when there is one.
@@ -318,6 +319,7 @@ fn fog_density_at(world_y: f32) -> f32 {
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    atmosphere_aerosol = vol.aerosol;
     let dims = textureDimensions(volume_out);
     if gid.x >= dims.x || gid.y >= dims.y {
         return;
@@ -397,7 +399,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // going opaque within a metre of the camera.
             const KM_PER_M: f32 = 0.001;
             let scatter_rayleigh = RAYLEIGH_SCATTERING * density.x * KM_PER_M;
-            let scatter_mie = vec3<f32>(MIE_SCATTERING * density.y * KM_PER_M);
+            let scatter_mie = vec3<f32>(MIE_SCATTERING * atmosphere_aerosol * density.y * KM_PER_M);
 
             let mu_sun = sun_dir.y;
             // Phase 25M. `atmosphere.wgsl` and `atmosphere_lut.wgsl` both guard

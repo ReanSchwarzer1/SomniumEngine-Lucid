@@ -191,7 +191,8 @@ fn skin_visibility(p: vec3<f32>, emitter: vec3<f32>, reach: f32) -> f32 {
 @group(1) @binding(9) var volumetrics: texture_3d<f32>;
 @group(1) @binding(10) var volumetric_sampler: sampler;
 // a: x metres the volume spans (0 when volumetrics are switched off), y the height fog's density, z its falloff, w
-// its base. b: x the fog's flat top (at or under the base: none), y the metres it fades over.
+// its base. b: x the fog's flat top (at or under the base: none), y the metres it fades over, z the aerosols' factor
+// (`atmosphere_aerosol`, set from it at the top of `fs_main`).
 struct VolumetricRange {
     a: vec4<f32>,
     b: vec4<f32>,
@@ -2347,6 +2348,7 @@ fn compute_depth_slice(view_depth: f32) -> u32 {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    atmosphere_aerosol = volumetric_range.b.z;
     let pixel_coords = vec2<i32>(in.clip_pos.xy);
     // Published for the terrain material's stochastic filtering, which needs a
     // screen-space dither index. See `terrain_screen_pixel`.
@@ -3994,7 +3996,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let dir = (hit_point - view.camera_pos) / max(dist, 1e-3);
             let h_km = max(view.camera_pos.y, 0.0) * 0.001;
             let air = (RAYLEIGH_SCATTERING * exp(-h_km / RAYLEIGH_SCALE_H)
-                + vec3<f32>(MIE_EXTINCTION * exp(-h_km / MIE_SCALE_H))) * 0.001;
+                + vec3<f32>(MIE_EXTINCTION * atmosphere_aerosol * exp(-h_km / MIE_SCALE_H))) * 0.001;
             let fog_depth = fog_depth_beyond(dir, beyond);
             let depth = air * beyond + vec3<f32>(fog_depth);
             let air_t = exp(-depth);

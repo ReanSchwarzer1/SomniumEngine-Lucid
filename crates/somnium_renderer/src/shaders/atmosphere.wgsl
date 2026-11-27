@@ -28,6 +28,10 @@ const MIE_SCATTERING: f32 = 3.996e-3;
 const MIE_EXTINCTION: f32 = 4.4e-3;
 const MIE_SCALE_H:    f32 = 1.2;
 const MIE_G:          f32 = 0.8;
+/// The aerosols' run-time factor (`Renderer::aerosol`, from the scene's Sky; Sunscar weather, 27 Nov 2026): the Mie
+/// scattering and extinction above are times this wherever they are read, 1 as written. Each entry point that reaches
+/// a Mie term sets it first from its own uniform; one that does not keeps 1.
+var<private> atmosphere_aerosol: f32 = 1.0;
 
 /// Ozone absorbs but does not scatter. Without it the sky stays washed-out and
 /// never reaches the deep blue of a real zenith, and twilight loses its purple.
@@ -48,7 +52,7 @@ fn atmosphere_density(altitude: f32) -> vec3<f32> {
 fn atmosphere_extinction(altitude: f32) -> vec3<f32> {
     let d = atmosphere_density(altitude);
     return RAYLEIGH_SCATTERING * d.x
-         + vec3<f32>(MIE_EXTINCTION) * d.y
+         + vec3<f32>(MIE_EXTINCTION * atmosphere_aerosol) * d.y
          + OZONE_ABSORPTION * d.z;
 }
 
@@ -200,7 +204,7 @@ fn raymarch_sky(
         let density    = atmosphere_density(alt);
         let extinction = atmosphere_extinction(alt);
         let scatter_r  = RAYLEIGH_SCATTERING * density.x;
-        let scatter_m  = MIE_SCATTERING * density.y;
+        let scatter_m  = MIE_SCATTERING * atmosphere_aerosol * density.y;
 
         let mu_sun = dot(pos, sun_dir) / ri;
 
@@ -293,7 +297,7 @@ fn raymarch_sky_twilight(
         let density    = atmosphere_density(alt);
         let extinction = atmosphere_extinction(alt);
         let scatter_r  = RAYLEIGH_SCATTERING * density.x;
-        let scatter_m  = MIE_SCATTERING * density.y;
+        let scatter_m  = MIE_SCATTERING * atmosphere_aerosol * density.y;
 
         // The sun against this point's own horizon (the planet dips below its level by acos(R / r)).
         let mu_sun = dot(pos, sun_dir) / ri;

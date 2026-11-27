@@ -69,7 +69,9 @@ struct VolumetricParams {
     cloud_sky: f32,
     /// 1: `sun_illuminance` is the sun above the air (`VolumetricPass::above_air`).
     above_air: f32,
-    _cloud_pad: [f32; 2],
+    /// The aerosols' factor (`VolumetricPass::aerosol`).
+    aerosol: f32,
+    _cloud_pad: f32,
     /// The planet over the horizon (`VolumetricPass::planet`).
     planet_direction: [f32; 4],
     planet_light: [f32; 4],
@@ -82,6 +84,19 @@ mod tests {
     #[test]
     fn params_keep_rust_and_wgsl_uniform_alignment() {
         assert_eq!(std::mem::size_of::<VolumetricParams>() % 16, 0);
+    }
+
+    /// The aerosols' factor sits where naga puts `aerosol` in `volumetric.wgsl` (the old padding: the struct keeps its
+    /// size), and the froxel march reads it into `atmosphere_aerosol` before anything else.
+    #[test]
+    fn the_factor_lies_where_the_shader_reads_it() {
+        let text = crate::shaders::Shaders::new().source_or_panic("volumetric.wgsl");
+        let (aerosol, size) = crate::shaders::wgsl_member_offset(&text, "VolumetricParams", "aerosol");
+        assert_eq!(aerosol as usize, std::mem::offset_of!(VolumetricParams, aerosol));
+        let (planet, _) = crate::shaders::wgsl_member_offset(&text, "VolumetricParams", "planet_light");
+        assert_eq!(planet as usize, std::mem::offset_of!(VolumetricParams, planet_light));
+        assert_eq!(size as usize, std::mem::size_of::<VolumetricParams>());
+        assert_eq!(text.matches("atmosphere_aerosol = vol.aerosol;").count(), 1);
     }
 
     /// A weather transition moves the fog a little each frame; a preset change or a new range starts the volume again.
@@ -210,6 +225,9 @@ pub struct VolumetricPass {
     pub above_air: bool,
     /// The planet over the horizon, as the cloud pass takes it (`CloudPass::planet`); all zero is none.
     pub planet: [[f32; 4]; 2],
+    /// The aerosols' factor on the air's Mie scattering and extinction (`Renderer::aerosol`, as the renderer steps it;
+    /// set each frame), 1 as the shader's constants are written.
+    pub aerosol: f32,
 }
 
 impl VolumetricPass {
@@ -436,6 +454,7 @@ impl VolumetricPass {
             max_distance: DEFAULT_MAX_DISTANCE,
             above_air: false,
             planet: [[0.0; 4]; 2],
+            aerosol: 1.0,
         }
     }
 
@@ -631,7 +650,8 @@ impl VolumetricPass {
                 fog_top_softness: self.fog.top_softness.max(0.1),
                 cloud_sky: f32::from(u8::from(cloud_sky)),
                 above_air: f32::from(u8::from(self.above_air)),
-                _cloud_pad: [0.0; 2],
+                aerosol: self.aerosol,
+                _cloud_pad: 0.0,
                 planet_direction: self.planet[0],
                 planet_light: self.planet[1],
             }),

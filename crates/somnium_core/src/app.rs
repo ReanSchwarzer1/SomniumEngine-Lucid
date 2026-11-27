@@ -8618,6 +8618,8 @@ impl<G: GameApp> Engine<G> {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
+        // The air's aerosols ride the Sky whether its cloud layer is on or not; a scene without one has the engine's own.
+        renderer.aerosol = sky.map_or(1.0, |s| s.aerosol);
         let Some(sky) = sky else {
             // No Environment: the pass stays exactly as the environment
             // variable left it, which is how a scene with no sky component

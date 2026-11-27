@@ -1293,6 +1293,9 @@ fn sky_schema() -> ComponentSchema {
             quality { min: 0, max: 2, group: "Clouds", display_name: "Cloud Quality" },
             temporal_jitter { group: "Quality", display_name: "Temporal Jitter",
                 advanced: true },
+            aerosol { min: 0.0, soft_max: 10.0, step: 0.01, precision: 2, group: "Atmosphere",
+                display_name: "Aerosols",
+                doc: "Haze, dust and smoke in the air: a factor on the atmosphere's Mie scattering and extinction. 1 is the engine's own." },
         }
     };
     // `quality` is an integer in Rust and a named choice in the panel. The

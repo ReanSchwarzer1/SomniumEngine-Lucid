@@ -105,7 +105,7 @@ fn a_running_clock_moves_the_sky_light_without_a_step() {
     let (device, queue) = gpu::device();
     let shaders = somnium_renderer::shaders::Shaders::new();
     let mut atmosphere = AtmospherePass::new(&device, &shaders);
-    atmosphere.ensure_built(&device, &queue);
+    atmosphere.ensure_built(&device, &queue, 1.0);
     let mut ibl = IblPass::new(&device, &shaders, &atmosphere);
     let probe = Probe::new(&device);
 
@@ -165,7 +165,7 @@ fn a_sky_lit_above_the_air_keeps_its_light_after_sunset() {
     let (device, queue) = gpu::device();
     let shaders = somnium_renderer::shaders::Shaders::new();
     let mut atmosphere = AtmospherePass::new(&device, &shaders);
-    atmosphere.ensure_built(&device, &queue);
+    atmosphere.ensure_built(&device, &queue, 1.0);
     let mut ibl = IblPass::new(&device, &shaders, &atmosphere);
     let probe = Probe::new(&device);
     let above = glam::Vec3::splat(80_000.0);
