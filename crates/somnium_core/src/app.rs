@@ -1275,6 +1275,8 @@ pub struct Engine<G: GameApp> {
     autosave: crate::autosave::AutosaveClock,
     /// A recoverable autosave found at launch, until the person answers.
     pending_recovery: Option<crate::autosave::Recovery>,
+    /// This session wrote an autosave: a clean close takes it away (nothing is left to recover).
+    autosave_written: bool,
     /// Most-recently-opened scenes, newest first.
     recent_scenes: Vec<std::path::PathBuf>,
     /// The project's levels (`ProjectPaths::level_scenes`), listed in the File
@@ -2013,6 +2015,7 @@ impl<G: GameApp + 'static> Engine<G> {
             hover_picked_at: std::time::Instant::now(),
             autosave: crate::autosave::AutosaveClock::new(autosave_interval),
             pending_recovery: None,
+            autosave_written: false,
             recent_scenes: crate::settings::load_recent_scenes(),
             level_scenes,
             entity_clipboard: crate::clipboard::EntityClipboard::default(),
@@ -2584,7 +2587,14 @@ impl<G: GameApp> Engine<G> {
             &self.type_registry,
             &path.to_string_lossy(),
         ) {
-            Ok(()) => info!(?reason, "autosaved"),
+            Ok(()) => {
+                self.autosave_written = true;
+                // The note names the scene this copies, so the next start holds it against that scene's own save.
+                match crate::autosave::note_scene(&path, self.open_scene_file().as_deref()) {
+                    Ok(()) => info!(?reason, "autosaved"),
+                    Err(error) => warn!(%error, "autosaved, but the note naming its scene was not written: it will not be offered"),
+                }
+            }
             Err(error) => warn!(%error, "autosave failed"),
         }
     }
@@ -2673,17 +2683,26 @@ impl<G: GameApp> Engine<G> {
         if self.config.player_mode {
             return;
         }
-        let scene = std::path::PathBuf::from("scene.somnium");
-        self.pending_recovery = crate::autosave::find_recovery(&self.config.content_root, &scene);
+        // Each autosave is held against the scene its note names (`autosave::find_recovery`), not a fixed name.
+        self.pending_recovery = crate::autosave::find_recovery(&self.config.content_root);
         if let Some(recovery) = &self.pending_recovery {
             let reason = match recovery.reason {
                 crate::autosave::AutosaveReason::BeforePlay => "before Play",
                 crate::autosave::AutosaveReason::Interval => "autosave",
             };
-            let message = format!("Unsaved work was recovered ({reason}) — File > Open it");
+            let scene = recovery
+                .scene
+                .as_deref()
+                .and_then(std::path::Path::file_name)
+                .map_or_else(|| "an unsaved scene".to_owned(), |n| n.to_string_lossy().into_owned());
+            let file = recovery.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let message = format!(
+                "Unsaved work on {scene} was kept ({reason}): File > Open {}/{file} in the content folder",
+                crate::autosave::AUTOSAVE_DIR
+            );
             if let Some(ui) = self.ui_manager.as_mut() {
                 ui.append_log(&format!(
-                    "[scene] recovered {} ({reason})",
+                    "[scene] recovered {} ({reason}), unsaved work on {scene}",
                     recovery.path.display()
                 ));
                 ui.push_toast(&message);
@@ -7208,6 +7227,11 @@ impl<G: GameApp> Engine<G> {
         }
         info!("Initiating engine shutdown");
         self.release_play_cursor();
+        // A close the person chose (every path here passed `may_quit`, which asks about unsaved work): what this
+        // session autosaved is either saved or let go, so the next start offers nothing. A crash never comes here.
+        if self.autosave_written && !self.config.player_mode {
+            crate::autosave::clear(&self.config.content_root);
+        }
         self.state = LifecycleState::ShuttingDown;
         self.game.on_shutdown();
         event_loop.exit();
