@@ -1089,7 +1089,7 @@ impl<G: GameApp> Engine<G> {
         let Some(layer) = self.editing.layer.as_ref() else {
             return;
         };
-        let count = layer.entities.len() + layer.painted.len();
+        let (objects, plants) = (layer.entities.len(), layer.painted.len());
         match layer.write(&scene) {
             Ok(()) => {
                 self.scene_dirty = false;
@@ -1098,10 +1098,13 @@ impl<G: GameApp> Engine<G> {
                 self.remember_recent_scene(&scene);
                 let file = scene_edits::layer_path(&scene);
                 let file = file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                let mut message = if count == 0 {
-                    "Saved: no edits to this scene".to_owned()
-                } else {
-                    format!("Saved {count} edited object{} to {file}", if count == 1 { "" } else { "s" })
+                let objects_text = format!("{objects} edited object{}", if objects == 1 { "" } else { "s" });
+                let plants_text = format!("{plants} removed plant{}", if plants == 1 { "" } else { "s" });
+                let mut message = match (objects, plants) {
+                    (0, 0) => "Saved: no edits to this scene".to_owned(),
+                    (_, 0) => format!("Saved {objects_text} to {file}"),
+                    (0, _) => format!("Saved {plants_text} to {file}"),
+                    _ => format!("Saved {objects_text} and {plants_text} to {file}"),
                 };
                 if self.editing.terrain_touched {
                     message.push_str(" (terrain sculpting and foliage painting are not kept there: File > Save Scene As keeps them)");

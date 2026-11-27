@@ -104,13 +104,14 @@ impl SceneEdits {
         Ok(Some(layer))
     }
 
-    /// Write the layer beside `scene`, or move an empty one aside so a scene without edits has no layer.
+    /// Write the layer beside `scene`, or move an empty one aside so a scene without edits has no layer. A layer
+    /// is empty when it holds neither edited objects nor taken-out painted copies.
     ///
     /// # Errors
     /// The file could not be written.
     pub fn write(&self, scene: &Path) -> Result<(), String> {
         let path = layer_path(scene);
-        if self.entities.is_empty() {
+        if self.entities.is_empty() && self.painted.is_empty() {
             if path.exists() {
                 // Kept, renamed: the house rule is that nothing is hard-deleted.
                 let aside = path.with_extension("json.cleared");
@@ -849,6 +850,49 @@ mod tests {
         SceneEdits::new(&scene_path).write(&scene_path).unwrap();
         assert_eq!(SceneEdits::read(&scene_path).unwrap(), None);
         assert!(layer_path(&scene_path).with_extension("json.cleared").exists());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    fn temp_scene(tag: &str) -> (PathBuf, PathBuf) {
+        let directory = std::env::temp_dir().join(format!("somnium-edits-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let scene_path = directory.join("town.scene.json");
+        (directory, scene_path)
+    }
+
+    fn painted_edit(x: f32) -> PaintedEdit {
+        PaintedEdit { ground: "scenes/town.scene.json".into(), kind: 7, at: [x, 0.0, 1.0] }
+    }
+
+    #[test]
+    fn a_layer_with_only_taken_out_copies_is_saved() {
+        let (directory, scene_path) = temp_scene("painted");
+        let mut edits = SceneEdits::new(&scene_path);
+        edits.painted.push(painted_edit(2.0));
+        edits.write(&scene_path).unwrap();
+        assert_eq!(SceneEdits::read(&scene_path).unwrap(), Some(edits.clone()));
+
+        // A save of the same layer again does not set the file aside.
+        edits.write(&scene_path).unwrap();
+        assert!(layer_path(&scene_path).exists());
+        assert!(!layer_path(&scene_path).with_extension("json.cleared").exists());
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn an_existing_file_is_not_renamed_away_while_copies_are_taken_out() {
+        let (directory, scene_path) = temp_scene("painted-keep");
+        let bench = entity(A, "Bench", [1.0, 0.4, 2.0]);
+        let mut edits = SceneEdits::new(&scene_path);
+        record_change(&mut edits, &bench, &moved(&bench, [1.0, 0.0, 2.0]), &Origin::default());
+        edits.write(&scene_path).unwrap();
+        // The only edit left is a taken-out copy.
+        edits.entities.clear();
+        edits.painted.push(painted_edit(3.0));
+        edits.write(&scene_path).unwrap();
+        assert_eq!(SceneEdits::read(&scene_path).unwrap(), Some(edits));
+        assert!(!layer_path(&scene_path).with_extension("json.cleared").exists());
         let _ = std::fs::remove_dir_all(&directory);
     }
 
