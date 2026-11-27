@@ -14,6 +14,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+#[path = "app_carry.rs"]
+mod carry;
+
 /// A click picks the part, not the object, when the object has more parts than this.
 const CONTAINER_PARTS: usize = 400;
 /// Find Floating Objects looks this far round the camera.
@@ -276,6 +279,8 @@ pub(crate) struct EditingState {
     set_names: HashMap<PathBuf, Arc<BTreeMap<u8, String>>>,
     /// Each mesh's surface, by mesh range (`None`: too big or unreadable).
     shapes: HashMap<(u32, u32, u32), Option<MeshShape>>,
+    /// Move on the Ground: the selection in hand, following the mouse.
+    carry: Option<carry::CarryState>,
 }
 
 /// What a ground material set calls its slots: `layers[]` with `slot` and `layer` in the set's `SOURCE.json` (Sunscar's
@@ -2798,26 +2803,64 @@ impl<G: GameApp> Engine<G> {
             self.toast("Select an object first");
             return;
         }
-        let Some(renderer) = self.renderer.as_ref() else {
+        let Some((changes, moved, left)) = self.ground_moves(&objects, align) else {
             return;
         };
+        let commands: Vec<Box<dyn EditorCommand>> = changes
+            .into_iter()
+            .map(|(object, start, end)| Box::new(SetTransformCmd::new(object.index(), start, end)) as Box<dyn EditorCommand>)
+            .collect();
+        crate::propagate_transforms(&mut self.world);
+        let label = if align { "Align to Surface" } else { "Drop to Ground" };
+        if !commands.is_empty() {
+            self.undo_stack.push(
+                Box::new(CommandGroup::named(label.to_owned(), commands)),
+                &mut self.world,
+                &mut self.selection.primary,
+            );
+            self.selection.reconcile();
+            self.scene_dirty = true;
+            crate::propagate_transforms(&mut self.world);
+        }
+        let mut message = format!("{label}: ");
+        if !moved.is_empty() {
+            message.push_str(&summarise(&moved));
+        }
+        if !left.is_empty() {
+            if !moved.is_empty() {
+                message.push_str("; ");
+            }
+            message.push_str("left ");
+            message.push_str(&summarise(&left));
+        }
+        self.toast(&message);
+    }
+
+    /// What Drop to Ground (with `align`, Align to Surface) does to `objects`, worked out and not applied: each changed
+    /// object with its transform before and after, then the words for the toast (what moved, what was left). The world
+    /// is as it was on return. `None` without a renderer.
+    #[allow(clippy::type_complexity)]
+    pub(super) fn ground_moves(
+        &mut self,
+        objects: &[Entity],
+        align: bool,
+    ) -> Option<(Vec<(Entity, Transform, Transform)>, Vec<String>, Vec<String>)> {
+        let renderer = self.renderer.as_ref()?;
         crate::propagate_transforms(&mut self.world);
         let index = MeshIndex::build(&self.world, renderer);
         let terrains = self.prepare_terrains();
         let children = children_map(&self.world);
-        let mut commands: Vec<Box<dyn EditorCommand>> = Vec::new();
+        let mut changes: Vec<(Entity, Transform, Transform)> = Vec::new();
         let mut moved: Vec<String> = Vec::new();
         let mut left: Vec<String> = Vec::new();
-        for object in objects {
+        for &object in objects {
             let Some(start) = self.world.get::<Transform>(object).copied() else {
                 continue;
             };
             let members = subtree(&children, object);
             let excluded: HashSet<Entity> = members.iter().copied().collect();
             let name = name_of(&self.world, object);
-            let Some(renderer) = self.renderer.as_ref() else {
-                return;
-            };
+            let renderer = self.renderer.as_ref()?;
             let Some((mut min, mut max)) = world_bounds(&self.world, renderer, &members) else {
                 left.push(format!("{name} (no mesh)"));
                 continue;
@@ -2869,33 +2912,10 @@ impl<G: GameApp> Engine<G> {
                 && transform.rotation == start.rotation
                 && transform.scale == start.scale;
             if !unchanged {
-                commands.push(Box::new(SetTransformCmd::new(object.index(), start, transform)));
+                changes.push((object, start, transform));
             }
         }
-        crate::propagate_transforms(&mut self.world);
-        let label = if align { "Align to Surface" } else { "Drop to Ground" };
-        if !commands.is_empty() {
-            self.undo_stack.push(
-                Box::new(CommandGroup::named(label.to_owned(), commands)),
-                &mut self.world,
-                &mut self.selection.primary,
-            );
-            self.selection.reconcile();
-            self.scene_dirty = true;
-            crate::propagate_transforms(&mut self.world);
-        }
-        let mut message = format!("{label}: ");
-        if !moved.is_empty() {
-            message.push_str(&summarise(&moved));
-        }
-        if !left.is_empty() {
-            if !moved.is_empty() {
-                message.push_str("; ");
-            }
-            message.push_str("left ");
-            message.push_str(&summarise(&left));
-        }
-        self.toast(&message);
+        Some((changes, moved, left))
     }
 
     /// Select every object within `FLOAT_RADIUS` of the camera that hangs in the air, worst first in the log.
