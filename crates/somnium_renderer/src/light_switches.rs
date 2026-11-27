@@ -9,6 +9,7 @@
 //! | `SOMNIUM_GI_HIT_SKY` | 0.75 | How much of the sky a ReSTIR GI hit on a mesh sees (`restir_gi.wgsl`'s `GI_HIT_SKY`). |
 //! | `SOMNIUM_GTAO_FORMAT` | `rgba8` | `rgba16f` keeps GTAO's visibility and bent normal in half floats (8 bits banded). |
 //! | `SOMNIUM_ENV_CUBE` | 256 | The environment cube's face size, a power of two from 64 to 2048 (both cubes). |
+//! | `SOMNIUM_PLANET_AIR` | 1 | The planet's light on the air (the sky cube's glow round it and the fog's), times this; its disc and the clouds keep theirs. |
 //! | `SOMNIUM_GI_SCALE` | 2 | The GI grid step in pixels, 1 for full resolution: read in `pass/restir_gi.rs`, listed so the table is whole. |
 //!
 //! The aerosol finding behind the first switch is lucid/sky-aerosol 5291071 (sunscar-photoreal and sunscar-sky, 19 Nov
@@ -31,11 +32,12 @@ pub struct LightSwitches {
     pub gi_hit_sky: f32,
     pub gtao_rgba16f: bool,
     pub env_cube: u32,
+    pub planet_air: f32,
 }
 
 impl Default for LightSwitches {
     fn default() -> Self {
-        Self { mie_scale: 1.0, mie_g: 0.8, gi_hit_sky: 0.75, gtao_rgba16f: false, env_cube: 256 }
+        Self { mie_scale: 1.0, mie_g: 0.8, gi_hit_sky: 0.75, gtao_rgba16f: false, env_cube: 256, planet_air: 1.0 }
     }
 }
 
@@ -84,6 +86,7 @@ impl LightSwitches {
             gi_hit_sky: float("SOMNIUM_GI_HIT_SKY", d.gi_hit_sky, |v| (0.0..=1.0).contains(&v)),
             gtao_rgba16f,
             env_cube,
+            planet_air: float("SOMNIUM_PLANET_AIR", d.planet_air, |v| (0.0..=16.0).contains(&v)),
         }
     }
 
@@ -97,13 +100,14 @@ impl LightSwitches {
     pub fn summary(&self) -> String {
         let gi_scale = std::env::var("SOMNIUM_GI_SCALE").unwrap_or_else(|_| "2 (default)".into());
         format!(
-            "mie_scale {} mie_g {} gi_hit_sky {} gtao {} env_cube {} gi_scale {}",
+            "mie_scale {} mie_g {} gi_hit_sky {} gtao {} env_cube {} gi_scale {} planet_air {}",
             self.mie_scale,
             self.mie_g,
             self.gi_hit_sky,
             if self.gtao_rgba16f { "rgba16f" } else { "rgba8" },
             self.env_cube,
-            gi_scale.trim()
+            gi_scale.trim(),
+            self.planet_air
         )
     }
 

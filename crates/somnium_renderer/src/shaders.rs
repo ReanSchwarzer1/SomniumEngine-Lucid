@@ -495,6 +495,7 @@ mod tests {
             gi_hit_sky: 0.5,
             gtao_rgba16f: true,
             env_cube: 1024,
+            planet_air: 0.5,
         };
         let valid = |text: &str| {
             naga::front::wgsl::parse_str(text).is_ok_and(|module| {

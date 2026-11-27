@@ -106,7 +106,9 @@ pub fn planet_params(planet: &crate::PlanetParams) -> [[f32; 4]; 3] {
         return [[0.0; 4]; 3];
     }
     let d = planet.direction.normalize_or(glam::Vec3::Y);
-    [d.extend(1.0).to_array(), planet.light_above_air.extend(0.0).to_array(), planet.light_ground.extend(0.0).to_array()]
+    // Its light on the air, times SOMNIUM_PLANET_AIR (1: as before; sunscar-photoreal, 27 Nov 2026).
+    let air = planet.light_above_air * crate::light_switches::get().planet_air;
+    [d.extend(1.0).to_array(), air.extend(0.0).to_array(), planet.light_ground.extend(0.0).to_array()]
 }
 
 /// A night sky with no moon (Rimeborn's Undersun under the Lid), drawn into the environment cubemap so the background,

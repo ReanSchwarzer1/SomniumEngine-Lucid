@@ -6855,7 +6855,11 @@ impl SomniumRenderer {
         self.profiler.end(&mut encoder);
         self.profiler.begin(&mut encoder, "Volumetrics");
         self.volumetric_pass.above_air = self.sky_above_air;
-        self.volumetric_pass.planet = self.planet_march_params();
+        // The fog's planet light times SOMNIUM_PLANET_AIR (1: as before); the clouds keep theirs.
+        let mut planet = self.planet_march_params();
+        let share = crate::light_switches::get().planet_air;
+        planet[1][..3].iter_mut().for_each(|c| *c *= share);
+        self.volumetric_pass.planet = planet;
         self.volumetric_pass.record(
             &mut encoder,
             &ctx.queue,
