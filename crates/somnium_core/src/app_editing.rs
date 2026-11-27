@@ -299,6 +299,17 @@ fn set_slot_names(dir: &Path) -> BTreeMap<u8, String> {
         .collect()
 }
 
+/// Every ground slot's name, slot by slot ("" where nothing names one): a layer set's own name for the slot, else the
+/// project's (a set re-skins some slots and keeps the project's files in the others).
+fn merge_slot_names(own: Option<&BTreeMap<u8, String>>, project: &BTreeMap<u8, String>) -> Vec<String> {
+    (0..somnium_renderer::terrain::textures::LAYER_NAMES.len())
+        .map(|slot| {
+            let slot = u8::try_from(slot).unwrap_or(u8::MAX);
+            own.and_then(|names| names.get(&slot)).or_else(|| project.get(&slot)).cloned().unwrap_or_default()
+        })
+        .collect()
+}
+
 #[derive(Clone, PartialEq)]
 struct CardKey {
     entity: Entity,
@@ -2099,24 +2110,54 @@ impl<G: GameApp> Engine<G> {
             .and_then(|(e, _)| self.world.get::<crate::cell_streaming::TerrainStreamingComponent>(e))
             .map(|s| s.layer_set.trim().to_owned())
             .unwrap_or_default();
-        let terrain_root = self.config.content_root.join("terrain");
-        let dir = crate::cell_streaming::layer_set_dir(&terrain_root, &set).unwrap_or(terrain_root);
-        let names = match self.editing.set_names.get(&dir) {
-            Some(names) => Arc::clone(names),
-            None => {
-                let names = Arc::new(set_slot_names(&dir));
-                self.editing.set_names.insert(dir, Arc::clone(&names));
-                names
-            }
-        };
+        let names = self.slot_names_for_set(&set);
         let in_set = if set.is_empty() { String::new() } else { format!(" in set {set}") };
-        match names.get(&layer) {
+        match names.get(usize::from(layer)).filter(|n| !n.is_empty()) {
             Some(name) => format!("slot {layer} \"{name}\"{in_set}"),
             None => {
                 let engine = somnium_renderer::terrain::textures::LAYER_NAMES.get(usize::from(layer)).copied().unwrap_or("?");
                 format!("slot {layer}{in_set} (the set names none; the engine's \"{engine}\")")
             }
         }
+    }
+
+    /// A ground material set's names for its slots (its folder's `SOURCE.json`), read once per folder.
+    fn set_names_in(&mut self, dir: PathBuf) -> Arc<BTreeMap<u8, String>> {
+        if let Some(names) = self.editing.set_names.get(&dir) {
+            return Arc::clone(names);
+        }
+        let names = Arc::new(set_slot_names(&dir));
+        self.editing.set_names.insert(dir, Arc::clone(&names));
+        names
+    }
+
+    /// What a layer set calls each ground slot, slot by slot ("" where nothing names one): the set's own
+    /// `SOURCE.json`, then the project's `terrain/SOURCE.json` (a set's other slots are the project's files).
+    fn slot_names_for_set(&mut self, set: &str) -> Vec<String> {
+        let terrain_root = self.config.content_root.join("terrain");
+        let project = self.set_names_in(terrain_root.clone());
+        let own = match set.trim() {
+            "" => None,
+            set => crate::cell_streaming::layer_set_dir(&terrain_root, set).ok().map(|dir| self.set_names_in(dir)),
+        };
+        merge_slot_names(own.as_deref(), &project)
+    }
+
+    /// What the selected terrain's ground calls each slot, for the paint palettes (27 Nov 2026: they showed the
+    /// engine's roster, so Sunscar's chalk read "Snow"). Empty when no terrain is selected, or in a game.
+    pub(super) fn selected_terrain_layer_names(&mut self) -> Vec<String> {
+        if self.config.player_mode {
+            return Vec::new();
+        }
+        let Some(entity) = self.selection.primary.filter(|&e| self.world.get::<TerrainComponent>(e).is_some()) else {
+            return Vec::new();
+        };
+        let set = self
+            .world
+            .get::<crate::cell_streaming::TerrainStreamingComponent>(entity)
+            .map(|s| s.layer_set.trim().to_owned())
+            .unwrap_or_default();
+        self.slot_names_for_set(&set)
     }
 
     /// The card for a ground-cover copy: what kind, which model, the ground it grows on (its habitat), how dense it
@@ -3735,6 +3776,20 @@ mod tests {
         assert_eq!(names.get(&31).map(String::as_str), Some("moss"), "the set's name, not the engine's \"Hard Snow\"");
         assert_eq!(names.len(), 2, "a slot past 255 and a blank name are skipped: {names:?}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The paint palettes' names (27 Nov 2026): a region's set re-skins some slots and keeps the project's files in
+    /// the others (Sunscar's eld names 13 of 32), so a slot it does not name takes the project's name.
+    #[test]
+    fn a_layer_set_names_its_slots_over_the_projects() {
+        let project: BTreeMap<u8, String> = [(0, "pasture"), (2, "chalk rock")].map(|(s, n)| (s, n.to_owned())).into();
+        let eld: BTreeMap<u8, String> = [(2, "great limestone, red-stained")].map(|(s, n)| (s, n.to_owned())).into();
+        let names = merge_slot_names(Some(&eld), &project);
+        assert_eq!(names.len(), somnium_renderer::terrain::textures::LAYER_NAMES.len());
+        assert_eq!(names[2], "great limestone, red-stained", "the set's own name wins");
+        assert_eq!(names[0], "pasture", "a slot the set keeps is the project's");
+        assert_eq!(names[1], "", "named by neither");
+        assert_eq!(merge_slot_names(None, &project)[2], "chalk rock", "the project's own ground");
     }
 
     #[test]
