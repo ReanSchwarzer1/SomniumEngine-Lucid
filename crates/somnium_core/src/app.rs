@@ -5561,7 +5561,10 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             // Phase 16-D: the Scripts section, built from what each
             // attached script declared. Computed before the `ui` borrow
             // because it reads the world and the script host.
-            let tool_context = self.persona_tool_context();
+            // The selected terrain's own names for its ground slots, for both paint palettes.
+            let layer_names = self.selected_terrain_layer_names();
+            let mut tool_context = self.persona_tool_context();
+            tool_context.layer_names = layer_names.clone();
             let animation_transport = self.animation_transport();
             let sel_scripts = self.script_inspector_state();
             self.zone_end();
@@ -5822,6 +5825,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                         .filter(|e| self.world.is_alive(*e)),
                 );
                 ui.update_generated_details(self.selection.primary, generated_panels);
+                ui.set_terrain_layer_names(layer_names);
                 ui.update_terrain_inspector(sel_terrain);
                 ui.update_foliage_inspector(sel_foliage);
                 ui.update_tool_context(tool_context);
@@ -7690,6 +7694,8 @@ impl<G: GameApp> Engine<G> {
                 .selected_terrain()
                 .and_then(|tc| self.renderer.as_ref()?.terrain(tc.terrain_id))
                 .map_or(0, |t| t.layers.len()),
+            // Filled by the caller, which may read the ground sets' files (`selected_terrain_layer_names`).
+            layer_names: Vec::new(),
         }
     }
     /// Publish changed paint to the renderer, with each layer's material
