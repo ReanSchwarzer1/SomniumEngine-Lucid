@@ -351,12 +351,13 @@ fn burn(
             initial_speed: 0.0,
             spread_angle: 0.0,
             gravity: 0.0,
-            size_start: 0.16,
-            size_end: 0.42,
+            size_start: 0.1,
+            size_end: 0.34,
+            // As bright as the flame's own body near it (1.5 x 0.3 was not seen at all, p20 23:13).
             color_over_life: ramp(&[
-                (0.0, [1.5, 0.75, 0.25, 0.0]),
-                (0.2, [1.5, 0.75, 0.25, 0.3]),
-                (1.0, [1.0, 0.4, 0.1, 0.0]),
+                (0.0, [5.0, 2.6, 0.9, 0.0]),
+                (0.15, [5.0, 2.6, 0.9, 0.4]),
+                (1.0, [3.0, 1.2, 0.3, 0.0]),
             ]),
             spawn_accum: seed,
             ..Default::default()
