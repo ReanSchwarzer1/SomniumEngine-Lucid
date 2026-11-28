@@ -1,355 +1,266 @@
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)"
-            srcset="crates/somnium_ui/assets/brand/somnium-lockup-horizontal.svg">
-    <source media="(prefers-color-scheme: light)"
-            srcset="crates/somnium_ui/assets/brand/somnium-lockup-horizontal-light.svg">
-    <img alt="Somnium Engine"
-         src="crates/somnium_ui/assets/brand/somnium-lockup-horizontal.svg"
-         width="400">
-  </picture>
-</p>
+# Somnium Engine: Lucid
+
+Lucid is the open-world fork of [Somnium Engine](https://github.com/ReanSchwarzer1/SomniumEngine), a 3D game engine and
+editor written from scratch in Rust on [`wgpu`](https://wgpu.rs). The renderer, editor, runtime UI, asset pipeline and
+game framework are one native workspace. Lucid is developed alongside two games that are not part of this
+repository: **Sunscar**, a first-person, photo-real, far-future post-apocalyptic open world, and **Rimeborn**, an
+isometric RPG.
+
+> **Status:** pre-1.0, a single-author research project, developed and tested on Windows only. APIs, file formats and
+> defaults change often. Expect rough edges.
+
+> **Which branch:** `main` holds Lucid as of 24 October 2026. The open-world work this page describes, from late
+> October to 27 November, is on the [`sunscar`](https://github.com/ReanSchwarzer1/SomniumEngine-Lucid/tree/sunscar)
+> branch and is not in `main` yet: check out `sunscar` to build it. The newest work, shown in some of the pictures
+> below, is not published yet; [Not published yet](#not-published-yet) lists it.
 
 <p align="center">
-  <em>A precise instrument for constructing impossible worlds.</em>
+  <img src="docs/media/sunscar_lucara_planet.jpg" width="100%"
+       alt="Ruined two-storey stone houses of a village under a clear noon sky, a huge pale planet hanging above them">
 </p>
+<p align="center"><em>Sunscar: the ruined village of Lucara under the planet at noon. Every picture here is from the
+running game or editor on the development build of 27 and 28 November 2026.</em></p>
 
----
+<table>
+  <tr>
+    <td width="50%"><img src="docs/media/sunscar_chalk_scarp.jpg"
+        alt="Lichened grey limestone pillars and layered ledges set into a steep chalk slope, autumn trees below"></td>
+    <td width="50%"><img src="docs/media/sunscar_aurel_bridge.jpg"
+        alt="A cobbled stone bridge deck running across a wide river toward snow mountains, a fingerpost and lantern at its head"></td>
+  </tr>
+  <tr>
+    <td><em>Scanned limestone set into the chalk scarp west of the Play start.</em></td>
+    <td><em>The Royal Road crosses the Aurel.</em></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/media/sunscar_city_smiths_row.jpg"
+        alt="A flagged street between stone workshops with plank doors and rendered houses with shutters, bollards along the gutter"></td>
+    <td width="50%"><img src="docs/media/sunscar_brazier_night.jpg"
+        alt="A brazier burning beside a bench on a frosted path at night, trees in silhouette and the planet rising"></td>
+  </tr>
+  <tr>
+    <td><em>The smiths' row in Monargent, the city.</em></td>
+    <td><em>Night: a brazier's flames and embers.</em></td>
+  </tr>
+</table>
 
-A from-scratch 3D game engine written in Rust and built directly on `wgpu`.
-Somnium implements its renderer, editor, runtime UI, asset pipeline, and game
-framework as one native workspace. Production engines are studied for
-architecture and comparison; Somnium's implementation is its own.
+<table>
+  <tr>
+    <td width="50%"><img src="docs/media/sunscar_sky_grey_day.jpg"
+        alt="Ruins in grass below a chalk hill, a grey sky breaking into sunlit cumulus"></td>
+    <td width="50%"><img src="docs/media/sunscar_sky_storm.jpg"
+        alt="The same ruins under a heavy grey storm deck that reaches down to the hills"></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/media/sunscar_rain.jpg"
+        alt="The same place in heavy rain, slanting streaks over the meadow"></td>
+    <td width="50%"><img src="docs/media/sunscar_snow.jpg"
+        alt="The same place in falling snow, soft white flecks in the air"></td>
+  </tr>
+  <tr>
+    <td colspan="2"><em>One place, four skies: a grey day breaking, a storm deck, rain and snow. The weather is the
+    game's own; the clouds, light and precipitation are the engine's.</em></td>
+  </tr>
+</table>
 
-### [`context.md`](context.md) is the map
+<p align="center">
+  <img src="docs/media/lucid_editor_sunscar.jpg" width="100%"
+       alt="The Lucid editor open on Sunscar's world: the Tools and agent panel on the left, the viewport on ruins and limestone below a chalk hill, the Outliner and Details on the right, the Content Drawer with the game's folders below">
+</p>
+<p align="center"><em>The editor on Sunscar's world at the Play start, 39,828 objects streamed in.</em></p>
 
-One living document, kept current, describing the engine as it is rather than as
-it was planned. Read it before the source.
+## Not published yet
 
-| | |
-|---|---|
-| [Architecture](context.md#architectural-rules) | Runtime boundaries and data flow |
-| [Rendering](context.md#renderer-and-simulation-contracts) | Current rendering and simulation contracts |
-| [Authoring model](context.md#scene-and-authoring-model) | Schemas, prefab overrides and saves |
-| [Phase ledger](context.md#phase-ledger-and-remaining-work) | Shipped, open, deferred, refused |
-| [Projects and automation](docs/editor/automation.md) | Open game editors, semantic MCP controls, public interaction and GPU animation examples |
-| [Textured particles](docs/editor/particles.md) | Sprite/flipbook effects, native Details controls and the CC0 Hello example |
+The pictures above were taken on the development build of 27 and 28 November. These parts of it are on development
+branches that are not published yet, so neither `main` nor `sunscar` has them:
 
-The engine is organized around three deliberate commitments:
+- Rain and snow drawn as lit sprites near the eye: drops as slanting streaks, flakes as soft round flecks, lit by the
+  sun through its shadow cascades and by the sky.
+- Embers rising from open fires, and a soft glow round a lamp's flame.
+- The editor's level-design round. **G** carries a thing over the ground (a roof, a rock or the terrain under the
+  pointer) and a click puts it down. The Content Drawer shows a large game's folders at once. A scene opens at its
+  first place, where the game starts. **Help > What's New** lists each round of changes in plain words.
 
-| Commitment | Why it matters |
-|---|---|
-| **Visibility-buffer rendering** | Geometry writes compact instance and triangle identity. A later fullscreen pass reconstructs and shades each visible surface. |
-| **Archetype ECS** | Entities sharing a component signature occupy dense columns, keeping common queries contiguous. |
-| **Native wgpu UI** | Editor and game UI use the same retained widget and paint system, with Nocturne Atelier tokens, bundled type, and one icon family. |
+## Lucid or Somnium?
 
-> **Status:** actively developed, single-author hobby/research project. Expect
-> rough edges and churn.
->
-> **Current work (October 2026):** the engine is being driven by a first-person
-> horror game built on it, *The Somnus Fracture*. It lives outside this repository.
-> The game needs have brought:
-> - a real-time path tracer and ray-traced reflections;
-> - spot-light cookies and a lens flare;
-> - skinned characters in the ray-traced scene;
-> - cached shadow cascades and BC7 texture memory;
-> - FSR 3 upscaling and frame generation, with runtime frame pacing;
-> - binaural audio and room acoustics;
-> - a PS2-style picture mode.
->
-> See [what landed](context.md#engine-work-driven-by-the-somnus-fracture-septemberoctober-2026).
-> [MORROWIND](dev%20records/phase_MORROWIND.md) (NetImmerse) remains the open phase for the engine's non-renderer half.
->
-> **Architecture reference:** [`context.md`](context.md) — living, continuously
-> updated, and the file to read before the source.
+The two engines share their history up to October 2026 (the last common commit is from 19 October) and the same
+licence. Since then each has followed its own games, and fixes move between them by hand in both directions.
 
-## What is in here
+| | [Somnium Engine](https://github.com/ReanSchwarzer1/SomniumEngine) | Lucid (this repository) |
+|---|---|---|
+| Built for | *The Somnus Fracture*: first-person horror in small, dense levels | Sunscar and Rimeborn: open worlds several kilometres across |
+| Depth buffer | Forward depth | Reversed infinite depth, camera-relative rays far from the origin |
+| Only here | Packed game data for shipping (`somnium_vfs`), video-memory limits and an out-of-memory report, fog cut for hand-held lights | Everything under [What Lucid adds](#what-lucid-adds) |
+| Crates | 21, including `somnium_vfs` | 21, including `somnium_life` |
 
-Seventeen engine crates, two example games, and the tools that keep the
-documentation honest. `somnium_core` is deliberately the widest: it coordinates
-subsystems without absorbing their internals.
+Pick Somnium for compact levels and a pack format you can ship today. Pick Lucid for large outdoor worlds, streaming,
+grass, weather and the open-world editing tools.
 
-```mermaid
-flowchart TB
-    OS["winit and the operating system"] --> CORE["somnium_core<br/>lifecycle, GameApp, editor, scene schema"]
+## What Lucid adds
 
-    subgraph Foundation["Foundations"]
-        ECS["somnium_ecs<br/>archetype storage"]
-        JOBS["somnium_jobs<br/>priorities and deadlines"]
-        SHADER["somnium_shader<br/>WGSL composition"]
-        ANIM["somnium_anim"]
-        AI["somnium_ai<br/>navigation and behavior"]
-        INPUT["somnium_input"]
-        I18N["somnium_i18n"]
-    end
+Each line was checked against the code in this tree. The linked pages explain how to use it.
 
-    subgraph Boundaries["Boundaries to the outside"]
-        ASSET["somnium_asset<br/>glTF, cook, residency"]
-        SCRIPT["somnium_script + _luau"]
-        PHYS["somnium_physics<br/>Jolt"]
-        AUDIO["somnium_audio<br/>Kira"]
-    end
+**Open worlds**
+- Streaming for worlds many kilometres across, built on the cell streaming both engines have: terrain tiles stream in
+  as cells and reuse renderer slots, each region can wear its own ground layer set, stand-in cells cover far tiles
+  while the near ones load, far land loads first, and the first fill reads on several cores. See
+  [Open worlds](docs/editor/open_world.md).
+- Reversed infinite depth, and camera-relative ray rebuilds and terrain precision, so the ground stays sharp kilometres
+  from the world origin.
+- Prop sets: thousands of copies of one model as a single entity. See [Prop sets](docs/editor/prop_sets.md).
+- Instance batches: copies kept on the GPU, culled and drawn without a per-frame submit, with LOD hand-over by dither.
 
-    subgraph Present["What you see"]
-        RENDER["somnium_renderer<br/>visibility buffer, terrain, water"]
-        UI["somnium_ui<br/>editor shell and game canvas"]
-        VOXEL["somnium_voxel"]
-    end
+**Ground and foliage**
+- GPU grass: blades laid out on the GPU every frame around the eye from a habitat table per terrain layer, and drawn
+  into the visibility buffer. `SOMNIUM_GPU_GRASS=0` turns it off. See [GPU grass](docs/editor/open_world.md#gpu-grass).
+- Ground cover by habitat: the near-view cover both engines grow per cell also follows habitat tables per terrain
+  layer, and a streamed tile grows the same cover wherever its renderer slot lands.
+- A painted tree or shrub can be deleted, or turned into an ordinary object to move and save
+  (**Level > Make This an Object**, Ctrl+Shift+O).
 
-    CORE --> Foundation
-    CORE --> Boundaries
-    CORE --> Present
-    RENDER --> ECS
-    RENDER --> ASSET
-    RENDER --> ANIM
-    RENDER --> SHADER
-    UI --> SHADER
-    ASSET --> JOBS
+**Sky, light and weather**
+- Rain, snow and hail near the eye, lightning channels, and storm bodies inside the volumetric cloud march. All are off
+  by default and driven by the game; there is no built-in weather director yet.
+- Snow lying on surfaces (off by default).
+- A moving sun with the sky light rebuilt a few faces a frame, a north offset for the day clock, and the sun forms of
+  Sunscar's sky.
+- Lamps that are switched, or go out in daylight (above 1,200 lux), real fire, and more than 256 lights in a scene
+  (the nearest and brightest 256 are kept, with a fade).
+- A photographic camera (fitted tone curves, sky-weighted metering, lens glare, sensor noise) and grading controls: a
+  `.cube` LUT, a bloom threshold, eye-adaptation range and rates, low-light vision.
 
-    FFX["third_party:<br/>wgpu-ffx (FSR 3 upscale),<br/>wgpu-ffx-fg (frame generation, WGSL)"] --> RENDER
-    CORE --> GAMES["examples:<br/>hello_engine, vvardenfell"]
-    TOOLS["tools: census, ghostfence,<br/>shadercook, reachability, assetcook"] -.->|"gate the tree"| CORE
-```
+**People and play** (built for Rimeborn)
+- `somnium_life`: villagers on daily routines, livestock and carts, with simulation LOD. See
+  [Living towns](docs/editor/life.md).
+- Isometric interaction: doors that swing and close, talk, take, sit, read, use. See
+  [Interaction](docs/editor/interaction.md).
+- Switching between two protagonists with a camera lift. See [Protagonist switch](docs/editor/protagonist_switch.md).
+- Game save slots in the engine's save format. See [Saves](docs/editor/saves.md).
+- Animation LOD and combat brain LOD for crowds.
 
-## Screenshots
+**Diagnostics** (see [When something goes wrong](docs/editor/diagnostics.md))
+- Crash reports: a panic writes `logs/crash-<time>.txt` (build, GPU, driver, backtrace) and shows where it is; a native
+  crash (driver, Jolt, Luau) also writes a minidump. The log goes to `logs/editor.log` or `logs/game.log`, with the two
+  runs before kept. `SOMNIUM_CRASH_REPORT=0` and `SOMNIUM_LOG_FILE=0` turn them off.
+- Models are validated before upload (buffer sizes, accessors, indices, images). A broken model is refused with one log
+  line and a toast instead of reaching the GPU, and the status bar, the game screen and the last log line count the
+  models that did not load.
+- `gltf_check` checks glTF files the way the engine reads them, before you commit them.
+- **Level > Check Meshes** lists models that will not load, objects that draw nothing, and rocks open on a side.
+  (Census of the World and Select All Using This Model, next to it, are in both engines.)
+- Acceleration-structure builds are capped at 2 million triangles a frame, so a loading burst stays inside the
+  driver's GPU timeout.
 
-![The Somnium editor](media/editor.png)
-![Volumetric Clouds](media/vol_clouds.png)
-![The Somnium editor with foliage](media/editor_foliage.png)
-![The Somnium editor with boat and sea](media/editor_boatsea.png)
-![The Somnium editor with sunset and sea](media/sunset_sea.png)
+## What both engines can do
 
-Every capture in this repository comes from a running build.
-`SOMNIUM_CAPTURE_UI_PNG` reads back the swapchain after the UI pass. More
-captures live in [`media/`](media/).
+A summary. The full list is in [docs/features.md](docs/features.md).
 
-## Highlights
+- **Rendering:** visibility buffer with bindless resources and GPU-driven culling; physically based shading; cascaded
+  and virtual shadow maps; ReSTIR GI on hardware ray tracing with a DDGI fallback; a real-time path tracer and traced
+  reflections; physical sky and volumetric clouds; FFT ocean water; FSR 3 upscaling and frame generation; TAA, SMAA,
+  FXAA; order-independent transparency.
+- **Terrain and world:** 32-layer terrain with clipmaps and virtual texturing, sculpting and painting, foliage
+  painting, voxel worlds, world partition, cell streaming, deterministic asset cook and budgeted residency.
+  [Edit layers](docs/editor/open_world.md#edit-layers) keep the changes you make to a generated scene in
+  `<scene>.edits.json` and apply them again on every load, in the editor, the game and streamed cells.
+- **Simulation:** Jolt physics, Kira audio with binaural output and room acoustics, skeletal animation with blend
+  trees and state machines, navigation, a job system with priorities and deadlines, Luau scripting in a sandbox.
+- **Editor:** schema-generated Details with undo, one command registry for menus, palette and shortcuts, node graph
+  and timeline, gizmos, Content Drawer, autosave and crash recovery, MCP automation, in-editor Help (F1).
 
-**Rendering**
-- Visibility-buffer pipeline with programmable vertex pulling and bindless resources (single global bind group)
-- GPU-driven rendering: `multi_draw_indirect`, compute frustum culling, meshlet clusters, Hi-Z two-phase occlusion culling
-- Physically based shading (Cook-Torrance GGX) with an alternative cel-shading mode, plus **multiple-scattering energy compensation** on both the direct lobe and the IBL, **Hammon's rough diffuse**, **micro-shadowing**, and geometric **specular antialiasing** with a roughness-scaled bound on every lobe, the sun and the moon both on it
-- **Two-sided foliage transport** — a wrapped, view-scattered transmission lobe so a backlit leaf glows, on the same `shadow_factor` the reflected term uses. Occlusion composes rather than replaces: GTAO, the authored map, baked sky visibility and terrain layer occlusion multiply into one number, and micro-shadowing takes a material-only copy
-- **Shadows** — cascaded shadow maps with PCSS and contact shadows, plus **sparse virtual shadow maps** (clipmap page table, persistent physical atlas, per-page raster). Cascades stop at 100 m, so terrain also carries a baked heightfield **horizon map** that shadows it at any distance, cross-faded in where the last cascade fades out
-- **Global illumination** — ReSTIR DI/GI on wgpu acceleration structures, with a **portable DDGI tier** (SDF-traced 4×4×4 volume, budgeted temporal SH updates) for hardware without ray query
-- **Atmosphere and sky** — Hillaire scattering LUTs driving both sky and IBL, analytic NOAA sun position, a five-track day cycle, and volumetric clouds (Perlin–Worley, quarter-res adaptive march, cloud shadows folded into one `shadow_factor` every surface reads)
-- **Weather** — coverage → precipitation → wetness on Lagarde's two time constants, porosity as a material channel, rain ripples on water
-- HDR pipeline: `Rgba16Float`, AgX/ACES tone mapping, GTAO, bloom, DoF, motion blur, deferred decals
-- **Anti-aliasing as one authored choice** — Off / FXAA / SMAA 1x / SMAA T2x / TAA / FSR 3, plus SMAA quality presets. (It was three independent booleans until MORROWIND-AC, where the default configuration was measured to run *no* AA pass while showing a checked box.)
-- **FSR 3 frame generation** — AMD's FidelityFX 1.1.4 frame interpolation and optical flow translated to WGSL (`third_party/wgpu-ffx-fg`, 18 passes). It is paced by split submits, and the game UI is drawn fresh over real and generated frames alike. In the debug build, 42 fps becomes 77 presented
-- **Real-time path tracer** — one path a pixel, starting from the raster's own visibility-buffer surface. Next-event estimation for the sun, the moon and resampled lamps; GGX visible-normal sampling; a reprojected temporal pass and an edge-stopping à-trous denoiser. A second mode traces **reflections on glossy surfaces only**, lit by the same lamps, in place of the environment specular
-- **Spot-light cookies** — every spot cone in every lighting path (shading, glass, fog, GI, the path tracer, scene capture) goes through one procedural pattern function: a torch reflector, blinds, window panes, a caged lamp, a grimy fixture
-- **Skinned characters in ray tracing** — posed meshes get their own BLAS, rebuilt within a reach, so characters cast traced lamp shadows and appear in reflections
-- **Cached shadow cascades** — revisions per cascade; a caster's movement under four of a cascade's texels leaves it cached, and posed casters reach only the cascades their shadow can land in
-- **Lens flare** from the threshold-free bloom chain; **scene capture** (a cheap second view for mirrors and screens); a **PS2-style picture** and animated picture shifts
-- **A game's own graphics budget** — per-feature choices laid over every scene in place of a quality tier, plus requests for what no scene authors (path tracing, traced reflections, lens flare) and runtime V-sync and frame-cap changes
-- **Imported textures as BC7**, only for the materials a level draws, with a content-keyed cache outside the repository; scene restore decodes in parallel and pipelines decode with upload
-- **Order-independent transparency** — weighted-blended, authored per scene, with the sorted path retained
-- Water: three-cascade 1024² inverse-FFT ocean spectrum with Jacobian whitecaps, temporal foam, Beer's-law transport, a shoreline SDF and a depth-faded shore. Reflections blend screen-space tracing, half-res hardware ray tracing, and the environment cube
-- **Terrain** — 32-layer material with strongest-four blending, triplanar cliffs, hex tiling and parallax occlusion; nested material **clipmaps**; **virtual texturing** streaming BC7 source pages into a fixed 64 MiB atlas
-- **Terrain lighting** — three heightfield bakes: horizon angles in eight azimuths for long-range sun shadow, cosine-weighted **sky visibility** with a bent direction so valleys are darker than the ridges above them, and a mip-chained **relief normal** that carries its own discarded variance into roughness
+## Requirements
 
-**World & content**
-- glTF 2.0 loading (meshes, PBR materials, textures, skins), importable at runtime
-- **Deterministic asset cook** — versioned, integrity-checked payloads with a SHA-256 recipe key; changing a texture recooks its material's reverse closure while unrelated meshes stay cached
-- **Residency** — typed placeholders returned immediately, resolver I/O through the job system, per-frame upload budget, deterministic LRU, atomic publish
-- **World partition** — double-precision cell hashing, camera/player/volume want-state, transactional unload that persists real ECS components through the schema serializer
-- **Voxel world** — 32³ padded chunks, `block_mesh` face culling, 3 LOD levels, sparse edit overlay
-- **Heightmap terrain** — chunked CDLOD-style LOD with crack-free stitching, real-time sculpting and texture painting
-- **Foliage painting** — brush over terrain with density, size and single-instance placement. A 25-entry CC0 palette; entries that require a terrain layer underneath them say so in the log when they refuse, and the requirement is a brush setting rather than a fixed property of the entry
+- **Windows 10 or 11.** It is the only platform built and tested; CI runs on `windows-latest`.
+- **A Vulkan GPU.** The ray-traced features need a driver that exposes ray queries; without them the renderer uses its
+  raster fallbacks and the DDGI tier.
+- **Rust 1.88**, pinned in [`rust-toolchain.toml`](rust-toolchain.toml).
+- **A C++ toolchain** (MSVC Build Tools). Jolt Physics and Luau are compiled from source.
 
-**Scripting & simulation**
-- **Luau** (`mlua`, interpreter only) — sandboxed, with a deferred command buffer as the only route into the world, generated type declarations, and acceptance budgets asserted as tests
-- **Animation** — skeletons, four-weight skinning, clips, `Blend1D`/`Blend2D`, masked layers, typed parameters and triggers, sync tracks, state machines with a bounded pose cache
-- **Jobs** — declared priorities and deadlines, cancellation, a budgeted main-thread completion drain, and profiler telemetry. A job whose deadline passed while queued is dropped rather than run
-- Jolt physics integration; Kira audio with buses, attenuation curves, cones, occlusion and Doppler
-- **Binaural audio** through the MIT KEMAR head responses (368 directions), and **room acoustics**: a reverb send that follows how enclosed the listener is, and a muffled track for occluded sounds
-- CPU particle system with GPU billboard instancing
-
-**Editor**
-- **Schema-generated Details** — all **267** editable fields across **25** registered component schemas are generated from the schema, with scoped undo, drag coalescing, multi-select intersection and mixed-value rows. The hand-wiring census is **0 identifiers**: there is no hand-written inspector left, and a generated table proves it rather than a claim
-- **One command registry** — 52+ commands generate the menus, Create surfaces, toolbar, tooltips, shortcuts, palette and F1 index
-- **Node graph editor** and **timeline**, both archetype-driven and feature-neutral, with material and animation catalogues as the first consumers
-- Curve and gradient editing as reflected *values* (`FieldType::Curve`), so a curve gets its Details row, undo and round-trip for free
-- Scene lifecycle: format-routed load, retained unknown components and fields (no silent data loss), header thumbnails, autosave and crash recovery, clickable undo history
-- Preferences with a `default → project.toml → editor.toml → SOMNIUM_*` order. All **115** `SOMNIUM_*` variables have a declared, checked route — schema field, setting, command or a stated harness reason — and **0** are unexplained, enforced by `tools/reachability/`
-- Transform gizmos, light gizmos, selection outline, infinite grid, camera bookmarks, statistics overlay, output log with severity chips and jump-to-source
-- Accessibility: roles, names, values, focus announcements, reduced motion, high contrast reusing the theme's certified contrast pairs
-
-**Editor design system — Nocturne Atelier**
-- **Correct colour pipeline.** Authored sRGB decodes to linear exactly once before the sRGB swapchain, straight alpha through the widget API. `#1C1E26` reaches the framebuffer as `#1C1E26`
-- **Layered tokens** — palette → semantic roles → component recipes → interaction state, so a widget asks for `style::button(state)` rather than picking a grey
-- **Typography with actual hierarchy** — Inter Regular/Medium/SemiBold and JetBrains Mono Regular/Medium behind named roles; numeric fields use the mono face so a scrub cannot shift a row
-- **One icon family** — 67 Tabler outline icons plus 16 original Somnium glyphs on the same 24×24 / 2 px grid, rasterized from SVG by `resvg`
-- The full contract is [`dev records/phase_26_Zeta.md`](dev%20records/phase_26_Zeta.md)
-
-## Building
-
-Requires:
-- **Rust 1.88** (edition 2024; pinned in `rust-toolchain.toml` and gated by GHOSTFENCE)
-- A **C++ toolchain** — MSVC Build Tools on Windows, clang/gcc elsewhere. Both
-  the Jolt physics bridge and Luau are built from source
+## Build and run
 
 ```sh
 cargo build --workspace
-cargo run -p hello_engine        # runnable editor demo
+cargo run -p hello_engine                              # the editor, on the demo project in this repository
+cargo run -p hello_engine -- --project <game folder>   # the editor on a game's project
 ```
 
-`.cargo/config.toml` optimises every non-member package in `dev` builds. A game
-built from this repo (`cargo build --manifest-path games/<game>/Cargo.toml`)
-therefore gets an optimised engine, Jolt and Luau in `target/debug`, while its
-own crate keeps fast rebuilds. The unoptimised editor had held dressed levels at
-7–15 FPS on a GPU that finished frames in 6–14 ms.
+A project is a folder with a `game.project.json`. If that file names the game's own editor, `hello_engine` starts that
+editor instead. Games live in their own repositories, not in this one.
 
-Running the gates:
+Other runnable programs:
 
 ```sh
-cargo test --workspace -j 1      # -j 1 avoids transient LNK1104 on Windows
-python tools/ghostfence/run.py   # every gate; --fast skips the test row
-python tools/census/generate.py  # regenerate the engine census
+cargo run -p vvardenfell                                        # public-API-only sample
+cargo run -p somnium_asset --example gltf_check -- [--full] <file or folder>...
+cargo run -p somnium_assetcook -- <source-root> <output-root> <cache-root> <plan.json>   # standalone cook
 ```
 
-A timing run, which is how any frame-time claim is made:
+Tests and checks:
 
 ```sh
-SOMNIUM_TIME=after.somtime SOMNIUM_TIME_VIEW=coastal-ground \
-SOMNIUM_MAXIMIZE=1 SOMNIUM_TIME_QUIT=1 \
-cargo run --release -p hello_engine
+cargo test --workspace --lib            # what CI runs
+cargo test --workspace -j 1             # everything, including GPU tests; -j 1 avoids LNK1104 link errors on Windows
+python tools/ghostfence/run.py          # every gate; --fast skips the test row
 ```
 
-### Editor controls (demo)
+`.cargo/config.toml` optimises every non-member package in `dev` builds, so a game built against this repository gets
+an optimised engine, Jolt and Luau while its own crate keeps fast rebuilds.
 
-- **Right mouse + WASD/QE** — fly camera (Shift = faster); **RMB + scroll** adjusts speed
-- **T / R / S** — translate / rotate / scale gizmo · **Ctrl+Z/Y** — undo/redo
-- **L** — light gizmos · **F1** — in-editor Help (`docs/editor/`) · **Esc** — close the top overlay
-- **Ctrl+Space** — Content Drawer · **Ctrl+P** — command palette
-- **Play / Pause / Stop** — simulation transport
-- **F6** — terrain edit mode; then `1`–`6` pick Raise / Lower / Smooth / Flatten / Noise / Paint
-- **F9 / F10** — A/B the GPU-driven indirect path and GPU frustum culling
-- **File > Import Model…** — import any glTF/GLB
-- **Create menu** — primitives, lights, particle emitters, terrain, or a runtime UI Canvas root
-- **Tab / Shift+Tab** — move between shell regions; **Window menu** — switch workspace
-- Click the indigo dot in a Details row's gutter to revert that property in one undo step
+## Using the editor
+
+- **Right mouse + WASD/QE** to fly, Shift for speed, right mouse + scroll to change speed.
+- **T / R / S** move, rotate, scale. **Ctrl+Z / Ctrl+Y** undo, redo. **Ctrl+S** save.
+- **Ctrl+P** command palette. **Ctrl+Space** Content Drawer. **F1** Help.
+- **F6** terrain tools, **F8** foliage tools. **File > Import Model…** for glTF/GLB.
+- **Play / Pause / Stop** run the scene in the editor.
+
+The full list is in [Shortcuts](docs/editor/shortcuts.md); all editor pages are in [docs/editor](docs/editor/).
 
 ## Repository layout
 
+21 engine crates, two example programs and one command-line tool are workspace members.
+
+| Crate | What it holds |
+|---|---|
+| `somnium_core` | App lifecycle, editor logic, scene schema, scripting host, streaming, edit layers, crash reports |
+| `somnium_ecs` | Archetype ECS and reflection (no external dependencies) |
+| `somnium_renderer` | wgpu backend, visibility buffer, render passes, terrain, water, grass, weather |
+| `somnium_shader` | WGSL module registry, `//!include` composition, variant cache |
+| `somnium_jobs` | Job system: priorities, deadlines, cancellation, budgeted drain |
+| `somnium_anim` | Skeletons, clips, blend graphs, state machines |
+| `somnium_asset` | Vertex type, glTF loader and validation, deterministic cook, residency |
+| `somnium_script` | Language-neutral scripting seam (command buffer, budgets) |
+| `somnium_script_luau` | Luau backend through `mlua` |
+| `somnium_input` | Action maps, control paths, processors, rebinding |
+| `somnium_i18n` | CLDR plural and gender rules, fallback chains, key extraction |
+| `somnium_audio` | Kira wrapper: buses, attenuation, occlusion, Doppler, binaural output |
+| `somnium_physics` | Jolt high-level wrapper |
+| `somnium_physics_sys` | Raw Jolt FFI (compiles Jolt C++ at build time) |
+| `somnium_ui` | Native wgpu widget tree, editor shell, graph, timeline, theme |
+| `somnium_voxel` | Voxel world: chunks, meshing, streaming |
+| `somnium_ai` | Headless navigation and decision making |
+| `somnium_combat` | Real-time combat and abilities, as a deterministic headless simulation |
+| `somnium_character` | Kinematic character movement: walk, run, slopes, jump, mantle, climb, swim |
+| `somnium_story` | World state, quests, dialogue, barks and the journal |
+| `somnium_life` | Ambient life for open worlds (Lucid only) |
+
 ```
-crates/
-  somnium_core/         App lifecycle, events, editor logic, scene schema, scripting host
-  somnium_ecs/          Archetype ECS + reflection (no external deps)
-  somnium_renderer/     wgpu backend, visibility buffer, render passes, terrain, water
-  somnium_shader/       WGSL module registry, //!include composition, variant cache
-  somnium_jobs/         Priorities, deadlines, cancellation, budgeted drain (no deps)
-  somnium_anim/         Skeletons, clips, blend graphs, state machines
-  somnium_asset/        Vertex type, glTF loader, deterministic cook, residency
-  somnium_script/       Language-neutral scripting seam (command buffer, budgets)
-  somnium_script_luau/  Luau backend via mlua
-  somnium_input/        Action maps, control paths, processors, rebinding
-  somnium_i18n/         CLDR plural/gender rules, fallback chains, key extraction
-  somnium_audio/        Kira wrapper — buses, attenuation, occlusion, Doppler
-  somnium_physics/      Jolt high-level wrapper
-  somnium_physics_sys/  Raw Jolt FFI (compiles Jolt C++ at build time)
-  somnium_ui/           Native wgpu widget tree, editor shell, graph, timeline, theme
-  somnium_voxel/        Voxel world (chunks, meshing, async streaming)
-examples/
-  hello_engine/         Runnable editor demo
-  vvardenfell/          Public-API-only sample — exercises the engine boundary
-third_party/
-  wgpu-ffx/             FSR 3 upscaler binding (AMD SPIR-V)
-  wgpu-ffx-fg/          FSR 3 frame interpolation + optical flow, translated to WGSL
-games/                  Game projects built on the engine — NOT committed
-tools/
-  census/               Generates the engine census (GHOSTFENCE row)
-  ghostfence/           The gate: seven rows, and a standard-library PNG codec
-  shadercook/           Shader variant budget report
-  reachability/         Environment/component/hand-wiring reachability tables
-  assetcook/            Standalone deterministic cook CLI
-context.md              Living architecture document (phase history, GPU layouts)
-dev records/            Phase plans, sub-phase records, and committed evidence
-ATTRIBUTION.md          Provenance: which reference patterns informed which files
-THIRD_PARTY_NOTICES.md  Bundled fonts and icons, their licences and modifications
-example_repo/           Local reference codebases — NOT committed (see below)
+examples/hello_engine/   the editor and demo project
+examples/vvardenfell/    sample that uses only the public API
+tools/assetcook/         standalone cook CLI (workspace member)
+tools/                   ghostfence (gates), census, reachability, shadercook, slangcook, somnium_mcp, scene_edits.py, ...
+third_party/             wgpu-ffx (FSR 3 upscaler), wgpu-ffx-fg (frame generation in WGSL)
+docs/                    editor pages, feature list, history, media
+context.md               the living architecture document
+dev records/             phase plans, records and evidence
 ```
-
-## How this project works
-
-Somnium is developed in codenamed phases. Each phase has a plan, a record of
-what shipped, and evidence proportionate to its claims.
-
-### Measurements
-
-`.somtime` files record mean, standard deviation, minimum, maximum, and sample
-count for GPU and CPU zones after a fixed warm-up at a pinned camera. Frame
-changes use matched before and after runs. A delta inside the noise band is
-reported as noise.
-
-This has changed decisions. DOOM's tile-specialisation path and aerial terrain
-split measured slower and stayed off. PORTAL-0 reverted a WGSL optimization
-after repeated runs showed a regression.
-
-### Generated checks
-
-`tools/census/generate.py` derives structural counts from the current tree.
-`tools/ghostfence/run.py` checks census freshness, the frozen toolchain, shader
-variant budget, job-system ownership, duplicate singleton systems, golden
-images, and workspace tests. A row that cannot run reports `SKIP` with a reason.
-
-### Negative results
-
-Rejected and inconclusive work stays in the record. A phase document separates
-what was planned, what shipped, what was deferred, and what evidence refused.
-
-## Phase history
-
-Roughly chronological. Detailed records live in [`dev records/`](dev%20records/).
-
-| Phase | Codename | What it built | Status |
-|---|---|---|---|
-| 1–15 | — | Lifecycle, ECS, visibility buffer, shadows, PBR, clustered lights, glTF, voxels, heightmap terrain, GPU-driven rendering | In tree |
-| 16 | — | **Scripting** — Luau via `mlua`, sandboxed, with a deferred command boundary and measured budgets | Complete |
-| IV | — | Great Lakes landscape and finite water; three-cascade FFT ocean | Complete |
-| XV | — | 32-layer terrain material, splat/biome authoring, BC7 packs | XV-A–J complete |
-| VV | Halcyon | Ray-traced water reflections and refraction | VV-A–H + VV+1 |
-| CR | Crysis | CPU/GPU frustum culling | In engine |
-| DF | Daggerfall | Terrain material clipmaps (macro + detail stacks) | In engine |
-| 26 / 26-Zeta | Metaphor / Nocturne Atelier | Editor information architecture, then its token and paint layer | In tree |
-| 27 | Hades | Editor paint layer, motion, elevation | 27-A–G |
-| DOOM | id Tech | **The clock** — GPU/CPU profiler, `.somtime`, pixel census, dynamic resolution | A, B, C, E, F |
-| CONTROL | Northlight | **Editor reach** — property seam, asset database, drag-and-drop, viewport control, preferences, scene lifecycle, curves, time of day, clouds, weather, decals | **A–O complete** |
-| MORROWIND | NetImmerse | The engine's non-renderer half — see below | **In progress** |
-| PORTAL-0 | Source | Performance audit and engineering health | **Complete** |
-| TSUSHIMA | Ghost of Tsushima | **Terrain photorealism** — long-range sun shadow, baked sky visibility, sky-lit aerial perspective, a relief normal that survives distance, the BRDF's energy terms, splat boundaries the brush cannot paint, macro colour variance, parallax on cliffs, a 25-entry foliage palette, four kinds of water, and the foliage lighting transport that three earlier phases left unqualified | **A–K in tree**, H's contrast-with-distance open, transmitted moonlight deferred |
-
-### Phase MORROWIND, by track
-
-| Track | Codename | Shipped | Open |
-|---|---|---|---|
-| 0 | BALMORA | Census, **job system** (priorities, deadlines, cancellation), **shader system** (`//!include` composition, variant cache, hot reload), wgpu 30 | — |
-| 1 | VIVEC | **Runtime UI framework** — canvases, anchors, paths and gradients, directional navigation, rich text and IME, motion/springs, accessibility tree (AccessKit) | Text shaping (`cosmic-text`, decided, behind a flag) |
-| 2 | CONSTRUCTION SET | **Node graph editor** (material + animation catalogues), **timeline** with embedded curve editor | Docking, virtualisation, play-in-editor, GUI layout editor |
-| 3 | HLAALU | **Prefabs**, splines/blockout, rule-driven scattering; generated Details and shared graph authoring | — |
-| 4 | SILT STRIDER | **Deterministic asset cook** with content-hashed incremental cache, **budgeted residency** + hot reload, **world partition** with cell-owned entity streaming, **HLOD/impostors** and a floating origin | — |
-| 5 | DWEMER | **Skeletal animation** — GPU skinning into the shared geometry pool, clips, blend trees, state machines, sync tracks, **root motion/IK/events/ragdolls**, compression and pose jobs | — |
-| 6 | SIXTH HOUSE | **Tiled navigation**, pathfinding, obstacles/agents/links, behavior graphs, Luau tasks and perception | — |
-| 7 | RED MOUNTAIN | **Virtual shadow maps**, **portable DDGI** (SDF-traced, no ray query), **virtual texturing** for terrain, **OIT + SMAA** | GPU particles |
-| 8 | ALMSIVI | **Input actions** (control paths, processors, rebinding), **audio** (buses, attenuation, occlusion, Doppler), **localisation** (CLDR plurals, fallback chains), **save games/state stack** | Video, final playable slice |
-
-### Planned phases
-
-| Phase | Purpose | State |
-|---|---|---|
-| PORTAL | Rebase and close engineering-health work not covered by PORTAL-0 | Plan only |
-| KENSHI | Measure combined load and publish engine limits before optimizing | Plan only |
-| STALKER | Build the player, packaging, mods, product UI, living-world systems, and release proof | Plan only |
-
-See [`context.md`](context.md) for prerequisites, open work, and the distinction
-between current capability and planned design.
 
 ## How a frame becomes a pixel
 
-Geometry is rasterized once into identity, not colour. One fullscreen pass then
-shades each visible pixel exactly once, which is why the shading cost tracks the
-framebuffer rather than the scene.
+Geometry is rasterized once into identity, not colour. One fullscreen pass then shades each visible pixel exactly
+once, so the shading cost follows the framebuffer rather than the scene. [`context.md`](context.md) is the map of the
+engine as it is now: start with [Architectural rules](context.md#architectural-rules) and
+[Where the frame actually goes](context.md#where-the-frame-actually-goes).
 
 ```mermaid
 flowchart LR
@@ -373,115 +284,59 @@ flowchart LR
     FG --> OUT["present"]
 ```
 
-Measured on the default Coastal view at 1920x1032, the shading pass reports
-exactly 1,981,440 fragment invocations for 1,981,440 pixels. No overdraw, by
-construction. Where the rest of the frame goes is in
-[context.md](context.md#renderer-and-simulation-contracts).
+## How it is developed
 
-### What one pixel of that shading pass does
+Frame-time claims come from matched before-and-after `.somtime` runs at a pinned camera; a change inside the noise
+band is reported as noise. `tools/ghostfence/run.py` checks the census, the toolchain, shader variant budgets and the
+tests. Rejected work stays in the records. The phase ledger and Lucid's history since the fork are in
+[docs/history.md](docs/history.md).
 
-Every visible surface walks the same path. The BRDF is the ordinary part. What
-matters is that each term carries the factor deciding when it applies:
-visibility for anything direct, composition for anything ambient, an energy
-bound for anything specular.
+## Contributing
 
-```mermaid
-flowchart TB
-    VB["visibility buffer<br/>instance + triangle"] --> SURF["reconstruct surface<br/>position, normal, uv,<br/>analytic uv gradients"]
-    SURF --> MAT["material<br/>albedo, roughness, metallic,<br/>normal map, AO map"]
-
-    MAT --> AMB["surface.occlusion<br/>GTAO x authored AO x sky visibility<br/>x terrain layer AO"]
-    MAT ==> MICRO["micro_occlusion<br/>material-scale only"]
-
-    SUN["sun"] --> DIR["reflected: area BRDF<br/>+ specular lobe bound"]
-    SUN --> TR["transmitted: two-sided<br/>wrapped lobe, thin surfaces"]
-    MOON["moon"] --> MDIR["reflected: same area BRDF,<br/>same bound"]
-
-    SHAD["shadow_factor<br/>cascades x cloud x terrain horizon<br/>x micro-shadow"] --> DIR
-    SHAD --> TR
-    MICRO --> SHAD
-
-    DIR --> OUT["HDR radiance"]
-    TR --> OUT
-    MDIR --> OUT
-    AMB --> IBL["IBL + ReSTIR GI + volumetrics"]
-    IBL --> OUT
-```
-
-Four of those qualifiers were missing until TSUSHIMA-K, and painted foliage is
-what exposed them. `shadow_factor` did not reach the transmitted lobe, so leaves
-glowed through hills. The authored AO map overwrote GTAO instead of multiplying
-into it, so grass sat on the ground rather than in it. Moonlight skipped the
-specular bound the sun had. The moon's own transmitted lobe is not in the
-diagram because it was removed: there is no moon-direction shadow to multiply it
-by yet, and unshadowed it turned night foliage into green pinpricks. Details in
-[TSUSHIMA-K](dev%20records/phase%20TSUSHIMA/TSUSHIMA-K.md).
-
+See [CONTRIBUTING.md](CONTRIBUTING.md), including which of the two repositories a change belongs in.
 
 ## Development with AI assistance
 
-Somnium is built with substantial **AI pair-programming assistance (Anthropic's
-Claude, via Claude Code)**. The AI is used as an implementation and research
-partner — reading reference engines, drafting subsystems, running the
-measurement harnesses, and maintaining the architecture docs — while design
-direction, review, and verification are human-driven. This is noted for
-transparency; it has no bearing on how the code is licensed or how you may use
-it.
-
-The assistant's own working files (session memory, planning notes, local
-configuration) live alongside the source during development but are intentionally
-kept out of version control — see the AI-assisted section of
-[`.gitignore`](.gitignore).
+Somnium and Lucid are built with substantial AI pair-programming assistance (Anthropic's Claude, through Claude Code).
+The AI is used as an implementation and research partner: reading reference engines, drafting subsystems, running the
+measurement harnesses and keeping the architecture docs current. Design direction, review and verification are done by
+the author. This is noted for transparency; it has no bearing on how the code is licensed or how you may use it. The
+assistant's working files are kept out of version control (see [`.gitignore`](.gitignore)).
 
 ## A note on `example_repo/` and ATTRIBUTION.md
 
-[`ATTRIBUTION.md`](ATTRIBUTION.md) and many source-file comments cite paths
-inside an `example_repo/` directory (Unreal Engine, The Forge, Fyrox, Bevy
-plugins, Jolt, O3DE, Godot, Stride, Wicked, and others). That directory is a
-local, multi-gigabyte collection of third-party reference repositories studied
-**for architectural patterns only — no source is copied**. It is intentionally
-excluded from version control for two reasons:
+[`ATTRIBUTION.md`](ATTRIBUTION.md) and many source comments cite paths inside an `example_repo/` directory (Unreal
+Engine, The Forge, Fyrox, Bevy plugins, Jolt, O3DE, Godot, Stride, Wicked and others). That directory is a local,
+multi-gigabyte collection of reference repositories, studied for architectural patterns only; no source is copied. It
+is not in version control, because of its size and because some references (Unreal Engine and Flax among them) may
+not be redistributed. After cloning, the cited paths will be missing; the citations remain as provenance, and nothing
+in the build depends on them.
 
-1. **Size** — several gigabytes, far beyond GitHub's limits.
-2. **Licensing** — some references (notably Unreal Engine and Flax) are under
-   licenses that forbid redistribution. Where a reference is proprietary or
-   copyleft, `ATTRIBUTION.md` records that it informed *architecture only* and
-   supplied no code, identifiers, constants, layouts or comments.
+One exception: `somnium_physics_sys/build.rs` compiles [Jolt Physics](https://github.com/jrouwe/JoltPhysics) (MIT)
+from `example_repo/JoltPhysics-master/`, so that one subtree is in version control.
 
-After cloning, those cited paths will not be present. The citations remain
-meaningful as *provenance*, and the engine does **not** depend on the reference
-code: `example_repo/` is excluded from the Cargo workspace and nothing is
-`include!`d from it.
-
-**One exception:** `somnium_physics_sys/build.rs` compiles
-[Jolt Physics](https://github.com/jrouwe/JoltPhysics) (MIT-licensed) directly
-from `example_repo/JoltPhysics-master/`, so that single subtree **is** kept under
-version control — without it a fresh clone cannot build the physics crate.
-
-## License
+## Licence
 
 Licensed under either of, at your option:
 
 - **MIT License** ([LICENSE-MIT](LICENSE-MIT))
 - **Apache License, Version 2.0** ([LICENSE-APACHE](LICENSE-APACHE))
 
-This is the conventional Rust-ecosystem dual license. Unless you explicitly state
-otherwise, any contribution you intentionally submit for inclusion in the work,
-as defined in the Apache-2.0 license, shall be dual-licensed as above, without
-any additional terms or conditions.
+Unless you state otherwise, any contribution you submit for inclusion, as defined in the Apache-2.0 licence, is
+dual-licensed as above, without additional terms.
 
-Bundled third-party code and assets retain their own licenses:
+Bundled third-party code and assets keep their own licences:
 
-- **Jolt Physics** (in `example_repo/JoltPhysics-master/`) — MIT; see its `LICENSE`
-- **Luau** (built from source by `mlua-sys`) — MIT
-- **Inter** and **JetBrains Mono** — SIL Open Font License 1.1
-- **Tabler Icons** — MIT
-- **Great Lakes height map** (Motion Forge Pictures) — CC0 1.0; provenance and
-  audited source hashes in `assets/terrain/great_lakes/README.md`
+- **Jolt Physics** (in `example_repo/JoltPhysics-master/`): MIT; see its `LICENSE`
+- **Luau** (built from source by `mlua-sys`): MIT
+- **Inter** and **JetBrains Mono**: SIL Open Font License 1.1
+- **Tabler Icons**: MIT
+- **Great Lakes height map** (Motion Forge Pictures): CC0 1.0; provenance and source hashes in
+  `assets/terrain/great_lakes/README.md`
 
-Every bundled asset, its upstream, its version and any modification is recorded
-in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md). The Somnium name, the
-Eclipse `S` monogram and the engine-specific icons are original project assets and
-are **not** covered by the dual license above; they are excluded from the
-trademark-style grant the way project branding usually is, and have not been
-through trademark clearance.
+Every bundled asset, its upstream, version and changes are recorded in
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md); the brand marks' provenance is in
+[`crates/somnium_ui/assets/brand/PROVENANCE.md`](crates/somnium_ui/assets/brand/PROVENANCE.md). The Somnium name,
+the Eclipse `S` monogram and the engine-specific icons are original project assets and are not covered by the dual
+licence above; they have not been through trademark clearance. The Lucid mark and wordmark are original drawings,
+recorded in the same provenance file.

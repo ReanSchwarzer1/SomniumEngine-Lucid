@@ -2,7 +2,7 @@
 
 ## General
 
-- **F1** — this Help (Welcome, Viewport, Shortcuts, Content Drawer, About, Outliner, Terrain, Water, Lighting)
+- **F1** — this Help (Welcome, Viewport, Shortcuts, Content Drawer, About, Outliner, Terrain, Water, Lighting, Scripting, Designer Tools, Story)
 - **Esc during captured Play** — release the cursor; also restore the editor from fullscreen. Click the scene to recapture.
 - **Esc in the editor** — close one layer: modal → command palette → popup → drawer → search filter → selection.
 - **Tab / Shift+Tab** — move between shell regions: application bar → mode bar →
