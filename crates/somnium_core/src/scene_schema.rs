@@ -1636,7 +1636,17 @@ mod tests {
         let text = serde_json::to_string(&document).unwrap();
         assert!(text.contains(&asset.to_string()));
         assert!(!text.contains("runtime_id"));
-        assert!(!text.contains("913"));
+        // No number 913 anywhere in the document. Not a search of the text: the entity's random persistent id is
+        // hex and can hold "913" (editor-ux saw this fail, 28 Nov 2026).
+        fn holds_number(value: &serde_json::Value, n: u64) -> bool {
+            match value {
+                serde_json::Value::Number(v) => v.as_u64() == Some(n),
+                serde_json::Value::Array(items) => items.iter().any(|v| holds_number(v, n)),
+                serde_json::Value::Object(fields) => fields.values().any(|v| holds_number(v, n)),
+                _ => false,
+            }
+        }
+        assert!(!holds_number(&document, 913));
 
         let mut loaded = World::new();
         scene_from_json(&mut loaded, &registry, &document).unwrap();
