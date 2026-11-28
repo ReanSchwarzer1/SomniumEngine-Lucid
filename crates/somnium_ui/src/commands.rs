@@ -1251,6 +1251,16 @@ fn declarations() -> Vec<Command> {
             selection
         ),
         command!(
+            "editor.level.copy_and_carry",
+            "Copy and Move",
+            "Level",
+            Some(Chord::press(CommandKey::Letter('D')).shift()),
+            "Make a copy of the selected objects and pick it up: it follows the mouse over the ground. Click to put it down, Esc to remove it, Shift+D again for another.",
+            A::LevelTool(L::CopyAndCarry),
+            EDIT,
+            selection
+        ),
+        command!(
             "editor.level.find_floating",
             "Find Floating Objects",
             "Level",
@@ -2598,7 +2608,7 @@ pub fn icon_for(id: &str) -> crate::icons::IconId {
         "editor.edit.undo" => I::Undo,
         "editor.edit.redo" => I::Redo,
         "editor.edit.delete" => I::Delete,
-        "editor.edit.duplicate" => I::Duplicate,
+        "editor.edit.duplicate" | "editor.level.copy_and_carry" => I::Duplicate,
         "editor.edit.copy" => I::Copy,
         "editor.edit.paste" => I::Paste,
         "editor.edit.select_all" => I::Select,

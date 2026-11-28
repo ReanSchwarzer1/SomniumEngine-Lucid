@@ -11391,7 +11391,7 @@ impl<G: GameApp> Engine<G> {
                     | EditorEvent::LoadScene(_)
                     | EditorEvent::Undo
                     | EditorEvent::Redo
-            ) || matches!(ev, EditorEvent::LevelTool(tool) if tool != L::Carry);
+            ) || matches!(ev, EditorEvent::LevelTool(tool) if !matches!(tool, L::Carry | L::CopyAndCarry));
             if ends {
                 self.cancel_carry();
                 if matches!(ev, EditorEvent::Undo | EditorEvent::Redo) {
@@ -12095,6 +12095,7 @@ impl<G: GameApp> Engine<G> {
                     L::SelectSameAsset => self.select_same_asset(),
                     L::MakeObject => self.make_painted_object(),
                     L::Carry => self.toggle_carry(),
+                    L::CopyAndCarry => self.copy_and_carry(),
                 }
             }
 
@@ -13051,37 +13052,8 @@ impl<G: GameApp> Engine<G> {
                     return;
                 }
                 // The whole object, every part (an imported model's root alone is an empty shell), beside its
-                // original: the clipboard's subtree copy, under the original's parent, as one undo step.
-                let mut clipboard =
-                    crate::clipboard::EntityClipboard::duplicate(&self.world, self.selection.as_slice());
-                let (renderer, render_ctx) = (&mut self.renderer, &self.render_ctx);
-                clipboard.for_each_snapshot_mut(|snapshot, root| {
-                    if root {
-                        // Offset the duplicate slightly so it's visible.
-                        if let Some(transform) = snapshot.transform.as_mut() {
-                            transform.translation += glam::Vec3::X;
-                        }
-                        let name = snapshot.name.as_ref().map_or_else(|| "Entity".to_owned(), |n| n.as_str().to_owned());
-                        snapshot.name = Some(Name::new(&format!("{name}_copy")));
-                    }
-                    // Terrains are not duplicated — two entities sharing one terrain_id would draw the same
-                    // terrain twice. Nor is the scene's environment, or what was painted onto the original.
-                    snapshot.environment = false;
-                    snapshot.terrain = None;
-                    snapshot.world_partition = None;
-                    snapshot.ui_canvas = None;
-                    snapshot.voxel_terrain = None;
-                    snapshot.foliage = None;
-                    if let Some(component) = snapshot.water.as_mut()
-                        && let (Some(renderer), Some(render_ctx)) = (renderer.as_mut(), render_ctx.as_ref())
-                    {
-                        component.water_id = renderer.allocate_water_body_id();
-                        if let Err(error) = renderer.ensure_water_body(render_ctx, component.descriptor()) {
-                            warn!("Failed to duplicate water data: {error}");
-                        }
-                    }
-                });
-                let count = clipboard.root_count();
+                // original (a metre along x, so it is seen): the clipboard's subtree copy, under the original's
+                // parent, as one undo step.
                 // Named for the original, read before the selection moves to the copy.
                 let original = self
                     .selection
@@ -13090,9 +13062,10 @@ impl<G: GameApp> Engine<G> {
                     .and_then(|entity| self.world.get::<Name>(*entity))
                     .map(|name| name.as_str().to_owned());
                 use crate::editor_commands::EditorCommand as _;
-                let mut command = crate::clipboard::PasteEntitiesCmd::new(clipboard, None);
+                let mut command = self.duplicate_paste(glam::Vec3::X, "Duplicate");
                 command.execute(&mut self.world, &mut self.selection.primary);
                 let roots = command.roots().to_vec();
+                let count = roots.len();
                 self.undo_stack.push_silent(Box::new(command));
                 self.selection.set_many(roots);
                 self.after_selection_change();
