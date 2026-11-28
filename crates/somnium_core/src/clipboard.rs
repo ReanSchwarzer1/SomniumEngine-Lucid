@@ -158,6 +158,8 @@ pub struct PasteEntitiesCmd {
     spawned: Vec<Entity>,
     /// The roots, in clipboard order — what the paste selects afterwards.
     roots: Vec<Entity>,
+    /// The step's name in Undo and Redo.
+    name: &'static str,
 }
 
 impl PasteEntitiesCmd {
@@ -183,13 +185,39 @@ impl PasteEntitiesCmd {
             parent,
             spawned: Vec::new(),
             roots: Vec::new(),
+            name: "Paste",
         }
+    }
+
+    /// Name the step for Undo and Redo: a duplicate is a paste underneath, and "Undid: Paste" after Ctrl+D named a
+    /// thing the person never did.
+    #[must_use]
+    pub fn named(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
     }
 
     /// The top-level entities the paste created. Empty before `execute`.
     #[must_use]
     pub fn roots(&self) -> &[Entity] {
         &self.roots
+    }
+
+    /// The top-level copy made of `source`, once executed.
+    #[must_use]
+    pub fn root_of(&self, source: Entity) -> Option<Entity> {
+        let at = self.clipboard.roots.iter().position(|node| node.source == source)?;
+        self.roots.get(at).copied()
+    }
+
+    /// Keep where each top-level copy stands now as the place it is made at: a copy that was moved before it entered
+    /// the history (Copy and Move) comes back where it was put when the step is redone.
+    pub fn keep_root_places(&mut self, world: &World) {
+        for (node, entity) in self.clipboard.roots.iter_mut().zip(&self.roots) {
+            if let Some(transform) = world.get::<Transform>(*entity) {
+                node.snapshot.transform = Some(*transform);
+            }
+        }
     }
 
     fn spawn_node(&mut self, world: &mut World, node: &ClipNode, parent: Option<Entity>) -> Entity {
@@ -351,7 +379,7 @@ impl EditorCommand for PasteEntitiesCmd {
     }
 
     fn description(&self) -> &str {
-        "Paste"
+        self.name
     }
 
     fn is_no_op(&self) -> bool {
@@ -433,6 +461,34 @@ mod tests {
                 .target,
             paste.roots()[1]
         );
+    }
+
+    /// Copy and Move: a copy that was moved before it entered the history is made again where it was put, the step
+    /// carries its own name, and each copy is found from its original.
+    #[test]
+    fn a_moved_copy_comes_back_where_it_was_put() {
+        let mut world = World::new();
+        let crate_a = world.spawn((Name::new("crate_a"), Transform::from_translation(glam::Vec3::new(1.0, 0.0, 0.0))));
+        let crate_b = world.spawn((Name::new("crate_b"), Transform::from_translation(glam::Vec3::new(2.0, 0.0, 0.0))));
+        let mut paste =
+            PasteEntitiesCmd::new(EntityClipboard::duplicate(&world, &[crate_a, crate_b]), None).named("Copy and Move");
+        assert_eq!(paste.description(), "Copy and Move");
+        let mut selected = None;
+        paste.execute(&mut world, &mut selected);
+        let (copy_a, copy_b) = (paste.root_of(crate_a).unwrap(), paste.root_of(crate_b).unwrap());
+        assert_eq!(paste.roots().to_vec(), vec![copy_a, copy_b]);
+        world.get_mut::<Transform>(copy_a).unwrap().translation = glam::Vec3::new(10.0, 3.0, -4.0);
+        paste.keep_root_places(&world);
+        paste.undo(&mut world, &mut selected);
+        assert!(paste.root_of(crate_a).is_none(), "an undone copy has no entity");
+        paste.execute(&mut world, &mut selected);
+        let again_a = paste.root_of(crate_a).unwrap();
+        let again_b = paste.root_of(crate_b).unwrap();
+        assert_eq!(world.get::<Transform>(again_a).unwrap().translation, glam::Vec3::new(10.0, 3.0, -4.0));
+        assert_eq!(world.get::<Transform>(again_b).unwrap().translation, glam::Vec3::new(2.0, 0.0, 0.0));
+        // The originals never moved, and a plain paste keeps its name.
+        assert_eq!(world.get::<Transform>(crate_a).unwrap().translation, glam::Vec3::new(1.0, 0.0, 0.0));
+        assert_eq!(PasteEntitiesCmd::new(EntityClipboard::default(), None).description(), "Paste");
     }
 
     #[test]

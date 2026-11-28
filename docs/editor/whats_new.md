@@ -2,6 +2,12 @@
 
 Newest first. Each line is something you can do now that you could not do before.
 
+## 28 November 2026
+
+- **Shift+D makes a copy and puts it in your hand.** Select a thing, press Shift+D, and its copy follows the pointer over the ground, just as G does. Click or Enter puts the copy down. Esc removes it. The copy is one undo step.
+- **Shift+D again makes the next copy.** With a copy in your hand, Shift+D puts it down and hands you another, so a row of crates is Shift+D, move, Shift+D, move.
+- **Undo after Duplicate (Ctrl+D) says "Undid: Duplicate".** Before, it said "Undid: Paste".
+
 ## 27 November 2026, evening
 
 - **G moves a thing over the ground.** Select it, press G, and it follows the pointer over whatever lies under it: the ground, a roof, a rock. Click or Enter puts it down. Esc puts it back where it was. The whole move is one undo step.

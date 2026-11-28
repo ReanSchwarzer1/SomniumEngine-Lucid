@@ -816,6 +816,8 @@ pub enum LevelTool {
     MakeObject,
     /// Pick up the selection: it follows the mouse over whatever is under it until a click puts it down.
     Carry,
+    /// Copy and Move: make a copy of the selection and pick the copy up at once.
+    CopyAndCarry,
 }
 
 /// Designer actions whose implementation belongs to the engine host.
