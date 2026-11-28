@@ -4,6 +4,7 @@
 // resolver (`somnium_shader`) emits each module once, in this order, and
 // hoists every `enable` above everything.
 //!include "atmosphere.wgsl"
+//!include "froxel_depth.wgsl"
 
 // Somnium Engine — Froxel volumetrics: aerial perspective + fog (24U, 25I).
 //
@@ -91,6 +92,24 @@ struct VolumetricParams {
     grain_enabled: u32,
     /// How far the sun's shadow map also hides skylight from the fog, 0..1.
     fog_sky_occlusion: f32,
+    /// Scale on the sky light the fog scatters (1 as the sky gives it), apart from the sun's and the lamps'.
+    fog_skylight: f32,
+    /// World height where the fog stops, softly over `fog_top_softness` metres; at or under `fog_base_height`, none.
+    fog_top_height: f32,
+    fog_top_softness: f32,
+    /// 1 when the clouds' sky-light capture (`cloud_sky_tex`) holds a marched deck: the sky light the air and the fog
+    /// scatter then comes through it. 0 leaves the clear sky's (the multiscatter LUT) as it was.
+    cloud_sky: f32,
+    /// 1: `sun_illuminance` is the sun above the air (a running day clock): the multiscatter table is read for a set
+    /// sun as its light falls (`sample_multiscatter_twilight`).
+    above_air: f32,
+    /// The aerosols' factor (`atmosphere_aerosol`, set from it at the top of `main`).
+    aerosol: f32,
+    _cloud_pad2: f32,
+    /// The planet over the horizon: toward it, w 1 by night (the clouds' shadow field is then cast toward it); its
+    /// light above the air (rgb, lux), w 1 when there is one.
+    planet_direction: vec4<f32>,
+    planet_light: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> vol: VolumetricParams;
@@ -138,6 +157,45 @@ struct VolClusterParams {
 @group(0) @binding(11) var<storage, read> vol_light_indices: array<u32>;
 @group(0) @binding(12) var<storage, read> vol_cluster_offsets: array<VolClusterOffset>;
 @group(0) @binding(13) var<storage, read> vol_cluster: VolClusterParams;
+
+// The clouds (Sunscar, 6 Nov 2026). The fog was lit by the full sun and the clear sky's blue whatever the deck did,
+// while the ground under it had the clouds' shadow and their grey sky light: under an overcast every hill past a
+// kilometre wore a bright blue veil the land under it could not have, and read cobalt.
+/// The clouds' capture of the sky (clouds.wgsl `cloud_env`): in-scattered light and transmittance per direction.
+@group(0) @binding(14) var cloud_sky_tex: texture_cube<f32>;
+/// The world-XZ field of how much sun reaches the ground through the deck (clouds.wgsl `cloud_shadow`), last frame's.
+@group(0) @binding(15) var cloud_shadow_tex: texture_2d<f32>;
+/// `[centre_x, centre_z, extent_metres, strength]`; strength 0: no clouds, the field is not read.
+@group(0) @binding(16) var<uniform> cloud_shadow_params: vec4<f32>;
+
+/// How much sun reaches this air through the deck. Past the field's edge its edge holds: the volume reaches ~1 km,
+/// well inside the field, so this only guards a short field (shading's `cloud_shadow_at` fades to the field's mean).
+fn cloud_sun_at(p: vec3<f32>) -> f32 {
+    if cloud_shadow_params.w <= 0.0 {
+        return 1.0;
+    }
+    let local = clamp((p.xz - cloud_shadow_params.xy) / max(cloud_shadow_params.z, 1.0), vec2<f32>(-1.0), vec2<f32>(1.0));
+    return clamp(textureSampleLevel(cloud_shadow_tex, lut_sampler, local * 0.5 + 0.5, 0.0).r, 0.0, 1.0);
+}
+
+/// The sky light through the deck, as (mean transmittance, mean in-scatter) over the upper hemisphere: the zenith and
+/// rings at 50 and 15 degrees, a solid-angle-even enough spread for a light that only sets a tint and a level.
+fn cloud_sky_mean() -> vec4<f32> {
+    var t = 0.0;
+    var s = vec3<f32>(0.0);
+    let c0 = textureSampleLevel(cloud_sky_tex, lut_sampler, vec3<f32>(0.0, 1.0, 0.0), 0.0);
+    t += c0.a;
+    s += c0.rgb;
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        let a = f32(i) * 0.7853982;
+        let el = select(0.2617994, 0.8726646, i % 2u == 0u);
+        let d = vec3<f32>(cos(a) * cos(el), sin(el), sin(a) * cos(el));
+        let c = textureSampleLevel(cloud_sky_tex, lut_sampler, d, 0.0);
+        t += c.a;
+        s += c.rgb;
+    }
+    return vec4<f32>(s / 9.0, clamp(t / 9.0, 0.0, 1.0));
+}
 
 /// Lights read per froxel step; the cluster list is already culled to the cell.
 const VOL_MAX_LOCAL: u32 = 12u;
@@ -251,11 +309,17 @@ fn fog_density_at(world_y: f32) -> f32 {
         return vol.fog_density;
     }
     let h = max(world_y - vol.fog_base_height, 0.0);
-    return vol.fog_density * exp(-h / vol.fog_height_falloff);
+    var d = vol.fog_density * exp(-h / vol.fog_height_falloff);
+    // Valley fog: a flat top, the ridges standing clear above it.
+    if vol.fog_top_height > vol.fog_base_height {
+        d *= 1.0 - smoothstep(vol.fog_top_height, vol.fog_top_height + vol.fog_top_softness, world_y);
+    }
+    return d;
 }
 
 @compute @workgroup_size(8, 8, 1)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+    atmosphere_aerosol = vol.aerosol;
     let dims = textureDimensions(volume_out);
     if gid.x >= dims.x || gid.y >= dims.y {
         return;
@@ -264,9 +328,11 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     // Ray for this froxel column, from the camera through the pixel centre.
     let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims.xy);
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    let near = vol.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-    let far = vol.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
-    let ray_dir = normalize(far.xyz / far.w - near.xyz / near.w);
+    // Reversed-Z (Sunscar, 6 Nov 2026): depth 1 is the near plane and 0 infinity, where a perspective's point has
+    // w = 0 and its xyz is the ray's direction (taken undivided, an orthographic view's far plane less its near).
+    let near = vol.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    let far = vol.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
+    let ray_dir = normalize(far.xyz - near.xyz / near.w * far.w);
 
     let sun_dir = normalize(vol.sun_direction);
     let cos_theta = dot(ray_dir, sun_dir);
@@ -286,6 +352,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     var inscatter = vec3<f32>(0.0);
     var throughput = vec3<f32>(1.0);
 
+    // The sky light the air and the fog scatter, through the deck: the clear sky's (multiscatter LUT) where the deck
+    // lets it through, and the clouds' own light. The clouds fill the upper half of the sphere an isotropic scatterer
+    // sees, so half their mean; per unit of sun, as the LUT's is.
+    var sky_through = 1.0;
+    var sky_clouds = vec3<f32>(0.0);
+    if vol.cloud_sky > 0.5 {
+        let mean = cloud_sky_mean();
+        sky_through = mean.a;
+        sky_clouds = 0.5 * mean.rgb / max(vol.sun_illuminance, vec3<f32>(1e-3));
+    }
+
     for (var slice = 0u; slice < slices; slice = slice + 1u) {
         for (var step = 0u; step < VOL_STEPS_PER_SLICE; step = step + 1u) {
             // Position within the slice, offset by a per-frame jitter (24U).
@@ -302,7 +379,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // negative extinction amplifies light and erases shafts.
             let frac = (f32(step) + clamp(sample_jitter, 0.001, 0.999))
                 / f32(VOL_STEPS_PER_SLICE);
-            let t = vol.max_distance * (f32(slice) + frac) / f32(slices);
+            let t = froxel_t((f32(slice) + frac) / f32(slices), vol.max_distance);
             let dt = t - prev_t;
             prev_t = t;
 
@@ -322,7 +399,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // going opaque within a metre of the camera.
             const KM_PER_M: f32 = 0.001;
             let scatter_rayleigh = RAYLEIGH_SCATTERING * density.x * KM_PER_M;
-            let scatter_mie = vec3<f32>(MIE_SCATTERING * density.y * KM_PER_M);
+            let scatter_mie = vec3<f32>(MIE_SCATTERING * atmosphere_aerosol * density.y * KM_PER_M);
 
             let mu_sun = sun_dir.y;
             // Phase 25M. `atmosphere.wgsl` and `atmosphere_lut.wgsl` both guard
@@ -333,12 +410,16 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
             // out — so every froxel went on being lit by the reddest possible
             // sunlight instead of by none. That is the red frame.
             var sun_transmittance = vec3<f32>(0.0);
-            var multiscatter = vec3<f32>(0.0);
             if !ray_hits_ground(sample_r, mu_sun) {
                 sun_transmittance = sample_transmittance(
                     transmittance_lut, lut_sampler, sample_r, mu_sun);
-                multiscatter = sample_multiscatter(
-                    multiscatter_lut, lut_sampler, sample_r, mu_sun);
+            }
+            // The multiply scattered sky stays after sunset: its table carries the planet's shadow itself, so a sun
+            // under the horizon reads the twilight's light, not the reddest grazing row. Under the light on the ground
+            // (no day clock) a set sun's light is zero and this is nothing, as before.
+            var multiscatter = sample_multiscatter(multiscatter_lut, lut_sampler, sample_r, mu_sun);
+            if vol.above_air > 0.5 {
+                multiscatter = sample_multiscatter_twilight(multiscatter_lut, lut_sampler, sample_r, mu_sun);
             }
 
             var sun_vis = 1.0;
@@ -364,6 +445,8 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 // a closed room glowed with the whole sky (the Forest lodge).
                 sky_vis = mix(1.0, shadow_vis, saturate(vol.fog_sky_occlusion));
             }
+            sun_vis *= cloud_sun_at(world_pos);
+            multiscatter = multiscatter * sky_through + sky_clouds;
 
             var step_scatter = (scatter_rayleigh * rayleigh + scatter_mie * mie)
                 * sun_transmittance * sun_vis
@@ -392,7 +475,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 // it is the same term the air already uses, so the two media
                 // now agree about what is illuminating them.
                 step_scatter += vec3<f32>(fog * fog_phase) * sun_vis * sun_transmittance
-                    + vec3<f32>(fog) * multiscatter * sky_vis;
+                    + vec3<f32>(fog) * multiscatter * sky_vis * vol.fog_skylight;
                 extinction += vec3<f32>(fog);
             }
 
@@ -413,7 +496,31 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
                 / max(extinction, vec3<f32>(VOL_MIN_EXTINCTION));
             let integrated_local = (local_scatter - local_scatter * step_transmittance)
                 / max(extinction, vec3<f32>(VOL_MIN_EXTINCTION));
-            inscatter += throughput * (integrated * vol.sun_illuminance + integrated_local);
+            // The planet over the horizon lights the air and the fog as a second sun does: its light through the air
+            // above the sample, its glow on the air, and by night the clouds' shadow cast toward it. No shafts.
+            var integrated_planet = vec3<f32>(0.0);
+            if vol.planet_light.w > 0.5 {
+                let planet_dir = normalize(vol.planet_direction.xyz + vec3<f32>(0.0, 1e-6, 0.0));
+                var through_air = vec3<f32>(0.0);
+                if !ray_hits_ground(sample_r, planet_dir.y) {
+                    through_air = sample_transmittance(transmittance_lut, lut_sampler, sample_r, planet_dir.y);
+                }
+                if vol.planet_direction.w > 0.5 {
+                    through_air *= cloud_sun_at(world_pos);
+                }
+                let glow = sample_multiscatter_twilight(multiscatter_lut, lut_sampler, sample_r, planet_dir.y) * sky_through;
+                let cos_p = dot(ray_dir, planet_dir);
+                var planet_scatter = (scatter_rayleigh * rayleigh_phase(cos_p) + scatter_mie * mie_phase(cos_p)) * through_air
+                    + (scatter_rayleigh + scatter_mie) * glow;
+                if fog > 0.0 {
+                    planet_scatter += vec3<f32>(fog * hg_phase(cos_p, vol.fog_asymmetry)) * through_air
+                        + vec3<f32>(fog) * glow * sky_vis * vol.fog_skylight;
+                }
+                planet_scatter *= vol.planet_light.rgb;
+                integrated_planet = (planet_scatter - planet_scatter * step_transmittance)
+                    / max(extinction, vec3<f32>(VOL_MIN_EXTINCTION));
+            }
+            inscatter += throughput * (integrated * vol.sun_illuminance + integrated_local + integrated_planet);
             throughput *= step_transmittance;
         }
 
@@ -429,13 +536,14 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
         // identity across a move — reprojecting through world space is what
         // makes the history mean the same piece of air.
         if vol.history_valid > 0.5 {
-            let slice_t = vol.max_distance * (f32(slice) + 0.5) / f32(slices);
-            let centre_ws = vol.camera_pos + ray_dir * slice_t;
+            let slice_t = froxel_t((f32(slice) + 0.5) / f32(slices), vol.max_distance);
+            // Camera-relative, as `prev_view_proj` takes it (it carries the camera's step).
+            let centre_ws = ray_dir * slice_t;
             let prev_clip = vol.prev_view_proj * vec4<f32>(centre_ws, 1.0);
             if prev_clip.w > 0.0 {
                 let prev_ndc = prev_clip.xy / prev_clip.w;
                 let prev_uv = vec2<f32>(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
-                let prev_w = slice_t / vol.max_distance;
+                let prev_w = froxel_w(slice_t, vol.max_distance);
                 if all(prev_uv >= vec2<f32>(0.0)) && all(prev_uv <= vec2<f32>(1.0))
                     && prev_w <= 1.0 {
                     let history = textureSampleLevel(

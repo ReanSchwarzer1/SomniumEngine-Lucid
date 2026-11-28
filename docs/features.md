@@ -3,8 +3,7 @@
 The longer list behind the README's summary. Everything here is in both Somnium Engine and Lucid unless it says
 otherwise; what Lucid adds on top is listed in the [README](../README.md#what-lucid-adds). Where a feature has an
 editor Help page, it is linked. Counts that were in older versions of this list have been left out where they were no
-longer current; `tools/census/generate.py` gives today's numbers. For Lucid, this page describes the `sunscar` branch
-(27 November 2026); `main` holds Lucid as of 24 October.
+longer current; `tools/census/generate.py` gives today's numbers.
 
 ## Rendering
 

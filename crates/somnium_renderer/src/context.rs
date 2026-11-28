@@ -13,8 +13,70 @@
 //! Interface) during its `Init` phase.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
 use winit::window::Window;
+
+/// Whether an uncaptured GPU error stops the program. The game sets it (nothing drawn after a validation error can be
+/// trusted, and its crash report needs the GPU and driver); the editor clears it, so a bad shader edit is logged and
+/// the editor stays up for the author to save and fix it. wgpu's own handler always panicked, with no GPU named.
+static GPU_ERRORS_FATAL: AtomicBool = AtomicBool::new(true);
+
+/// See [`GPU_ERRORS_FATAL`]. Call before [`RenderContext::new`]; it is read when an error arrives.
+pub fn set_gpu_errors_fatal(fatal: bool) {
+    GPU_ERRORS_FATAL.store(fatal, Ordering::Relaxed);
+}
+
+/// The GPU the program draws with, named for a crash report once its device exists.
+static GPU_IN_USE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The GPU in use (name, backend, driver and its version), once a device exists: what a crash report names.
+#[must_use]
+pub fn gpu_in_use() -> Option<&'static str> {
+    GPU_IN_USE.get().map(String::as_str)
+}
+
+/// The GPU as a crash report needs it: name, backend, driver and its version.
+fn gpu_label(info: &wgpu::AdapterInfo) -> String {
+    format!("{} ({:?}, {} {})", info.name, info.backend, info.driver, info.driver_info)
+}
+
+/// What to do with an uncaptured GPU error the `times`th time its message is seen: `Some(line)` to log (the first
+/// time, then every thousandth, since one bad pipeline repeats every frame), or `None` to stay quiet.
+fn gpu_error_line(gpu: &str, text: &str, times: u32) -> Option<String> {
+    (times == 1 || times % 1000 == 0).then(|| format!("GPU error on {gpu} (seen {times} times; the editor goes on): {text}"))
+}
+
+/// Report uncaptured GPU errors and a lost device with the GPU named.
+fn watch_gpu_errors(device: &wgpu::Device, info: &wgpu::AdapterInfo) {
+    let gpu = gpu_label(info);
+    let _ = GPU_IN_USE.set(gpu.clone());
+    let seen = std::sync::Mutex::new(std::collections::HashMap::<String, u32>::new());
+    let named = gpu.clone();
+    device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+        let text = error.to_string();
+        if GPU_ERRORS_FATAL.load(Ordering::Relaxed) {
+            panic!("GPU error on {named}: {text}");
+        }
+        let mut seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if seen.len() > 256 {
+            seen.clear();
+        }
+        let times = seen.entry(text.clone()).or_insert(0);
+        *times += 1;
+        if let Some(line) = gpu_error_line(&named, &text, *times) {
+            tracing::error!("{line}");
+        }
+    }));
+    device.set_device_lost_callback(move |reason, message| {
+        // `Destroyed` is the program letting its device go at exit, not a lost GPU.
+        if reason == wgpu::DeviceLostReason::Destroyed {
+            tracing::debug!("GPU device released on {gpu}");
+        } else {
+            tracing::error!(?reason, "GPU device lost on {gpu}: {message}");
+        }
+    });
+}
 
 /// Encapsulates the core `wgpu` state for the application.
 pub struct RenderContext {
@@ -315,6 +377,10 @@ impl RenderContext {
                 info!("Indirect draw validation off (SOMNIUM_INDIRECT_VALIDATION=0)");
             }
         }
+        if let Some(salt) = crate::shaders::salt() {
+            info!(salt, "SOMNIUM_SHADER_SALT: debug SPIR-V and salted shaders, so every composed pipeline compiles cold");
+            descriptor.flags |= wgpu::InstanceFlags::DEBUG;
+        }
         let instance = wgpu::Instance::new(descriptor);
 
         // Create the surface from the window.
@@ -589,6 +655,7 @@ impl RenderContext {
             })
             .await
             .expect("Failed to request wgpu device with required features");
+        watch_gpu_errors(&device, &adapter.get_info());
 
         let surface_caps = surface.get_capabilities(&adapter);
 
@@ -690,6 +757,14 @@ impl RenderContext {
 #[cfg(test)]
 mod tests {
     use super::{nvidia_driver_version, ray_query_compiler_is_safe};
+
+    #[test]
+    fn a_repeating_gpu_error_is_logged_once_then_every_thousandth_time() {
+        let logged: Vec<u32> = (1..=2500).filter(|&t| super::gpu_error_line("RTX", "bad pipeline", t).is_some()).collect();
+        assert_eq!(logged, [1, 1000, 2000]);
+        let line = super::gpu_error_line("RTX 5080 (Vulkan, NVIDIA 617.42)", "bad pipeline", 1).unwrap();
+        assert!(line.contains("RTX 5080") && line.contains("617.42") && line.contains("bad pipeline"));
+    }
 
     /// Both shapes wgpu hands us decode to the number NVIDIA publishes.
     #[test]

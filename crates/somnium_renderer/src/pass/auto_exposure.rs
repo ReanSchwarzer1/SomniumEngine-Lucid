@@ -18,6 +18,41 @@ use wgpu::util::DeviceExt;
 const MIN_LOG_LUM: f32 = -10.0;
 const MAX_LOG_LUM: f32 = 20.0;
 
+/// How the eye adapts: the EV100 range it stays in and its rates per second (`PostProcessComponent`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EyeAdaptation {
+    pub min_ev100: f32,
+    pub max_ev100: f32,
+    /// When the view gets brighter.
+    pub to_bright: f32,
+    /// When the view gets darker.
+    pub to_dark: f32,
+    /// How much of the meter's swing from `anchor_ev` the eye follows (1 all of it; `PostProcessComponent::
+    /// exposure_adaptation`). Below 1 a dark wood is shown darker than the open land, by the stops it keeps.
+    pub adaptation: f32,
+    /// The EV100 partial adaptation pivots on.
+    pub anchor_ev: f32,
+    /// How much an open-sky pixel counts in the meter (`PostProcessComponent::exposure_sky_weight`; 1 as any other).
+    pub sky_weight: f32,
+    /// The share followed when the meter reads brighter than `anchor_ev` (`exposure_adaptation_bright`; 1 all).
+    pub adaptation_bright: f32,
+}
+
+impl Default for EyeAdaptation {
+    fn default() -> Self {
+        Self {
+            min_ev100: -8.0,
+            max_ev100: 18.0,
+            to_bright: 3.0,
+            to_dark: 1.0,
+            adaptation: 1.0,
+            anchor_ev: 12.0,
+            sky_weight: 1.0,
+            adaptation_bright: 1.0,
+        }
+    }
+}
+
 /// GPU-side settings, matching `ExposureParams` in `auto_exposure.wgsl`.
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -32,8 +67,11 @@ struct ExposureParams {
     max_ev100: f32,
     highlight_start_nits: f32,
     highlight_end_nits: f32,
-    _pad0: f32,
-    _pad1: f32,
+    adaptation: f32,
+    anchor_ev: f32,
+    sky_weight: f32,
+    adaptation_bright: f32,
+    _pad: [f32; 2],
 }
 
 /// Histogram build + resolve, plus the two-float exposure result buffer.
@@ -77,6 +115,17 @@ impl AutoExposurePass {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
                         min_binding_size: None,
+                    },
+                    count: None,
+                },
+                // The visibility buffer: the open sky is where nothing was drawn.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
                     count: None,
                 },
@@ -139,8 +188,8 @@ impl AutoExposurePass {
         &self.exposure
     }
 
-    /// Rebuild the bind group against a (possibly resized) HDR view.
-    pub fn resize(&mut self, device: &wgpu::Device, hdr_view: &wgpu::TextureView) {
+    /// Rebuild the bind group against a (possibly resized) HDR view and the visibility buffer of the same size.
+    pub fn resize(&mut self, device: &wgpu::Device, hdr_view: &wgpu::TextureView, vis_view: &wgpu::TextureView) {
         self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("AutoExposure BG"),
             layout: &self.layout,
@@ -161,6 +210,10 @@ impl AutoExposurePass {
                     binding: 3,
                     resource: self.params.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(vis_view),
+                },
             ],
         }));
     }
@@ -175,6 +228,7 @@ impl AutoExposurePass {
         height: u32,
         delta_time: f32,
         exposure_compensation: f32,
+        eye: EyeAdaptation,
     ) {
         let Some(bind_group) = self.bind_group.as_ref() else {
             return;
@@ -189,17 +243,20 @@ impl AutoExposurePass {
                 // A long frame (a hitch, or a breakpoint) must not teleport the
                 // exposure; clamping keeps adaptation smooth across stalls.
                 delta_time: delta_time.clamp(0.0, 0.1),
-                speed_down: 3.0,
-                speed_up: 1.0,
+                speed_down: eye.to_bright,
+                speed_up: eye.to_dark,
                 exposure_compensation,
-                min_ev100: -8.0,
-                max_ev100: 18.0,
+                min_ev100: eye.min_ev100,
+                max_ev100: eye.max_ev100,
                 // Above roughly a sunlit white surface, samples start losing
                 // their vote — a glint should not decide the exposure.
                 highlight_start_nits: 8_000.0,
                 highlight_end_nits: 40_000.0,
-                _pad0: 0.0,
-                _pad1: 0.0,
+                adaptation: eye.adaptation.clamp(0.0, 1.0),
+                anchor_ev: eye.anchor_ev,
+                sky_weight: eye.sky_weight.clamp(0.0, 1.0),
+                adaptation_bright: eye.adaptation_bright.clamp(0.0, 1.0),
+                _pad: [0.0; 2],
             }),
         );
 

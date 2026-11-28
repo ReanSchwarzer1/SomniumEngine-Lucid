@@ -10,6 +10,10 @@ struct View {
     _padding: f32,
     time: f32,
     _pad1: vec2<f32>,
+    _wind: vec4<f32>,
+    _wind_time: vec4<f32>,
+    // global_pool.wgsl `View.inv_view_proj_rel`, offset 256.
+    inv_view_proj_rel: mat4x4<f32>,
 }
 
 struct DirectionalLight {
@@ -96,8 +100,9 @@ fn depth_at(local: vec3<f32>) -> f32 {
 
 fn reconstruct_world(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let clip = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
-    let world = view.inv_view_proj * clip;
-    return world.xyz / world.w;
+    // Camera-relative, then moved out: the absolute inverse snaps to 2^-6 in ndc kilometres from the origin.
+    let world = view.inv_view_proj_rel * clip;
+    return world.xyz / world.w + view.camera_pos;
 }
 
 fn hg(g: f32, cosine: f32) -> f32 {
@@ -132,7 +137,8 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     let original = textureSampleLevel(scene_color, linear_sampler, input.uv, 0.0);
     if params.frame.z < 0.5 { return original; }
     let camera_local = (params.inverse_model * vec4<f32>(view.camera_pos, 1.0)).xyz;
-    let near_world = reconstruct_world(input.uv, 0.0001);
+    // Just past the near plane, which is depth 1 under reversed-Z (Sunscar, 6 Nov 2026).
+    let near_world = reconstruct_world(input.uv, 0.9999);
     let near_local = (params.inverse_model * vec4<f32>(near_world, 1.0)).xyz;
     let near_signed = near_local.y - wave_height(near_local.xz);
     // A per-pixel near-plane classification: when the near plane intersects
@@ -142,8 +148,9 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
 
     let depth = textureLoad(opaque_depth, vec2<i32>(input.position.xy), 0);
     let ray = normalize(near_world - view.camera_pos);
-    let endpoint_world = select(reconstruct_world(input.uv, min(depth, 0.9999)),
-        view.camera_pos + ray * 240.0, depth >= 0.9999);
+    // The sky (reversed-Z's 0) ends 240 m out.
+    let endpoint_world = select(reconstruct_world(input.uv, max(depth, 1e-7)),
+        view.camera_pos + ray * 240.0, depth <= 0.0);
     let endpoint_local = (params.inverse_model * vec4<f32>(endpoint_world, 1.0)).xyz;
     let start_signed = camera_local.y - wave_height(camera_local.xz);
     let end_signed = endpoint_local.y - wave_height(endpoint_local.xz);
@@ -179,7 +186,7 @@ fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
     // Portable projected caustics: only opaque submerged receivers, faded by
     // water depth, travelled path, and turbidity. Sky and above-water pixels
     // can never receive them.
-    if depth < 0.9999 && end_signed < 0.0 && mask_at(endpoint_local) > 0.5 {
+    if depth > 0.0 && end_signed < 0.0 && mask_at(endpoint_local) > 0.5 {
         let bed_depth = depth_at(endpoint_local);
         let turbidity = dot(sigma_t, vec3<f32>(0.333333));
         let caustic_fade = exp(-depth_below * 0.24 - path_length * turbidity * 0.18)

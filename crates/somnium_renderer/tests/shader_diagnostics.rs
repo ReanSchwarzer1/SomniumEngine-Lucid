@@ -35,6 +35,16 @@ const MODULES: &[&str] = &[
     "wind.wgsl",
     "sky_eye.wgsl",
     "spot_cookie.wgsl",
+    // Since this list was written, shading.wgsl's own includes (snow, standing water, the sky's planet and sun,
+    // the terrain morph, froxel depth) and the GPU grass's blade rebuild (grass_pool includes grass_blade).
+    "snow.wgsl",
+    "standing_water.wgsl",
+    "sky_planet.wgsl",
+    "sky_sun.wgsl",
+    "terrain_morph.wgsl",
+    "froxel_depth.wgsl",
+    "grass_pool.wgsl",
+    "grass_blade.wgsl",
 ];
 
 fn shader_dir() -> std::path::PathBuf {

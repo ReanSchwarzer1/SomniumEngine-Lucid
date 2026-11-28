@@ -8,7 +8,7 @@
 //! destination one.
 
 use crate::editor_commands::{EditorCommand, EntitySnapshot};
-use crate::{Children, Parent};
+use crate::{Children, Parent, Transform};
 use somnium_ecs::{Entity, World};
 use std::collections::HashMap;
 
@@ -19,6 +19,8 @@ pub struct ClipNode {
     snapshot: EntitySnapshot,
     scripts: Option<somnium_script::attachment::ScriptSet>,
     children: Vec<ClipNode>,
+    /// Where a duplicate goes: its original's parent. `None` for copies, which go where they are pasted.
+    home: Option<Entity>,
 }
 
 /// A copied forest. Empty until something is copied; a paste of an empty
@@ -51,11 +53,21 @@ impl EntityClipboard {
     /// what "these entities" means.
     #[must_use]
     pub fn copy(world: &World, selection: &[Entity]) -> Self {
+        // Children by `Parent`, not the 16-slot `Children` list, so an object with more parts keeps them all.
+        let mut children: HashMap<Entity, Vec<Entity>> = HashMap::new();
+        for (entity, parent) in world.iter_with::<Parent>() {
+            if world.is_alive(parent.entity) {
+                children.entry(parent.entity).or_default().push(entity);
+            }
+        }
+        for parts in children.values_mut() {
+            parts.sort_by_key(|part| part.index());
+        }
         let roots: Vec<_> = selection
             .iter()
             .copied()
             .filter(|entity| !has_selected_ancestor(world, *entity, selection))
-            .map(|entity| capture(world, entity))
+            .map(|entity| capture(world, &children, entity))
             .collect();
         let external_ids = world
             .entities()
@@ -64,6 +76,29 @@ impl EntityClipboard {
         Self {
             roots,
             external_ids,
+        }
+    }
+
+    /// Copy a selection to duplicate it: like [`Self::copy`], but each copy goes back under its original's parent.
+    #[must_use]
+    pub fn duplicate(world: &World, selection: &[Entity]) -> Self {
+        let mut clipboard = Self::copy(world, selection);
+        for root in &mut clipboard.roots {
+            root.home = parent_of(world, root.source);
+        }
+        clipboard
+    }
+
+    /// Change every copied snapshot before a paste; the flag says whether it is a top-level copy.
+    pub fn for_each_snapshot_mut(&mut self, mut change: impl FnMut(&mut EntitySnapshot, bool)) {
+        fn walk(node: &mut ClipNode, root: bool, change: &mut impl FnMut(&mut EntitySnapshot, bool)) {
+            change(&mut node.snapshot, root);
+            for child in &mut node.children {
+                walk(child, false, change);
+            }
+        }
+        for root in &mut self.roots {
+            walk(root, true, &mut change);
         }
     }
 }
@@ -86,7 +121,7 @@ fn parent_of(world: &World, entity: Entity) -> Option<Entity> {
         .filter(|parent| world.is_alive(*parent))
 }
 
-fn capture(world: &World, entity: Entity) -> ClipNode {
+fn capture(world: &World, children: &HashMap<Entity, Vec<Entity>>, entity: Entity) -> ClipNode {
     let mut snapshot = EntitySnapshot::capture(world, entity);
     // Links are rebuilt from the tree, so the captured handles are dead
     // weight — and worse, they are handles into the *source* world.
@@ -97,10 +132,11 @@ fn capture(world: &World, entity: Entity) -> ClipNode {
     // original instance root would make edits propagate into unrelated copies.
     snapshot.persistent_id = None;
     snapshot.prefab = None;
-    let children = world
-        .entities()
-        .filter(|child| parent_of(world, *child) == Some(entity))
-        .map(|child| capture(world, child))
+    let parts = children
+        .get(&entity)
+        .into_iter()
+        .flatten()
+        .map(|child| capture(world, children, *child))
         .collect();
     ClipNode {
         source: entity,
@@ -108,7 +144,8 @@ fn capture(world: &World, entity: Entity) -> ClipNode {
         scripts: world
             .get::<somnium_script::attachment::ScriptSet>(entity)
             .cloned(),
-        children,
+        children: parts,
+        home: None,
     }
 }
 
@@ -121,6 +158,8 @@ pub struct PasteEntitiesCmd {
     spawned: Vec<Entity>,
     /// The roots, in clipboard order — what the paste selects afterwards.
     roots: Vec<Entity>,
+    /// The step's name in Undo and Redo.
+    name: &'static str,
 }
 
 impl PasteEntitiesCmd {
@@ -146,13 +185,39 @@ impl PasteEntitiesCmd {
             parent,
             spawned: Vec::new(),
             roots: Vec::new(),
+            name: "Paste",
         }
+    }
+
+    /// Name the step for Undo and Redo: a duplicate is a paste underneath, and "Undid: Paste" after Ctrl+D named a
+    /// thing the person never did.
+    #[must_use]
+    pub fn named(mut self, name: &'static str) -> Self {
+        self.name = name;
+        self
     }
 
     /// The top-level entities the paste created. Empty before `execute`.
     #[must_use]
     pub fn roots(&self) -> &[Entity] {
         &self.roots
+    }
+
+    /// The top-level copy made of `source`, once executed.
+    #[must_use]
+    pub fn root_of(&self, source: Entity) -> Option<Entity> {
+        let at = self.clipboard.roots.iter().position(|node| node.source == source)?;
+        self.roots.get(at).copied()
+    }
+
+    /// Keep where each top-level copy stands now as the place it is made at: a copy that was moved before it entered
+    /// the history (Copy and Move) comes back where it was put when the step is redone.
+    pub fn keep_root_places(&mut self, world: &World) {
+        for (node, entity) in self.clipboard.roots.iter_mut().zip(&self.roots) {
+            if let Some(transform) = world.get::<Transform>(*entity) {
+                node.snapshot.transform = Some(*transform);
+            }
+        }
     }
 
     fn spawn_node(&mut self, world: &mut World, node: &ClipNode, parent: Option<Entity>) -> Entity {
@@ -186,10 +251,37 @@ impl EditorCommand for PasteEntitiesCmd {
     fn execute(&mut self, world: &mut World, selected: &mut Option<Entity>) {
         self.spawned.clear();
         self.roots.clear();
-        let roots = self.clipboard.roots.clone();
+        let mut roots = self.clipboard.roots.clone();
         let parent = self.parent.filter(|parent| world.is_alive(*parent));
+        for node in &mut roots {
+            // A root's recorded parent counts only while it is still the same object (a handle can be reused by
+            // another scene). When it is gone the copy lands where the original stood in the world, not at the
+            // original's local offset from a parent that no longer exists.
+            let Some(home) = node.home else {
+                continue;
+            };
+            let same = world.is_alive(home)
+                && self
+                    .clipboard
+                    .external_ids
+                    .get(&home)
+                    .is_none_or(|id| world.persistent_id(home) == Some(*id));
+            if same {
+                continue;
+            }
+            node.home = None;
+            let stood = node.snapshot.wt.as_ref().map(|wt| wt.0.to_scale_rotation_translation());
+            if let Some((scale, rotation, translation)) = stood {
+                node.snapshot.transform = Some(Transform {
+                    translation,
+                    rotation,
+                    scale,
+                });
+            }
+        }
         for node in &roots {
-            let entity = self.spawn_node(world, node, parent);
+            let home = node.home.filter(|home| world.is_alive(*home)).or(parent);
+            let entity = self.spawn_node(world, node, home);
             self.roots.push(entity);
         }
         // Internal targets follow the copy; external targets resolve by durable
@@ -287,7 +379,7 @@ impl EditorCommand for PasteEntitiesCmd {
     }
 
     fn description(&self) -> &str {
-        "Paste"
+        self.name
     }
 
     fn is_no_op(&self) -> bool {
@@ -369,6 +461,34 @@ mod tests {
                 .target,
             paste.roots()[1]
         );
+    }
+
+    /// Copy and Move: a copy that was moved before it entered the history is made again where it was put, the step
+    /// carries its own name, and each copy is found from its original.
+    #[test]
+    fn a_moved_copy_comes_back_where_it_was_put() {
+        let mut world = World::new();
+        let crate_a = world.spawn((Name::new("crate_a"), Transform::from_translation(glam::Vec3::new(1.0, 0.0, 0.0))));
+        let crate_b = world.spawn((Name::new("crate_b"), Transform::from_translation(glam::Vec3::new(2.0, 0.0, 0.0))));
+        let mut paste =
+            PasteEntitiesCmd::new(EntityClipboard::duplicate(&world, &[crate_a, crate_b]), None).named("Copy and Move");
+        assert_eq!(paste.description(), "Copy and Move");
+        let mut selected = None;
+        paste.execute(&mut world, &mut selected);
+        let (copy_a, copy_b) = (paste.root_of(crate_a).unwrap(), paste.root_of(crate_b).unwrap());
+        assert_eq!(paste.roots().to_vec(), vec![copy_a, copy_b]);
+        world.get_mut::<Transform>(copy_a).unwrap().translation = glam::Vec3::new(10.0, 3.0, -4.0);
+        paste.keep_root_places(&world);
+        paste.undo(&mut world, &mut selected);
+        assert!(paste.root_of(crate_a).is_none(), "an undone copy has no entity");
+        paste.execute(&mut world, &mut selected);
+        let again_a = paste.root_of(crate_a).unwrap();
+        let again_b = paste.root_of(crate_b).unwrap();
+        assert_eq!(world.get::<Transform>(again_a).unwrap().translation, glam::Vec3::new(10.0, 3.0, -4.0));
+        assert_eq!(world.get::<Transform>(again_b).unwrap().translation, glam::Vec3::new(2.0, 0.0, 0.0));
+        // The originals never moved, and a plain paste keeps its name.
+        assert_eq!(world.get::<Transform>(crate_a).unwrap().translation, glam::Vec3::new(1.0, 0.0, 0.0));
+        assert_eq!(PasteEntitiesCmd::new(EntityClipboard::default(), None).description(), "Paste");
     }
 
     #[test]
@@ -519,6 +639,82 @@ mod tests {
         // …and the original is untouched.
         assert_eq!(world.get::<Children>(root).unwrap().count, 1);
         undo.push(Box::new(command), &mut world, &mut selected);
+    }
+
+    /// Duplicate copies every part, past the 16 slots of `Children`, and puts the copy beside its original.
+    #[test]
+    fn a_duplicate_keeps_every_part_and_its_parent() {
+        let mut world = World::new();
+        let room = world.spawn((Name::new("room"), Transform::default(), WorldTransform::identity()));
+        let chest = world.spawn((
+            Name::new("chest"),
+            Transform::default(),
+            WorldTransform::identity(),
+            Parent { entity: room },
+        ));
+        for part in 0..20 {
+            world.spawn((
+                Name::new(&format!("part{part}")),
+                Transform::default(),
+                WorldTransform::identity(),
+                Parent { entity: chest },
+            ));
+        }
+        let mut clipboard = EntityClipboard::duplicate(&world, &[chest]);
+        let mut roots = 0;
+        clipboard.for_each_snapshot_mut(|_, root| roots += usize::from(root));
+        assert_eq!(roots, 1);
+
+        let before = world.entity_count();
+        let mut selected = None;
+        let mut command = PasteEntitiesCmd::new(clipboard, None);
+        command.execute(&mut world, &mut selected);
+        let copy = command.roots()[0];
+        assert_eq!(world.entity_count(), before + 21);
+        assert_eq!(world.get::<Parent>(copy).unwrap().entity, room);
+        let parts = world.iter_with::<Parent>().filter(|(_, p)| p.entity == copy).count();
+        assert_eq!(parts, 20, "every part, not the 16 the Children list holds");
+
+        command.undo(&mut world, &mut selected);
+        assert_eq!(world.entity_count(), before);
+    }
+
+    /// A copy pasted with nothing to paste into goes under its original's parent, in the same place; when that
+    /// parent is gone it goes to the scene root, where the original stood in the world.
+    #[test]
+    fn a_paste_lands_where_the_original_stood_even_when_its_parent_is_gone() {
+        let mut world = World::new();
+        let room = world.spawn((
+            Name::new("room"),
+            Transform::from_translation(glam::Vec3::new(100.0, 0.0, 0.0)),
+            WorldTransform(glam::Mat4::from_translation(glam::Vec3::new(100.0, 0.0, 0.0))),
+            Children::empty(),
+        ));
+        let chest = world.spawn((
+            Name::new("chest"),
+            Transform::from_translation(glam::Vec3::new(1.0, 2.0, 3.0)),
+            WorldTransform(glam::Mat4::from_translation(glam::Vec3::new(101.0, 2.0, 3.0))),
+            Parent { entity: room },
+        ));
+        let clipboard = EntityClipboard::duplicate(&world, &[chest]);
+
+        let mut selected = None;
+        let mut beside = PasteEntitiesCmd::new(clipboard.clone(), None);
+        beside.execute(&mut world, &mut selected);
+        let copy = beside.roots()[0];
+        assert_eq!(world.get::<Parent>(copy).unwrap().entity, room);
+        assert_eq!(world.get::<Transform>(copy).unwrap().translation, glam::Vec3::new(1.0, 2.0, 3.0));
+
+        world.despawn(room);
+        let mut orphaned = PasteEntitiesCmd::new(clipboard, None);
+        orphaned.execute(&mut world, &mut selected);
+        let moved = orphaned.roots()[0];
+        assert!(world.get::<Parent>(moved).is_none(), "it goes to the scene root");
+        assert_eq!(
+            world.get::<Transform>(moved).unwrap().translation,
+            glam::Vec3::new(101.0, 2.0, 3.0),
+            "and keeps its world position"
+        );
     }
 
     /// Pasting is one gesture: one undo removes the whole subtree.

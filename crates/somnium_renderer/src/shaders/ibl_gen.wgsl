@@ -35,6 +35,19 @@ struct GenParams {
     night: vec4<f32>,
     /// `.rgb` the glow's colour.
     night_tint: vec4<f32>,
+    /// x: 1 lays the sky light's cloud cube over the sky (and `overcast` is 0). y: how far the air under the clouds
+    /// takes the light they let through (`haze_under_clouds`); z the aerosols' factor (`atmosphere_aerosol`, which
+    /// `fs_sky` and `fs_prefilter` set from it); w unused.
+    clouds: vec4<f32>,
+    /// w 1: `sun_color` is the sun above the air (a running day clock, `Renderer::sky_above_air`) and the sky marches
+    /// its own transmittance and the planet's shadow, so twilight exists; rgb is then the sun on the ground, for the
+    /// land below the horizon. w 0: `sun_color` is the sun on the ground, as it always was.
+    sun_ground: vec4<f32>,
+    /// The planet over the horizon (`PlanetParams`): toward it, w 1 when there is one; its light above the air (rgb,
+    /// lux), which lights the air as a second sun does; its light on the ground (rgb), on the land below the horizon.
+    planet: vec4<f32>,
+    planet_light: vec4<f32>,
+    planet_ground: vec4<f32>,
 }
 
 /// The Undersun's night (`NightSky`, Rimeborn): no moon. A glow over the dome, brighter overhead and toward the hidden
@@ -141,11 +154,31 @@ fn sky(ray_dir: vec3<f32>) -> vec3<f32> {
     // Transmittance fades smoothly across twilight (via HORIZON_FADE in sun.rs), causing the sky to
     // transition naturally from daylight (8000 cd/m²) -> sunset (500 cd/m²) -> night airglow floor.
     let sun_illuminance = params.sun_color.w;
+    // A running day clock (`sun_ground.w`): the sun above the air, through the twilight march. Lit by the sun on the
+    // ground instead, the march's own transmittance counted the air twice and the sky went out with the sun's last
+    // ray: no dusk, the stars on at once.
+    let above_air = params.sun_ground.w > 0.5;
 
-    var radiance = raymarch_sky(
-        transmittance_lut, multiscatter_lut, atmos_sampler,
-        view_pos, ray_dir, sun_dir, 32,
-    ) * sun_illuminance;
+    var radiance: vec3<f32>;
+    if above_air {
+        radiance = raymarch_sky_twilight(
+            transmittance_lut, multiscatter_lut, atmos_sampler,
+            view_pos, ray_dir, sun_dir, 40,
+        ) * sun_illuminance;
+    } else {
+        radiance = raymarch_sky(
+            transmittance_lut, multiscatter_lut, atmos_sampler,
+            view_pos, ray_dir, sun_dir, 32,
+        ) * sun_illuminance;
+    }
+    // The planet lights the air too: by night its glow is the sky round it, blue-grey and brightest near it.
+    let planet_on = params.planet.w > 0.5;
+    if planet_on {
+        radiance += raymarch_sky_twilight(
+            transmittance_lut, multiscatter_lut, atmos_sampler,
+            view_pos, ray_dir, normalize(params.planet.xyz), 24,
+        ) * params.planet_light.rgb;
+    }
 
     // A cloud deck replaces the blue dome with the CIE overcast sky: neutral,
     // no sun disc, three times as bright at the zenith as at the horizon, and
@@ -154,17 +187,33 @@ fn sky(ray_dir: vec3<f32>) -> vec3<f32> {
     // tied to the clear zenith, so exposure holds as the deck closes.
     let cover = smoothstep(0.35, 0.95, params.overcast);
     if cover > 0.0 {
-        let zenith = raymarch_sky(
-            transmittance_lut, multiscatter_lut, atmos_sampler,
-            view_pos, vec3<f32>(0.0, 1.0, 0.0), sun_dir, 16,
-        ) * sun_illuminance;
+        var zenith: vec3<f32>;
+        if above_air {
+            zenith = raymarch_sky_twilight(
+                transmittance_lut, multiscatter_lut, atmos_sampler,
+                view_pos, vec3<f32>(0.0, 1.0, 0.0), sun_dir, 16,
+            ) * sun_illuminance;
+        } else {
+            zenith = raymarch_sky(
+                transmittance_lut, multiscatter_lut, atmos_sampler,
+                view_pos, vec3<f32>(0.0, 1.0, 0.0), sun_dir, 16,
+            ) * sun_illuminance;
+        }
+        if planet_on {
+            zenith += raymarch_sky_twilight(
+                transmittance_lut, multiscatter_lut, atmos_sampler,
+                view_pos, vec3<f32>(0.0, 1.0, 0.0), normalize(params.planet.xyz), 12,
+            ) * params.planet_light.rgb;
+        }
         let lz = dot(zenith, vec3<f32>(0.2126, 0.7152, 0.0722)) * 1.6;
         let dome = select(0.2, (1.0 + 2.0 * ray_dir.y) / 3.0, ray_dir.y >= 0.0);
         radiance = mix(radiance, vec3<f32>(0.97, 1.0, 1.03) * lz * dome, cover);
     }
 
     let moon_dir = -sun_dir;
-    let moon_strength = saturate(1.0 - sun_illuminance / 10.0);
+    // Above the air the sun never dims, so it cannot say night has come: the airglow is simply there, and the day's
+    // sky outshines it by ten million.
+    let moon_strength = select(saturate(1.0 - sun_illuminance / 10.0), 1.0, above_air);
     radiance += night_sky_ambient(ray_dir, moon_dir, moon_strength);
     radiance += undersun_night(ray_dir, sun_dir);
 
@@ -173,6 +222,7 @@ fn sky(ray_dir: vec3<f32>) -> vec3<f32> {
 
 @fragment
 fn fs_sky(in: VOut) -> @location(0) vec4<f32> {
+    atmosphere_aerosol = params.clouds.z;
     return vec4(sky(cube_dir(params.face, in.uv)), 1.0);
 }
 
@@ -180,9 +230,73 @@ fn fs_sky(in: VOut) -> @location(0) vec4<f32> {
 
 @group(0) @binding(1) var src_cube: texture_cube<f32>;
 @group(0) @binding(2) var src_samp: sampler;
+// The cloud layer the camera sees (clouds.wgsl `cloud_env`): in-scatter and transmittance per direction. Laid over
+// each sample below, so every prefiltered mip carries the deck and the ground's ambient, its specular and every GI
+// miss see it (Sunscar, 5 Nov 2026); mip 0 stays the bare sky the background draws under the real clouds.
+@group(0) @binding(6) var cloud_capture: texture_cube<f32>;
 
 const PI: f32 = 3.14159265359;
 const SAMPLE_COUNT: u32 = 64u;
+/// The land's albedo seen from afar below the horizon: grass, scrub and soil run 0.15 to 0.25.
+const GROUND_ALBEDO: f32 = 0.18;
+
+/// What the land below the horizon sends back (Lambertian, albedo / pi x its irradiance), for the prefiltered mips:
+/// the sun on it, through the clouds' capture when that is laid over, and the sky above it. Before, mip 0's ground
+/// was the air's in-scatter alone, near black, so the lower half of the sky light was dark and whatever faced down
+/// or sideways had no light from the ground (Sunscar, 6 Nov 2026). Mip 0, the background, stays as it was. Under the
+/// overcast dome (no capture) the dome's own floor stands in, so this stands down with it.
+fn ground_radiance() -> vec3<f32> {
+    let sun = normalize(params.sun_direction.xyz);
+    let up = vec3<f32>(0.0, 1.0, 0.0);
+    var sky_up = textureSampleLevel(src_cube, src_samp, up, 0.0).rgb;
+    var sun_through = 1.0;
+    if params.clouds.x > 0.5 {
+        let c = textureSampleLevel(cloud_capture, src_samp, up, 0.0);
+        sky_up = sky_up * c.a + c.rgb;
+        sun_through = textureSampleLevel(cloud_capture, src_samp, sun, 0.0).a;
+    }
+    // The sky's irradiance on level ground is about pi times its zenith radiance times 0.85 (the CIE overcast's
+    // cosine-weighted mean against its zenith; a clear sky's brighter horizon makes up its lower zenith). The sun on
+    // the land is the one on the ground, whichever the sky was lit by.
+    let sun_on_land = select(params.sun_color.rgb, params.sun_ground.rgb, params.sun_ground.w > 0.5);
+    var e = sun_on_land * max(sun.y, 0.0) * sun_through + 0.85 * PI * sky_up;
+    if params.planet.w > 0.5 {
+        // The planet's light on the land, through the clouds' capture in its direction.
+        let planet_dir = normalize(params.planet.xyz);
+        var planet_through = 1.0;
+        if params.clouds.x > 0.5 {
+            planet_through = textureSampleLevel(cloud_capture, src_samp, planet_dir, 0.0).a;
+        }
+        e += params.planet_ground.rgb * max(planet_dir.y, 0.0) * planet_through;
+    }
+    return GROUND_ALBEDO / PI * e * (1.0 - smoothstep(0.35, 0.95, params.overcast));
+}
+
+/// What the air under a deck closed to the horizon scatters toward the eye: its colour, and how far it stands in for
+/// the open sky's (`clouds.y`, 0 for every sky but a closed deck). Below the horizon mip 0 holds the clear air's
+/// scatter toward the ground under an open sun and sky, bright and blue and brightest toward the sun, and the far
+/// land fades toward it: under an overcast, a haze twice as bright as the deck (the summit stills, 12 Nov 2026;
+/// scaled by the light the deck lets through it lost its blue and stayed a stop over the deck, since an open sky's
+/// haze is forward-lit by the sun and a deck's is not). Under a deck the air is lit from every side by the deck above
+/// and the darker land below: six tenths of the deck's mean, taken at the zenith and rings at 50 and 15 degrees as the
+/// fog's own sky light takes it (volumetric.wgsl `cloud_sky_mean`).
+fn haze_under_clouds() -> vec4<f32> {
+    if params.clouds.x < 0.5 || params.clouds.y <= 0.0 {
+        return vec4<f32>(0.0);
+    }
+    var laid = vec3<f32>(0.0);
+    for (var i = 0u; i < 9u; i = i + 1u) {
+        var d = vec3<f32>(0.0, 1.0, 0.0);
+        if i > 0u {
+            let a = f32(i) * 0.7853982;
+            let el = select(0.2617994, 0.8726646, i % 2u == 0u);
+            d = vec3<f32>(cos(a) * cos(el), sin(el), sin(a) * cos(el));
+        }
+        let c = textureSampleLevel(cloud_capture, src_samp, d, 0.0);
+        laid += textureSampleLevel(src_cube, src_samp, d, 0.0).rgb * c.a + c.rgb;
+    }
+    return vec4<f32>(0.6 * laid / 9.0, saturate(params.clouds.y));
+}
 
 /// Van der Corput radical inverse — the low-discrepancy half of Hammersley.
 fn radical_inverse_vdc(bits_in: u32) -> f32 {
@@ -221,11 +335,15 @@ fn importance_sample_ggx(xi: vec2<f32>, n: vec3<f32>, roughness: f32) -> vec3<f3
 
 @fragment
 fn fs_prefilter(in: VOut) -> @location(0) vec4<f32> {
+    atmosphere_aerosol = params.clouds.z;
     let n = cube_dir(params.face, in.uv);
     // The split-sum approximation assumes the view direction equals the normal,
     // which is what makes a single prefiltered map usable from any angle.
     let v = n;
 
+    let ground = ground_radiance();
+    let haze = haze_under_clouds();
+    let view_r = GROUND_RADIUS + 0.5;
     var total  = vec3(0.0);
     var weight = 0.0;
     for (var i = 0u; i < SAMPLE_COUNT; i = i + 1u) {
@@ -237,9 +355,32 @@ fn fs_prefilter(in: VOut) -> @location(0) vec4<f32> {
         if n_dot_l > 0.0 {
             // Explicit LOD: this is inside a data-dependent branch, so
             // implicit-derivative sampling would be illegal in WGSL.
-            total  += textureSampleLevel(src_cube, src_samp, l, 0.0).rgb * n_dot_l;
+            var radiance = textureSampleLevel(src_cube, src_samp, l, 0.0).rgb;
+            // Below the horizon the ray ends on the land, seen through the air near the ground (sky(): 0.5 km up).
+            if ray_hits_ground(view_r, l.y) {
+                // What mip 0 holds there is the air's scatter toward the ground under an open sky: under a closed
+                // deck, the deck's own haze.
+                radiance = mix(radiance, haze.rgb, haze.a) + ground * exp(-atmosphere_extinction(0.25) * distance_to_ground(view_r, l.y));
+            }
+            if params.clouds.x > 0.5 {
+                let c = textureSampleLevel(cloud_capture, src_samp, l, 0.0);
+                radiance = radiance * c.a + c.rgb;
+            }
+            total  += radiance * n_dot_l;
             weight += n_dot_l;
         }
     }
     return vec4(total / max(weight, 1e-4), 1.0);
+}
+
+// ─── Crossfade (a running day clock, `IblPass::step_moving`) ─────────────────
+
+// One face and mip of the cube built for the newest sun, read texel for texel; the pipeline blends it over the same
+// face and mip of the cube everything reads by a constant share, so the sky light walks to the new sky in straight
+// steps too small to see instead of jumping to it.
+@group(0) @binding(7) var blend_src: texture_2d<f32>;
+
+@fragment
+fn fs_blend(in: VOut) -> @location(0) vec4<f32> {
+    return textureLoad(blend_src, vec2<i32>(in.clip.xy), 0);
 }

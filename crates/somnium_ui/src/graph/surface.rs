@@ -395,7 +395,7 @@ impl GraphSurface {
     pub fn dispatch_command(&mut self, command: &str, paste_offset: Vec2) -> bool {
         match command {
             "editor.edit.undo" => self.undo(),
-            "editor.edit.redo" => self.redo(),
+            "editor.edit.redo" | "editor.edit.redo_alt" => self.redo(),
             "editor.edit.copy" => {
                 if self.selection.ids().is_empty() {
                     false

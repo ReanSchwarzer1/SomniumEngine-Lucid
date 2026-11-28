@@ -24,6 +24,8 @@ pub enum CommandKey {
     Delete,
     /// A function key.
     Function(u8),
+    /// End.
+    End,
 }
 
 impl fmt::Display for CommandKey {
@@ -33,6 +35,7 @@ impl fmt::Display for CommandKey {
             Self::Space => f.write_str("Space"),
             Self::Delete => f.write_str("Del"),
             Self::Function(number) => write!(f, "F{number}"),
+            Self::End => f.write_str("End"),
         }
     }
 }
@@ -140,6 +143,7 @@ impl Chord {
             KeyCode::KeyZ => CommandKey::Letter('Z'),
             KeyCode::Space => CommandKey::Space,
             KeyCode::Delete => CommandKey::Delete,
+            KeyCode::End => CommandKey::End,
             KeyCode::F1 => CommandKey::Function(1),
             KeyCode::F2 => CommandKey::Function(2),
             KeyCode::F3 => CommandKey::Function(3),
@@ -206,6 +210,14 @@ impl Enablement {
     }
 }
 
+/// What a click on a disabled menu row says (it used to do nothing at all): the command and why. `None` while the
+/// command may run, or for an id that is not a registry command.
+pub fn disabled_message(id: &str, ctx: &EditorCtx) -> Option<String> {
+    let command = registry().get(id)?;
+    let reason = command.enabled(ctx).reason()?;
+    Some(format!("{} is not available: {reason}", command.label))
+}
+
 /// State consulted by command enablement predicates.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct EditorCtx {
@@ -219,6 +231,10 @@ pub struct EditorCtx {
     pub has_content_target: bool,
     /// The entity clipboard holds something to paste.
     pub has_clipboard: bool,
+    /// A painted copy (a tree, a shrub) is picked, its card showing, with no entity selected.
+    pub has_picked_copy: bool,
+    /// The open project's folder holds an EDITOR_GUIDE.md.
+    pub has_project_guide: bool,
 }
 
 /// Application menu that owns a command row.
@@ -248,6 +264,7 @@ pub enum CommandSurface {
 pub enum CommandAction {
     CreateComponent(&'static str),
     DesignerTool(crate::editor_event::DesignerTool),
+    LevelTool(crate::editor_event::LevelTool),
     Prefab(crate::editor_event::PrefabAction),
     GraphTool(crate::editor_event::GraphToolAction),
     ExportBlockout,
@@ -397,6 +414,20 @@ fn selection(ctx: &EditorCtx) -> Enablement {
         Enablement::Disabled("Select an entity first")
     }
 }
+fn selection_or_copy(ctx: &EditorCtx) -> Enablement {
+    if ctx.has_selection || ctx.has_picked_copy {
+        Enablement::Enabled
+    } else {
+        Enablement::Disabled("Select an entity first")
+    }
+}
+fn picked_copy(ctx: &EditorCtx) -> Enablement {
+    if ctx.has_picked_copy {
+        Enablement::Enabled
+    } else {
+        Enablement::Disabled("Click a painted tree or shrub first")
+    }
+}
 fn undo(ctx: &EditorCtx) -> Enablement {
     if ctx.can_undo {
         Enablement::Enabled
@@ -416,6 +447,14 @@ fn clipboard(ctx: &EditorCtx) -> Enablement {
         Enablement::Enabled
     } else {
         Enablement::Disabled("Copy something first")
+    }
+}
+
+fn project_guide(ctx: &EditorCtx) -> Enablement {
+    if ctx.has_project_guide {
+        Enablement::Enabled
+    } else {
+        Enablement::Disabled("This project has no EDITOR_GUIDE.md")
     }
 }
 
@@ -674,6 +713,7 @@ fn camera_commands() -> Vec<Command> {
 
 fn declarations() -> Vec<Command> {
     use crate::viewport_layout::ViewportLayout as VL;
+    use crate::editor_event::LevelTool as L;
     use CommandAction as A;
     use CreateKind as C;
     use Workspace as W;
@@ -1073,7 +1113,7 @@ fn declarations() -> Vec<Command> {
             "Save Scene",
             "Scene",
             ctrl('S'),
-            "Save the current scene.",
+            "Save your edits to this scene (moved, added and removed objects). Sculpted or painted ground needs Save Scene As.",
             A::SaveScene,
             FILE,
             always
@@ -1108,15 +1148,27 @@ fn declarations() -> Vec<Command> {
             EDIT,
             redo
         ),
+        // The second way to Redo that most editors have. No surface: the Edit menu and the
+        // toolbar already show Redo once.
+        command!(
+            "editor.edit.redo_alt",
+            "Redo (Ctrl+Shift+Z)",
+            "Edit",
+            Some(Chord::press(CommandKey::Letter('Z')).ctrl().shift()),
+            "Redo the most recently undone change, with the other common shortcut.",
+            A::Redo,
+            &[],
+            redo
+        ),
         command!(
             "editor.edit.delete",
             "Delete",
             "Edit",
             Some(Chord::press(CommandKey::Delete)),
-            "Delete the selected entity.",
+            "Delete the selected entity, or take out the painted tree or shrub you clicked.",
             A::DeleteSelected,
             EDIT_OUTLINER,
-            selection
+            selection_or_copy
         ),
         command!(
             "editor.edit.duplicate",
@@ -1169,6 +1221,166 @@ fn declarations() -> Vec<Command> {
             selection
         ),
         command!(
+            "editor.level.drop_to_ground",
+            "Drop to Ground",
+            "Level",
+            Some(Chord::press(CommandKey::End)),
+            "Move the selected objects down (or up) until they rest on what is under them.",
+            A::LevelTool(L::DropToGround),
+            EDIT_OUTLINER,
+            selection
+        ),
+        command!(
+            "editor.level.align_to_surface",
+            "Align to Surface",
+            "Level",
+            Some(Chord::press(CommandKey::End).shift()),
+            "Tilt the selected objects to the surface under them, then drop them onto it.",
+            A::LevelTool(L::AlignToSurface),
+            EDIT_OUTLINER,
+            selection
+        ),
+        command!(
+            "editor.level.carry",
+            "Move on the Ground",
+            "Level",
+            Some(Chord::press(CommandKey::Letter('G'))),
+            "Pick up the selected objects: they follow the mouse over the ground, floors and roofs. Click to put them down, Esc to put them back.",
+            A::LevelTool(L::Carry),
+            EDIT,
+            selection
+        ),
+        command!(
+            "editor.level.copy_and_carry",
+            "Copy and Move",
+            "Level",
+            Some(Chord::press(CommandKey::Letter('D')).shift()),
+            "Make a copy of the selected objects and pick it up: it follows the mouse over the ground. Click to put it down, Esc to remove it, Shift+D again for another.",
+            A::LevelTool(L::CopyAndCarry),
+            EDIT,
+            selection
+        ),
+        command!(
+            "editor.level.find_floating",
+            "Find Floating Objects",
+            "Level",
+            Some(Chord::press(CommandKey::Letter('F')).ctrl().shift()),
+            "Select every object near the camera that hangs in the air; End then drops them all.",
+            A::LevelTool(L::FindFloating),
+            EDIT,
+            always
+        ),
+        command!(
+            "editor.level.hide",
+            "Hide or Show Selected",
+            "Level",
+            Some(Chord::press(CommandKey::Letter('H'))),
+            "Hide the selected objects, or show them again when they are all hidden.",
+            A::LevelTool(L::ToggleHide),
+            EDIT_OUTLINER,
+            selection
+        ),
+        command!(
+            "editor.level.isolate",
+            "Isolate Selection",
+            "Level",
+            Some(Chord::press(CommandKey::Letter('H')).shift()),
+            "Hide everything but the selected objects until Show Everything. Never saved.",
+            A::LevelTool(L::Isolate),
+            VIEW_OUTLINER,
+            selection
+        ),
+        command!(
+            "editor.level.end_isolation",
+            "Show Everything",
+            "Level",
+            Some(Chord::press(CommandKey::Letter('H')).alt()),
+            "Show again everything Isolate Selection hid.",
+            A::LevelTool(L::EndIsolation),
+            VIEW,
+            always
+        ),
+        command!(
+            "editor.level.find_in_outliner",
+            "Find in Outliner",
+            "Level",
+            Some(Chord::press(CommandKey::Letter('F')).shift()),
+            "Scroll the Outliner to the selection and open the rows above it.",
+            A::LevelTool(L::FindInOutliner),
+            VIEW_OUTLINER,
+            selection
+        ),
+        command!(
+            "editor.level.select_parent",
+            "Select Parent",
+            "Level",
+            None,
+            "Select what the selection hangs under: a click picks a whole object, this climbs further.",
+            A::LevelTool(L::SelectParent),
+            EDIT_OUTLINER,
+            selection
+        ),
+        command!(
+            "editor.level.census",
+            "Census of the World",
+            "Level",
+            None,
+            "Count every painted kind (trees, shrubs, grass) and every model the loaded objects draw, and write the list beside the scene. Tree models from outside the painted palette are listed apart.",
+            A::LevelTool(L::Census),
+            EDIT,
+            always
+        ),
+        command!(
+            "editor.level.check_meshes",
+            "Check Meshes",
+            "Level",
+            None,
+            "Check the surface of every model the loaded objects draw: closed, open only at its base (fine where it sits in the ground), or open on a side or top (hollow from behind). Rocks and cliffs come first; the list is written beside the scene.",
+            A::LevelTool(L::CheckMeshes),
+            EDIT,
+            always
+        ),
+        command!(
+            "editor.level.select_same_asset",
+            "Select All Using This Model",
+            "Level",
+            None,
+            "Select every object that draws the selected object's model files.",
+            A::LevelTool(L::SelectSameAsset),
+            EDIT,
+            always
+        ),
+        command!(
+            "editor.level.make_object",
+            "Make This an Object",
+            "Level",
+            Some(Chord::press(CommandKey::Letter('O')).ctrl().shift()),
+            "Make the painted tree or shrub you clicked an object, to move, turn, delete and save like any prop.",
+            A::LevelTool(L::MakeObject),
+            EDIT,
+            picked_copy
+        ),
+        command!(
+            "editor.level.select_looked_at",
+            "Select What You Look At",
+            "Level",
+            Some(Chord::press(CommandKey::Function(4))),
+            "Select the object at the centre of the view. In Play it stops first and selects it in the editor, framed.",
+            A::LevelTool(L::SelectLookedAt),
+            VIEW,
+            always
+        ),
+        command!(
+            "editor.level.copy_identity",
+            "Copy What This Is",
+            "Level",
+            Some(Chord::press(CommandKey::Letter('C')).ctrl().shift()),
+            "Copy the selection's card: name, ids, mesh, material, textures, file and the tool that made it.",
+            A::LevelTool(L::CopyIdentity),
+            EDIT_OUTLINER,
+            selection
+        ),
+        command!(
             "editor.view.focus_selection",
             "Focus Selection",
             "View",
@@ -1186,6 +1398,16 @@ fn declarations() -> Vec<Command> {
             "Open editor preferences, project settings and the keyboard map.",
             A::OpenPreferences,
             WINDOW,
+            always
+        ),
+        command!(
+            "editor.scene.save_as",
+            "Save Scene As…",
+            "Scene",
+            Some(Chord::press(CommandKey::Letter('S')).ctrl().shift()),
+            "Write the whole scene, edits included, to a file you choose. Save (Ctrl+S) keeps your edits beside the scene instead.",
+            A::LevelTool(L::SaveSceneAs),
+            FILE,
             always
         ),
         command!(
@@ -1299,6 +1521,16 @@ fn declarations() -> Vec<Command> {
             always
         ),
         command!(
+            "editor.help.whats_new",
+            "What's New",
+            "Help",
+            None,
+            "List what you can do in the editor now that you could not before.",
+            A::OpenHelp(crate::metaphor::WHATS_NEW_PAGE),
+            HELP,
+            always
+        ),
+        command!(
             "editor.help.index",
             "Help Overlay",
             "Help",
@@ -1327,6 +1559,16 @@ fn declarations() -> Vec<Command> {
             A::OpenHelp(4),
             HELP,
             always
+        ),
+        command!(
+            "editor.help.project_guide",
+            "This Project's Guide",
+            "Help",
+            None,
+            "Show the guide this project keeps for its own editor use.",
+            A::OpenHelp(crate::metaphor::PROJECT_GUIDE_PAGE),
+            HELP,
+            project_guide
         ),
         command!(
             "editor.script.reload",
@@ -2351,13 +2593,22 @@ pub fn icon_for(id: &str) -> crate::icons::IconId {
         "editor.scene.open" | "editor.file.open_project" => I::FolderOpen,
         "editor.file.welcome" => I::Home,
         "editor.file.save_thumbnail" => I::Screenshot,
-        "editor.scene.save" => I::Save,
+        "editor.scene.save" | "editor.scene.save_as" => I::Save,
+        "editor.level.drop_to_ground" | "editor.level.align_to_surface" | "editor.level.carry" => I::Landscape,
+        "editor.level.find_floating" | "editor.level.find_in_outliner" => I::Search,
+        "editor.level.hide" | "editor.level.end_isolation" => I::View,
+        "editor.level.isolate" => I::Focus,
+        "editor.level.select_parent" => I::Select,
+        "editor.level.copy_identity" => I::Copy,
+        "editor.level.select_looked_at" => I::Focus,
+        "editor.level.census" | "editor.level.check_meshes" => I::Search,
+        "editor.level.select_same_asset" => I::Select,
         "editor.asset.import_model" => I::Import,
         "editor.asset.new_material" => I::MaterialBall,
         "editor.edit.undo" => I::Undo,
         "editor.edit.redo" => I::Redo,
         "editor.edit.delete" => I::Delete,
-        "editor.edit.duplicate" => I::Duplicate,
+        "editor.edit.duplicate" | "editor.level.copy_and_carry" => I::Duplicate,
         "editor.edit.copy" => I::Copy,
         "editor.edit.paste" => I::Paste,
         "editor.edit.select_all" => I::Select,
@@ -2387,9 +2638,11 @@ pub fn icon_for(id: &str) -> crate::icons::IconId {
         "editor.viewport.layout.split_horizontal" => I::PanelBottom,
         "editor.viewport.layout.quad" => I::GridView,
         "editor.search.commands" => I::Search,
+        "editor.help.whats_new" => I::Docs,
         "editor.help.index" => I::HelpCircle,
         "editor.help.shortcuts" => I::Keyboard,
         "editor.help.about" => I::Info,
+        "editor.help.project_guide" => I::Docs,
         "editor.script.reload" => I::Refresh,
         "editor.simulation.play" => I::Play,
         "editor.simulation.pause" => I::Pause,
@@ -2520,6 +2773,17 @@ pub fn sectioned(commands: Vec<Command>) -> Vec<(&'static str, Vec<Command>)> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn a_disabled_menu_row_says_why_and_an_enabled_one_says_nothing() {
+        let undo = super::registry().get("editor.edit.undo").expect("undo is a command");
+        let message = super::disabled_message("editor.edit.undo", &super::EditorCtx::default()).expect("nothing to undo");
+        assert!(message.starts_with(&format!("{} is not available: ", undo.label)), "{message}");
+        assert!(message.len() > undo.label.len() + 20, "the reason is in it: {message}");
+        let can = super::EditorCtx { can_undo: true, ..super::EditorCtx::default() };
+        assert_eq!(super::disabled_message("editor.edit.undo", &can), None);
+        assert_eq!(super::disabled_message("no.such.command", &can), None);
+    }
+
+    #[test]
     fn foliage_mode_and_f8_use_the_painter_command() {
         let command = registry().get("editor.foliage.edit").unwrap();
         assert_eq!(command.action, CommandAction::ToggleFoliagePaint);
@@ -2595,6 +2859,30 @@ mod tests {
             assert_eq!(set.action, CommandAction::SetBookmark(slot));
             assert_eq!(recall.action, CommandAction::RecallBookmark(slot));
         }
+    }
+
+    /// Ctrl+Shift+Z is a second way to redo, and Ctrl+Z still only undoes.
+    #[test]
+    fn ctrl_shift_z_redoes_as_well_as_ctrl_y() {
+        let registry = registry();
+        let redo = |chord| registry.binding(chord).map(|command| command.action);
+        assert_eq!(
+            redo(Chord::press(CommandKey::Letter('Z')).ctrl().shift()),
+            Some(CommandAction::Redo)
+        );
+        assert_eq!(
+            redo(Chord::press(CommandKey::Letter('Y')).ctrl()),
+            Some(CommandAction::Redo)
+        );
+        assert_eq!(
+            redo(Chord::press(CommandKey::Letter('Z')).ctrl()),
+            Some(CommandAction::Undo)
+        );
+        // The same lookup the UI's own dispatcher uses.
+        assert_eq!(
+            KeyBindings::default().command_for(Chord::press(CommandKey::Letter('Z')).ctrl().shift()),
+            Some("editor.edit.redo_alt")
+        );
     }
 
     /// An override is what dispatch consults; the declaration is the fallback.
@@ -2725,6 +3013,49 @@ mod tests {
         assert!(command.enabled(&filled).is_enabled());
     }
 
+    /// A clicked painted copy is something to delete or make an object of; nothing picked is neither.
+    #[test]
+    fn a_picked_painted_copy_can_be_deleted_or_made_an_object() {
+        let (delete, make) = (*registry().get("editor.edit.delete").unwrap(), *registry().get("editor.level.make_object").unwrap());
+        let picked = EditorCtx { has_picked_copy: true, ..EditorCtx::default() };
+        assert!(delete.enabled(&picked).is_enabled() && make.enabled(&picked).is_enabled());
+        assert!(!delete.enabled(&EditorCtx::default()).is_enabled() && !make.enabled(&EditorCtx::default()).is_enabled());
+    }
+
+    /// What's New leads the Help menu and opens its page; the project guide is greyed out, with the reason, until
+    /// the project has one.
+    #[test]
+    fn help_menu_leads_with_whats_new_and_guards_the_project_guide() {
+        let ids: Vec<_> = registry()
+            .menu(Menu::Help)
+            .into_iter()
+            .map(|command| command.id)
+            .collect();
+        assert_eq!(ids.first(), Some(&"editor.help.whats_new"));
+        assert!(ids.contains(&"editor.help.project_guide"));
+        let whats_new = *registry().get("editor.help.whats_new").unwrap();
+        assert_eq!(whats_new.label, "What's New");
+        assert_eq!(whats_new.default_binding, None);
+        assert_eq!(
+            whats_new.action,
+            CommandAction::OpenHelp(crate::metaphor::WHATS_NEW_PAGE)
+        );
+        let guide = *registry().get("editor.help.project_guide").unwrap();
+        assert_eq!(
+            guide.enabled(&EditorCtx::default()),
+            Enablement::Disabled("This project has no EDITOR_GUIDE.md")
+        );
+        let with_guide = EditorCtx {
+            has_project_guide: true,
+            ..EditorCtx::default()
+        };
+        assert!(guide.enabled(&with_guide).is_enabled());
+        assert_eq!(
+            guide.action,
+            CommandAction::OpenHelp(crate::metaphor::PROJECT_GUIDE_PAGE)
+        );
+    }
+
     #[test]
     fn ids_bindings_help_and_palette_coverage_are_complete() {
         let mut ids = HashSet::new();
@@ -2767,9 +3098,9 @@ mod tests {
     fn extra_modifiers_do_not_match_a_registered_binding() {
         assert!(
             registry()
-                .binding(Chord::press(CommandKey::Letter('S')).ctrl().shift())
+                .binding(Chord::press(CommandKey::Letter('S')).ctrl().alt())
                 .is_none(),
-            "Ctrl+Shift+S must not silently run the Ctrl+S command"
+            "Ctrl+Alt+S must not silently run the Ctrl+S command"
         );
         assert!(
             registry()

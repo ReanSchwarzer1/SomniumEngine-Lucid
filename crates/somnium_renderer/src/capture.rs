@@ -34,6 +34,28 @@ static CAPTURE_FINISHED: AtomicBool = AtomicBool::new(false);
 /// did, every time.
 static SURFACE_PENDING: AtomicUsize = AtomicUsize::new(0);
 
+/// Captures written this run. `SOMNIUM_SURFACES_AB=captures` turns photoreal's surface changes off and on by it, so a
+/// proof's before and after come from one launch (one launch per turn at the window lock, Sunscar 11 Nov 2026).
+static CAPTURES_WRITTEN: AtomicUsize = AtomicUsize::new(0);
+
+/// Cells being read or waiting for a reader, as the app last said ([`set_cells_waiting`]).
+static CELLS_WAITING: AtomicUsize = AtomicUsize::new(0);
+
+/// The longest a settled capture waits past its frame before it fires anyway (and says so in the log).
+const MAX_SETTLE_FRAMES: u64 = 3600;
+
+/// The app's cell streamer says how many cells are still coming (the settled signal, sunscar-engine 26 Nov 2026).
+/// With `SOMNIUM_CAPTURE_SETTLED=<frames>` the frame capture fires at its frame or later, once this has been 0
+/// for that many frames in a row. Unset, it fires on its frame as before.
+pub fn set_cells_waiting(cells: usize) {
+    CELLS_WAITING.store(cells, Ordering::Relaxed);
+}
+
+/// How many captures this run has written.
+pub fn captures_written() -> usize {
+    CAPTURES_WRITTEN.load(Ordering::Relaxed)
+}
+
 /// Say that one more surface is going to be written before the run may end.
 pub fn expect_surface_capture() {
     SURFACE_PENDING.fetch_add(1, Ordering::Relaxed);
@@ -405,6 +427,11 @@ pub struct FrameCapture {
     display_pending: Option<(u32, u32, wgpu::TextureFormat)>,
     ui_staging: Option<wgpu::Buffer>,
     ui_pending: Option<(u32, u32, wgpu::TextureFormat)>,
+    /// `SOMNIUM_CAPTURE_SETTLED`: frames with no cell coming before the capture may fire (0: on its frame).
+    settle_frames: u64,
+    /// Frames in a row with no cell coming, and whether the settled capture has fired.
+    calm: u64,
+    settle_fired: bool,
 }
 
 impl FrameCapture {
@@ -415,15 +442,22 @@ impl FrameCapture {
         path: &std::path::Path,
         include_editor: bool,
     ) -> Result<(), String> {
-        if self.pending.is_some() || (self.active() && self.frame < self.target_frame) {
+        let settling = self.settle_frames > 0 && !self.settle_fired;
+        if self.pending.is_some() || (self.active() && (self.frame < self.target_frame || settling)) {
             return Err("another frame capture is pending".into());
         }
-        self.write_to = None;
+        // `SOMNIUM_CAPTURE_STILL_HDR=1` (the photoreal harness, 6 Nov 2026): a scene still also keeps the frame's linear
+        // HDR and its pixel classes beside the picture, as `<name>.somcap`, so tone curves and grades can be tried on
+        // the light itself afterwards without another run. Off, nothing changes.
+        self.write_to = (!include_editor && std::env::var("SOMNIUM_CAPTURE_STILL_HDR").as_deref() == Ok("1"))
+            .then(|| path.with_extension("somcap").to_string_lossy().into_owned());
         self.write_png = None;
         self.compare_to = None;
         self.write_display_png = (!include_editor).then(|| path.to_string_lossy().into_owned());
         self.write_ui_png = include_editor.then(|| path.to_string_lossy().into_owned());
         self.target_frame = self.frame.saturating_add(1);
+        // A capture armed here fires on its frame, as before: its caller waits in its own way.
+        self.settle_frames = 0;
         CAPTURE_FINISHED.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -447,6 +481,9 @@ impl FrameCapture {
             display_pending: None,
             ui_staging: None,
             ui_pending: None,
+            settle_frames: std::env::var("SOMNIUM_CAPTURE_SETTLED").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0),
+            calm: 0,
+            settle_fired: false,
         }
     }
 
@@ -474,7 +511,28 @@ impl FrameCapture {
             return false;
         }
         self.frame += 1;
-        self.frame == self.target_frame
+        if self.settle_frames == 0 {
+            return self.frame == self.target_frame;
+        }
+        self.calm = if CELLS_WAITING.load(Ordering::Relaxed) == 0 { self.calm + 1 } else { 0 };
+        if self.frame < self.target_frame || self.settle_fired {
+            return false;
+        }
+        let late = self.frame - self.target_frame;
+        if self.calm < self.settle_frames && late < MAX_SETTLE_FRAMES {
+            return false;
+        }
+        self.settle_fired = true;
+        let settled = self.calm >= self.settle_frames;
+        tracing::info!(
+            frame = self.frame,
+            waited = late,
+            settled,
+            cells_waiting = CELLS_WAITING.load(Ordering::Relaxed),
+            "capture: {}",
+            if settled { "the cells have settled" } else { "fired after the longest wait, the cells still coming" }
+        );
+        true
     }
 
     /// Bytes per padded row for a texture of `width` texels of `texel_bytes`.
@@ -780,6 +838,7 @@ impl FrameCapture {
         self.display_pending = None;
         self.ui_staging = None;
         self.ui_pending = None;
+        CAPTURES_WRITTEN.fetch_add(1, Ordering::Relaxed);
         CAPTURE_FINISHED.store(true, Ordering::Relaxed);
     }
 

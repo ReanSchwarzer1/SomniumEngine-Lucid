@@ -1,15 +1,22 @@
 //!include "spot_cookie.wgsl"
+//!include "snow.wgsl"
+//!include "standing_water.wgsl"
 // MORROWIND-C: composition is declared here rather than assembled by a
 // `format!` of `include_str!` calls at this pass's construction site. The
 // resolver (`somnium_shader`) emits each module once, in this order, and
 // hoists every `enable` above everything.
 //!include "sky_eye.wgsl"
+//!include "sky_planet.wgsl"
+//!include "sky_sun.wgsl"
 //!include "global_pool.wgsl"
+//!include "grass_pool.wgsl"
 //!include "brdf.wgsl"
 //!include "sampling.wgsl"
 //!include "atmosphere.wgsl"
 //!include "hextile.wgsl"
 //!include "terrain_material.wgsl"
+//!include "terrain_morph.wgsl"
+//!include "froxel_depth.wgsl"
 //!include "clipmap_shade.wgsl"
 //!include "wind.wgsl"
 //!if LOCAL_SHADOWS
@@ -32,7 +39,7 @@ fn practical_visibility(p: vec3<f32>, geometric_normal: vec3<f32>, emitter: vec3
             // shadow its own authored source. This is a world-space fixture
             // tolerance, not a distance-dependent leak across room partitions.
             rayQueryInitialize(&rq, local_shadow_accel,
-                RayDesc(0x4u, 0x1u, 0.008, distance - 0.06, origin, delta / distance));
+                RayDesc(0x4u, 0x5u, 0.008, distance - 0.06, origin, delta / distance));   // 0x4: cut-out casters
             rayQueryProceed(&rq);
             return select(0.0, 1.0, rayQueryGetCommittedIntersection(&rq).kind == RAY_QUERY_INTERSECTION_NONE);
         }
@@ -151,7 +158,7 @@ fn skin_visibility(p: vec3<f32>, emitter: vec3<f32>, reach: f32) -> f32 {
         if distance > reach + 0.07 {
             var rq: ray_query;
             rayQueryInitialize(&rq, local_shadow_accel,
-                RayDesc(0x4u, 0x1u, reach, distance - 0.06, p, delta / distance));
+                RayDesc(0x4u, 0x5u, reach, distance - 0.06, p, delta / distance));   // 0x4: cut-out casters
             rayQueryProceed(&rq);
             return select(0.0, 1.0, rayQueryGetCommittedIntersection(&rq).kind == RAY_QUERY_INTERSECTION_NONE);
         }
@@ -183,14 +190,58 @@ fn skin_visibility(p: vec3<f32>, emitter: vec3<f32>, reach: f32) -> f32 {
 // a = surviving transmittance. See pass/volumetric.rs.
 @group(1) @binding(9) var volumetrics: texture_3d<f32>;
 @group(1) @binding(10) var volumetric_sampler: sampler;
-// Metres the volume spans; 0 when volumetrics are switched off.
-@group(1) @binding(11) var<uniform> volumetric_range: vec4<f32>;
-// Phase 24L: traced indirect diffuse. `rgb` is incoming irradiance — the GI
-// pass does not know this surface's albedo and must not, or it would be applied
-// twice — and `a` is the "a traced result exists" flag, on the convention 24K
-// established. Alpha 0 is what an unsupported device and a switched-off pass
-// both produce, and it is what sends `evaluate_ibl` back to the cubemap.
-@group(1) @binding(12) var restir_gi: texture_2d<f32>;
+// a: x metres the volume spans (0 when volumetrics are switched off), y the height fog's density, z its falloff, w
+// its base. b: x the fog's flat top (at or under the base: none), y the metres it fades over, z the aerosols' factor
+// (`atmosphere_aerosol`, set from it at the top of `fs_main`).
+struct VolumetricRange {
+    a: vec4<f32>,
+    b: vec4<f32>,
+}
+@group(1) @binding(11) var<uniform> volumetric_range: VolumetricRange;
+
+/// The height fog's optical depth along `dir` from the volume's range on for `beyond` metres: its exponential
+/// integrated exactly, and only under its flat top where it has one (valley fog: a ridge above the top stands clear,
+/// and so does the sky over it). With no top this is the integral it always was.
+fn fog_depth_beyond(dir: vec3<f32>, beyond: f32) -> f32 {
+    let fog = volumetric_range.a.y;
+    if fog <= 0.0 || beyond <= 0.0 {
+        return 0.0;
+    }
+    let falloff = max(volumetric_range.a.z, 1.0);
+    let base = volumetric_range.a.w;
+    let top = volumetric_range.b.x + 0.5 * volumetric_range.b.y;
+    let y0 = view.camera_pos.y + dir.y * volumetric_range.a.x;
+    var enters = 0.0;
+    var leaves = beyond;
+    if volumetric_range.b.x > base {
+        if abs(dir.y) > 1e-5 {
+            let crossing = (top - y0) / dir.y;
+            if dir.y > 0.0 {
+                leaves = min(leaves, max(crossing, 0.0));
+            } else {
+                enters = max(crossing, 0.0);
+            }
+        } else if y0 > top {
+            return 0.0;
+        }
+    }
+    let run = leaves - enters;
+    if run <= 0.0 {
+        return 0.0;
+    }
+    let start = fog * exp(-max(y0 + dir.y * enters - base, 0.0) / falloff);
+    let k = clamp(dir.y * run / falloff, -20.0, 20.0);
+    return start * select(run * (1.0 - exp(-k)) / k, run, abs(k) < 1e-3);
+}
+// Phase 24L: traced indirect diffuse, as `gi_accumulate.wgsl` leaves it on the GI grid, in three layers (one
+// binding: this stage already holds the device's 16 sampled textures).
+// 0: `rgb` the light the scene bounces onto the surface (incoming: the GI pass does not know this surface's albedo
+//    and must not, or it would be applied twice), `a` the traced surface's camera distance. 0 there is "nothing
+//    traced", which an unsupported device and a switched-off pass both produce, and it sends `evaluate_ibl` back to
+//    the cubemap alone.
+// 1: the sky's share as two sums (`r` over `g`), and the open sky a thin leaf's far side receives (`b` over `a`).
+// 2: the frames behind the estimate, in red.
+@group(1) @binding(12) var restir_gi: texture_2d_array<f32>;
 // Phase 24M/N/O/P/Q: world cache + scene specular / path tracer (2D) and the
 // clipmapped volume (cache rgb, SDF in alpha). Dummy 1×1 targets when off.
 @group(1) @binding(13) var lighting_aux: texture_2d<f32>;
@@ -208,7 +259,9 @@ fn skin_visibility(p: vec3<f32>, emitter: vec3<f32>, reach: f32) -> f32 {
 /// pass is off and the texture must not be read; that is what keeps a disabled
 /// cloud pass free rather than merely cheap.
 @group(1) @binding(18) var<uniform> cloud_shadow_params: vec4<f32>;
-/// CONTROL-N: `[wet_diffuse, wet_specular, puddles, unused]`.
+/// CONTROL-N: `[wet_diffuse, wet_specular, puddles, standing water]`. The last is Sunscar weather's (11 Nov 2026;
+/// `standing_water.wgsl`): its whole part over 100 is how much water has collected on level ground (0..1), its
+/// fraction how hard it is raining on it (0..1, the rings). Zero unless a game sets it.
 ///
 /// All zero when no weather is driving, and `apply_wetness` returns
 /// immediately in that case — so a scene with no Weather component shades
@@ -261,13 +314,20 @@ struct VirtualShadowParams {
 // the built-in weathering (R dirt, G rust, B wetness, A blood).
 @group(1) @binding(30) var<storage, read> vertex_paint: array<u32>;
 
+// While the path tracer runs (path mode bit, 29 Oct 2026): each pixel's finished surface, so it traces the bounced
+// light from exactly the material lit here (path_tracer.wgsl `pt_raster_surface`). Albedo and metallic; the shading
+// normal and roughness; the material's own occlusion (negative: the light is baked into the surface, trace nothing)
+// and the fog's transmittance.
+@group(1) @binding(31) var path_surface_albedo: texture_storage_2d<rgba16float, write>;
+@group(1) @binding(32) var path_surface_normal: texture_storage_2d<rgba16float, write>;
+@group(1) @binding(33) var path_surface_extra: texture_storage_2d<rgba16float, write>;
+
 /// Sun visibility through the cloud layer at a world position.
 ///
-/// Returns 1 — no shadow at all — when the cloud pass is off, when the point
-/// falls outside the field, or when the strength is zero. Outside rather than
-/// clamped: the field is centred on the camera and clamping would smear the
-/// edge texel across the whole horizon, which reads as a permanent shadow
-/// wall at the edge of the world.
+/// Returns 1 — no shadow at all — when the cloud pass is off or the strength is zero. Past the field (centred on the
+/// camera, `extent` each way) the land takes the field's mean, faded in over half an extent from the edge: not the
+/// edge texel clamped (that smears one column across the horizon as a shadow wall), and not 1 either. Under an
+/// overcast, 1 lit everything past 4 km in full sun, a hard bright ring round a dark middle (Sunscar, 7 Nov 2026).
 fn cloud_shadow_at(world_pos: vec3<f32>) -> f32 {
     let strength = cloud_shadow_params.w;
     if strength <= 0.0 {
@@ -275,11 +335,20 @@ fn cloud_shadow_at(world_pos: vec3<f32>) -> f32 {
     }
     let extent = max(cloud_shadow_params.z, 1.0);
     let local = (world_pos.xz - cloud_shadow_params.xy) / extent;
-    if any(abs(local) > vec2<f32>(1.0)) {
-        return 1.0;
+    let near = clamp(textureSampleLevel(cloud_shadow_tex, default_sampler,
+        clamp(local, vec2<f32>(-1.0), vec2<f32>(1.0)) * 0.5 + 0.5, 0.0).r, 0.0, 1.0);
+    let past = max(abs(local.x), abs(local.y)) - 1.0;
+    if past <= 0.0 {
+        return near;
     }
-    let uv = local * 0.5 + 0.5;
-    return clamp(textureSampleLevel(cloud_shadow_tex, default_sampler, uv, 0.0).r, 0.0, 1.0);
+    // The field's mean over a 4 x 4 grid: the same for every pixel of a frame, so the far land is shaded as evenly as
+    // the deck covers it on average, and moves with it.
+    var mean = 0.0;
+    for (var i = 0; i < 16; i = i + 1) {
+        let g = (vec2<f32>(f32(i & 3), f32(i >> 2)) + 0.5) / 4.0;
+        mean += textureSampleLevel(cloud_shadow_tex, default_sampler, g, 0.0).r;
+    }
+    return mix(near, clamp(mean / 16.0, 0.0, 1.0), saturate(past * 2.0));
 }
 
 /// CONTROL-N: what rain does to a surface, following Lagarde's *Water drop 3b*.
@@ -857,6 +926,12 @@ override enable_debug: bool = true;
 // top of the execution savings.
 override shade_ablate: u32 = 0u;
 
+// Whether this pipeline writes the surface for the path tracer (29 Oct 2026). False in the depth split's near and
+// aerial pipelines (shading.rs `make_pipeline`): they rely on early-Z to skip the half of the screen the other owns,
+// and a storage write anywhere in the shader makes the driver test depth late, so both would shade every pixel. The
+// split never runs under the tracer (renderer.rs), so the writes are dead code there and the compiler drops them.
+override path_surface: bool = true;
+
 const ABLATE_OFF:     u32 = 0u;
 const ABLATE_SKY:     u32 = 1u;
 const ABLATE_MESH:    u32 = 2u;
@@ -991,10 +1066,14 @@ fn vis_barycentric(
 /// and column, a plaid on the Office's entry wall. The ray form has no such division. `None` when the ray runs
 /// along the plane.
 fn ray_barycentric(p0: vec3<f32>, p1: vec3<f32>, p2: vec3<f32>, sample_ndc: vec2<f32>) -> vec4<f32> {
-    let near = view.inv_view_proj * vec4<f32>(sample_ndc, 0.0, 1.0);
-    let far = view.inv_view_proj * vec4<f32>(sample_ndc, 1.0, 1.0);
-    let origin = near.xyz / near.w;
-    let dir = far.xyz / far.w - origin;
+    // From the eye itself, with a camera-relative direction: every ray of a perspective view starts at the eye
+    // (this runs only for a vertex within a metre of the eye's plane, which an orthographic view never has), and
+    // `inv_view_proj`'s columns cancel 15 km out (at x -15408: 154087.6 against -154103.0, ulp 2^-6), so a
+    // direction built through it snapped every 21.6 px at 2560 wide: the "blocky ground" (Sunscar, 5 Nov 2026).
+    // Depth 1 is the near plane (reversed-Z): a point on the ray, camera-relative, so the ray's direction.
+    let on_ray = view.inv_view_proj_rel * vec4<f32>(sample_ndc, 1.0, 1.0);
+    let origin = view.camera_pos;
+    let dir = on_ray.xyz / on_ray.w;
     let e1 = p1 - p0;
     let e2 = p2 - p0;
     let pv = cross(dir, e2);
@@ -1214,6 +1293,61 @@ fn sample_material_map(
 /// (geometric, world space), `local_height` metres above its object's origin
 /// (grounded assets sit on it, so this is height above their foot), with
 /// `crevice` the scan's own occlusion.
+// ── Far ground (Sunscar, 7 Nov 2026) ─────────────────────────────────────────
+//
+// A backdrop or far stand-in's colour comes in texels 16-64 m wide, so from 2-6 km a hillside drew as one smooth wash
+// and its shading as the 32-64 m mesh alone: clay, not ground. Real slopes at that range show scree fans, turf and
+// rock in patches, and gullies and ribs in their light. This adds both, in world space so they hold still: value
+// noise at 8, 24, 72 and 216 m, each scale only where it spans several pixels (it fades in with distance so it never
+// aliases), shifting the albedo by up to about a fifth and tilting the shading normal by the same relief.
+
+fn far_ground_hash(c: vec2<i32>) -> f32 {
+    var h = u32(c.x) * 374761393u + u32(c.y) * 668265263u;
+    h = (h ^ (h >> 13u)) * 1274126177u;
+    h = h ^ (h >> 16u);
+    return f32(h & 0xffffu) / 65535.0;
+}
+
+fn far_ground_noise(p: vec2<f32>) -> f32 {
+    let i = vec2<i32>(floor(p));
+    let f = p - floor(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = far_ground_hash(i);
+    let b = far_ground_hash(i + vec2<i32>(1, 0));
+    let c = far_ground_hash(i + vec2<i32>(0, 1));
+    let d = far_ground_hash(i + vec2<i32>(1, 1));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+fn apply_far_ground(surface: ptr<function, Surface>, world_pos: vec3<f32>, distance: f32) {
+    // Metres a pixel spans there (about 1 mrad at 1440p after FSR), and a scale shows once it is 4+ pixels wide.
+    let footprint = max(distance * 0.001, 0.01);
+    let scales = array<f32, 4>(8.0, 24.0, 72.0, 216.0);
+    let colour_amp = array<f32, 4>(0.07, 0.08, 0.08, 0.06);
+    var tone = 0.0;
+    var grad = vec2<f32>(0.0);
+    for (var k = 0; k < 4; k = k + 1) {
+        let s = scales[k];
+        let w = saturate((s / footprint - 4.0) / 4.0);
+        if w <= 0.0 {
+            continue;
+        }
+        let p = world_pos.xz / s + vec2<f32>(f32(k) * 17.3, f32(k) * 7.1);
+        let n0 = far_ground_noise(p);
+        let e = 0.25;
+        let nx = far_ground_noise(p + vec2<f32>(e, 0.0));
+        let nz = far_ground_noise(p + vec2<f32>(0.0, e));
+        tone += w * colour_amp[k] * (2.0 * n0 - 1.0);
+        // Relief 12% of the scale: d(height)/dx = 0.12 s dn/(e s) = 0.12 dn / e.
+        grad += w * 0.12 * vec2<f32>(nx - n0, nz - n0) / e;
+    }
+    let dry = far_ground_noise(world_pos.xz / 55.0 + vec2<f32>(3.7, 9.1));
+    (*surface).albedo = (*surface).albedo * (1.0 + tone)
+        * mix(vec3<f32>(1.0), vec3<f32>(1.06, 1.0, 0.9), saturate(dry * 2.0 - 1.0) * saturate(30.0 / footprint));
+    let n = (*surface).normal;
+    (*surface).normal = normalize(vec3<f32>(n.x - grad.x, n.y, n.z - grad.y));
+}
+
 fn apply_weathering(
     surface: ptr<function, Surface>,
     amount: f32,
@@ -1417,96 +1551,129 @@ fn sh_probe_volume_weight(pos: vec3<f32>) -> f32 {
     return smoothstep(-0.25, 0.5, edge);
 }
 
-/// Image-based ambient: diffuse irradiance + split-sum specular.
-/// ReSTIR estimates directional-light bounce only: escaped rays carry no sky
-/// energy and local lights are not sampled. Keep environment illumination and
-/// add the measured bounce, including when a valid reservoir measures zero.
-/// ReSTIR GI arrives on a coarser grid (restir_gi.rs `GI_SCALE`): each texel
-/// traced one pixel of its block and stored that surface's camera distance in
-/// alpha (0: none). Bilinear weights, each also asking that the texel's surface
-/// be as far from the camera as this pixel's, so indirect light is smooth
-/// across a surface and never bleeds across a silhouette. `a` of the result is
-/// 1 when any texel could vouch for this pixel.
-///
-/// The footprint is 4x4 texels with a Gaussian falloff, and it denoises as
-/// well as upsamples: one reservoir per texel is still a stochastic estimate,
-/// and a texel that drew a rare bright sample (a bounce off a lamp housing) was
-/// reproduced as a gold firefly — always on the first-person hands, which keep
-/// little temporal history, and on everything while running.
-///
-/// Two bounds per tap, both relative so they need no exposure. A tap may not
-/// exceed `GI_SPECK_RATIO` times its brightest same-surface neighbour in the
-/// footprint: an isolated hot texel is exactly a speck, while real bounce is
-/// smooth and its neighbours vouch for it. A cap against the footprint mean
-/// alone could not do this — the speck lifts the mean it is measured against,
-/// so a texel 100x its neighbours came out 18x and stayed visible. The mean
-/// cap stays as the backstop for small clusters.
-fn gi_upsample(pixel: vec2<f32>, dist: f32) -> vec4<f32> {
-    let gdims = vec2<i32>(textureDimensions(restir_gi));
-    let ratio = vec2<f32>(textureDimensions(vis_buffer)) / vec2<f32>(gdims);
-    let gp = pixel / ratio - 0.5;
-    let g0 = vec2<i32>(floor(gp));
-    let f = gp - floor(gp);
-    var taps: array<vec4<f32>, 16>;
-    // Tap luminance, or -1 for a tap on another surface (or none).
-    var luma: array<f32, 16>;
-    var mean = vec3<f32>(0.0);
-    var wsum = 0.0;
-    for (var k = 0; k < 16; k = k + 1) {
-        let d = vec2<i32>(k & 3, k >> 2) - vec2<i32>(1);
-        let t = textureLoad(restir_gi, clamp(g0 + d, vec2<i32>(0), gdims - 1), 0);
-        luma[k] = -1.0;
-        if t.a <= 0.0 {
-            taps[k] = vec4<f32>(0.0);
-            continue;
-        }
-        let offset = vec2<f32>(d) - f;
-        let ws = exp(-0.5 * dot(offset, offset) / (GI_FILTER_SIGMA * GI_FILTER_SIGMA));
-        let wd = exp(-abs(t.a - dist) / (dist * 0.025 + 0.05));
-        let w = (ws + 0.002) * wd;
-        taps[k] = vec4<f32>(t.rgb, w);
-        if wd > 0.1 {
-            luma[k] = dot(t.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-        }
-        mean += t.rgb * w;
-        wsum += w;
-    }
-    if wsum < 1.0e-4 {
-        return vec4<f32>(0.0);
-    }
-    mean /= wsum;
-    let mean_ceiling = GI_FIREFLY_RATIO * dot(mean, vec3<f32>(0.2126, 0.7152, 0.0722)) + 1.0e-6;
-    var sum = vec3<f32>(0.0);
-    for (var k = 0; k < 16; k = k + 1) {
-        if taps[k].a <= 0.0 {
-            continue;
-        }
-        var neighbour_max = -1.0;
-        for (var n = 0; n < 9; n = n + 1) {
-            let x = (k & 3) + n % 3 - 1;
-            let y = (k >> 2) + n / 3 - 1;
-            if n != 4 && x >= 0 && x < 4 && y >= 0 && y < 4 {
-                neighbour_max = max(neighbour_max, luma[y * 4 + x]);
-            }
-        }
-        var ceiling = mean_ceiling;
-        if neighbour_max >= 0.0 {
-            ceiling = min(ceiling, GI_SPECK_RATIO * neighbour_max + 1.0e-6);
-        }
-        let l = dot(taps[k].rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
-        sum += taps[k].rgb * min(1.0, ceiling / max(l, 1.0e-6)) * taps[k].a;
-    }
-    return vec4<f32>(sum / wsum, 1.0);
+/// What the traced GI says about a pixel (`gi_upsample`).
+struct TracedLight {
+    /// Light the scene bounces onto the surface, before the surface's own albedo.
+    bounce: vec3<f32>,
+    /// The share of the environment's light that gets past the scene to the surface: 1 in the open, 0 in a closed
+    /// room.
+    sky: f32,
+    /// How far to take the estimate over the untraced fallback: 0 where nothing was traced, rising to 1 over the
+    /// first `GI_SETTLED_FRAMES` frames a place has been in view.
+    trust: f32,
+    /// The screen-space visibility the sky's share is held under (`screen_occlusion`; 1 on a thin leaf).
+    contact: f32,
+    /// The sky's light that comes through a thin leaf from its far side, as a share of the open sky overhead: what
+    /// the far side sees of the sky, times what the leaf lets through. 0 on anything that is not a leaf.
+    through: f32,
 }
 
-/// Gaussian radius of the GI upsample, in GI texels.
-const GI_FILTER_SIGMA: f32 = 1.0;
-/// A GI texel may be at most this many times brighter than its neighbourhood.
-const GI_FIREFLY_RATIO: f32 = 2.5;
-/// ...and than its brightest same-surface neighbour.
-const GI_SPECK_RATIO: f32 = 1.25;
+/// No traced estimate: the sky under the surface's occlusion, as on a device without ray query.
+fn untraced_light() -> TracedLight {
+    return TracedLight(vec3<f32>(0.0), 1.0, 0.0, 1.0, 0.0);
+}
 
-fn evaluate_ibl_diffuse(surface: Surface, traced_diffuse: vec4<f32>) -> vec3<f32> {
+/// Frames in view after which a place's traced estimate stands alone. Under that it is a handful of rays, and what
+/// shows is part the untraced fallback, which is smooth.
+const GI_SETTLED_FRAMES: f32 = 4.0;
+
+/// The traced GI at a pixel. It arrives on a coarser grid (restir_gi.rs `GI_SCALE`), already averaged over
+/// neighbours and frames (`gi_accumulate.wgsl`): each texel holds the bounce, the sky's two sums, the frames behind
+/// them, and the camera distance of the surface it traced (0: none).
+///
+/// Bilinear over the four texels round the pixel, each also asked that its surface be as far from the camera as
+/// this pixel's, so indirect light is smooth across a surface and does not bleed across a silhouette. A pixel none
+/// of the four vouches for (a blade of grass before a far hill, when no texel traced the blade this frame) takes
+/// their plain bilinear mean: the light around it is a better guess than none, and it does not flicker as the
+/// texels' traced pixels walk on and off the blade.
+///
+/// Four taps of three layers. It was sixteen with a Gaussian falloff, and that footprint was the denoiser; the
+/// averaging now happens once per GI texel, and per screen pixel it was 11 of a dense wood's 19.6 ms of shading.
+///
+/// The upsample does not know the material: `contact` is passed through to the result, and `leaf` (what a thin leaf
+/// lets through, 0 for anything else) scales the far side's sky into `through`.
+fn gi_upsample(pixel: vec2<f32>, dist: f32, contact: f32, leaf: f32) -> TracedLight {
+    let gdims = vec2<i32>(textureDimensions(restir_gi));
+    // The grid's step is whole and the grid rounds up, so the ratio of the two sizes falls a little short of it.
+    let grid_step = round(vec2<f32>(textureDimensions(vis_buffer)) / vec2<f32>(gdims));
+    let gp = pixel / grid_step - 0.5;
+    let g0 = vec2<i32>(floor(gp));
+    let f = gp - floor(gp);
+    var bounce = vec3<f32>(0.0);
+    var sky = vec4<f32>(0.0);
+    var frames = 0.0;
+    var wsum = 0.0;
+    for (var k = 0; k < 4; k = k + 1) {
+        let d = vec2<i32>(k & 1, k >> 1);
+        let at = clamp(g0 + d, vec2<i32>(0), gdims - 1);
+        let t = textureLoad(restir_gi, at, 0, 0);
+        if t.a <= 0.0 {
+            continue;
+        }
+        let wb = mix(1.0 - f.x, f.x, f32(d.x)) * mix(1.0 - f.y, f.y, f32(d.y));
+        let wd = exp(-abs(t.a - dist) / (dist * 0.025 + 0.05));
+        let w = (wb + 0.002) * (wd + 1.0e-4);
+        bounce += t.rgb * w;
+        sky += textureLoad(restir_gi, at, 1, 0) * w;
+        frames += textureLoad(restir_gi, at, 2, 0).r * w;
+        wsum += w;
+    }
+    if wsum <= 0.0 {
+        return untraced_light();
+    }
+    // The ratio of the averaged sums, not the average of ratios: a texel whose rays met a dim part of the sky
+    // weighs as little as they did. No sums at all is a black sky, and the share of nothing may as well be 1.
+    let share = select(1.0, saturate(sky.x / max(sky.y, 1.0e-6)), sky.y > 1.0e-6);
+    // The far side's sums are there only on a leaf; without them nothing comes through.
+    let far_side = select(0.0, sky.z / max(sky.w, 1.0e-6), sky.w > 1.0e-6);
+    return TracedLight(bounce / wsum, share, saturate(frames / wsum / GI_SETTLED_FRAMES), contact, leaf * far_side);
+}
+
+/// The terrain bake's sky visibility at this pixel (1 off terrain). `surface.occlusion` carries it for the sky light;
+/// a traced GI estimate already sees the canopy and the near ground, so it takes the bake back out rather than count
+/// the same crowns twice (Sunscar, 6 Nov 2026).
+var<private> baked_sky_vis: f32 = 1.0;
+/// How much of the sky the traced GI saw here against the unshadowed sky, past what the bake already says (1 when
+/// nothing was traced, or in the open). The sky's reflection takes it as the diffuse sky does: under a canopy the
+/// leaves and the litter stop mirroring a sky they cannot see (Sunscar, 6 Nov 2026).
+var<private> gi_sky_seen: f32 = 1.0;
+/// GTAO's visibility at this pixel, as it was folded into `surface.occlusion` (1 until it is). The traced sky light
+/// takes it out again and holds the sky to the lesser of its own share and this, not to their product: the rays
+/// that measured the share met the occluders GTAO sees, and counting them twice blackened creases and crowns.
+var<private> screen_occlusion: f32 = 1.0;
+
+/// The diffuse light a surface gathers that no light source sends it directly: the sky's, and what the scene
+/// bounces. `sky` is the environment's irradiance about the surface (the cube's roughest mip, the scene's intensity
+/// in it). The result is weighed by the surface's albedo, and by nothing else: its occlusion is in it.
+///
+/// Untraced, it is the sky under the surface's occlusion: the material's, GTAO's, the terrain's bake.
+///
+/// Traced, the sky comes by the share of it the rays found open (`TracedLight.sky`), which is smooth because it is
+/// a ratio averaged over neighbours and frames and exact where nothing is in the way, and the scene's bounce is
+/// added. Until 11 Nov 2026 the reservoir carried the sky as well, one noisy sample of a whole dome per texel, and
+/// under a cloud deck its blotches were the picture ("black splotches"). The bake comes back out (the rays saw the
+/// same crowns), GTAO bounds the sky's share instead of multiplying it, and only the material's own occlusion,
+/// which no ray sees, multiplies both.
+///
+/// A thin leaf adds what comes through it from its far side (`TracedLight.through`), measured against the sky
+/// overhead and not against the leaf's own normal: a leaf that hangs face down over the ground shows the sky above
+/// it, by as much as it lets through.
+fn gathered_light(surface: Surface, traced: TracedLight, sky: vec3<f32>) -> vec3<f32> {
+    let untraced = sky * surface.occlusion;
+    if traced.trust <= 0.0 {
+        return untraced;
+    }
+    let fine = surface.occlusion / (max(screen_occlusion, 0.004) * max(baked_sky_vis, 0.05));
+    gi_sky_seen = mix(1.0, saturate(traced.sky / max(baked_sky_vis, 0.05)), traced.trust);
+    var gathered = sky * min(traced.sky, traced.contact) + traced.bounce;
+    if traced.through > 0.0 {
+        gathered += textureSampleLevel(env_cube, env_sampler, vec3<f32>(0.0, 1.0, 0.0), ENV_MAX_MIP).rgb
+            * (light.ibl_intensity * traced.through);
+    }
+    return mix(untraced, gathered * fine, traced.trust);
+}
+
+fn evaluate_ibl_diffuse(surface: Surface, traced_diffuse: TracedLight) -> vec3<f32> {
     let n = surface.normal;
 
     // Diffuse: the roughest mip approximates a cosine-convolved irradiance
@@ -1519,12 +1686,9 @@ fn evaluate_ibl_diffuse(surface: Surface, traced_diffuse: vec4<f32>) -> vec3<f32
     let gather_n = normalize(mix(n, surface.bent_normal, 0.75));
     let irradiance = textureSampleLevel(env_cube, env_sampler, gather_n, ENV_MAX_MIP).rgb;
     let kd = (vec3<f32>(1.0) - surface.f0) * (1.0 - surface.metallic);
-    var diffuse = irradiance * light.ibl_intensity * surface.albedo * kd;
-    if traced_diffuse.a > 0.5 {
-        diffuse += traced_diffuse.rgb * surface.albedo * kd;
-    }
-
-    return diffuse * surface.occlusion;
+    // Traced, the sky comes by the share of it the rays found open: the floor of a wood gets the sky its canopy
+    // lets through, and the bounce off the scene with it.
+    return gathered_light(surface, traced_diffuse, irradiance * light.ibl_intensity) * surface.albedo * kd;
 }
 
 /// Bound a specular reflection against the sky it is reflecting.
@@ -1573,7 +1737,7 @@ fn evaluate_ibl_specular(surface: Surface) -> vec3<f32> {
     let specular = prefiltered * env_brdf_approx(surface.f0, surface.roughness, n_dot_v);
     let spec_ao  = specular_occlusion(n_dot_v, surface.occlusion, surface.roughness);
 
-    return specular * spec_ao;
+    return specular * spec_ao * gi_sky_seen;
 }
 
 /// Multiple-scattering IBL, Fdez-Agüera (JCGT 8(1), 2019).
@@ -1588,7 +1752,7 @@ fn evaluate_ibl_specular(surface: Surface) -> vec3<f32> {
 /// adding a term to it. The old split computed a diffuse lobe and a specular
 /// lobe independently and lost the energy that should have passed between
 /// them; you cannot recover that by adding something to the outside.
-fn evaluate_ibl_ms(surface: Surface, traced_diffuse: vec4<f32>) -> vec3<f32> {
+fn evaluate_ibl_ms(surface: Surface, traced_diffuse: TracedLight) -> vec3<f32> {
     let n = surface.normal;
     let v = surface.view_dir;
     let n_dot_v = max(dot(n, v), 1e-4);
@@ -1612,10 +1776,10 @@ fn evaluate_ibl_ms(surface: Surface, traced_diffuse: vec4<f32>) -> vec3<f32> {
     // sun or local lamps. Lowering outdoor sky fill must not extinguish a
     // hospital's practical-light bounce.
     let gather_n = normalize(mix(n, surface.bent_normal, 0.75));
-    var irradiance = textureSampleLevel(env_cube, env_sampler, gather_n, ENV_MAX_MIP).rgb * light.ibl_intensity;
-    if traced_diffuse.a > 0.5 {
-        irradiance += traced_diffuse.rgb;
-    }
+    // Under its occlusion already, and traced where it can be (`gathered_light`). It notes how much sky the traced
+    // GI saw, which the reflection below reads.
+    let irradiance = gathered_light(surface, traced_diffuse,
+        textureSampleLevel(env_cube, env_sampler, gather_n, ENV_MAX_MIP).rgb * light.ibl_intensity);
 
     let fss_ess = k_s * ab.x + ab.y;
     let ems = 1.0 - (ab.x + ab.y);
@@ -1625,18 +1789,19 @@ fn evaluate_ibl_ms(surface: Surface, traced_diffuse: vec4<f32>) -> vec3<f32> {
         * (1.0 - surface.metallic);
 
     let spec_ao = specular_occlusion(n_dot_v, surface.occlusion, surface.roughness);
-    return fss_ess * radiance * light.ibl_intensity * spec_ao
-        + (fms_ems + k_d) * irradiance * surface.occlusion;
+    return fss_ess * radiance * light.ibl_intensity * spec_ao * gi_sky_seen
+        + (fms_ems + k_d) * irradiance;
 }
 
-fn evaluate_ibl(surface: Surface, traced_diffuse: vec4<f32>) -> vec3<f32> {
+fn evaluate_ibl(surface: Surface, traced_diffuse: TracedLight) -> vec3<f32> {
     if brdf_multiscatter {
         return evaluate_ibl_ms(surface, traced_diffuse);
     }
     // Occlusion applies to indirect light only. The sun already has shadow
     // maps, and multiplying it by AO as well double-darkens lit surfaces.
-    return evaluate_ibl_diffuse(surface, traced_diffuse)
-        + evaluate_ibl_specular(surface) * light.ibl_intensity;
+    // Diffuse first: it notes how much sky the traced GI saw, which the specular then reads.
+    let diffuse = evaluate_ibl_diffuse(surface, traced_diffuse);
+    return diffuse + evaluate_ibl_specular(surface) * light.ibl_intensity;
 }
 
 // ─── Vertex shader ───────────────────────────────────────────────────────────
@@ -2068,6 +2233,10 @@ fn contact_shadow(
         // point and the light.
         let texel = vec2<i32>(uv * vec2<f32>(textureDimensions(scene_depth)));
         let scene_z = textureLoad(scene_depth, texel, 0);
+        // Sky (reversed-Z's cleared 0) is at infinity: nothing there to stand between this point and the light.
+        if scene_z <= 0.0 {
+            continue;
+        }
 
         // `CONTACT_THICKNESS` is metres. Comparing it to `ndc.z` made the
         // accepted slab grow dramatically with distance because perspective
@@ -2076,8 +2245,8 @@ fn contact_shadow(
         // shadows across the ground. Reconstruct the sampled surface and do
         // the thickness test in view-space metres instead.
         let scene_ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, scene_z, 1.0);
-        let scene_world_h = view.inv_view_proj * scene_ndc;
-        let scene_world = scene_world_h.xyz / scene_world_h.w;
+        let scene_world_h = view.inv_view_proj_rel * scene_ndc;
+        let scene_world = scene_world_h.xyz / scene_world_h.w + view.camera_pos;
         let ray_view_depth = -(view.view * vec4<f32>(sample_pos, 1.0)).z;
         let scene_view_depth = -(view.view * vec4<f32>(scene_world, 1.0)).z;
         let diff = ray_view_depth - scene_view_depth;
@@ -2179,6 +2348,7 @@ fn compute_depth_slice(view_depth: f32) -> u32 {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    atmosphere_aerosol = volumetric_range.b.z;
     let pixel_coords = vec2<i32>(in.clip_pos.xy);
     // Published for the terrain material's stochastic filtering, which needs a
     // screen-space dither index. See `terrain_screen_pixel`.
@@ -2212,9 +2382,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             return vec4<f32>(0.0, 0.0, 0.0, 1.0);
         }
         let ndc = (screen_uv * 2.0 - 1.0) * vec2<f32>(1.0, -1.0);
-        let near_plane = view.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-        let far_plane  = view.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
-        let ray_dir    = normalize(far_plane.xyz / far_plane.w - near_plane.xyz / near_plane.w);
+        // Camera-relative: the difference below is the same, without the absolute inverse's 2^-6 steps.
+        // Reversed-Z (Sunscar, 6 Nov 2026): depth 1 is the near plane and 0 infinity, where a perspective's point
+        // has w = 0 and its xyz is the ray's direction (undivided, an orthographic view's far plane less its near).
+        let near_plane = view.inv_view_proj_rel * vec4<f32>(ndc, 1.0, 1.0);
+        let far_plane  = view.inv_view_proj_rel * vec4<f32>(ndc, 0.0, 1.0);
+        let ray_dir    = normalize(far_plane.xyz - near_plane.xyz / near_plane.w * far_plane.w);
 
         // Phase 24C: sample the environment cubemap rather than evaluating a
         // second sky here. That cubemap is now generated by a real atmospheric
@@ -2230,13 +2403,79 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // orbital model in sun.rs, not the old `-sun_dir` full-moon hack.
         let moon_dir = normalize(light.moon_direction);
         let moon_strength = saturate(1.0 - sun_illuminance / 10.0);
-        let detail = sky_detail(ray_dir, sun_dir, sun_illuminance, moon_dir, moon_strength);
+        // Under a sky lit above the air (a running day clock) the stars are always there, dimmed only by the air toward
+        // the horizon: the day's sky outshines them, and they come out as the twilight fades, not at the sun's last ray.
+        // There the stars are also twelve times sky_detail's: its brightest were some forty times under a first-
+        // magnitude star's radiance in a pixel, and vanished on a planet-lit sky; the day's sky still hides them all.
+        let star_strength = select(moon_strength, star_extinction(ray_dir.y) * 12.0, light.sky_above_air > 0.5);
+        // The sun seen through the Lid's wreck (`sun_form.y`): in place of the whole disc, the form's disc cut by the
+        // wreck's lanes, with their dust beside it (`sky_sun.wgsl`). The disc keeps sky_detail's brightness in the colour
+        // the air left it; what lies beside it is in space, lit by the sun above the air and dimmed by the air along this
+        // ray, so it stays lit after the ground's sunset.
+        let wreck = light.sun_form.y > 0.5;
+        var detail = sky_detail(ray_dir, sun_dir, select(sun_illuminance, 0.0, wreck), moon_dir, moon_strength, star_strength);
+        // The debris ring orbits far nearer than the planet, so it lies in front of it; the stars and the sun behind.
+        var ring = vec3<f32>(0.0);
+        if wreck {
+            // The celestial pole: the clock's true north (turned by its north offset, `sun_form.z`), raised by the
+            // latitude.
+            let latitude = radians(light.sun_above.w);
+            let north = light.sun_form.z;
+            let pole = vec3<f32>(sin(north) * cos(latitude), sin(latitude), cos(north) * cos(latitude));
+            let beside = light.sun_above.rgb * view_extinction_rgb(ray_dir.y);
+            // In its last ten degrees the disc is kept at least twenty times the sky beside it (`low_sun_lift`), and at
+            // any height at least four times it: a wide span of shards (`sun_wreck_span_deg`) spreads the sun so thin
+            // that they would read grey on the blue (sunscar-weather, 27 Nov).
+            let low_sun = 1.0 - smoothstep(0.03, 0.17, sun_dir.y);
+            let floor_lum = max(20.0 * low_sun, 4.0) * dot(sky, vec3<f32>(0.2126, 0.7152, 0.0722));
+            detail += fragmented_sun(ray_dir, sun_dir, light.sun_angular_radius, light.color, beside, pole,
+                view.time, i32(light.sun_form.x), floor_lum, light.sun_form.w);
+            // The wreck's debris ring across the sky: lit by the sun from below the horizon at dusk, cut by the
+            // world's shadow by night, outshone by day.
+            ring = debris_ring(ray_dir, sun_dir, pole, beside, view.time);
+        }
         // The eye in the sky (somnium.SkyEye): drawn here, behind the cloud
         // composite, where fog does not reach.
         let eye = sky_eye(ray_dir, normalize(light.eye_direction), light.eye_tan_half_width, light.eye_color,
                           light.eye_intensity, light.eye_shape, view.time);
+        // The planet over the horizon (somnium.SkyPlanet): behind the air, which dims and reddens it and lays the
+        // day's blue in front of it; in front of the stars and the sun's disc, which it hides.
+        var planet = vec4<f32>(0.0);
+        if light.planet_direction.w > 0.0 {
+            planet = sky_planet(ray_dir, normalize(light.planet_direction.xyz), light.planet_direction.w, sun_dir,
+                                light.planet_sun.x, light.planet_light.w, light.planet_surface);
+            // An eye adapted to the night ground still sees the planet's face, as one sees the Moon's seas; a camera
+            // exposed for that ground would show a white disc some eleven stops over it. So as the sun goes down the
+            // disc is drawn up to 7.5 stops under its radiance (a fifth of it with the sun 3 degrees down, 1/180 from 8
+            // on). Its light on the world (`planet_light`) is not changed.
+            let night_eye = exp2(-7.5 * (1.0 - smoothstep(-0.139, 0.0, sun_dir.y)));
+            // By day it reads as a daytime moon does, its sunlit face some 40% over the sky round it. Its true radiance
+            // is a few per cent of the day sky's (the albedo the night's light needs: 1 lux after dusk), so by day the
+            // drawn face is lifted to that share of the sky here, its pattern, phase and terminator kept and its dark
+            // part still the sky's colour. As the sky darkens the lift falls to nothing and the true radiance is
+            // drawn. The light it casts is never changed.
+            let luma = vec3<f32>(0.2126, 0.7152, 0.0722);
+            let face = max(light.planet_light.w * light.planet_sun.x / 3.14159265
+                           * dot(view_extinction_rgb(ray_dir.y), luma), 1e-4);
+            let lift = max(0.5 * dot(sky, luma) / face, 1.0);
+            planet = vec4<f32>(planet.rgb * view_extinction_rgb(ray_dir.y) * lift * night_eye, planet.a);
+        }
 
-        return vec4<f32>((sky + detail) * (1.0 - eye.a) + eye.rgb, 1.0);
+        var background = (sky + detail * (1.0 - planet.a) + planet.rgb + ring) * (1.0 - eye.a) + eye.rgb;
+        // Valley fog (a fog with a flat top) lies between the eye and the sky as it lies between the eye and a ridge:
+        // from inside it the sky is gone, and comes back as the eye looks up through less of it. The sky's own march
+        // has the air in it and not this fog; without this the sky stood clear and blue over a wall of fog (w9
+        // stills, 11 Nov 2026). Only a fog with a top: one without is every scene before this, left as it was.
+        if volumetric_range.a.x > 0.0 && volumetric_range.b.x > volumetric_range.a.w {
+            let slices = f32(textureDimensions(volumetrics).z);
+            let far = textureSampleLevel(volumetrics, volumetric_sampler, vec3<f32>(screen_uv, 1.0 - 0.5 / slices), 0.0);
+            let lit = exp(far.rgb);
+            background = background * far.a + lit;
+            // And on past the volume's range to the fog's top, in the colour the volume found it.
+            let through = exp(-fog_depth_beyond(ray_dir, 1.0e6));
+            background = background * through + lit / max(1.0 - far.a, 0.05) * (1.0 - through);
+        }
+        return vec4<f32>(background, 1.0);
     }
 
     // ── PBR surface ─────────────────────────────────────────────────────────
@@ -2266,29 +2505,66 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    let i0 = indices[instance.index_offset + prim_id * 3u + 0u];
-    let i1 = indices[instance.index_offset + prim_id * 3u + 1u];
-    let i2 = indices[instance.index_offset + prim_id * 3u + 2u];
+    var i0 = 0u;
+    var i1 = 0u;
+    var i2 = 0u;
+    var v0: Vertex;
+    var v1: Vertex;
+    var v2: Vertex;
+    var p0: vec3<f32>;
+    var p1: vec3<f32>;
+    var p2: vec3<f32>;
+    // GPU grass (grass_pool.wgsl): the grass instance's triangle is a blade's, rebuilt as the grass draw built it,
+    // in world space with its wind; its colour and root shade are the blade's own.
+    let is_grass = grass_material(material);
+    var grass_tint = vec3<f32>(1.0);
+    var grass_root_ao = 0.0;
+    if is_grass {
+        let blade = grass_pool_tri(instance.vertex_offset, prim_id, material, view.wind_time.x);
+        v0 = blade.v[0];
+        v1 = blade.v[1];
+        v2 = blade.v[2];
+        p0 = vec3<f32>(v0.pos_x, v0.pos_y, v0.pos_z);
+        p1 = vec3<f32>(v1.pos_x, v1.pos_y, v1.pos_z);
+        p2 = vec3<f32>(v2.pos_x, v2.pos_y, v2.pos_z);
+        grass_tint = blade.colour;
+        grass_root_ao = blade.root_ao;
+    } else {
+        i0 = indices[instance.index_offset + prim_id * 3u + 0u];
+        i1 = indices[instance.index_offset + prim_id * 3u + 1u];
+        i2 = indices[instance.index_offset + prim_id * 3u + 2u];
 
-    let v0 = vertices[instance.vertex_offset + i0];
-    let v1 = vertices[instance.vertex_offset + i1];
-    let v2 = vertices[instance.vertex_offset + i2];
+        v0 = vertices[instance.vertex_offset + i0];
+        v1 = vertices[instance.vertex_offset + i1];
+        v2 = vertices[instance.vertex_offset + i2];
 
-    var p0 = (instance.model * vec4<f32>(v0.pos_x, v0.pos_y, v0.pos_z, 1.0)).xyz;
-    var p1 = (instance.model * vec4<f32>(v1.pos_x, v1.pos_y, v1.pos_z, 1.0)).xyz;
-    var p2 = (instance.model * vec4<f32>(v2.pos_x, v2.pos_y, v2.pos_z, 1.0)).xyz;
-    // The triangle the visibility pass rasterised, wind included (visibility.wgsl):
-    // reconstructing the rest pose would shade a leaf where it is not drawn.
-    if material.terrain_index < 0 {
-        let pivot = instance.model[3].xyz;
-        p0 += wind_offset(p0, pivot, material.wind_bend, material.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
-        p1 += wind_offset(p1, pivot, material.wind_bend, material.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
-        p2 += wind_offset(p2, pivot, material.wind_bend, material.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
+        // The terrain morph the visibility pass applied (terrain_morph.wgsl): the triangle as it was rasterised.
+        let m0 = terrain_morph(vec3<f32>(v0.pos_x, v0.pos_y, v0.pos_z), i0, instance.vertex_offset, instance._padding,
+                               instance.model, view.camera_pos);
+        let m1 = terrain_morph(vec3<f32>(v1.pos_x, v1.pos_y, v1.pos_z), i1, instance.vertex_offset, instance._padding,
+                               instance.model, view.camera_pos);
+        let m2 = terrain_morph(vec3<f32>(v2.pos_x, v2.pos_y, v2.pos_z), i2, instance.vertex_offset, instance._padding,
+                               instance.model, view.camera_pos);
+        p0 = (instance.model * vec4<f32>(m0, 1.0)).xyz;
+        p1 = (instance.model * vec4<f32>(m1, 1.0)).xyz;
+        p2 = (instance.model * vec4<f32>(m2, 1.0)).xyz;
+        // The triangle the visibility pass rasterised, wind included (visibility.wgsl):
+        // reconstructing the rest pose would shade a leaf where it is not drawn.
+        if material.terrain_index < 0 {
+            let pivot = instance.model[3].xyz;
+            p0 += wind_offset(p0, pivot, material.wind_bend, material.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
+            p1 += wind_offset(p1, pivot, material.wind_bend, material.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
+            p2 += wind_offset(p2, pivot, material.wind_bend, material.wind_flutter, view.wind_time.x, view.wind, view.camera_pos);
+        }
     }
 
-    let c0 = view.view_proj * vec4<f32>(p0, 1.0);
-    let c1 = view.view_proj * vec4<f32>(p1, 1.0);
-    let c2 = view.view_proj * vec4<f32>(p2, 1.0);
+    // Camera-relative, as the visibility pass rasterised them (depth_tie.wgsl `depth_tie_clip`): a world position
+    // kilometres from the origin keeps only millimetres in f32, and projecting it whole stepped the barycentrics,
+    // and with them everything they interpolate (Sunscar, 31 Oct 2026: blocky ground at the feet 15 km out).
+    let eye_clip = view.view_proj * vec4<f32>(view.camera_pos, 1.0);
+    let c0 = view.view_proj * vec4<f32>(p0 - view.camera_pos, 0.0) + eye_clip;
+    let c1 = view.view_proj * vec4<f32>(p1 - view.camera_pos, 0.0) + eye_clip;
+    let c2 = view.view_proj * vec4<f32>(p2 - view.camera_pos, 0.0) + eye_clip;
 
     let ndc0 = c0.xy / c0.w;
     let ndc1 = c1.xy / c1.w;
@@ -2316,7 +2592,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // (`VertexPaintComponent::baked_light`, slot word 16 bit 16): 0.5 is the texture as painted, 1 twice as bright.
     var baked = false;
     var baked_light = vec3<f32>(0.0);
-    if material.terrain_index < 0 {
+    // Grass has no paint, and its instance lies past the paint table.
+    if material.terrain_index < 0 && !is_grass {
         paint_slot = vertex_paint_slot(instance_id);
         if paint_slot != 0u {
             baked = ((vertex_paint[paint_slot + 16u] >> 16u) & 1u) != 0u;
@@ -2410,6 +2687,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     let hit_point = p0 * bary.x + p1 * bary.y + p2 * bary.z;
+    // The same point in the mesh's own space: a terrain's coordinates come from it (`terrain_xz`, below).
+    let local_hit = vec3<f32>(v0.pos_x, v0.pos_y, v0.pos_z) * bary.x
+        + vec3<f32>(v1.pos_x, v1.pos_y, v1.pos_z) * bary.y
+        + vec3<f32>(v2.pos_x, v2.pos_y, v2.pos_z) * bary.z;
 
     let dbg = select(0.0, light._pad2_z, enable_debug);
     // Source texels per world metre, independent of camera distance, render
@@ -2522,15 +2803,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     // Handedness, from the sign of the UV determinant.
     //
-    // A mirrored UV island has a negative determinant, and mirroring is
-    // routine on bark and other trunk-like meshes because it halves the
-    // texture needed for a symmetric surface. Without this sign the bitangent
-    // points the wrong way there, which inverts the normal map's green channel
-    // and tilts the shading normal away from the light. It shows as hard-edged
-    // patches that follow UV seams rather than anything in the geometry —
-    // dark navy where the wrongly-tilted normal picks up sky instead of sun.
+    // A mirrored UV island has the opposite determinant to its neighbours, and
+    // mirroring is routine on bark and other trunk-like meshes because it
+    // halves the texture needed for a symmetric surface. Without this sign the
+    // bitangent points the wrong way there, which inverts the normal map's
+    // green channel and tilts the shading normal away from the light. It shows
+    // as hard-edged patches that follow UV seams rather than anything in the
+    // geometry — dark navy where the wrongly-tilted normal picks up sky
+    // instead of sun.
+    //
+    // glTF's v runs down the image, so an unmirrored island on a front-facing
+    // (counter-clockwise) triangle has a NEGATIVE determinant, and the map's
+    // green (+Y, up the image) is -dP/dv = cross(N, T) there. Sunscar, 30 Oct
+    // 2026: this read `* handedness`, which inverted green on every island
+    // (a raking sun lit stones from below; the DirectX-green copy of the same
+    // scan looked right). The forward passes' screen-derivative frames
+    // (`transparent.wgsl`, `preview_studio.wgsl`) already agree with this one.
     let handedness = select(-1.0, 1.0, tbn_det >= 0.0);
-    let bitangent = cross(geo_normal, tangent) * handedness;
+    let bitangent = cross(geo_normal, tangent) * -handedness;
     let tbn       = mat3x3<f32>(tangent, bitangent, geo_normal);
 
     // Parallax occlusion: every map below is sampled at the displaced UV.
@@ -2556,6 +2846,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var surface: Surface;
     surface.albedo    = material.base_color.rgb;
     surface.normal    = geo_normal;
+    // A grass blade is lit partly as the ground under it is: its own normal lies near the horizontal, so under a
+    // high sky a sward of them read grey and dull beside the tufts and the photographs (fr_gg_1, 19 Nov). After the
+    // two-sided flip, tilted toward up: some near the eye, where each blade's own shape reads, most far off, where
+    // the sward is a surface (Ghost of Tsushima blends toward the clump's normal with distance).
+    if is_grass {
+        let tilt = mix(0.45, 0.85, smoothstep(5.0, 40.0, distance(hit_point, view.camera_pos)));
+        surface.normal = normalize(mix(geo_normal, vec3<f32>(0.0, 1.0, 0.0), tilt));
+    }
     // De-tiling needs the analytic gradients: implicit ones jump at every
     // region's offset and would pick the finest mip along the seams.
     let detiled = material.detile > 0.5 && analytic_grad;
@@ -2581,6 +2879,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
     surface.albedo *= interior_shade;
+    if is_grass {
+        // Dark at the root, bright at the tip: low in the sward a blade sits in the others' shadow for the sun as well
+        // as the sky (grass casts none), and its tip catches the light (the lead, 21:42: "one flat tone").
+        surface.albedo *= grass_tint * mix(0.6, 1.1, pow(saturate(uv.y), 0.6));
+    }
     // Foliage remembered alive (`VertexPaintPool::green`, header word 7): withered leaf colour is
     // pulled to a living green at the leaf's own brightness.
     if (material.flags & 2u) != 0u {
@@ -2609,6 +2912,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // minimum would discard whichever is more informative at any given pixel.
     let gtao = textureLoad(gtao_tex, pixel_coords, 0);
     surface.occlusion = surface.occlusion * gtao.a;
+    screen_occlusion = gtao.a;
 
     // GTAO works in view space; the gather happens in world space.
     let bent_view = gtao.rgb * 2.0 - 1.0;
@@ -2635,6 +2939,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         surface.occlusion *= material_occlusion;
         // Phase TSUSHIMA-F1: the *material-scale* half, kept separately.
         micro_occlusion = material_occlusion;
+    }
+    // A blade in a sward sits in the others' shade, darkest at the root (grass casts no shadow; this is its share).
+    if is_grass {
+        let blade_occlusion = mix(1.0 - grass_root_ao, 1.0, sqrt(saturate(uv.y)));
+        surface.occlusion *= blade_occlusion;
+        micro_occlusion = blade_occlusion;
     }
 
     var normal_variance = 0.0;
@@ -2675,6 +2985,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // The same fade that takes paint back takes the authored weathering back with it.
         apply_weathering(&surface, material.weathering * (1.0 - saturate(bitcast<f32>(vertex_paint[6]))),
             hit_point, geo_normal, local_height, micro_occlusion);
+    }
+    // Far ground; see `apply_far_ground`.
+    if (material.flags & 64u) != 0u {
+        apply_far_ground(&surface, hit_point, length(hit_point - view.camera_pos));
     }
 
     // ── Foliage: curved card normals (Phase 17E, re-gated in TSUSHIMA-J) ─────
@@ -2750,9 +3064,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Derivatives of world position, which the hex-tiled layer sampling
         // needs explicitly. Taken here rather than inside the material because
         // that is where the terrain UVs are derived from.
-        let world_ddx = dpdx(hit_point.xz);
-        let world_ddy = dpdy(hit_point.xz);
         let tm_idx = u32(material.terrain_index);
+        // Terrain coordinates from the vertices' own tile-local positions, turned and scaled by the model but not
+        // moved by it (its translation is the terrain's origin): a world position 13-17 km from the origin holds
+        // only 1-2 mm in f32, a texel or two of a ground layer, and subtracting the origin afterwards can't give
+        // those digits back (Sunscar, 31 Oct 2026: blocky texels at the feet on every layer).
+        let terrain_xz = (instance.model * vec4<f32>(local_hit, 0.0)).xz
+            + (instance.model[3].xz - terrain_materials[tm_idx].terrain_origin);
+        let world_ddx = dpdx(terrain_xz);
+        let world_ddy = dpdy(terrain_xz);
         var terrain: TerrainSurface;
         // `enable_live_terrain` is checked first and is a pipeline override, so
         // when the clipmap owns every queued terrain the live branch is
@@ -2768,7 +3088,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 terrain_materials[tm_idx], tm_idx, hit_point, geo_normal, uv, world_ddx, world_ddy);
         } else {
             terrain = evaluate_terrain_material(
-                tm_idx, hit_point, geo_normal, uv, world_ddx, world_ddy);
+                tm_idx, hit_point, terrain_xz, geo_normal, uv, world_ddx, world_ddy);
         }
         surface.albedo = terrain.albedo;
         surface.roughness = terrain.roughness;
@@ -2910,6 +3230,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         surface.albedo = surface.albedo * mix(vec3(1.0), vec3(0.88, 0.97, 0.78), sheltered);
 
         surface.occlusion = surface.occlusion * sky_vis;
+        baked_sky_vis = sky_vis;
         // The landscape-scale bent normal, **composed with** the contact-scale
         // one GTAO already wrote rather than replacing it. The two see
         // different occluders — GTAO sees the boulder a metre away and cannot
@@ -2999,6 +3320,28 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         apply_wetness(&surface, material.porosity);
     }
 
+    // Water standing on level ground, and rain's rings on it (standing_water.wgsl; Sunscar weather, 11 Nov 2026):
+    // terrain only, after its wetness. Off unless a game sets it.
+    if weather.w > 0.0 && material.terrain_index >= 0 {
+        surface = apply_standing_water(surface, hit_point, geo_normal, terrain_wetness_factor,
+                                       floor(weather.w) / 100.0, fract(weather.w), view.time);
+        if sw_pool > 0.5 {
+            // A pool mirrors the land beyond it as often as the sky, and the sky light knows only the sky: pools in
+            // front of a hillside shone like snow (w9 stills). One ray the way the pool looks: where land or a wall
+            // stands within a kilometre and a half, it mirrors that, about a quarter of the sky's light.
+            let toward = reflect(-surface.view_dir, vec3<f32>(0.0, 1.0, 0.0));
+            let open = practical_visibility(hit_point, vec3<f32>(0.0, 1.0, 0.0), hit_point + toward * 1500.0);
+            surface.occlusion = min(surface.occlusion, mix(0.28, 1.0, open));
+        }
+    }
+    // Snow lying on the finished surface (snow.wgsl; sunscar-photoreal, 6 Nov 2026): before specular antialiasing
+    // and f0, after terrain, decals and wetness. Off unless a scene has a SnowCover.
+    // Never on cut-out cards (leaves, needles, grass, billboards): a card's normal stands for a whole spray, so snow
+    // whitened each upward card edge to edge and a crown read as "solid pale quads" (the developer, 11 Nov,
+    // notes/dev_20261111/02_leaf_cards.png). Bark and branches keep it; leaves and grass tips stand out of a snowfall.
+    if snow_params.p0.x > 0.5 && material.alpha_cutoff <= 0.0 {
+        surface = apply_snow(surface, hit_point, geo_normal);
+    }
     // ── Geometric specular antialiasing (TSUSHIMA-E) ─────────────────────────
     //
     // Tokuyoshi & Kaplanyan, I3D 2019. The filter kernel comes from the
@@ -3055,7 +3398,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let traced = textureLoad(restir_vis, pixel_coords, 0);
     var shadow_factor: f32;
     if (cluster_params.shading_mode & 16u) != 0u {
-        shadow_factor = traced.r * terrain_parallax_shadow_factor;
+        // Hybrid (Sunscar, 6 Nov 2026): the traced sun covers opaque casters (TLAS mask 0x1); the cascades hold only
+        // what it does not: cut-out leaf and grass cards (alpha-tested in the shadow pass, so light dapples through
+        // them at a fraction of an alpha-tested ray's cost) and whatever is left out of the traced scene, as ground
+        // cover is (`rays_shade_opaque`, renderer.rs). Faded out over the last cascade's last 15%.
+        let raster = sample_shadow(hit_point, shadow_normal, view_depth, in.clip_pos.xy);
+        let reach = smoothstep(0.85, 1.0, view_depth / max(light.cascade_splits.w, 1.0));
+        shadow_factor = traced.r * mix(raster, 1.0, reach) * terrain_parallax_shadow_factor;
     } else {
         shadow_factor = sample_shadow(hit_point, shadow_normal, view_depth, in.clip_pos.xy)
             * terrain_parallax_shadow_factor;
@@ -3261,6 +3610,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // ── Shading ───────────────────────────────────────────────────────────────
     var result: vec3<f32>;
+    // The path tracer's mode (path_tracer.rs): this pass keeps the direct light and the glow, and the tracer adds the
+    // bounced light after it, traced from this pixel's surface (written at the end) in place of the ambient here.
+    let path_traced = (bitcast<u32>(lighting_extra.x) & 4u) != 0u;
 
     if (cluster_params.shading_mode & 1u) == 1u {
         // ── Cel-shading path ─────────────────────────────────────────────────
@@ -3334,7 +3686,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let sun_illuminance = dot(light.color, vec3<f32>(0.2126, 0.7152, 0.0722));
         let moon_strength = saturate(1.0 - sun_illuminance / 10.0);
 
-        if moon_strength > 0.0 && light.moon_intensity > 0.0 {
+        if light.planet_direction.w > 0.0 {
+            // The planet over the horizon takes the moon's slot: its own light through the air, in its own colour,
+            // by day as by night (outshone by day), and a disc degrees wide, not half of one.
+            moonlight = evaluate_brdf_area(surface, normalize(light.moon_direction), light.planet_direction.w)
+                * light.planet_light.rgb;
+            // By night the clouds' shadow on the land is cast toward the planet (`planet_sun.y`): a deck dims it.
+            if light.planet_sun.y > 0.5 {
+                moonlight *= cloud_shadow_at(hit_point);
+            }
+        } else if moon_strength > 0.0 && light.moon_intensity > 0.0 {
             let moon_dir = normalize(light.moon_direction);
             let moon_color = vec3<f32>(0.55, 0.72, 1.0) * light.moon_intensity * moon_strength;
 
@@ -3393,7 +3754,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             }
         }
 
-        let gi_texel = gi_upsample(in.clip_pos.xy, length(hit_point - view.camera_pos));
+        // A thin leaf takes the sky's share as traced: in a crown GTAO is dark with the very leaves the rays met, and
+        // held under it the crowns went black. A leaf here is any two-sided cut-out. The foliage flag will not do:
+        // it marks a sidecar mask, and a grown tree's leaves are cut out by their glTF's own alpha mode.
+        let thin_leaf = (material.flags & 1u) != 0u && material.alpha_cutoff > 0.0;
+        let gi_texel = gi_upsample(in.clip_pos.xy, length(hit_point - view.camera_pos),
+            select(screen_occlusion, 1.0, thin_leaf), select(0.0, material.transmission, thin_leaf));
         var ambient = evaluate_ibl(surface, gi_texel);
         if (material.flags & 8u) != 0u {
             ambient += eye_glint(surface, ambient);
@@ -3445,6 +3811,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             // ambient mix discarded diffuse illumination and treated raw hit
             // radiance as an already-evaluated BRDF, bleaching boats/terrain.
             ambient += (traced_spec - baseline_spec) * spec_w;
+        }
+        // Traced instead (`path_traced`): the light bounced off the scene's surfaces and their reflections come from the
+        // path tracer, added after this pass. The sky's light stays the raster's, its fill and its reflection, under
+        // GTAO and specular occlusion as here, and the eyes keep their glint (29 Oct): the game's rooms are lit by it,
+        // and a traced sky reaches a room only through its windows, which left the Town's houses fog and their metal
+        // and glossy things without the sky they reflect.
+        if path_traced {
+            ambient = evaluate_ibl(surface, untraced_light());
+            if (material.flags & 8u) != 0u {
+                ambient += eye_glint(surface, ambient);
+            }
         }
 
         // Local lights (clustered)
@@ -3585,34 +3962,89 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // The sky is not touched: it returned far above, and its radiance already
     // came from a full march through the same atmosphere. Applying this to it
     // as well would count the air twice.
-    // The path tracer's picture (pass/path_tracer.rs) in place of the raster's light, before the fog, so the fog
-    // still lies over it (17 Oct: composited after, it wiped the fog out of every traced frame).
-    if (bitcast<u32>(lighting_extra.x) & 4u) != 0u {
-        let traced = textureSampleLevel(lighting_aux, default_sampler, screen_uv, 0.0);
-        if traced.a > 0.01 {
-            result = traced.rgb;
-        }
-    }
-
-    if volumetric_range.x > 0.0 {
+    // The path tracer's bounced light is added after this pass, through the same transmittance (written below), so
+    // the fog lies over it as over this (17 Oct: a traced picture composited after the fog wiped the fog out).
+    var fog_transmittance = 1.0;
+    if volumetric_range.a.x > 0.0 {
         let dist = length(hit_point - view.camera_pos);
         let slices = f32(textureDimensions(volumetrics).z);
 
         // Each texel is the integral over its *whole* slice, so sampling at a
         // slice boundary needs the previous slice's centre — hence the half
         // slice offset (bevy's aerial_view_lut sampling does the same).
-        let w = saturate(dist / volumetric_range.x - 0.5 / slices);
+        let w = saturate(froxel_w(dist, volumetric_range.a.x) - 0.5 / slices);
         let sample = textureSampleLevel(
             volumetrics, volumetric_sampler, vec3<f32>(screen_uv, w), 0.0);
 
         // Anything nearer than the first slice centre clamps to that slice, so
         // without this fade the full first-slice scattering would be applied
         // right at the camera — fog appearing on the lens.
-        let fade = saturate(dist / (volumetric_range.x / slices));
+        let fade = saturate(dist / froxel_t(1.0 / slices, volumetric_range.a.x));
         let inscatter = exp(sample.rgb) * fade;
         let transmittance = mix(1.0, sample.a, fade);
 
         result = result * transmittance + inscatter;
+        fog_transmittance = transmittance;
+
+        // Aerial perspective past the volume's range. Its last slice held from there on, so a ridge 5 km out had
+        // the haze of one at the range, and the far view read as cut-outs (ENGINE_AUDIT E21, E52: real ridges grow
+        // paler and bluer layer by layer). The rest of the ray loses its light to the air (the atmosphere's own
+        // Rayleigh and Mie extinction at the eye's height) and to the height fog (its exponential, integrated
+        // exactly), and gains the sky's colour toward that horizon, the limit long air scatters toward.
+        let beyond = dist - volumetric_range.a.x;
+        if beyond > 0.0 {
+            let dir = (hit_point - view.camera_pos) / max(dist, 1e-3);
+            let h_km = max(view.camera_pos.y, 0.0) * 0.001;
+            let air = (RAYLEIGH_SCATTERING * exp(-h_km / RAYLEIGH_SCALE_H)
+                + vec3<f32>(MIE_EXTINCTION * atmosphere_aerosol * exp(-h_km / MIE_SCALE_H))) * 0.001;
+            let fog_depth = fog_depth_beyond(dir, beyond);
+            let depth = air * beyond + vec3<f32>(fog_depth);
+            let air_t = exp(-depth);
+            let horizon = normalize(vec3<f32>(dir.x, max(dir.y, 0.02), dir.z));
+            // With clouds, mip 1: the first mip the clouds' capture is laid over (mip 0 is the bare sky the
+            // background draws under them), so the far land fades to the horizon the deck leaves, not the clear
+            // sky's blue behind it (Sunscar, 6 Nov 2026).
+            let sky_mip = select(0.0, 1.0, cloud_shadow_params.w > 0.0);
+            var sky = textureSampleLevel(env_cube, env_sampler, horizon, sky_mip).rgb;
+            if volumetric_range.b.x > volumetric_range.a.w {
+                // Valley fog: what the far land fades into is the fog as the volume found it along this ray (its
+                // light over what it hid), by the fog's share of the depth; the air's share still goes to the sky.
+                let source = exp(sample.rgb) / max(1.0 - sample.a, 0.05);
+                sky = mix(sky, source, saturate(fog_depth / max(dot(depth, vec3<f32>(1.0 / 3.0)), 1e-6)));
+            }
+            result = result * air_t + sky * (vec3<f32>(1.0) - air_t);
+            fog_transmittance *= dot(air_t, vec3<f32>(0.2126, 0.7152, 0.0722));
+        }
+    }
+
+    // The surface lit here, for the path tracer (`path_traced`). A surface whose light is baked into it
+    // (`VertexPaint.baked_light`) is marked to receive nothing: its light is the bake, as above. Only in pipelines
+    // built with `path_surface` (all but the depth split's, below).
+    if path_surface {
+        if path_traced {
+            textureStore(path_surface_albedo, pixel_coords, vec4<f32>(surface.albedo, surface.metallic));
+            textureStore(path_surface_normal, pixel_coords, vec4<f32>(surface.normal, surface.roughness));
+            textureStore(path_surface_extra, pixel_coords,
+                vec4<f32>(select(micro_occlusion, -1.0, baked), fog_transmittance, 0.0, 0.0));
+        }
+    }
+
+    // 36: what the traced GI says, as numbers for a linear capture to read (`.somcap`), not a picture: red the sky's
+    // share, green how far the estimate is trusted, blue the bounce against the sky's own light. It has no menu
+    // entry; a proof run asks for it by number (editor script `view=36`).
+    if dbg > 35.5 && dbg < 36.5 {
+        let gi = gi_upsample(in.clip_pos.xy, length(hit_point - view.camera_pos), 1.0, 0.0);
+        let luma = vec3<f32>(0.2126, 0.7152, 0.0722);
+        let sky = dot(textureSampleLevel(env_cube, env_sampler, surface.normal, ENV_MAX_MIP).rgb, luma)
+            * light.ibl_intensity;
+        return vec4<f32>(gi.sky, gi.trust, dot(gi.bounce, luma) / max(sky, 1.0e-6), 1.0);
+    }
+    // 37: the leaf's side of it, the same way. Red what the material lets through, green 1 on a thin leaf (two-sided
+    // and cut out), blue the open sky its far side receives (0 to 1, before the material's share).
+    if dbg > 36.5 && dbg < 37.5 {
+        let leaf = (material.flags & 1u) != 0u && material.alpha_cutoff > 0.0;
+        let gi = gi_upsample(in.clip_pos.xy, length(hit_point - view.camera_pos), 1.0, 1.0);
+        return vec4<f32>(material.transmission, select(0.0, 1.0, leaf), gi.through, 1.0);
     }
 
     // Phase 24AB: lighting debug views (24–31). 0–23 remain the existing
@@ -3624,8 +4056,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             return vec4<f32>(t, 0.2 * (1.0 - t), 1.0 - t, 1.0) * 4.0;
         }
         if dbg < 25.5 {
-            let gi = gi_upsample(in.clip_pos.xy, length(hit_point - view.camera_pos));
-            return vec4<f32>(gi.rgb * 4.0, 1.0);
+            let gi = gi_upsample(in.clip_pos.xy, length(hit_point - view.camera_pos), 1.0, 0.0);
+            return vec4<f32>(gi.bounce * 4.0, 1.0);
         }
         if dbg < 26.5 {
             let tile = vec2<u32>(in.clip_pos.xy) / vec2(cluster_params.tile_size);

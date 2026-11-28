@@ -52,7 +52,8 @@ fn close_open_surface_does_not_occlude_itself_at_screen_boundaries() {
         dimension: Some(wgpu::TextureViewDimension::D2Array),
         ..Default::default()
     });
-    let proj = glam::Mat4::perspective_rh(60.0_f32.to_radians(), 1.0, 0.1, 100.0);
+    // Reversed-Z, as the scene draws (renderer.rs `set_view`).
+    let proj = somnium_renderer::view::reversed_z(glam::Mat4::perspective_rh(60.0_f32.to_radians(), 1.0, 0.1, 100.0));
     let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("Close AO fixture"),
         contents: bytemuck::bytes_of(&Params {
@@ -114,7 +115,9 @@ fn close_open_surface_does_not_occlude_itself_at_screen_boundaries() {
         ],
     });
     // Device depth is affine across a projected plane. A sloped fixture catches
-    // view-dependent bending that a front-facing plane alone would miss.
+    // view-dependent bending that a front-facing plane alone would miss. Depth is
+    // reversed, so nearer is larger: the occluder adds, and the slope is taken
+    // off, to keep the planes they were with forward depth.
     let depth_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("Sloped plane depth fixture"),
         source: wgpu::ShaderSource::Wgsl(
@@ -125,8 +128,8 @@ fn close_open_surface_does_not_occlude_itself_at_screen_boundaries() {
                 return vec4(p[i],0.,1.);
             }
             @fragment fn fs(@builtin(position) p: vec4<f32>) -> @builtin(frag_depth) f32 {
-                if plane.w > 0. && p.x < 12. && p.y > 16. { return plane.x - .03; }
-                return plane.x + dot(p.xy / 32. - .5, plane.yz);
+                if plane.w > 0. && p.x < 12. && p.y > 16. { return plane.x + .03; }
+                return plane.x - dot(p.xy / 32. - .5, plane.yz);
             }
         "#
             .into(),

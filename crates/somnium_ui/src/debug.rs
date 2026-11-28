@@ -385,6 +385,12 @@ pub const TOGGLES: &[Toggle] = &[
         help: "Include terrain in the ray-tracing acceleration structure.",
     },
     Toggle {
+        id: "gpu_grass",
+        label: "GPU Grass",
+        env: "SOMNIUM_GPU_GRASS",
+        help: "Grass blades grown on the GPU over the painted ground; off draws the painted grass copies in their place.",
+    },
+    Toggle {
         id: "pixel_census",
         label: "Pixel Census",
         env: "SOMNIUM_CENSUS",
@@ -541,6 +547,7 @@ fn default_for(id: &str) -> bool {
             | "rt_terrain"
             | "shading_bins"
             | "dreams_grain"
+            | "gpu_grass"
     )
 }
 
@@ -584,7 +591,8 @@ fn interpret(id: &str, raw: &str) -> bool {
         | "terrain_detail_fade"
         | "rt_terrain"
         | "dreams_grain"
-        | "dreams_stf" => raw != "0",
+        | "dreams_stf"
+        | "gpu_grass" => raw != "0",
         _ => set,
     }
 }
@@ -840,6 +848,22 @@ pub(crate) mod tests {
         let toggles =
             DebugToggles::seed(|name| (name == "SOMNIUM_CASCADE_CULL").then(|| "0".to_string()));
         assert!(!toggles.is_on("cascade_cull"));
+    }
+
+    /// The GPU grass was reachable only as `SOMNIUM_GPU_GRASS=0` in a shell. It is a View > Pipeline row now: on
+    /// unless the variable says 0, and the menu can turn it off and on again.
+    #[test]
+    fn the_gpu_grass_is_a_pipeline_switch_on_by_default() {
+        let mut toggles = DebugToggles::seed(|_| None);
+        assert!(toggles.is_on("gpu_grass"));
+        assert_eq!(toggles.set("gpu_grass", false), Ok(()));
+        assert!(!toggles.is_on("gpu_grass"));
+        assert_eq!(toggles.set("gpu_grass", true), Ok(()));
+        assert!(toggles.is_on("gpu_grass"));
+        let off = DebugToggles::seed(|name| (name == "SOMNIUM_GPU_GRASS").then(|| "0".to_string()));
+        assert!(!off.is_on("gpu_grass"));
+        assert_eq!(off.override_of("gpu_grass"), Some("SOMNIUM_GPU_GRASS"));
+        assert!(on_by_default_for_env("SOMNIUM_GPU_GRASS"));
     }
 
     /// Craft defect C8 again, in the renderer: an overridden toggle says which

@@ -57,12 +57,14 @@ pub mod blockout;
 pub mod character;
 pub mod clipboard;
 pub mod config;
+mod crash_report;
 pub mod context;
 pub mod cpu_watchdog;
 /// Phase CONTROL-O: deferred decals.
 pub mod decal;
 pub mod editor_commands;
 mod editor_gizmo;
+pub mod editor_ground;
 pub mod error;
 pub mod event;
 mod foliage_batches;
@@ -89,7 +91,12 @@ pub mod prefab;
 pub mod reflect_registry;
 pub mod save_game;
 pub mod scatter_scene;
+pub mod fire;
+pub mod level_portal;
+mod model_faults;
 mod scene_delta;
+pub mod scene_edits;
+pub mod scene_places;
 pub mod spline;
 pub mod story_actor;
 pub mod story_authoring;
@@ -1114,6 +1121,18 @@ pub fn normalized_from_camera_speed(speed: f32) -> f32 {
     (s / MIN_CAMERA_SPEED).ln() / (MAX_CAMERA_SPEED / MIN_CAMERA_SPEED).ln()
 }
 
+/// The editor camera's vertical field of view in degrees, as the shell projects it; framing maths reads it from here.
+pub const EDITOR_CAMERA_FOV_Y_DEGREES: f32 = 45.0;
+
+/// How far from the middle of a subject the camera stands so that the sphere of `radius` round it fills about two
+/// thirds of the view height at the vertical field of view `fov_y` (radians), and never closer than half a metre
+/// outside the sphere.
+#[must_use]
+pub fn camera_focus_distance(radius: f32, fov_y: f32) -> f32 {
+    let half_height = (fov_y * 0.5).tan().max(1e-3);
+    (radius / (half_height * (2.0 / 3.0))).max(radius + 0.5)
+}
+
 // ─── Phase 15A1: Post-processing volume ─────────────────────────────────────
 
 /// Scene-wide post-processing settings, exposed as a selectable entity.
@@ -1154,6 +1173,24 @@ pub struct PostProcessComponent {
     pub auto_exposure: bool,
     /// Stops added on top of the metered or manual value. Negative darkens.
     pub exposure_compensation: f32,
+    /// The darkest and brightest EV100 the eye adapts to (defaults -8 and 18). A narrow range keeps a night
+    /// dark and a noon from blowing out: the meter stops there and the picture holds what it got.
+    pub exposure_min_ev: f32,
+    /// The brightest EV100 the eye adapts to (see `exposure_min_ev`).
+    pub exposure_max_ev: f32,
+    /// How fast the eye adapts, per second (defaults 3 into brightness, 1 into the dark): a slow dark
+    /// adaptation is what makes a cave mouth swallow the player for a moment.
+    pub adapt_to_bright: f32,
+    /// How fast the eye adapts into the dark, per second (see `adapt_to_bright`).
+    pub adapt_to_dark: f32,
+    /// A `.cube` 3-D LUT, project-relative, applied after the grade below (empty: none). Made in a grading tool
+    /// on a neutral frame from this engine, it carries a whole look in one file.
+    pub grade_lut: String,
+    /// How much of `grade_lut` to take, 0..1 (default 1).
+    pub grade_lut_strength: f32,
+    /// Colour as the eye sees it in dim light, 0..1 (default 0, off): under about 4 cd/m2 chroma fades and the
+    /// picture goes toward the rods' blue-grey, reds first (Hunt and Purkinje). For nights played by eye.
+    pub low_light_vision: f32,
     /// Which tone-mapping curve maps HDR luminance to display (Phase 24B).
     pub tonemapper: Tonemapper,
     /// Colour grading, applied after tone mapping (Phase 24Y).
@@ -1203,6 +1240,9 @@ pub struct PostProcessComponent {
     pub bloom_enabled: bool,
     /// Strength of the bloom contribution; zero disables its visible effect.
     pub bloom_intensity: f32,
+    /// Stops above the adapted middle grey where light starts to bloom, soft over the stop below (default 0: all
+    /// light blooms, as a lens does). Keeps bright gaps in a canopy from blooming a wood into milk.
+    pub bloom_threshold: f32,
     /// Screen-space occlusion (Phase 24I).
     pub gtao_enabled: bool,
     /// Depth of field (Phase 24Z). Focus distance is in metres.
@@ -1368,6 +1408,23 @@ pub struct PostProcessComponent {
     /// 0 (default) lights fog with the whole sky everywhere; toward 1, fog
     /// under roofs and dense canopy loses its skylit glow.
     pub fog_sky_occlusion: f32,
+    /// How far the fog volume reaches, in metres (default 1200). Its 32
+    /// slices are spread evenly over this, so thick fog that hides everything
+    /// past ~100 m reads finer up close with a short range (~150 m puts a
+    /// slice every 5 m instead of every 37). Past the range the last slice
+    /// holds, so it should reach about as far as the fog lets anyone see.
+    pub fog_range: f32,
+    /// Scale on the sky light the fog scatters (default 1), apart from the
+    /// sun's and the lamps'. Under 1, a moon can light the ground while the fog
+    /// away from the lights stays blue-black.
+    pub fog_skylight: f32,
+    /// World height the fog's falloff starts from (default 0, sea level).
+    pub fog_base_height: f32,
+    /// World height where the fog stops, softly over `fog_top_softness` metres: a valley fills to a flat top and the
+    /// ridges stand clear. At or under `fog_base_height` there is no top (the default).
+    pub fog_top_height: f32,
+    /// Metres over which the fog's top fades (default 8).
+    pub fog_top_softness: f32,
     /// How far every vertex-painted layer and every material's authored
     /// weathering is taken back toward the bare material, 0..=1. 0 (default)
     /// is as authored. A whole level shown as it was before it decayed.
@@ -1404,6 +1461,71 @@ pub struct PostProcessComponent {
     /// Light ramp, 0 off ..= 1 full: the sun's light on a surface follows a soft painterly ramp (lit faces come up
     /// flat, the terminator is a narrow soft band) while GI, reflections and shadows stay physical. 0 skips it.
     pub light_ramp: f32,
+    // ── The photographic camera (sunscar-photoreal, 6 Nov 2026) ───────────────────────────────────────────────
+    // Fields after this line belong to the photoreal block; append other new fields above it.
+    /// The photographic camera, off by default (the picture exactly as before). On: the grade works on the scene's
+    /// own light before the tone curve (white balance, temperature and tint, gain, saturation and contrast, which
+    /// can no longer crush the darks), the bloom becomes the lens's glare (a share of the light spread into a wide
+    /// halo, energy kept, no threshold), the vignette is the lens's own cos^4 fall-off, chromatic aberration splits
+    /// along the spectrum, and `sensor_noise` grains the picture as a sensor does at that exposure. Lift, gamma, the
+    /// response curve and the LUT stay on the display picture.
+    pub photographic: bool,
+    /// How much of the meter's swing the eye follows, 0..1 (default 1: all of it, as before). Below 1, exposure
+    /// pivots on `exposure_anchor_ev`: at 0.7 a wood metered 3 stops darker than open land is shown 0.9 stops
+    /// darker, as a photograph shows it. `exposure_min_ev` / `exposure_max_ev` still bound the result.
+    pub exposure_adaptation: f32,
+    /// The EV100 that partial adaptation pivots on (default 12, open land under broken cloud).
+    pub exposure_anchor_ev: f32,
+    /// Lens glare with `photographic`: the share of the light the lens spreads into its wide halo, 0..0.2 (default
+    /// 0.03, a good lens). Replaces `bloom_intensity` and `bloom_threshold` there; `bloom_enabled` still gates it.
+    pub lens_glare: f32,
+    /// Sensor noise with `photographic`, 0 off ..= 1 a real camera's (default 0): photon and read noise on the
+    /// exposed light, so a bright day is clean and a dim wood or a night grows grain, as a camera raising its ISO.
+    pub sensor_noise: f32,
+    /// Camera white balance in kelvin with `photographic` (default 0: the light as rendered, which is balanced for
+    /// D65 daylight). The white the camera is set for: below 6500 the picture goes cooler, above it warmer.
+    pub white_balance: f32,
+    /// How much an open-sky pixel counts in the exposure meter, 0..1 (default 1: as any other). At 0.25 the eye
+    /// exposes for the land and lets the sky run bright, as a photographer does; a view that is mostly sky still
+    /// meters on it.
+    pub exposure_sky_weight: f32,
+    /// The share of the meter's swing the eye follows when the view is brighter than `exposure_anchor_ev`, 0..1
+    /// (default 1). A reflected-light meter turns sunlit sand and snow grey; at 0.5 sand (meter about EV 16.6) and
+    /// snow (17.7) expose near 14.3-14.9 about an anchor of 12, so sand reads pale and snow near white.
+    pub exposure_adaptation_bright: f32,
+    /// Heat shimmer over hot ground, 0 off (default) ..= 1 a desert noon: far ground seen along grazing rays wobbles
+    /// at a few hertz, up to about 3 px. Set it where and when the ground is hot.
+    pub heat_shimmer: f32,
+    /// The inferior mirage, 0 off (default) ..= 1 full: below a vanishing line `mirage_dip_deg` under the horizon, far
+    /// hot ground shows the sky and the land above the horizon mirrored, shimmering, as a lake would.
+    pub mirage: f32,
+    /// How far under the horizon the mirage's vanishing line lies, degrees (default 0.3: hot ground ~300 m ahead of an
+    /// eye 1.7 m up). Steeper heat gradients bring it closer.
+    pub mirage_dip_deg: f32,
+    /// Snow lying on surfaces (snow.wgsl), off by default: on every up-facing surface above `snowline_m` (terrain,
+    /// rock, ruins, roofs, branches, the far ranges), only where the slope holds it, lower on faces turned from the
+    /// sun, scoured where the wind strikes, breaking crisply against rock. Set per region by the looks.
+    pub snow: bool,
+    /// Height where snow starts, metres (ragged by about ±40 m). Default 600.
+    pub snowline_m: f32,
+    /// Height where it covers everything that can hold it, metres. Default 800.
+    pub snow_full_m: f32,
+    /// Steepest slope that holds snow, degrees. Default 40.
+    pub snow_max_slope_deg: f32,
+    /// How much lower snow lies on faces turned from the sun, 0..1: up to 150 m at 1. Default 0.5.
+    pub snow_shade_bias: f32,
+    /// 0 fresh, 1 old, grey and dirty. Default 0.3.
+    pub snow_age: f32,
+    /// The bearing the wind blows toward, degrees (0 toward +Z, 90 toward +X), for scouring. Default 0.
+    pub snow_wind_deg: f32,
+    /// How hard the wind scours faces turned into it, 0..1. Default 0.3.
+    pub snow_scour: f32,
+    /// Steepest face that keeps any snow, degrees: between `snow_max_slope_deg` and this it keeps to gullies and
+    /// ledges, fewer the steeper. Default 65.
+    pub snow_bare_slope_deg: f32,
+    /// A local snowline map, project-relative (`SNOWLN01`, see `somnium_renderer::snow_map`): where it covers, its
+    /// snowline replaces `snowline_m` and already carries the sun's shade. Empty for none.
+    pub snow_map: String,
 }
 
 impl Default for PostProcessComponent {
@@ -1441,6 +1563,13 @@ impl Default for PostProcessComponent {
             use_physical_camera: false,
             auto_exposure: true,
             exposure_compensation: 0.0,
+            exposure_min_ev: -8.0,
+            exposure_max_ev: 18.0,
+            adapt_to_bright: 3.0,
+            adapt_to_dark: 1.0,
+            grade_lut: String::new(),
+            grade_lut_strength: 1.0,
+            low_light_vision: 0.0,
             tonemapper: Tonemapper::AgX,
             cel_shading: false,
             temperature: 0.0,
@@ -1463,6 +1592,7 @@ impl Default for PostProcessComponent {
             // runtime source of truth after startup.
             bloom_enabled: std::env::var("SOMNIUM_BLOOM").as_deref() != Ok("0"),
             bloom_intensity: 0.04,
+            bloom_threshold: 0.0,
             // `SOMNIUM_GTAO=0` switches screen-space occlusion off for the
             // Phase 25A acceptance test — the same scene either side of the
             // flag has to differ *on terrain*, and before 25A-2 it could not.
@@ -1545,6 +1675,11 @@ impl Default for PostProcessComponent {
             analytic_grad: std::env::var("SOMNIUM_ANALYTIC_GRAD").as_deref() != Ok("0"),
             shaft_intensity: 1.5,
             fog_sky_occlusion: 0.0,
+            fog_range: 1200.0,
+            fog_skylight: 1.0,
+            fog_base_height: 0.0,
+            fog_top_height: 0.0,
+            fog_top_softness: 8.0,
             paint_fade: 0.0,
             foliage_green: 0.0,
             aa,
@@ -1563,6 +1698,27 @@ impl Default for PostProcessComponent {
             painterly: 0.0,
             ink_lines: 0.0,
             light_ramp: 0.0,
+            photographic: false,
+            exposure_adaptation: 1.0,
+            exposure_anchor_ev: 12.0,
+            lens_glare: 0.03,
+            sensor_noise: 0.0,
+            white_balance: 0.0,
+            exposure_sky_weight: 1.0,
+            exposure_adaptation_bright: 1.0,
+            heat_shimmer: 0.0,
+            mirage: 0.0,
+            mirage_dip_deg: 0.3,
+            snow: false,
+            snowline_m: 600.0,
+            snow_full_m: 800.0,
+            snow_max_slope_deg: 40.0,
+            snow_shade_bias: 0.5,
+            snow_age: 0.3,
+            snow_wind_deg: 0.0,
+            snow_scour: 0.3,
+            snow_bare_slope_deg: 65.0,
+            snow_map: String::new(),
         }
     }
 }
@@ -1735,6 +1891,12 @@ pub enum Tonemapper {
     Aces,
     /// Plain Reinhard. Mostly useful as a reference point when comparing.
     Reinhard,
+    /// A camera's tone response in AgX's working space (sunscar-photoreal, 6 Nov 2026): fitted to a digital
+    /// camera's JPEG curve from 7 stops under middle grey to 2 over, within a tenth of a stop, so the darks keep
+    /// their detail as a photograph's do; AgX's hue handling, so bright colour fades toward white without
+    /// skewing; a shoulder half a stop softer than a camera's, so cloud keeps its form. `contrast` scales its
+    /// slope with `photographic` on.
+    Photographic,
 }
 
 impl Tonemapper {
@@ -1745,6 +1907,7 @@ impl Tonemapper {
             Self::AgX => 0,
             Self::Aces => 1,
             Self::Reinhard => 2,
+            Self::Photographic => 3,
         }
     }
 
@@ -1754,7 +1917,8 @@ impl Tonemapper {
         match self {
             Self::AgX => Self::Aces,
             Self::Aces => Self::Reinhard,
-            Self::Reinhard => Self::AgX,
+            Self::Reinhard => Self::Photographic,
+            Self::Photographic => Self::AgX,
         }
     }
 
@@ -1765,6 +1929,7 @@ impl Tonemapper {
             Self::AgX => "AgX",
             Self::Aces => "ACES",
             Self::Reinhard => "Reinhard",
+            Self::Photographic => "Photographic",
         }
     }
 }
@@ -2610,6 +2775,10 @@ pub struct WaterComponent {
     pub underwater_enabled: bool,
     /// Half-width of a channel body, metres. Ignored by every other kind.
     pub half_width: f32,
+    /// How turbid the body is, 0..1. At 0 its own light is one scattering by the phase function, as clear water's
+    /// is. At 1 it is the diffuse reflectance of `absorption` and `scattering`, lit by sun and sky as a matte
+    /// surface is: glacial flour, brine, travertine and iron-red water, which are as bright in sun as the land.
+    pub turbidity: f32,
 }
 
 impl Default for WaterComponent {
@@ -2655,6 +2824,7 @@ impl Default for WaterComponent {
             // a sane default for the one kind that reads it and inert
             // for the other three.
             half_width: 3.0,
+            turbidity: 0.0,
         }
     }
 }
@@ -2939,6 +3109,19 @@ mod camera_speed_tests {
             assert!(s > prev, "not monotonic at {i}");
             prev = s;
         }
+    }
+
+    #[test]
+    fn a_big_box_is_framed_far_and_a_small_one_close_but_never_inside() {
+        let fov = EDITOR_CAMERA_FOV_Y_DEGREES.to_radians();
+        // A 20 m box: half its diagonal is about 17.3 m; a third of the view height left over around it.
+        let big = camera_focus_distance(17.32, fov);
+        assert!((55.0..70.0).contains(&big), "20 m box framed from {big}");
+        // A 0.3 m box: close, but clear of the surface by at least half a metre.
+        let small = camera_focus_distance(0.26, fov);
+        assert!(small >= 0.26 + 0.5 && small < 1.5, "0.3 m box framed from {small}");
+        // Bigger things are never framed nearer than smaller ones.
+        assert!(big > small);
     }
 }
 

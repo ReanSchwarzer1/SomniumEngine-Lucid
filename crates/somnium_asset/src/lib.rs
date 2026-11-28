@@ -5,6 +5,8 @@
 //! without ever seeing `gltf::` crate types directly.
 
 pub mod animated;
+mod atomic_write;
+pub use atomic_write::write_atomic;
 pub mod cook;
 pub mod database;
 /// MORROWIND-M item 3: what references what, across a whole project.
@@ -71,6 +73,21 @@ fn material_extra(mat: &gltf::Material<'_>, key: &str) -> f32 {
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw.get()).ok())
         .and_then(|v| v.get(key).and_then(serde_json::Value::as_f64))
         .map_or(0.0, |w| (w as f32).clamp(0.0, 1.0))
+}
+
+/// `SOMNIUM_LEAF_TRANSMISSION=broad,needle`: the share of light a glTF's own cut-out leaves let through when the
+/// material does not say (two numbers in 0..1; one number serves both). Unset or 0, nothing is inferred and such
+/// leaves stay opaque to light, as they were: a game opts in.
+fn leaf_transmission() -> Option<[f32; 2]> {
+    static RULE: std::sync::OnceLock<Option<[f32; 2]>> = std::sync::OnceLock::new();
+    *RULE.get_or_init(|| parse_leaf_transmission(&std::env::var("SOMNIUM_LEAF_TRANSMISSION").unwrap_or_default()))
+}
+
+fn parse_leaf_transmission(rule: &str) -> Option<[f32; 2]> {
+    let mut shares = rule.split(',').map(|share| share.trim().parse::<f32>().ok().map(|s| s.clamp(0.0, 1.0)));
+    let broad = shares.next()??;
+    let needle = shares.next().flatten().unwrap_or(broad);
+    (broad > 0.0 || needle > 0.0).then_some([broad, needle])
 }
 
 /// glTF material extras `somnium_interior_depth`: metres of room behind a
@@ -151,6 +168,14 @@ pub struct LoadedMaterial {
     /// `somnium_hair`): the shading pass adds the highlight that runs across
     /// strands, which a card's own flat normal cannot give.
     pub hair: bool,
+    /// Cut out against a moving noise threshold where its texture is minified (extras `somnium_hashed_alpha`):
+    /// bare twigs a texel wide break into flecks at a fixed 0.5 cut-off, and a hashed test turns them into the
+    /// soft, see-through haze a bare crown is from afar (TAA averages it).
+    pub hashed_alpha: bool,
+    /// Far ground (glTF material extras `somnium_far_ground`): a backdrop or far stand-in whose colour texels are tens
+    /// of metres wide. The shading pass adds world-space relief and colour at the scales its pixels can show, so a
+    /// slope 2-6 km out reads as ground, not a smooth wash (Sunscar, 7 Nov 2026).
+    pub far_ground: bool,
     /// This material is painted on **flat cut-out cards whose `uv.x` runs
     /// across the blade**, which is what `shading.wgsl`'s curved-card normal
     /// needs to be true.
@@ -248,6 +273,116 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<LoadedScene, String> {
     load_gltf_for(path, None)
 }
 
+// ─── Validation before upload ───────────────────────────────────────────────
+//
+// A model the importer refuses is skipped: one log line names the file and the reason, the engine's editor shows it
+// in a toast ([`take_refused`]), and nothing of it reaches the GPU. Sunscar, 6 Nov 2026: 84 paving models whose .gltf
+// and .bin came from two different writes lost the GPU device twice as they streamed in.
+
+thread_local! {
+    /// Set while this thread runs the importer under its panic guard.
+    static GUARDED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether this thread is inside a guarded model load: a panic here is caught, and the model skipped (a crash hook
+/// shows no "stopped" box for it).
+#[must_use]
+pub fn in_guarded_load() -> bool {
+    GUARDED.with(std::cell::Cell::get)
+}
+
+/// Models refused this run: every file seen once, and the ones not yet taken by [`take_refused`].
+static REFUSED: std::sync::LazyLock<std::sync::Mutex<(HashSet<std::path::PathBuf>, Vec<(std::path::PathBuf, String)>)>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The models refused since the last call, each file once a run, with why: what the editor's toast says.
+#[must_use]
+pub fn take_refused() -> Vec<(std::path::PathBuf, String)> {
+    std::mem::take(&mut REFUSED.lock().unwrap_or_else(std::sync::PoisonError::into_inner).1)
+}
+
+/// Whether `path` was refused this run, and how many of its refusals wait for [`take_refused`] (tests look without
+/// taking, so two tests never take each other's).
+#[cfg(test)]
+fn refused_state(path: &Path) -> (bool, usize) {
+    let refused = REFUSED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    (refused.0.contains(path), refused.1.iter().filter(|(p, _)| p == path).count())
+}
+
+/// One log line for a refused model, the first time this run, and a place in the editor's toast.
+fn refuse(path: &Path, reason: &str) {
+    let mut refused = REFUSED.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if refused.0.insert(path.to_path_buf()) {
+        warn!(file = %path.display(), "Skipped a broken model; nothing of it reaches the GPU: {reason}");
+        refused.1.push((path.to_path_buf(), reason.to_owned()));
+    }
+}
+
+/// Each buffer's file against the length the glTF declares, before it is read: a `.bin` from another write than its
+/// `.gltf` is refused (a buffer may be padded to four bytes, no more). A file that cannot be read is left to the
+/// importer, which names it.
+fn check_buffer_files(document: &gltf::Document, base_dir: &Path, blob: Option<&[u8]>) -> Result<(), String> {
+    for buffer in document.buffers() {
+        let declared = buffer.length();
+        let (actual, what) = match buffer.source() {
+            gltf::buffer::Source::Bin => (blob.map_or(0, <[u8]>::len), "binary chunk".to_owned()),
+            gltf::buffer::Source::Uri(uri) if uri.starts_with("data:") => continue,
+            gltf::buffer::Source::Uri(uri) => {
+                let file = base_dir.join(uri.replace("%20", " "));
+                let Ok(meta) = std::fs::metadata(&file) else { continue };
+                (meta.len() as usize, uri.to_owned())
+            }
+        };
+        if actual < declared || actual > declared + 3 {
+            return Err(format!(
+                "buffer {}: the glTF declares {declared} bytes and its {what} has {actual}: the two come from different \
+                 writes",
+                buffer.index()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Every buffer view inside its buffer, and every accessor (sparse parts too) inside its view: a `.gltf` from another
+/// write than its `.bin` points past it, where the reader finds nothing or the GPU garbage.
+fn check_accessors(document: &gltf::Document, buffers: &[gltf::buffer::Data]) -> Result<(), String> {
+    for view in document.views() {
+        let length = buffers.get(view.buffer().index()).map_or(0, |b| b.len());
+        let end = view.offset() + view.length();
+        if end > length {
+            return Err(format!("buffer view {} ends at byte {end}, past its buffer's {length} bytes", view.index()));
+        }
+    }
+    let past = |accessor: usize, part: &str, end: usize, length: usize| {
+        Err(format!("accessor {accessor}{part} reads to byte {end}, past its buffer view's {length} bytes"))
+    };
+    for accessor in document.accessors() {
+        let element = accessor.size();
+        if let Some(view) = accessor.view() {
+            if accessor.count() > 0 {
+                let stride = view.stride().unwrap_or(element);
+                let end = accessor.offset() + stride * (accessor.count() - 1) + element;
+                if end > view.length() {
+                    return past(accessor.index(), "", end, view.length());
+                }
+            }
+        }
+        if let Some(sparse) = accessor.sparse() {
+            let (indices, values) = (sparse.indices(), sparse.values());
+            let end = indices.offset() + sparse.count() * indices.index_type().size();
+            if end > indices.view().length() {
+                return past(accessor.index(), "'s sparse indices", end, indices.view().length());
+            }
+            let end = values.offset() + sparse.count() * element;
+            if end > values.view().length() {
+                return past(accessor.index(), "'s sparse values", end, values.view().length());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// [`load_gltf`] for a level that draws only `parts` of the file (uploaded-node
 /// ordinals, the order of [`LoadedScene::nodes`]): only the images their
 /// materials read are decoded. Every other image is a 1×1 magenta stand-in, so
@@ -259,15 +394,43 @@ pub fn load_gltf(path: impl AsRef<Path>) -> Result<LoadedScene, String> {
 /// 172 parts from (dev record `texture_memory_2026-10-12.md`). Images now
 /// decode on every core, each by `gltf::image::Data::from_source`, the call
 /// `gltf::import` makes, so formats and errors are as before.
+///
+/// Validated before anything is uploaded: buffer files against their declared lengths, every view and accessor inside
+/// its buffer, index bounds and corners ([`check_primitive`]), every image decoded. A panic in the importer is caught.
+/// A refused model is logged once a run (the file and the reason) and kept for the editor's toast ([`take_refused`]).
 pub fn load_gltf_for(path: impl AsRef<Path>, parts: Option<&HashSet<usize>>) -> Result<LoadedScene, String> {
     let path = path.as_ref();
+    let outer = GUARDED.with(|g| g.replace(true));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| load_gltf_checked(path, parts)))
+        .unwrap_or_else(|panic| {
+            let text = panic
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_owned())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "(no message)".to_owned());
+            Err(format!("the importer stopped on a panic: {text}"))
+        });
+    GUARDED.with(|g| g.set(outer));
+    // A file that is there and broken is refused; a missing one (an impostor not made yet, a renamed piece) is its
+    // caller's to report, as before, and Check Meshes lists it.
+    if let Err(reason) = &result {
+        if path.is_file() {
+            refuse(path, reason);
+        }
+    }
+    result
+}
+
+fn load_gltf_checked(path: &Path, parts: Option<&HashSet<usize>>) -> Result<LoadedScene, String> {
     info!("Loading glTF: {:?}", path);
 
     let base_dir = path.parent().unwrap_or_else(|| Path::new("./"));
     let gltf::Gltf { document, blob } =
         gltf::Gltf::open(path).map_err(|e| format!("glTF import failed: {e}"))?;
+    check_buffer_files(&document, base_dir, blob.as_deref())?;
     let buffers = gltf::import_buffers(&document, Some(base_dir), blob)
         .map_err(|e| format!("glTF import failed: {e}"))?;
+    check_accessors(&document, &buffers)?;
     let wanted = parts.map(|parts| images_for_parts(&document, parts));
 
     let mut scene = LoadedScene::default();
@@ -312,6 +475,8 @@ pub fn load_gltf_for(path: impl AsRef<Path>, parts: Option<&HashSet<usize>>) -> 
             subsurface: material_extra(&mat, "somnium_subsurface"),
             eye: material_extra(&mat, "somnium_eye") > 0.5,
             hair: material_extra(&mat, "somnium_hair") > 0.5,
+            hashed_alpha: material_extra(&mat, "somnium_hashed_alpha") > 0.5,
+            far_ground: material_extra(&mat, "somnium_far_ground") > 0.5,
             // Authored only: see the field's own note on why no import can
             // honestly infer it.
             foliage_card: false,
@@ -371,6 +536,22 @@ pub fn load_gltf_for(path: impl AsRef<Path>, parts: Option<&HashSet<usize>>) -> 
         }
     }
 
+    // A leaf the glTF cuts out itself (MASK, two-sided, fluttering in the wind) never meets the rule above, which
+    // looks for a sidecar mask: every grown tree's leaves came in letting no light through, and a crown seen from
+    // below or against the light was black (Sunscar, 11 Nov 2026). A game says what such leaves pass
+    // (`leaf_transmission`); needles pass less than broad leaves. An authored factor stands.
+    if let Some([broad, needle]) = leaf_transmission() {
+        for m in &mut scene.materials {
+            if m.alpha_mode == AlphaMode::Mask && m.double_sided && m.wind_flutter > 0.0 && m.transmission <= 0.0 {
+                let name = m.name.to_ascii_lowercase();
+                let needles = ["needle", "pine", "cypress", "juniper", "cedar", "spruce", "fir"]
+                    .iter()
+                    .any(|kind| name.contains(kind));
+                m.transmission = if needles { needle } else { broad };
+            }
+        }
+    }
+
     // Ensure there is always at least a default material at index 0.
     if scene.materials.is_empty() {
         scene.materials.push(LoadedMaterial {
@@ -394,6 +575,8 @@ pub fn load_gltf_for(path: impl AsRef<Path>, parts: Option<&HashSet<usize>>) -> 
             subsurface: 0.0,
             eye: false,
             hair: false,
+            hashed_alpha: false,
+            far_ground: false,
             foliage_card: false,
             emissive: [0.0; 3],
             emissive_intensity: 1.0,
@@ -546,6 +729,9 @@ pub fn load_gltf_for(path: impl AsRef<Path>, parts: Option<&HashSet<usize>>) -> 
                 .into_u32()
                 .collect();
 
+            // Unchecked, a broken file reaches the GPU, and the flat normals below panic on it.
+            check_primitive(mesh.name().unwrap_or("?"), prim_idx, &positions, &indices)?;
+
             if normals.is_none() {
                 generate_flat_normals(&mut vertices, &indices);
             }
@@ -594,6 +780,14 @@ pub fn load_gltf_for(path: impl AsRef<Path>, parts: Option<&HashSet<usize>>) -> 
                 skin,
             });
         }
+    }
+
+    // 3b. One-sided pieces with open edges: a warning, once a file a run (see [`open_edges`]).
+    if open_edges_first_look(path) {
+        let pieces = one_sided_open_pieces(&document, &buffers, |material| {
+            material.and_then(|i| scene.materials.get(i)).is_none_or(drawn_one_side_opaque)
+        });
+        warn_open_pieces(path, &pieces);
     }
 
     // 4. Scene graph → flat world-space nodes ----------------------------
@@ -841,6 +1035,582 @@ fn images_for_parts(document: &gltf::Document, parts: &HashSet<usize>) -> HashSe
     images
 }
 
+/// One uploaded part of a glTF, as the editor names it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GltfPart {
+    /// The node's name.
+    pub node: String,
+    /// The mesh's name.
+    pub mesh: String,
+    /// The material's name.
+    pub material: String,
+    /// The image files (or embedded image names) the material reads.
+    pub images: Vec<String>,
+}
+
+/// A primitive the engine can upload: every index names one of its vertices, and every corner a triangle uses is a
+/// number. A broken file (its .gltf and .bin from two different writes, say) fails this; uploaded, it sends the GPU
+/// outside the mesh, and a ray-tracing build can lose the device on it (Sunscar, 6 Nov 2026).
+///
+/// # Errors
+/// Which index or vertex, in which mesh and primitive.
+pub fn check_primitive(mesh: &str, primitive: usize, positions: &[[f32; 3]], indices: &[u32]) -> Result<(), String> {
+    if let Some(&past) = indices.iter().find(|&&i| i as usize >= positions.len()) {
+        return Err(format!(
+            "Mesh '{mesh}' primitive {primitive}: index {past} is past its {} vertices (its .gltf and .bin may come from \
+             two different writes)",
+            positions.len()
+        ));
+    }
+    if let Some(&corner) = indices.iter().find(|&&i| !positions[i as usize].iter().all(|c| c.is_finite())) {
+        return Err(format!("Mesh '{mesh}' primitive {primitive}: vertex {corner} is not a number"));
+    }
+    Ok(())
+}
+
+/// What stops a glTF loading in the engine, its images aside: [`gltf_file_problems`], then every primitive read as the
+/// importer reads it (a position attribute, an index buffer, [`check_primitive`]). Empty when it loads. Seconds for
+/// thousands of files, where [`load_gltf`] decodes every image.
+#[must_use]
+pub fn gltf_problems(path: &Path) -> Vec<String> {
+    let problems = gltf_file_problems(path);
+    if !problems.is_empty() {
+        return problems;
+    }
+    let geometry = || -> Result<(), String> {
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("./"));
+        let gltf::Gltf { document, blob } = gltf::Gltf::open(path).map_err(|e| format!("glTF import failed: {e}"))?;
+        check_buffer_files(&document, base_dir, blob.as_deref())?;
+        let buffers =
+            gltf::import_buffers(&document, Some(base_dir), blob).map_err(|e| format!("glTF import failed: {e}"))?;
+        check_accessors(&document, &buffers)?;
+        for mesh in document.meshes() {
+            let name = mesh.name().unwrap_or("?");
+            for (index, primitive) in mesh.primitives().enumerate() {
+                let reader = primitive.reader(|buf| Some(&buffers[buf.index()]));
+                let positions: Vec<[f32; 3]> = reader
+                    .read_positions()
+                    .ok_or_else(|| format!("Mesh '{name}' primitive {index}: no POSITION attribute"))?
+                    .collect();
+                let indices: Vec<u32> = reader
+                    .read_indices()
+                    .ok_or_else(|| format!("Mesh '{name}' primitive {index}: no index buffer"))?
+                    .into_u32()
+                    .collect();
+                check_primitive(name, index, &positions, &indices)?;
+            }
+        }
+        Ok(())
+    };
+    geometry().err().into_iter().collect()
+}
+
+// ─── Open edges on faces drawn on one side ──────────────────────────────────
+//
+// The developer, 27 Nov 2026: "the houses roofs dont contact the actual structure and there's always a thin line
+// visible". The cause (Sunscar's notes/OBSERVATION_FACTS_2026-11-27.md, section 1): a generator left a strip with no
+// underside, its material is drawn on one side only (glTF's default, which the renderer honours), and from below the
+// eye looks through the back of the tiles at the sky. Any one-sided opaque piece with open edges can show that, so the
+// importer names such pieces, once a file a run. A warning only: a cliff face or a rock whose foot is in the ground is
+// open on purpose, and nothing is refused or changed. `gltf_check --open-edges` lists the same for a folder, with no
+// window. `SOMNIUM_OPEN_EDGES=0` turns the warning off (its tracing target is `somnium_asset::open_edges`). A city
+// house of Sunscar's had 28 such pieces on 27 Nov (its roof tiles overlap, one-sided, with no underside), and every
+// house had some: the warning names where to look, it does not say each line shows.
+
+/// A piece of a glTF that is drawn on one side only and has open edges: where the sky can show through it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenPiece {
+    /// The node's name (the mesh's when the node has none), with `_<n>` after it for a mesh of several primitives, as
+    /// the scene's nodes are named.
+    pub name: String,
+    /// The material's name.
+    pub material: String,
+    /// Edges that only one triangle of the whole file uses, that triangle this piece's.
+    pub open_edges: usize,
+    /// The piece's triangles.
+    pub triangles: usize,
+}
+
+/// Above this many triangles a file is a ground sheet or a merged bank, not a built piece, and is not counted (a check
+/// of it would cost a streaming reader a quarter of a second).
+const OPEN_EDGES_MAX_TRIANGLES: usize = 1_000_000;
+
+/// The edges of a triangle list that only one triangle uses. Corners are welded at a tenth of a millimetre first, so a
+/// flat-shaded box, which repeats each corner once a face, is closed. A closed mesh has none; the rim of a sheet, a
+/// strip with no underside or a shell with a face missing has some. A triangle with two corners on one point, or one
+/// that names a vertex the list has not, is skipped.
+#[must_use]
+pub fn open_edges(positions: &[[f32; 3]], indices: &[u32]) -> usize {
+    let triangles: Vec<([u32; 3], u32)> = indices.chunks_exact(3).map(|t| ([t[0], t[1], t[2]], 0)).collect();
+    open_edge_owners(positions, &triangles).len()
+}
+
+/// For each edge that only one triangle uses ([`open_edges`]), that triangle's owner: `triangles` are three indices
+/// into `corners` and who owns them.
+fn open_edge_owners(corners: &[[f32; 3]], triangles: &[([u32; 3], u32)]) -> Vec<u32> {
+    let mut weld: HashMap<(i64, i64, i64), u32, std::hash::BuildHasherDefault<WeldHasher>> =
+        HashMap::with_capacity_and_hasher(corners.len(), Default::default());
+    let ids: Vec<u32> = corners
+        .iter()
+        .map(|p| {
+            // A corner that is no number welds to the origin: the importer refuses such a file before this is asked.
+            let [x, y, z] = p.map(|c| (f64::from(c) * 10_000.0).round() as i64);
+            let next = weld.len() as u32;
+            *weld.entry((x, y, z)).or_insert(next)
+        })
+        .collect();
+    let mut edges: Vec<(u64, u32)> = Vec::with_capacity(triangles.len() * 3);
+    for &(triangle, owner) in triangles {
+        let [Some(a), Some(b), Some(c)] = triangle.map(|i| ids.get(i as usize).copied()) else {
+            continue;
+        };
+        if a == b || b == c || c == a {
+            continue;
+        }
+        for (x, y) in [(a, b), (b, c), (c, a)] {
+            edges.push(((u64::from(x.min(y)) << 32) | u64::from(x.max(y)), owner));
+        }
+    }
+    edges.sort_unstable_by_key(|&(edge, _)| edge);
+    edges.chunk_by(|x, y| x.0 == y.0).filter(|run| run.len() == 1).map(|run| run[0].1).collect()
+}
+
+/// FxHash's multiply and rotate, for the weld's integer keys: the default SipHash costs several times as much, and
+/// nothing here needs its resistance to chosen keys.
+#[derive(Default)]
+struct WeldHasher(u64);
+
+impl std::hash::Hasher for WeldHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.write_u64(u64::from(byte));
+        }
+    }
+    fn write_u64(&mut self, value: u64) {
+        self.0 = (self.0.rotate_left(5) ^ value).wrapping_mul(0x517c_c1b7_2722_0a95);
+    }
+    fn write_i64(&mut self, value: i64) {
+        self.write_u64(value as u64);
+    }
+}
+
+/// Whether the renderer draws this material's faces from the front only and lets nothing through them: what can open
+/// a thin line to the sky. Far ground and foliage are left out (a far tile is a sheet by design; leaves are cut-outs).
+fn drawn_one_side_opaque(material: &LoadedMaterial) -> bool {
+    material.alpha_mode == AlphaMode::Opaque
+        && !material.double_sided
+        && !material.far_ground
+        && !material.foliage
+        && !material.foliage_card
+}
+
+/// Every piece of the default scene whose material `one_sided` says is drawn on one side only (`None`: a primitive
+/// with no material, which glTF draws one-sided) and which has open edges, most open first. The whole scene is welded
+/// in world space, every piece of every material in it: a generator writes one node a material, and where plaster
+/// meets its stone plinth the edge is closed, not open twice.
+fn one_sided_open_pieces(
+    document: &gltf::Document,
+    buffers: &[gltf::buffer::Data],
+    one_sided: impl Fn(Option<usize>) -> bool,
+) -> Vec<OpenPiece> {
+    struct Piece {
+        name: String,
+        material: String,
+        one_sided: bool,
+        triangles: usize,
+    }
+    let triangle_list = |p: &gltf::Primitive| p.mode() == gltf::mesh::Mode::Triangles;
+    let anything_one_sided = document
+        .meshes()
+        .flat_map(|mesh| mesh.primitives())
+        .any(|p| triangle_list(&p) && one_sided(p.material().index()));
+    let Some(scene) = document.default_scene().or_else(|| document.scenes().next()) else {
+        return Vec::new();
+    };
+    if !anything_one_sided {
+        return Vec::new();
+    }
+    let (mut pieces, mut corners, mut triangles) = (Vec::<Piece>::new(), Vec::<[f32; 3]>::new(), Vec::new());
+    let mut stack: Vec<(gltf::Node, Mat4)> = scene.nodes().map(|node| (node, Mat4::IDENTITY)).collect();
+    while let Some((node, parent)) = stack.pop() {
+        let world = parent * Mat4::from_cols_array_2d(&node.transform().matrix());
+        if let Some(mesh) = node.mesh() {
+            let count = mesh.primitives().count();
+            let name = node.name().or(mesh.name()).unwrap_or("Node");
+            for (index, primitive) in mesh.primitives().enumerate().filter(|(_, p)| triangle_list(p)) {
+                let reader = primitive.reader(|buf| Some(&buffers[buf.index()]));
+                let (Some(positions), Some(indices)) = (reader.read_positions(), reader.read_indices()) else {
+                    continue;
+                };
+                let first = corners.len() as u32;
+                corners.extend(positions.map(|p| world.transform_point3(Vec3::from(p)).to_array()));
+                let own = corners.len() as u32 - first;
+                // An index past this piece's own corners would weld it to another's: it names nothing.
+                let at = |i: u32| if i < own { first + i } else { u32::MAX };
+                let owner = pieces.len() as u32;
+                let before = triangles.len();
+                let indices: Vec<u32> = indices.into_u32().collect();
+                triangles.extend(indices.chunks_exact(3).map(|t| ([at(t[0]), at(t[1]), at(t[2])], owner)));
+                if triangles.len() > OPEN_EDGES_MAX_TRIANGLES {
+                    return Vec::new();
+                }
+                pieces.push(Piece {
+                    name: if count == 1 { name.to_owned() } else { format!("{name}_{index}") },
+                    material: primitive.material().name().unwrap_or("(default material)").to_owned(),
+                    one_sided: one_sided(primitive.material().index()),
+                    triangles: triangles.len() - before,
+                });
+            }
+        }
+        stack.extend(node.children().map(|child| (child, world)));
+    }
+    let mut open = vec![0usize; pieces.len()];
+    for owner in open_edge_owners(&corners, &triangles) {
+        open[owner as usize] += 1;
+    }
+    let mut found: Vec<OpenPiece> = pieces
+        .into_iter()
+        .zip(open)
+        .filter(|(piece, open)| piece.one_sided && *open > 0)
+        .map(|(piece, open_edges)| OpenPiece {
+            name: piece.name,
+            material: piece.material,
+            open_edges,
+            triangles: piece.triangles,
+        })
+        .collect();
+    found.sort_by(|a, b| b.open_edges.cmp(&a.open_edges).then_with(|| a.name.cmp(&b.name)));
+    found
+}
+
+/// Whether this run has not looked at `path`'s open edges yet, and marks it looked at. Always false under
+/// `SOMNIUM_OPEN_EDGES=0`.
+fn open_edges_first_look(path: &Path) -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("SOMNIUM_OPEN_EDGES").is_ok_and(|v| v.trim() == "0"));
+    static SEEN: std::sync::LazyLock<std::sync::Mutex<HashSet<std::path::PathBuf>>> =
+        std::sync::LazyLock::new(Default::default);
+    !*OFF && SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(path.to_path_buf())
+}
+
+/// One warning line for a file's one-sided pieces with open edges: the twelve most open by name, material and count.
+fn warn_open_pieces(path: &Path, pieces: &[OpenPiece]) {
+    const SHOWN: usize = 12;
+    if pieces.is_empty() {
+        return;
+    }
+    let edges: usize = pieces.iter().map(|p| p.open_edges).sum();
+    let mut list =
+        pieces.iter().take(SHOWN).map(|p| format!("{} ({}) {}", p.name, p.material, p.open_edges)).collect::<Vec<_>>();
+    if pieces.len() > SHOWN {
+        list.push(format!("and {} more", pieces.len() - SHOWN));
+    }
+    warn!(
+        target: "somnium_asset::open_edges",
+        file = %path.display(),
+        "One-sided pieces with open edges, where the sky can show through as a thin line (an underside, or the \
+         material doubleSided, closes it): {}; {} pieces, {edges} open edges",
+        list.join(", "),
+        pieces.len()
+    );
+}
+
+/// The pieces of the glTF at `path` that the importer warns of ([`open_edges`]), read without decoding an image: a
+/// material counts as one-sided when the file says opaque and not doubleSided, it is not far ground, and no cut-out
+/// mask lies beside its colour map (the importer makes such a material foliage). Most open first.
+///
+/// # Errors
+/// The file does not read as glTF, or its buffers do not match it.
+pub fn open_edge_pieces(path: &Path) -> Result<Vec<OpenPiece>, String> {
+    let base_dir = path.parent().unwrap_or_else(|| Path::new("./"));
+    let gltf::Gltf { document, blob } = gltf::Gltf::open(path).map_err(|e| format!("glTF import failed: {e}"))?;
+    check_buffer_files(&document, base_dir, blob.as_deref())?;
+    let buffers =
+        gltf::import_buffers(&document, Some(base_dir), blob).map_err(|e| format!("glTF import failed: {e}"))?;
+    check_accessors(&document, &buffers)?;
+    let one_sided: Vec<bool> = document
+        .materials()
+        .map(|mat| {
+            let cutout = mat.pbr_metallic_roughness().base_color_texture().is_some_and(|t| {
+                match t.texture().source().source() {
+                    gltf::image::Source::Uri { uri, .. } => sidecar_alpha_path(base_dir, uri).is_some(),
+                    gltf::image::Source::View { .. } => false,
+                }
+            });
+            mat.alpha_mode() == gltf::material::AlphaMode::Opaque
+                && !mat.double_sided()
+                && material_extra(&mat, "somnium_far_ground") <= 0.5
+                && !cutout
+        })
+        .collect();
+    Ok(one_sided_open_pieces(&document, &buffers, |material| {
+        material.is_none_or(|i| one_sided.get(i).copied().unwrap_or(true))
+    }))
+}
+
+/// What is wrong with a glTF file before its geometry is read: missing; a buffer file shorter than the glTF declares
+/// (the importer refuses it) or of another size (a pair from two different writes); a missing texture; a `.glb` cut
+/// short. Empty when nothing is. Cheap: the JSON and file sizes only.
+#[must_use]
+pub fn gltf_file_problems(path: &Path) -> Vec<String> {
+    let Ok(bytes) = std::fs::read(path) else {
+        return vec!["the file is missing".to_owned()];
+    };
+    let base = path.parent().unwrap_or(Path::new("."));
+    let document: serde_json::Value = if bytes.starts_with(b"glTF") {
+        let declared = bytes.get(8..12).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+        if declared != bytes.len() {
+            return vec![format!("the .glb declares {declared} bytes and has {}", bytes.len())];
+        }
+        let length = bytes.get(12..16).map_or(0, |b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize);
+        match bytes.get(20..20 + length).map(serde_json::from_slice::<serde_json::Value>) {
+            Some(Ok(json)) => json,
+            _ => return vec!["the .glb's JSON chunk does not read".to_owned()],
+        }
+    } else {
+        match serde_json::from_slice(&bytes) {
+            Ok(json) => json,
+            Err(error) => return vec![format!("the glTF JSON does not read: {error}")],
+        }
+    };
+    let external = |uri: &str| (!uri.starts_with("data:")).then(|| base.join(uri.replace("%20", " ")));
+    let name = |file: &Path| file.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let mut problems = Vec::new();
+    for (i, buffer) in document["buffers"].as_array().into_iter().flatten().enumerate() {
+        let Some(file) = buffer["uri"].as_str().and_then(external) else { continue };
+        let declared = buffer["byteLength"].as_u64().unwrap_or(0);
+        match std::fs::metadata(&file).map(|m| m.len()) {
+            Err(_) => problems.push(format!("buffer {i}: {} is missing", name(&file))),
+            Ok(size) if size < declared => {
+                problems.push(format!("buffer {i}: declares {declared} bytes, the .bin has {size}: the importer refuses it"));
+            }
+            // A buffer may be padded to four bytes, as the importer allows (`check_buffer_files`); more is two writes.
+            Ok(size) if size > declared + 3 => problems.push(format!(
+                "buffer {i}: declares {declared} bytes, the .bin has {size}: written apart, the importer refuses it"
+            )),
+            Ok(_) => {}
+        }
+    }
+    let missing: Vec<String> = document["images"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|image| image["uri"].as_str().and_then(external))
+        .filter(|file| !file.is_file())
+        .map(|file| name(&file))
+        .collect();
+    if !missing.is_empty() {
+        let shown = missing.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+        let more = if missing.len() > 3 { format!(" and {} more", missing.len() - 3) } else { String::new() };
+        problems.push(format!("missing texture{}: {shown}{more}", if missing.len() == 1 { "" } else { "s" }));
+    }
+    problems
+}
+
+/// What each uploaded part of a glTF is, in `ImportedMesh.node` order. Reads the JSON only (a `.glb`'s first chunk),
+/// never geometry or pixels, so asking about a 400 MB bank costs one JSON parse.
+///
+/// # Errors
+/// The file cannot be read or is not glTF.
+pub fn describe_gltf_parts(path: &Path) -> Result<Vec<GltfPart>, String> {
+    use std::io::Read;
+    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    let mut file = std::fs::File::open(path).map_err(|e| fail(&e))?;
+    let mut bytes = Vec::new();
+    let mut header = [0u8; 20];
+    if file.read_exact(&mut header).is_ok() && &header[..4] == b"glTF" {
+        let length = u32::from_le_bytes([header[12], header[13], header[14], header[15]]) as usize;
+        bytes.resize(length, 0);
+        file.read_exact(&mut bytes).map_err(|e| fail(&e))?;
+    } else {
+        bytes = std::fs::read(path).map_err(|e| fail(&e))?;
+    }
+    let gltf::Gltf { document, .. } = gltf::Gltf::from_slice(&bytes).map_err(|e| fail(&e))?;
+    fn image(texture: Option<gltf::Texture>) -> Option<String> {
+        let source = texture?.source();
+        Some(match source.source() {
+            gltf::image::Source::Uri { uri, .. } => uri.to_owned(),
+            gltf::image::Source::View { .. } => {
+                source.name().map_or_else(|| format!("embedded image {}", source.index()), str::to_owned)
+            }
+        })
+    }
+    fn walk(node: &gltf::Node, parts: &mut Vec<GltfPart>) {
+        if let Some(mesh) = node.mesh() {
+            for primitive in mesh.primitives() {
+                let material = primitive.material();
+                let pbr = material.pbr_metallic_roughness();
+                let images = [
+                    image(pbr.base_color_texture().map(|t| t.texture())),
+                    image(material.normal_texture().map(|t| t.texture())),
+                    image(pbr.metallic_roughness_texture().map(|t| t.texture())),
+                    image(material.occlusion_texture().map(|t| t.texture())),
+                    image(material.emissive_texture().map(|t| t.texture())),
+                ];
+                let mut seen = Vec::new();
+                for name in images.into_iter().flatten() {
+                    if !seen.contains(&name) {
+                        seen.push(name);
+                    }
+                }
+                parts.push(GltfPart {
+                    node: node.name().unwrap_or_default().to_owned(),
+                    mesh: mesh.name().unwrap_or_default().to_owned(),
+                    material: material.name().unwrap_or("(default material)").to_owned(),
+                    images: seen,
+                });
+            }
+        }
+        for child in node.children() {
+            walk(&child, parts);
+        }
+    }
+    let mut parts = Vec::new();
+    if let Some(scene) = document.default_scene().or_else(|| document.scenes().next()) {
+        for root in scene.nodes() {
+            walk(&root, &mut parts);
+        }
+    }
+    Ok(parts)
+}
+
+/// Decoded image files, shared between loads while a host asks for it ([`share_decoded_images`]).
+///
+/// A streamed world decoded an image once for every glTF that names it: a start at Monargent read 2,495 files and
+/// decoded 9,070 images for them from 2,036 image files, four fifths of its readers' time (Sunscar, 12 Nov 2026).
+/// A load now takes a copy of an image another load decoded a moment ago, and waits for one being decoded instead
+/// of decoding it too. An image is known by its file and the file's size and date, so one saved again is decoded
+/// again. Each load still gets its own pixels: a sidecar alpha mask written into them touches no other load's.
+mod decoded {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
+
+    use super::LoadedTexture;
+
+    pub(super) type Key = (PathBuf, u64, Option<std::time::SystemTime>);
+    /// An image being decoded or decoded: `None` inside when it did not decode.
+    type Slot = Arc<OnceLock<Option<Arc<LoadedTexture>>>>;
+
+    #[derive(Default)]
+    struct Cache {
+        /// Each image with when it was last asked for and the bytes it is counted at (0 until it is decoded).
+        slots: HashMap<Key, (Slot, u64, usize)>,
+        bytes: usize,
+        tick: u64,
+    }
+
+    /// RGBA8 bytes kept at most; 0 is off, the default.
+    static BUDGET: AtomicUsize = AtomicUsize::new(0);
+    static CACHE: LazyLock<Mutex<Cache>> = LazyLock::new(Mutex::default);
+
+    fn cache() -> MutexGuard<'static, Cache> {
+        CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(super) fn share(bytes: usize) {
+        BUDGET.store(bytes, Ordering::Relaxed);
+        if bytes == 0 {
+            let mut cache = cache();
+            cache.slots.clear();
+            cache.bytes = 0;
+        }
+    }
+
+    /// The file a glTF image names, with its stamp. `None` while nothing is shared, and for an image inside a
+    /// buffer or a data URI, or named by a scheme or with percent escapes: those are decoded as they always were.
+    pub(super) fn file_of(image: &gltf::Image, base_dir: &Path) -> Option<Key> {
+        if BUDGET.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        let gltf::image::Source::Uri { uri, .. } = image.source() else {
+            return None;
+        };
+        if uri.contains(':') || uri.contains('%') {
+            return None;
+        }
+        let path = base_dir.join(uri);
+        let meta = std::fs::metadata(&path).ok()?;
+        Some((path, meta.len(), meta.modified().ok()))
+    }
+
+    /// The image `decode` makes for `key`: decoded once however many loads ask at the same time, then copied.
+    pub(super) fn shared(
+        key: Key,
+        decode: impl FnOnce() -> Result<LoadedTexture, String>,
+    ) -> Result<LoadedTexture, String> {
+        let slot = {
+            let mut cache = cache();
+            cache.tick += 1;
+            let tick = cache.tick;
+            let entry = cache.slots.entry(key.clone()).or_insert_with(|| (Slot::default(), tick, 0));
+            entry.1 = tick;
+            entry.0.clone()
+        };
+        let (mut decode, mut failed, mut fresh) = (Some(decode), None, false);
+        let image = slot.get_or_init(|| match decode.take().map(|decode| decode()) {
+            Some(Ok(texture)) => {
+                fresh = true;
+                Some(Arc::new(texture))
+            }
+            Some(Err(error)) => {
+                failed = Some(error);
+                None
+            }
+            None => None,
+        });
+        let Some(image) = image else {
+            // It did not decode: forgotten, and every load that asked says so for itself.
+            let mut cache = cache();
+            if cache.slots.get(&key).is_some_and(|(held, ..)| Arc::ptr_eq(held, &slot)) {
+                cache.slots.remove(&key);
+            }
+            drop(cache);
+            return match (failed, decode) {
+                (Some(error), _) => Err(error),
+                (None, Some(decode)) => decode(),
+                (None, None) => Err("glTF import failed: an image did not decode".to_owned()),
+            };
+        };
+        if fresh {
+            let mut cache = cache();
+            // Counted only while it is still the one kept (the host may have emptied the cache meanwhile).
+            if let Some((_, _, counted)) = cache.slots.get_mut(&key).filter(|(held, ..)| Arc::ptr_eq(held, &slot)) {
+                *counted = image.data.len();
+                cache.bytes += image.data.len();
+            }
+            // ponytail: one scan of the kept images for each one dropped; a few hundred at most. An ordered
+            // index if a cache ever holds thousands.
+            let budget = BUDGET.load(Ordering::Relaxed);
+            while cache.bytes > budget {
+                let oldest = cache
+                    .slots
+                    .iter()
+                    .filter(|(_, (_, _, counted))| *counted > 0)
+                    .min_by_key(|(_, (_, tick, _))| *tick)
+                    .map(|(key, _)| key.clone());
+                let Some((_, _, counted)) = oldest.and_then(|key| cache.slots.remove(&key)) else {
+                    break;
+                };
+                cache.bytes -= counted;
+            }
+        }
+        Ok(LoadedTexture { data: image.data.clone(), width: image.width, height: image.height })
+    }
+}
+
+/// Share each decoded image file between loads, keeping at most `bytes` of RGBA8 (the least recently asked for go
+/// first); 0 stops the sharing and frees what is kept. A host that reads many files naming the same images (a
+/// streamed world's cell readers) turns it on while it reads and off when it has nothing left to read. Off, every
+/// load decodes its own images, as it always did.
+pub fn share_decoded_images(bytes: usize) {
+    decoded::share(bytes);
+}
+
 /// Every image the document holds, decoded on all cores (only `wanted`, if
 /// given; the rest are 1×1 magenta stand-ins). The first failure fails the
 /// file, as `gltf::import` did.
@@ -855,24 +1625,37 @@ fn decode_images(
     let todo: Vec<usize> = (0..images.len()).filter(|i| wanted.is_none_or(|w| w.contains(i))).collect();
     let next = AtomicUsize::new(0);
     let workers = std::thread::available_parallelism().map_or(4, |n| n.get()).min(todo.len()).max(1);
-    let decoded: Vec<(usize, Result<LoadedTexture, String>)> = std::thread::scope(|scope| {
+    let decoded: Result<Vec<(usize, Result<LoadedTexture, String>)>, String> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers)
             .map(|_| {
                 scope.spawn(|| {
                     let mut done = Vec::new();
                     while let Some(&index) = todo.get(next.fetch_add(1, Ordering::Relaxed)) {
-                        let texture = gltf::image::Data::from_source(images[index].source(), Some(base_dir), buffers)
-                            .map(|data| decode_to_rgba8(&data))
-                            .map_err(|e| format!("glTF import failed: image {index}: {e}"));
+                        let decode = || {
+                            gltf::image::Data::from_source(images[index].source(), Some(base_dir), buffers)
+                                .map(|data| decode_to_rgba8(&data))
+                                .map_err(|e| format!("glTF import failed: image {index}: {e}"))
+                        };
+                        let texture = match decoded::file_of(&images[index], base_dir) {
+                            Some(file) => decoded::shared(file, decode),
+                            None => decode(),
+                        };
                         done.push((index, texture));
                     }
                     done
                 })
             })
             .collect();
-        handles.into_iter().flat_map(|h| h.join().expect("image decode thread panicked")).collect()
+        let mut all = Vec::new();
+        for handle in handles {
+            match handle.join() {
+                Ok(done) => all.extend(done),
+                Err(_) => return Err("glTF import failed: an image decode stopped on a panic".to_owned()),
+            }
+        }
+        Ok(all)
     });
-    let mut decoded = decoded;
+    let mut decoded = decoded?;
     decoded.sort_by_key(|(index, _)| *index); // the same first error every time
     let mut textures: Vec<LoadedTexture> = (0..images.len())
         .map(|_| LoadedTexture { data: vec![255, 0, 255, 255], width: 1, height: 1 })
@@ -1322,6 +2105,54 @@ mod normal_scale_tests {
     }
 
     #[test]
+    fn loads_share_a_decoded_image_and_each_keeps_its_own_pixels() {
+        use super::decoded::shared;
+        // Keys no file has, so the other tests' loads (which share too while this runs) never ask for them.
+        let key = |name: &str| (std::path::PathBuf::from(name), 1, None);
+        let calls = std::cell::Cell::new(0);
+        let decode = || {
+            calls.set(calls.get() + 1);
+            Ok(super::LoadedTexture { data: vec![1, 2, 3, 4], width: 1, height: 1 })
+        };
+        super::share_decoded_images(usize::MAX);
+        let first = shared(key("shared decode a"), decode).unwrap();
+        let mut second = shared(key("shared decode a"), decode).unwrap();
+        assert_eq!(calls.get(), 1, "asked for twice, decoded once");
+        // A load's pixels are its own: a mask written into them does not reach the next load.
+        second.data[0] = 9;
+        assert_eq!(shared(key("shared decode a"), decode).unwrap().data, first.data);
+        // One that does not decode is not kept: each load reports it, and the next try decodes.
+        assert_eq!(shared(key("shared decode bad"), || Err("unreadable".to_owned())).err().as_deref(), Some("unreadable"));
+        assert_eq!(shared(key("shared decode bad"), decode).unwrap().data, first.data);
+        assert_eq!(calls.get(), 2);
+        // Past the budget the least recently asked for goes, and is decoded again when next asked for.
+        super::share_decoded_images(4);
+        shared(key("shared decode b"), decode).unwrap();
+        shared(key("shared decode a"), decode).unwrap();
+        assert_eq!(calls.get(), 4, "b's arrival dropped a");
+        // A real file, shared or not, loads the same pixels.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/foliage/fir_sapling/fir_sapling_2k.gltf");
+        super::share_decoded_images(usize::MAX);
+        let (once, again) = (super::load_gltf(&path).unwrap(), super::load_gltf(&path).unwrap());
+        super::share_decoded_images(0);
+        let alone = super::load_gltf(&path).unwrap();
+        assert!(alone.textures.iter().any(|t| t.width > 1));
+        for ((a, b), c) in alone.textures.iter().zip(&once.textures).zip(&again.textures) {
+            assert_eq!((a.width, a.height, &a.data), (b.width, b.height, &b.data));
+            assert_eq!((a.width, a.height, &a.data), (c.width, c.height, &c.data));
+        }
+    }
+
+    #[test]
+    fn the_leaf_rule_reads_one_share_or_two_and_is_off_when_unset() {
+        assert_eq!(super::parse_leaf_transmission(""), None);
+        assert_eq!(super::parse_leaf_transmission("0"), None);
+        assert_eq!(super::parse_leaf_transmission("0.5"), Some([0.5, 0.5]));
+        assert_eq!(super::parse_leaf_transmission(" 0.5, 0.2 "), Some([0.5, 0.2]));
+        assert_eq!(super::parse_leaf_transmission("7,-1"), Some([1.0, 0.0]));
+    }
+
+    #[test]
     fn material_extras_carry_weathering_and_detile() {
         let root = std::env::temp_dir().join(format!("somnium-extras-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
@@ -1342,7 +2173,7 @@ mod normal_scale_tests {
             "asset":{"version":"2.0"},
             "materials":[{"extras":{"somnium_wind_bend":0.00035,"somnium_wind_flutter":0.02}},
                          {"extras":{"somnium_subsurface":0.7}},
-                         {"extras":{"somnium_eye":1}}, {"extras":{"somnium_hair":1}}]
+                         {"extras":{"somnium_eye":1}}, {"extras":{"somnium_hair":1,"somnium_hashed_alpha":1}}]
         });
         std::fs::write(&path, document.to_string()).unwrap();
         let loaded = super::load_gltf(&path).unwrap();
@@ -1351,6 +2182,7 @@ mod normal_scale_tests {
         assert_eq!(loaded.materials[1].subsurface, 0.7, "skin");
         assert_eq!(loaded.materials.iter().map(|m| (m.eye, m.hair)).collect::<Vec<_>>(),
             [(false, false), (false, false), (true, false), (false, true)]);
+        assert_eq!(loaded.materials.iter().map(|m| m.hashed_alpha).collect::<Vec<_>>(), [false, false, false, true]);
         assert_eq!(loaded.materials[0].height_depth, 0.0, "no extras, no room");
         std::fs::remove_file(&path).unwrap();
         // A window onto a room carries the room's depth as a negative height depth.
@@ -1386,5 +2218,314 @@ mod height_sidecar_tests {
         assert!(sidecar_height_path(&root, "textures/stone_diff_2k.jpg").is_none(), "no map, no parallax");
         assert!(sidecar_height_path(&root, "textures/brick.png").is_none(), "only _diff colour maps qualify");
         let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod describe_parts_tests {
+    use super::*;
+
+    /// Two parts in walk order, each named with its material and the images it reads; the geometry is never read.
+    #[test]
+    fn parts_are_named_in_import_order_with_their_material_and_images() {
+        let root = std::env::temp_dir().join(format!("somnium-describe-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("bench.gltf");
+        let json = r#"{
+          "asset": {"version": "2.0"},
+          "scene": 0,
+          "scenes": [{"nodes": [0]}],
+          "nodes": [{"name": "Bench", "mesh": 0, "children": [1]}, {"name": "Cushion", "mesh": 1}],
+          "meshes": [
+            {"name": "bench_mesh", "primitives": [{"attributes": {"POSITION": 0}, "material": 0}]},
+            {"name": "cushion_mesh", "primitives": [{"attributes": {"POSITION": 0}, "material": 1}]}
+          ],
+          "materials": [
+            {"name": "oak", "pbrMetallicRoughness": {"baseColorTexture": {"index": 0}}, "normalTexture": {"index": 1}},
+            {"name": "velvet"}
+          ],
+          "textures": [{"source": 0}, {"source": 1}],
+          "images": [{"uri": "textures/oak_diff.png"}, {"uri": "textures/oak_nor.png"}],
+          "buffers": [{"byteLength": 36, "uri": "missing.bin"}],
+          "bufferViews": [{"buffer": 0, "byteLength": 36}],
+          "accessors": [{"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+                         "min": [0, 0, 0], "max": [1, 1, 1]}]
+        }"#;
+        std::fs::write(&path, json).unwrap();
+        let parts = describe_gltf_parts(&path).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].node, "Bench");
+        assert_eq!(parts[0].material, "oak");
+        assert_eq!(parts[0].images, vec!["textures/oak_diff.png", "textures/oak_nor.png"]);
+        assert_eq!(parts[1].node, "Cushion");
+        assert_eq!(parts[1].material, "velvet");
+        assert!(parts[1].images.is_empty());
+        let _ = std::fs::remove_dir_all(root);
+    }
+}
+
+#[cfg(test)]
+mod broken_file_tests {
+    use std::path::Path;
+
+    /// A one-triangle glTF beside its .bin: positions, then u16 indices.
+    fn triangle(dir: &Path, name: &str, corners: [[f32; 3]; 3], indices: [u16; 3]) -> std::path::PathBuf {
+        let mut bin: Vec<u8> = corners.iter().flatten().flat_map(|c| c.to_le_bytes()).collect();
+        bin.extend(indices.iter().flat_map(|i| i.to_le_bytes()));
+        bin.extend([0, 0]);
+        std::fs::write(dir.join(format!("{name}.bin")), &bin).unwrap();
+        let document = serde_json::json!({
+            "asset": {"version": "2.0"},
+            "buffers": [{"uri": format!("{name}.bin"), "byteLength": bin.len()}],
+            "bufferViews": [
+                {"buffer": 0, "byteOffset": 0, "byteLength": 36},
+                {"buffer": 0, "byteOffset": 36, "byteLength": 6}],
+            "accessors": [
+                {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3", "min": [0, 0, 0], "max": [1, 1, 0]},
+                {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"}],
+            "meshes": [{"name": "slab", "primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
+            "nodes": [{"mesh": 0}], "scenes": [{"nodes": [0]}], "scene": 0
+        });
+        let path = dir.join(format!("{name}.gltf"));
+        std::fs::write(&path, document.to_string()).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_file_that_names_a_vertex_it_has_not_or_a_corner_that_is_no_number_is_refused() {
+        let dir = std::env::temp_dir().join(format!("somnium-broken-gltf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let flat = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        assert!(super::load_gltf(triangle(&dir, "whole", flat, [0, 1, 2])).is_ok());
+        assert!(super::gltf_problems(&dir.join("whole.gltf")).is_empty());
+        let past = super::load_gltf(triangle(&dir, "past", flat, [0, 1, 5])).err().unwrap();
+        assert!(past.contains("index 5 is past its 3 vertices"), "{past}");
+        assert_eq!(super::gltf_problems(&dir.join("past.gltf")), vec![past], "the quick check says what the load does");
+        let nan = [[0.0, 0.0, 0.0], [f32::NAN, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let nan = super::load_gltf(triangle(&dir, "nan", nan, [0, 1, 2])).err().unwrap();
+        assert!(nan.contains("vertex 1 is not a number"), "{nan}");
+        assert_eq!(super::gltf_problems(&dir.join("nan.gltf")), vec![nan]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The triangle's .bin rewritten `by` bytes shorter (negative) or longer.
+    fn resize_bin(dir: &Path, name: &str, by: isize) {
+        let file = dir.join(format!("{name}.bin"));
+        let mut bin = std::fs::read(&file).unwrap();
+        let length = (bin.len() as isize + by).max(0) as usize;
+        bin.resize(length, 0);
+        std::fs::write(&file, bin).unwrap();
+    }
+
+    #[test]
+    fn a_truncated_or_overlong_bin_is_refused_before_anything_is_read() {
+        let dir = std::env::temp_dir().join(format!("somnium-bin-sizes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let flat = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let cut = triangle(&dir, "cut", flat, [0, 1, 2]);
+        resize_bin(&dir, "cut", -8);
+        let why = super::load_gltf(&cut).err().expect("a truncated .bin is refused");
+        assert!(why.contains("declares 44 bytes") && why.contains("has 36") && why.contains("different writes"), "{why}");
+        assert_eq!(super::gltf_problems(&cut).len(), 1, "the quick check refuses it too");
+        let long = triangle(&dir, "long", flat, [0, 1, 2]);
+        resize_bin(&dir, "long", 16);
+        assert!(super::load_gltf(&long).err().unwrap().contains("has 60"));
+        let padded = triangle(&dir, "padded", flat, [0, 1, 2]);
+        resize_bin(&dir, "padded", 0);
+        assert!(super::load_gltf(&padded).is_ok(), "an exact .bin loads");
+        // Refused once a run: one log line and one toast per file, however often it is asked for. (The only test that
+        // takes the list: the others look.)
+        assert!(super::load_gltf(&cut).is_err());
+        assert_eq!(super::refused_state(&cut), (true, 1));
+        let taken = super::take_refused();
+        assert_eq!(taken.iter().filter(|(p, _)| *p == cut).count(), 1, "{taken:?}");
+        assert_eq!(super::refused_state(&cut), (true, 0), "taken, and still known: no second line");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn an_accessor_past_its_view_and_an_image_that_will_not_decode_are_refused() {
+        let dir = std::env::temp_dir().join(format!("somnium-accessors-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let flat = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        // Four corners claimed in a view of three: the reader would run past it.
+        let path = triangle(&dir, "four", flat, [0, 1, 2]);
+        let text = std::fs::read_to_string(&path).unwrap().replacen("\"count\":3", "\"count\":4", 1);
+        std::fs::write(&path, text).unwrap();
+        let why = super::load_gltf(&path).err().expect("refused");
+        assert!(why.contains("accessor 0 reads to byte 48, past its buffer view's 36 bytes"), "{why}");
+        // A texture that is not a picture.
+        std::fs::write(dir.join("noise.png"), b"not a png at all").unwrap();
+        let path = triangle(&dir, "noisy", flat, [0, 1, 2]);
+        let mut document: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        document["images"] = serde_json::json!([{"uri": "noise.png"}]);
+        std::fs::write(&path, document.to_string()).unwrap();
+        let why = super::load_gltf(&path).err().expect("refused");
+        assert!(why.contains("image 0"), "{why}");
+        assert!(!super::in_guarded_load(), "the guard is off outside a load");
+        // A missing model is its caller's to report: refused, but no toast.
+        let missing = dir.join("never_written.gltf");
+        assert!(super::load_gltf(&missing).is_err());
+        assert_eq!(super::refused_state(&missing), (false, 0));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_model_file_that_will_not_load_says_why() {
+        let dir = std::env::temp_dir().join(format!("somnium-gltf-files-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gltf = |name: &str, length: u32, images: &str| {
+            let text = format!(
+                r#"{{"asset":{{"version":"2.0"}},"buffers":[{{"uri":"{name}.bin","byteLength":{length}}}],"images":[{images}]}}"#
+            );
+            std::fs::write(dir.join(format!("{name}.gltf")), text).unwrap();
+            dir.join(format!("{name}.gltf"))
+        };
+        std::fs::write(dir.join("whole.bin"), [0u8; 64]).unwrap();
+        std::fs::write(dir.join("short.bin"), [0u8; 40]).unwrap();
+        std::fs::write(dir.join("long.bin"), [0u8; 80]).unwrap();
+        std::fs::write(dir.join("padded.bin"), [0u8; 64]).unwrap();
+        std::fs::write(dir.join("bark.png"), [0u8; 4]).unwrap();
+        assert!(super::gltf_file_problems(&gltf("padded", 62, "")).is_empty(), "padded to four bytes, as the importer allows");
+        assert!(super::gltf_file_problems(&gltf("whole", 64, r#"{"uri":"bark.png"}"#)).is_empty());
+        assert!(super::gltf_file_problems(&gltf("short", 64, ""))[0].contains("the importer refuses it"));
+        assert!(super::gltf_file_problems(&gltf("long", 64, ""))[0].contains("written apart"));
+        assert!(super::gltf_file_problems(&gltf("lost", 64, ""))[0].contains("lost.bin is missing"));
+        let unseen = super::gltf_file_problems(&gltf("whole", 64, r#"{"uri":"leaf.png"},{"uri":"data:image/png;base64,AA"}"#));
+        assert_eq!(unseen, vec!["missing texture: leaf.png".to_owned()]);
+        assert_eq!(super::gltf_file_problems(&dir.join("nothing.gltf")), vec!["the file is missing".to_owned()]);
+        let mut glb = b"glTF".to_vec();
+        glb.extend(2u32.to_le_bytes());
+        glb.extend(999u32.to_le_bytes());
+        std::fs::write(dir.join("cut.glb"), &glb).unwrap();
+        assert!(super::gltf_file_problems(&dir.join("cut.glb"))[0].contains("declares 999 bytes and has 12"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+#[cfg(test)]
+mod open_edge_tests {
+    use std::path::{Path, PathBuf};
+
+    use super::OpenPiece;
+
+    /// An 18 cm strip with no underside, as a roof's verge band hangs past its gable wall.
+    const STRIP: [[f32; 3]; 4] = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 0.0, 0.18], [0.0, 0.0, 0.18]];
+    const QUAD: [u32; 6] = [0, 1, 2, 2, 3, 0];
+
+    /// One node of a test glTF: its name, its triangles (into the file's one corner list), its material, where it stands.
+    struct Part<'a> {
+        node: &'a str,
+        indices: &'a [u32],
+        material: Option<usize>,
+        at: [f32; 3],
+    }
+
+    /// A glTF beside its .bin: `corners` once, then one mesh and one node for each part, with `materials`.
+    fn model(dir: &Path, name: &str, corners: &[[f32; 3]], parts: &[Part], materials: serde_json::Value) -> PathBuf {
+        let mut bin: Vec<u8> = corners.iter().flatten().flat_map(|c| c.to_le_bytes()).collect();
+        let lo: [f32; 3] = std::array::from_fn(|k| corners.iter().map(|c| c[k]).fold(f32::MAX, f32::min));
+        let hi: [f32; 3] = std::array::from_fn(|k| corners.iter().map(|c| c[k]).fold(f32::MIN, f32::max));
+        let mut views = vec![serde_json::json!({"buffer": 0, "byteOffset": 0, "byteLength": bin.len()})];
+        let mut accessors = vec![serde_json::json!(
+            {"bufferView": 0, "componentType": 5126, "count": corners.len(), "type": "VEC3", "min": lo, "max": hi})];
+        let (mut meshes, mut nodes) = (Vec::new(), Vec::new());
+        for (k, part) in parts.iter().enumerate() {
+            views.push(serde_json::json!({"buffer": 0, "byteOffset": bin.len(), "byteLength": part.indices.len() * 4}));
+            bin.extend(part.indices.iter().flat_map(|i| i.to_le_bytes()));
+            accessors.push(serde_json::json!(
+                {"bufferView": k + 1, "componentType": 5125, "count": part.indices.len(), "type": "SCALAR"}));
+            let mut primitive = serde_json::json!({"attributes": {"POSITION": 0}, "indices": k + 1});
+            if let Some(material) = part.material {
+                primitive["material"] = material.into();
+            }
+            meshes.push(serde_json::json!({"name": "mesh", "primitives": [primitive]}));
+            nodes.push(serde_json::json!({"name": part.node, "mesh": k, "translation": part.at}));
+        }
+        std::fs::write(dir.join(format!("{name}.bin")), &bin).unwrap();
+        let mut document = serde_json::json!({
+            "asset": {"version": "2.0"},
+            "buffers": [{"uri": format!("{name}.bin"), "byteLength": bin.len()}],
+            "bufferViews": views, "accessors": accessors, "meshes": meshes, "nodes": nodes,
+            "scenes": [{"nodes": (0..parts.len()).collect::<Vec<_>>()}], "scene": 0
+        });
+        if materials.as_array().is_some_and(|m| !m.is_empty()) {
+            document["materials"] = materials;
+        }
+        let path = dir.join(format!("{name}.gltf"));
+        std::fs::write(&path, document.to_string()).unwrap();
+        path
+    }
+
+    /// A glTF of one node, called `node`, taking the first of `materials` when there is one.
+    fn piece(dir: &Path, name: &str, node: &str, corners: &[[f32; 3]], indices: &[u32], materials: serde_json::Value) -> PathBuf {
+        let material = materials.as_array().is_some_and(|m| !m.is_empty()).then_some(0);
+        model(dir, name, corners, &[Part { node, indices, material, at: [0.0; 3] }], materials)
+    }
+
+    #[test]
+    fn a_closed_box_has_no_open_edges_and_a_strip_or_a_box_with_a_face_missing_has() {
+        let (vertices, indices) = super::generate_cube(1.0);
+        let corners: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+        assert_eq!(super::open_edges(&corners, &indices), 0, "each corner repeats once a face, and is welded");
+        assert_eq!(super::open_edges(&corners, &indices[..30]), 4, "a face missing leaves its four edges open");
+        assert_eq!(super::open_edges(&STRIP, &QUAD), 4, "a strip with no underside is open all round");
+        let split = [STRIP[0], STRIP[1], STRIP[2], [1.000_04, 0.0, 0.18], STRIP[3], [0.0, 0.000_03, 0.0]];
+        assert_eq!(super::open_edges(&split, &[0, 1, 2, 3, 4, 5]), 4, "corners a tenth of a millimetre apart are one");
+        assert_eq!(super::open_edges(&STRIP, &[0, 1, 2, 0, 0, 3, 2, 3, 9]), 3, "a flat triangle and a lost vertex are skipped");
+    }
+
+    #[test]
+    fn a_one_sided_piece_with_open_edges_is_named_and_still_loads_and_a_two_sided_or_closed_one_is_not() {
+        let dir = std::env::temp_dir().join(format!("somnium-open-edges-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let eave = piece(&dir, "eave", "roof_eave", &STRIP, &QUAD, serde_json::json!([]));
+        let named = OpenPiece { name: "roof_eave".into(), material: "(default material)".into(), open_edges: 4, triangles: 2 };
+        assert_eq!(super::open_edge_pieces(&eave).unwrap(), vec![named]);
+        assert!(super::load_gltf(&eave).is_ok(), "a warning only: the piece loads as before");
+        assert!(!super::open_edges_first_look(&eave), "the importer looked at it once this run, and warns no more");
+
+        let tiles = piece(&dir, "tiles", "roof_eave", &STRIP, &QUAD, serde_json::json!([{"name": "tiles", "doubleSided": true}]));
+        assert!(super::open_edge_pieces(&tiles).unwrap().is_empty(), "drawn on both sides, the strip shows no sky");
+        let glass = piece(&dir, "glass", "pane", &STRIP, &QUAD, serde_json::json!([{"name": "glass", "alphaMode": "BLEND"}]));
+        assert!(super::open_edge_pieces(&glass).unwrap().is_empty(), "a blended pane is seen through anyway");
+        let far = r#"[{"name": "far", "extras": {"somnium_far_ground": 1}}]"#;
+        let far = piece(&dir, "far", "tile", &STRIP, &QUAD, serde_json::from_str(far).unwrap());
+        assert!(super::open_edge_pieces(&far).unwrap().is_empty(), "far ground is a sheet by design");
+
+        let (vertices, indices) = super::generate_cube(1.0);
+        let corners: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+        let stone = || serde_json::json!([{"name": "stone"}]);
+        let block = piece(&dir, "block", "wall_block", &corners, &indices, stone());
+        assert!(super::open_edge_pieces(&block).unwrap().is_empty(), "a closed one-sided box is right");
+        let shell = piece(&dir, "shell", "wall_shell", &corners, &indices[..30], stone());
+        let shell = super::open_edge_pieces(&shell).unwrap();
+        assert_eq!((shell[0].name.as_str(), shell[0].material.as_str(), shell[0].open_edges), ("wall_shell", "stone", 4));
+        assert!(super::open_edges_first_look(&block) && !super::open_edges_first_look(&block), "once a file a run");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_seam_between_two_materials_or_two_nodes_is_closed_and_a_hole_is_named_on_the_piece_round_it() {
+        let dir = std::env::temp_dir().join(format!("somnium-open-seams-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (vertices, indices) = super::generate_cube(1.0);
+        let corners: Vec<[f32; 3]> = vertices.iter().map(|v| v.position).collect();
+        let materials = || serde_json::json!([{"name": "stone"}, {"name": "plaster"}]);
+        // Front, back, top and bottom in stone, the two sides in plaster: one node a material, as the generators write.
+        let wall = |node, indices, material| Part { node, indices, material: Some(material), at: [0.0; 3] };
+        let house = model(&dir, "house", &corners, &[wall("plinth", &indices[..24], 0), wall("render", &indices[24..], 1)], materials());
+        assert!(super::open_edge_pieces(&house).unwrap().is_empty(), "where plaster meets stone the box is closed");
+        let holed = model(&dir, "holed", &corners, &[wall("plinth", &indices[..24], 0), wall("render", &indices[24..30], 1)], materials());
+        let holed = super::open_edge_pieces(&holed).unwrap();
+        assert_eq!(holed.len(), 1, "the left side is gone: its four edges are open on the stone round it, {holed:?}");
+        assert_eq!((holed[0].name.as_str(), holed[0].material.as_str(), holed[0].open_edges, holed[0].triangles), ("plinth", "stone", 4, 8));
+
+        // Two strips, the second node a metre along: they share one edge, so each is open on three.
+        let strip = |node, x| Part { node, indices: &QUAD, material: None, at: [x, 0.0, 0.0] };
+        let eaves = model(&dir, "eaves", &STRIP, &[strip("eave_a", 0.0), strip("eave_b", 1.0)], serde_json::json!([]));
+        let open: Vec<(String, usize)> = super::open_edge_pieces(&eaves).unwrap().into_iter().map(|p| (p.name, p.open_edges)).collect();
+        assert_eq!(open, vec![("eave_a".into(), 3), ("eave_b".into(), 3)], "nodes are welded where they stand");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

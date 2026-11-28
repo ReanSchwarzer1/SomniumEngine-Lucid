@@ -25,6 +25,7 @@
 // a still.
 
 //!include "sky_eye.wgsl"
+//!include "storm.wgsl"
 
 struct CompositeParams {
     inv_view_proj: mat4x4<f32>,
@@ -59,6 +60,8 @@ struct CompositeParams {
 @group(0) @binding(1) var cloud_tex: texture_2d<f32>;
 @group(0) @binding(2) var cloud_samp: sampler;
 @group(0) @binding(3) var comp_depth: texture_depth_2d;
+/// The storm's bodies (`storm.wgsl`): they stand below the layer, in front of ground the layer is behind.
+@group(0) @binding(4) var<uniform> comp_storm: Storm;
 
 struct VOut {
     @builtin(position) clip: vec4<f32>,
@@ -93,21 +96,95 @@ fn layer_entry(origin: vec3<f32>, dir: vec3<f32>) -> f32 {
     return max(enter, 0.0);
 }
 
+/// Distance along a ray to the nearest storm body's cylinder (huge if it meets none).
+fn storm_entry(origin: vec3<f32>, dir: vec3<f32>) -> f32 {
+    var nearest = 1e30;
+    for (var i = 0u; i < comp_storm.counts.x; i = i + 1u) {
+        let v = comp_storm.volumes[i];
+        if storm_is_modifier(v) {
+            continue;
+        }
+        let c = storm_cylinder(v, origin, dir);
+        if c.y > c.x {
+            // Never nearer than a body can veil anything: within forty metres even a downpour's air is clear, and
+            // an eye inside a body's cylinder would otherwise lay the far body over every leaf and hand in front of it.
+            nearest = min(nearest, max(c.x, 40.0));
+        }
+    }
+    return nearest;
+}
+
+/// The cloud over a sky pixel: the four low-resolution texels round it, blended as a bilinear read blends them,
+/// except a texel that is centred on geometry and holds no cloud. Nothing was marched for that one (the geometry was
+/// nearer than the clouds), so it is not clear sky, and blending it in let the bare sky through: under a dark deck a
+/// bright blue fringe round every crown and in every gap between leaves (w9 stills, 11 Nov 2026). Where no such
+/// texel is among the four (open sky, and every clear sky) this is the bilinear read exactly.
+fn sky_cloud(uv: vec2<f32>, depth_dims: vec2<u32>) -> vec4<f32> {
+    let low = uv * comp.low_size - 0.5;
+    let base = floor(low);
+    let f = low - base;
+    var colour = vec4<f32>(0.0);
+    var weight_sum = 0.0;
+    for (var j = 0; j < 2; j = j + 1) {
+        for (var i = 0; i < 2; i = i + 1) {
+            let clamped = clamp(base + vec2<f32>(f32(i), f32(j)), vec2<f32>(0.0), comp.low_size - 1.0);
+            let tap_uv = (clamped + 0.5) * comp.inv_low_size;
+            let tap = textureSampleLevel(cloud_tex, cloud_samp, tap_uv, 0.0);
+            let tap_depth = textureLoad(comp_depth, vec2<i32>(tap_uv * vec2<f32>(depth_dims)), 0);
+            var w = mix(1.0 - f.x, f.x, f32(i)) * mix(1.0 - f.y, f.y, f32(j));
+            if tap_depth > 0.0 && tap_depth < 1.0 && tap.a >= 0.9999 && dot(tap.rgb, vec3<f32>(1.0)) <= 0.0 {
+                w *= 0.001;
+            }
+            colour += tap * w;
+            weight_sum += w;
+        }
+    }
+    if weight_sum < 0.01 {
+        // None of the four was marched: a sliver of sky thinner than a low-resolution texel, as the gap between
+        // two pieces of far land at the horizon is. It showed the bare sky, bright dashes along the horizon
+        // under a dark deck (the summit stills, 12 Nov 2026). Its cloud is its neighbours': the marched texels
+        // in the two rings round the four, evenly.
+        var ring = vec4<f32>(0.0);
+        var found = 0.0;
+        for (var j = -2; j < 4; j = j + 1) {
+            for (var i = -2; i < 4; i = i + 1) {
+                if i >= 0 && i < 2 && j >= 0 && j < 2 {
+                    continue;
+                }
+                let clamped = clamp(base + vec2<f32>(f32(i), f32(j)), vec2<f32>(0.0), comp.low_size - 1.0);
+                let tap_uv = (clamped + 0.5) * comp.inv_low_size;
+                let tap = textureSampleLevel(cloud_tex, cloud_samp, tap_uv, 0.0);
+                let tap_depth = textureLoad(comp_depth, vec2<i32>(tap_uv * vec2<f32>(depth_dims)), 0);
+                if tap_depth > 0.0 && tap_depth < 1.0 && tap.a >= 0.9999 && dot(tap.rgb, vec3<f32>(1.0)) <= 0.0 {
+                    continue;
+                }
+                ring += tap;
+                found += 1.0;
+            }
+        }
+        if found > 0.0 {
+            return ring / found;
+        }
+    }
+    return colour / max(weight_sum, 1e-6);
+}
+
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let depth_dims = textureDimensions(comp_depth);
     let here = textureLoad(comp_depth, vec2<i32>(in.uv * vec2<f32>(depth_dims)), 0);
-    // Sky: the cloud is behind nothing, so a plain bilinear read — through a
-    // canopy the march now carries cloud in every texel that sees any sky.
+    // Sky: the cloud is behind nothing, so a bilinear read of the texels that were marched (`sky_cloud`).
     if here <= 0.0 || here >= 1.0 {
-        let cloud = textureSampleLevel(cloud_tex, cloud_samp, in.uv, 0.0);
+        let cloud = sky_cloud(in.uv, depth_dims);
         if comp.eye_intensity <= 0.0 {
             return cloud;
         }
         let sky_ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
-        let near_p = comp.inv_view_proj * vec4<f32>(sky_ndc, 0.0, 1.0);
-        let far_p = comp.inv_view_proj * vec4<f32>(sky_ndc, 1.0, 1.0);
-        let dir = normalize(far_p.xyz / far_p.w - near_p.xyz / near_p.w);
+        // Reversed-Z (Sunscar, 6 Nov 2026): depth 1 is the near plane and 0 infinity, where a perspective's point
+        // has w = 0 and its xyz is the ray's direction (undivided, an orthographic view's far plane less its near).
+        let near_p = comp.inv_view_proj * vec4<f32>(sky_ndc, 1.0, 1.0);
+        let far_p = comp.inv_view_proj * vec4<f32>(sky_ndc, 0.0, 1.0);
+        let dir = normalize(far_p.xyz - near_p.xyz / near_p.w * far_p.w);
         let eye = sky_eye(dir, normalize(comp.eye_direction), comp.eye_tan_half_width, comp.eye_color,
                           comp.eye_intensity, comp.eye_shape, comp.eye_time);
         // Through the deck: the cloud is darkened where the eye covers the sky
@@ -122,9 +199,11 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     // clouds) has no cloud in front of it.
     let ndc = vec2<f32>(in.uv.x * 2.0 - 1.0, 1.0 - in.uv.y * 2.0);
     let wp = comp.inv_view_proj * vec4<f32>(ndc, here, 1.0);
-    let to = wp.xyz / wp.w - comp.camera_pos;
+    // Camera-relative (`inv_view_proj` is, since 5 Nov 2026): already the offset from the eye.
+    let to = wp.xyz / wp.w;
     let distance = length(to);
-    if distance <= layer_entry(comp.camera_pos, to / max(distance, 1e-6)) {
+    let toward = to / max(distance, 1e-6);
+    if distance <= min(layer_entry(comp.camera_pos, toward), storm_entry(comp.camera_pos, toward)) {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
 

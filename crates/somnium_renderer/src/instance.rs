@@ -7,6 +7,21 @@ use bytemuck::{Pod, Zeroable};
 /// equal it; the CDLOD morph reads its own bits, all zero here, and does nothing.
 pub const NO_CONTACT_SHADOW: u32 = 0x8000_0000;
 
+/// `GpuInstanceData::_padding` of an instance-batch copy that hands over to another LOD at a band edge (Sunscar,
+/// 6 Nov 2026), from [`crate::instance_batch::InstanceBatch::fade`]: `edge` > 0 fades the copy out past that
+/// horizontal distance (the near band), `edge` < 0 fades it in past `-edge` (the far band), 0 is no fade (0).
+/// The edge in 1/16 m sits in bits 14..29 and the direction in bit 0 (set: in). Bits 4..13 stay clear, where every
+/// terrain chunk carries its vertex count, and bit 31 too, so neither the morph nor the contact-shadow test reads it.
+/// `visibility.wgsl` dithers alpha-tested parts across the edge and switches opaque ones at it; `shadow.wgsl` switches.
+#[must_use]
+pub fn foliage_fade(edge: f32) -> u32 {
+    if !edge.is_finite() || edge.abs() < 1.0 / 16.0 {
+        return 0;
+    }
+    let q = (edge.abs() * 16.0).round().clamp(1.0, 65535.0) as u32;
+    (q << 14) | u32::from(edge < 0.0)
+}
+
 /// Per-instance data matching the GPU layout.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
@@ -148,5 +163,24 @@ impl InstancePool {
     /// region with a few moving people sends the few chunks they are in, not every house again.
     pub fn upload(&mut self, queue: &wgpu::Queue) {
         self.written = upload_changed(queue, &self.buffer, &self.instances, &mut self.uploaded, UPLOAD_CHUNK);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fade_word_is_neither_terrain_nor_the_contact_flag() {
+        for edge in [45.0f32, -45.0, 0.07, -4000.0, 4095.9] {
+            let w = foliage_fade(edge);
+            assert_ne!(w, 0);
+            assert_ne!(w, NO_CONTACT_SHADOW);
+            assert_eq!((w >> 4) & 1023, 0, "terrain's vertex count and morph bit stay clear");
+            assert_eq!(w & 1, u32::from(edge < 0.0));
+            assert!((f32::from((w >> 14) as u16) / 16.0 - edge.abs()).abs() <= 1.0 / 32.0 + 1e-3);
+        }
+        assert_eq!(foliage_fade(0.0), 0);
+        assert_eq!(foliage_fade(f32::NAN), 0);
     }
 }

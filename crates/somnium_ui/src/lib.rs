@@ -60,7 +60,7 @@ use crate::editor::inspector_gen::GeneratedComponentPanel;
 use crate::editor::property_editors::PropertyEditorKind;
 use crate::editor::{
     content::{build_content_drawer, build_create_popup},
-    help::{build_help_overlay, fill_help_body},
+    help::{build_help_overlay, fill_help_body, fill_help_markdown},
     inspector::{build_generated_details, build_inspector},
     shell::build_editor_layout,
 };
@@ -630,6 +630,16 @@ const TERRAIN_LAYER_SHORT: [&str; 32] = [
     "Crust",
 ];
 
+/// A ground slot's label in the paint palettes: what the selected terrain's own ground set calls it (`names`, slot by
+/// slot, "" where nothing names one), with its number; else the engine's built-in short name, which a project's set
+/// need not follow (Sunscar's slot 3 is "sunbleached chalk", not "Snow").
+fn terrain_layer_label(names: &[String], slot: usize) -> String {
+    match names.get(slot).map(|n| n.trim()).filter(|n| !n.is_empty()) {
+        Some(name) => format!("{slot}: {name}"),
+        None => TERRAIN_LAYER_SHORT.get(slot).copied().unwrap_or("?").to_owned(),
+    }
+}
+
 const TERRAIN_BRUSH_NAMES: [&str; 6] = ["Raise", "Lower", "Smooth", "Flatten", "Noise", "Paint"];
 
 pub type LightInspectorValues = [f32; 11];
@@ -954,6 +964,109 @@ enum LogView {
     History,
 }
 
+/// How a shipped player's window is shown while immersive: a game's display options.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WindowMode {
+    /// Fills the screen at its own resolution, as a window without borders (quick to switch away from).
+    #[default]
+    Borderless,
+    /// Takes the screen over in one of its video modes.
+    Fullscreen,
+    /// A window with a title bar, moved and sized as any other.
+    Windowed,
+}
+
+/// A window mode and a size in physical pixels: the video mode in `Fullscreen`, the window's inner size in
+/// `Windowed`, unused in `Borderless`. `None` is the screen's own size (`Windowed`: the window as it is).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WindowDisplay {
+    pub mode: WindowMode,
+    pub size: Option<[u32; 2]>,
+}
+
+/// A process-wide slot, as `somnium_core::time::request_frame_pacing` is, since the request comes from game callbacks
+/// that never see the [`UiManager`]. The app hands the latest one over between frames.
+static DISPLAY_REQUEST: std::sync::Mutex<Option<WindowDisplay>> = std::sync::Mutex::new(None);
+/// The window's screen as last seen: its own size, and the sizes of its video modes (smallest first).
+static DISPLAY_SIZES: std::sync::Mutex<(Option<[u32; 2]>, Vec<[u32; 2]>)> = std::sync::Mutex::new((None, Vec::new()));
+
+/// `SOMNIUM_BACKGROUND_WINDOW=WIDTHxHEIGHT` (29 Oct 2026): checks run while someone works at the machine. The window
+/// opens at that size off every screen, is never activated and stays off the taskbar; it never goes fullscreen or
+/// resizes for a game's display options, and never captures the pointer (somnium_core `sync_play_cursor`). Pictures
+/// still come from its own frames, since the capture copies the swap chain. The developer: "i would prefer it if you
+/// stopped taking the mouse away for checks".
+///
+/// Set to anything that is not a size (`1`, `true`), it still means a background window, at 1600x900, and says so:
+/// a value that silently failed to parse used to open an ordinary window that took the focus (5 Nov 2026).
+pub fn background_window() -> Option<[u32; 2]> {
+    static SIZE: std::sync::LazyLock<Option<[u32; 2]>> = std::sync::LazyLock::new(|| {
+        background_window_size(std::env::var("SOMNIUM_BACKGROUND_WINDOW").ok().as_deref())
+    });
+    *SIZE
+}
+
+fn background_window_size(value: Option<&str>) -> Option<[u32; 2]> {
+    let value = value?.trim();
+    if value.is_empty() || matches!(value.to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no") {
+        return None;
+    }
+    Some(parse_window_size(value).unwrap_or_else(|| {
+        tracing::warn!(value, "SOMNIUM_BACKGROUND_WINDOW is not WIDTHxHEIGHT: a background window at 1600x900");
+        [1600, 900]
+    }))
+}
+
+#[cfg(test)]
+mod background_window_flag_tests {
+    #[test]
+    fn any_set_value_means_a_background_window() {
+        use super::background_window_size as size;
+        assert_eq!(size(Some("2560x1440")), Some([2560, 1440]));
+        assert_eq!(size(Some("1")), Some([1600, 900]), "a flag, not a size, must not open an ordinary window");
+        assert_eq!(size(Some("true")), Some([1600, 900]));
+        assert_eq!(size(Some("0")), None);
+        assert_eq!(size(Some("")), None);
+        assert_eq!(size(None), None);
+    }
+}
+
+fn parse_window_size(text: &str) -> Option<[u32; 2]> {
+    let (w, h) = text.split_once(['x', 'X'])?;
+    let size = [w.trim().parse().ok()?, h.trim().parse().ok()?];
+    size.iter().all(|v| (240..=8192).contains(v)).then_some(size)
+}
+
+#[cfg(test)]
+mod background_window_tests {
+    #[test]
+    fn a_background_window_size_is_width_by_height() {
+        use super::parse_window_size;
+        assert_eq!(parse_window_size("2560x1440"), Some([2560, 1440]));
+        assert_eq!(parse_window_size(" 1920 X 1080 "), Some([1920, 1080]));
+        assert_eq!(parse_window_size("1"), None, "a size, not a switch");
+        assert_eq!(parse_window_size("100x100"), None, "too small to picture anything");
+        assert_eq!(parse_window_size("2560x"), None);
+    }
+}
+
+/// Ask for the player's window to be shown this way; applied before the next frame, and whenever the window goes
+/// immersive after that.
+pub fn request_window_display(display: WindowDisplay) {
+    if let Ok(mut slot) = DISPLAY_REQUEST.lock() {
+        *slot = Some(display);
+    }
+}
+
+/// The pending request, once.
+pub fn take_window_display_request() -> Option<WindowDisplay> {
+    DISPLAY_REQUEST.lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// The window's screen: its own size, and every size its video modes offer, smallest first (empty with no window).
+pub fn display_sizes() -> (Option<[u32; 2]>, Vec<[u32; 2]>) {
+    DISPLAY_SIZES.lock().map(|sizes| sizes.clone()).unwrap_or_default()
+}
+
 pub struct UiManager {
     authoring_panel: Option<crate::authoring_panel::AuthoringPanel>,
     /// The welcome screen, built the first time it is shown.
@@ -1047,6 +1160,12 @@ pub struct UiManager {
     outliner_rows: Vec<(NodeHandle, u32)>,
     /// Entities the palette can jump to, mirrored from the Outliner.
     palette_entities: Vec<(u32, String)>,
+    /// The open scene's places for the palette's "Go to" rows: name, kind, and whether it is built yet.
+    palette_places: Vec<(String, String, bool)>,
+    /// The game's presets (id, label, category) as Command Palette rows: Sunscar's weather and its events, any game's.
+    palette_presets: Vec<(String, String, String)>,
+    /// What the selected terrain's ground set calls each slot ("" where nothing names one), for the paint palette.
+    terrain_layer_names: Vec<String>,
     /// Stable dynamic palette ids mapped to their current targets.
     palette_targets: std::collections::HashMap<String, PaletteTarget>,
     /// Persisted palette learning state.
@@ -1302,8 +1421,16 @@ pub struct UiManager {
     help_menu_open: bool,
     tooltip_since: Option<(NodeHandle, std::time::Instant)>,
     help_page: u8,
+    /// The open project's folder, for its editor guide. None with no project open.
+    project_root: Option<std::path::PathBuf>,
     /// The tiles that currently exist, in the order they were built.
     content_entries: Vec<(NodeHandle, crate::metaphor::ContentEntry)>,
+    /// The project's content folder, told by the app before the first inventory of it has been read.
+    content_root: Option<std::path::PathBuf>,
+    /// False until an inventory has been published. Until then the drawer lists folders straight from the disk.
+    content_indexed: bool,
+    /// Why the last read of the project's files failed, when it did.
+    content_scan_error: Option<String>,
     /// Every entry the last query returned, whether or not it has a tile.
     ///
     /// MORROWIND-M. This is the list the drawer *shows*; `content_entries` is
@@ -1323,6 +1450,9 @@ pub struct UiManager {
     outliner_entity_handles: HashMap<u32, somnium_ecs::Entity>,
     outliner_selection: Vec<u32>,
     clipboard_filled: bool,
+    picked_copy: bool,
+    /// Models that did not load this run (core's count), first in the status bar's right-hand cluster.
+    models_missing: usize,
     /// User keybinding overrides. Dispatch reads this, not the declarations.
     keybindings: crate::commands::KeyBindings,
     /// The command whose binding is being captured, if the Preferences window
@@ -1477,6 +1607,8 @@ pub struct UiManager {
     immersive: bool,
     immersive_restore_fullscreen: Option<Fullscreen>,
     immersive_restore_maximized: bool,
+    /// How the window is shown while immersive ([`request_window_display`]).
+    player_display: WindowDisplay,
 }
 
 /// Load the bundled Nocturne faces and publish the [`FontRole`] table.
@@ -1591,6 +1723,10 @@ enum PaletteTarget {
     /// Add this component (stable id) to the selected entity.
     AddComponent(String),
     Entity(u32),
+    /// A place of the open scene, by its row.
+    Place(usize),
+    /// A game preset by its id, run as the Authoring panel's Create runs it (one undoable step).
+    Preset(String),
     Asset(std::path::PathBuf),
     Help(u8),
     Drawer,
@@ -1598,6 +1734,26 @@ enum PaletteTarget {
 }
 
 impl UiManager {
+    /// The open scene's places, for the Command Palette's "Go to" rows: each a name, what kind of place it is, and
+    /// whether it is built yet. Choosing a row raises [`EditorEvent::GoToPlace`] with its index here. An empty list
+    /// shows no rows.
+    pub fn set_palette_places(&mut self, places: Vec<(String, String, bool)>) {
+        self.palette_places = places;
+    }
+
+    /// What the selected terrain's ground set calls each slot (slot by slot, "" where nothing names one; empty with
+    /// no terrain selected): the Terrain Tools palette shows these in place of the engine's built-in names.
+    pub fn set_terrain_layer_names(&mut self, names: Vec<String>) {
+        self.terrain_layer_names = names;
+    }
+
+    /// The game's presets for the Command Palette: each an id, a label and a category ("Weather"). A row reads
+    /// "Weather: Rain"; choosing it asks the host to run the preset exactly as the Authoring panel's Create does
+    /// (an `authoring.execute` request, so it is undoable). An empty list shows no rows.
+    pub fn set_palette_presets(&mut self, presets: Vec<(String, String, String)>) {
+        self.palette_presets = presets;
+    }
+
     fn allocate_property_gesture(&mut self) -> GestureId {
         let gesture = GestureId(self.next_property_gesture);
         self.next_property_gesture = self.next_property_gesture.wrapping_add(1).max(1);
@@ -1923,6 +2079,9 @@ impl UiManager {
             terrain_tool_items: layout.terrain_tool_items,
             outliner_rows: Vec::new(),
             palette_entities: Vec::new(),
+            palette_places: Vec::new(),
+            palette_presets: Vec::new(),
+            terrain_layer_names: Vec::new(),
             palette_targets: std::collections::HashMap::new(),
             command_history: crate::commands::CommandHistory::load(),
             inspector_handles: layout.inspector_handles,
@@ -2097,7 +2256,11 @@ impl UiManager {
             help_menu_open: false,
             tooltip_since: None,
             help_page: 0,
+            project_root: None,
             content_entries: Vec::new(),
+            content_root: None,
+            content_indexed: false,
+            content_scan_error: None,
             content_all: Vec::new(),
             content_window: None,
             dependency_index: somnium_asset::depend::DependencyIndex::default(),
@@ -2107,6 +2270,8 @@ impl UiManager {
             outliner_entity_handles: HashMap::new(),
             outliner_selection: Vec::new(),
             clipboard_filled: false,
+            picked_copy: false,
+            models_missing: 0,
             keybindings: crate::commands::KeyBindings::load(),
             rebinding: None,
             preferences_open: false,
@@ -2187,6 +2352,7 @@ impl UiManager {
             immersive: false,
             immersive_restore_fullscreen: None,
             immersive_restore_maximized: false,
+            player_display: WindowDisplay::default(),
         };
         // CONTROL-A evidence harness. A relative drawer path lets a timing run
         // queue the real `assets/terrain/` workload before frame one, without
@@ -3412,6 +3578,53 @@ impl UiManager {
             .send(TextMessage::set_text(self.status_text, text.to_string()));
     }
 
+    /// Once the editor is up: tell the person, one time per change of the What's New text, that there is something to
+    /// read. The text's hash is kept in the per-user folder; no file there means a first run, which also tells them.
+    /// Scripted and screenshot runs stay quiet, and so do runs that cannot keep the hash (they would repeat it).
+    pub fn announce_whats_new(&mut self) {
+        if std::env::var_os("SOMNIUM_CAPTURE_UI_PNG").is_some()
+            || std::env::var_os("SOMNIUM_EDITOR_SCRIPT").is_some()
+        {
+            return;
+        }
+        let Some(file) = crate::metaphor::whats_new_seen_path() else {
+            return;
+        };
+        let current = crate::metaphor::whats_new_hash();
+        let stored = std::fs::read(&file)
+            .ok()
+            .and_then(|bytes| crate::metaphor::parse_seen_hash(&bytes));
+        if !crate::metaphor::whats_new_unseen(stored.as_deref(), &current) {
+            return;
+        }
+        if let Err(error) = crate::metaphor::write_seen_hash(&file, &current) {
+            eprintln!("Could not remember that What's New was shown: {error}");
+            return;
+        }
+        self.push_toast("The editor has changed. Help > What's New lists what you can do now.");
+    }
+
+    /// Put a line in the status bar without raising a toast: a tool's running state, said once when it changes.
+    pub fn set_status_text(&mut self, text: &str) {
+        self.native_ui
+            .send(TextMessage::set_text(self.status_text, text.to_string()));
+    }
+
+    /// Run the command a press of `code` with these modifiers runs through the remappable bindings, under the same
+    /// guards as a real press (a text box with the focus, the game owning the keyboard). The editor script's `key=`
+    /// step. False when no enabled command takes the key.
+    pub fn run_key_command(&mut self, code: winit::keyboard::KeyCode, command: bool, shift: bool, alt: bool) -> bool {
+        if self.native_ui.has_text_focus() {
+            return false;
+        }
+        let Some(chord) = crate::commands::Chord::from_winit(code, command, shift, alt, false)
+            .filter(|chord| !self.game_owns_keyboard() || chord.has_modifier())
+        else {
+            return false;
+        };
+        self.keybindings.command_for(chord).is_some_and(|id| self.run_command_id(id))
+    }
+
     /// Dismiss the oldest sticky toast, reporting whether there was one.
     ///
     /// The boolean matters: `Esc` must fall through to the rest of the chain
@@ -3493,14 +3706,14 @@ impl UiManager {
         self.refresh_title();
     }
 
-    /// `Somnium Engine — scene.somnium •` — CONTROL-J's accurate title bar.
+    /// `Lucid — scene.somnium •` — CONTROL-J's accurate title bar.
     ///
     /// The bullet is the convention every editor uses for unsaved work, and
     /// the title bar is the one place that state is visible without looking
     /// down at the status bar. Composed here rather than at the two call
     /// sites so the facts it combines cannot get out of step.
     fn refresh_title(&mut self) {
-        let mut title = "Somnium Engine".to_string();
+        let mut title = "Lucid".to_string();
         if let Some(name) = &self.scene_name {
             title.push_str(" \u{2014} ");
             title.push_str(name);
@@ -3542,6 +3755,47 @@ impl UiManager {
         }
     }
 
+    /// The viewport's selection card: what the selection is and where it came from, several lines. `None` leaves the
+    /// one-line name [`Self::set_status_selection`] put there.
+    pub fn set_selection_card(&mut self, card: Option<&str>) {
+        if let Some(card) = card {
+            self.native_ui
+                .send(TextMessage::set_text(self.vp_overlay_text, card.to_owned()));
+            self.native_ui.set_visibility(self.vp_overlay, true);
+        }
+    }
+
+    /// Open every row above `id` and scroll the Outliner so it shows. False when the Outliner's search hides it.
+    pub fn reveal_outliner_row(&mut self, id: u32, ancestors: &[u32]) -> bool {
+        self.outliner_expanded.extend(ancestors.iter().copied());
+        let Some((rows, _)) = self.last_outliner_state.as_ref() else {
+            return false;
+        };
+        let filter = crate::outliner_filter::OutlinerFilter::parse(&format!(
+            "{} {}",
+            self.outliner_filter, self.persona.outliner_scope
+        ));
+        let mut visible = crate::outliner_filter::OutlinerVisibility::new(filter.is_empty());
+        let position = rows
+            .iter()
+            .filter(|row| filter.matches(row) && visible.shows(row, &self.outliner_expanded))
+            .position(|row| row.id == id);
+        // Rebuilt next frame with the rows just opened.
+        self.last_outliner_state = None;
+        let Some(position) = position else {
+            return false;
+        };
+        let row = theme::active().density.row_tree;
+        let view = self.native_ui.screen_bounds(self.outliner_scroll).h;
+        let offset = (position as f32 * row - view * 0.4).max(0.0);
+        self.native_ui.send(UiMessage::new(
+            self.outliner_scroll,
+            MessageDirection::ToWidget,
+            crate::widgets::scroll_viewer::ScrollViewerMessage::ScrollTo(offset),
+        ));
+        true
+    }
+
     /// Right-hand statistics cluster. Object count is what the editor can
     /// state honestly today; triangles and memory join it when the renderer
     /// reports them per frame (Zeta-G).
@@ -3560,6 +3814,11 @@ impl UiManager {
         if self.script_errors > 0 {
             let plural = if self.script_errors == 1 { "" } else { "s" };
             text = format!("{} script error{plural} · {text}", self.script_errors);
+        }
+        // Before everything else, for the same reason: it is the one fact here that makes the picture untrue.
+        if self.models_missing > 0 {
+            let plural = if self.models_missing == 1 { "" } else { "s" };
+            text = format!("{} model{plural} missing · {text}", self.models_missing);
         }
         self.native_ui
             .send(TextMessage::set_text(self.status_stats, text));
@@ -3885,6 +4144,14 @@ impl UiManager {
         self.prompt_unsaved_action(EditorEvent::NewScene);
     }
 
+    /// Ask "Save changes?" before the editor closes; the answer comes back as [`EditorEvent::Quit`]. Asking again
+    /// while it is open changes nothing.
+    pub fn prompt_unsaved_quit(&mut self) {
+        if !self.unsaved_open {
+            self.prompt_unsaved_action(EditorEvent::Quit { after_save: false });
+        }
+    }
+
     fn prompt_unsaved_action(&mut self, action: EditorEvent) {
         if !self.scene_dirty {
             self.editor_events.push_back(action);
@@ -3954,7 +4221,12 @@ impl UiManager {
 
     fn set_help_page(&mut self, page: u8) {
         self.help_page = page;
-        fill_help_body(&mut self.native_ui, self.help_body, self.font_id, page);
+        if page == crate::metaphor::PROJECT_GUIDE_PAGE {
+            let text = crate::metaphor::project_guide_text(self.project_root.as_deref());
+            fill_help_markdown(&mut self.native_ui, self.help_body, self.font_id, &text);
+        } else {
+            fill_help_body(&mut self.native_ui, self.help_body, self.font_id, page);
+        }
         let toc = self.help_toc.clone();
         for (handle, id) in toc {
             self.native_ui
@@ -4477,6 +4749,41 @@ impl UiManager {
             targets.insert(key, PaletteTarget::Entity(*id));
         }
 
+        // The scene's places: "Go to Lucara" takes the camera there. A planned place says so and can still be
+        // gone to, to look at its site.
+        for (i, (name, group, built)) in self.palette_places.iter().enumerate() {
+            let key = format!("place:{name}");
+            let hint = match (group.is_empty(), *built) {
+                (_, true) => group.clone(),
+                (true, false) => "planned".to_owned(),
+                (false, false) => format!("{group}, planned"),
+            };
+            items.push(
+                PaletteItem::new(&key, format!("Go to {name}"), hint, Cat::Panel)
+                    .with_recency(self.command_history.recency(&key))
+                    .with_icon(crate::icons::IconId::Pin),
+            );
+            targets.insert(key, PaletteTarget::Place(i));
+        }
+
+        // The game's presets: "Weather: Rain", "Weather: Event: a dust wall from ahead". Until now they were only in
+        // the Authoring panel's Create list.
+        for (id, label, category) in &self.palette_presets {
+            let key = format!("preset:{id}");
+            let title = if category.is_empty() { label.clone() } else { format!("{category}: {label}") };
+            let icon = if category.eq_ignore_ascii_case("weather") {
+                crate::icons::IconId::Weather
+            } else {
+                crate::icons::IconId::Prefab
+            };
+            items.push(
+                PaletteItem::new(&key, title, "Game preset (undoable)", Cat::Panel)
+                    .with_recency(self.command_history.recency(&key))
+                    .with_icon(icon),
+            );
+            targets.insert(key, PaletteTarget::Preset(id.clone()));
+        }
+
         // Assets in the current Content Drawer folder.
         for (_, entry) in &self.content_entries {
             if entry.is_dir {
@@ -4515,13 +4822,14 @@ impl UiManager {
         }
 
         // Help pages, so a question is answerable from the same surface.
-        for (i, title) in crate::metaphor::help_titles().iter().enumerate() {
+        let help_titles = crate::metaphor::help_titles();
+        for &i in crate::metaphor::help_order() {
             let key = format!("help:page:{i}");
             items.push(
-                PaletteItem::new(&key, (*title).to_string(), "F1", Cat::Help)
+                PaletteItem::new(&key, help_titles[i as usize].to_string(), "F1", Cat::Help)
                     .with_recency(self.command_history.recency(&key)),
             );
-            targets.insert(key, PaletteTarget::Help(i as u8));
+            targets.insert(key, PaletteTarget::Help(i));
         }
 
         // Panels, so the palette can also be used to reach a surface.
@@ -5557,8 +5865,14 @@ impl UiManager {
         true
     }
 
+    /// Tell the editor which folder the open project lives in, so Help can offer the project's own guide.
+    pub fn set_project_root(&mut self, root: Option<std::path::PathBuf>) {
+        self.project_root = root;
+    }
+
     fn command_context(&self) -> crate::commands::EditorCtx {
         crate::commands::EditorCtx {
+            has_project_guide: crate::metaphor::project_guide_path(self.project_root.as_deref()).is_some(),
             has_selection: self
                 .last_outliner_state
                 .as_ref()
@@ -5569,6 +5883,7 @@ impl UiManager {
             can_redo: self.history_position < self.history_rows.len(),
             has_content_target: self.content_menu_target.is_some(),
             has_clipboard: self.clipboard_filled,
+            has_picked_copy: self.picked_copy,
         }
     }
 
@@ -5576,6 +5891,17 @@ impl UiManager {
     /// every frame so `Paste` greys out honestly instead of always offering.
     pub fn set_clipboard_filled(&mut self, filled: bool) {
         self.clipboard_filled = filled;
+    }
+
+    /// Core owns the painted pick; this mirror lets Delete and Make This an Object act on a clicked tree or shrub.
+    pub fn set_picked_copy(&mut self, picked: bool) {
+        self.picked_copy = picked;
+    }
+
+    /// Core counts the models that did not load this run (broken ones skipped, files not found); the status bar says
+    /// so from then on, because a world with pieces missing must not be taken for a whole one.
+    pub fn set_models_missing(&mut self, count: usize) {
+        self.models_missing = count;
     }
 
     /// Output Log lines for an agent (Phase ALYX-M): at least `min` severe, newer than id `after`, containing
@@ -5680,6 +6006,11 @@ impl UiManager {
                             path.to_string_lossy().into_owned(),
                         ))
                 }
+                Some(PaletteTarget::Place(place)) => self.editor_events.push_back(EditorEvent::GoToPlace(place)),
+                Some(PaletteTarget::Preset(preset)) => self.editor_events.push_back(EditorEvent::AuthoringRequest {
+                    method: "authoring.execute".into(),
+                    params: serde_json::json!({"action": "preset", "id": preset, "args": {}}),
+                }),
                 Some(PaletteTarget::Help(page)) => self.toggle_help(Some(page)),
                 Some(PaletteTarget::Drawer) => self.toggle_drawer(),
                 Some(PaletteTarget::AddComponent(component)) => {
@@ -5706,6 +6037,7 @@ impl UiManager {
             A::DesignerTool(action) => self
                 .editor_events
                 .push_back(EditorEvent::DesignerTool(action)),
+            A::LevelTool(tool) => self.editor_events.push_back(EditorEvent::LevelTool(tool)),
             A::ExportBlockout => self.editor_events.push_back(EditorEvent::ExportBlockout),
             A::GraphTool(action) => self.run_graph_tool_action(action),
             A::ImportModel => self.editor_events.push_back(EditorEvent::ImportModel),
@@ -6099,6 +6431,14 @@ impl UiManager {
     /// Every entry point that changes folder goes through here so back/forward
     /// cannot drift out of step with what is on screen.
     pub fn navigate_content(&mut self, path: String) {
+        // The drawer names a folder from the content folder down. A whole path (right-click a folder > Open gave
+        // one) matched nothing and opened "Nothing Here": it becomes the drawer's own name here, for every caller.
+        let whole = std::path::Path::new(&path);
+        let path = if whole.is_absolute() {
+            self.content_relative(whole).unwrap_or(path)
+        } else {
+            path
+        };
         self.persona.prefs.visit(&path);
         self.content_history.push(path.clone());
         self.content_path = path;
@@ -6244,7 +6584,53 @@ impl UiManager {
         self.asset_db.get(id)
     }
 
+    /// The app says where the project's content lives, before the first inventory of it has been read.
+    ///
+    /// The inventory of a large project takes minutes to read. Until it is published the drawer lists the chosen
+    /// folder straight from the disk, so a full project never opens on "Nothing Here".
+    pub fn set_content_root(&mut self, root: &std::path::Path) {
+        if self.content_root.as_deref() == Some(root) {
+            return;
+        }
+        self.content_root = Some(root.to_path_buf());
+        if !self.content_indexed {
+            self.refresh_content_list();
+        }
+    }
+
+    /// The last read of the project's files failed (`Some`), or a later one went through (`None`).
+    pub fn set_content_scan_error(&mut self, error: Option<String>) {
+        if self.content_scan_error == error {
+            return;
+        }
+        if let Some(error) = &error {
+            self.push_toast(&format!("The project's files could not be read ({error}). Trying again."));
+        }
+        self.content_scan_error = error;
+        self.refresh_content_footer();
+    }
+
+    /// The content folder: the app's word until an inventory is published, then the inventory's own root.
+    fn content_root_path(&self) -> Option<std::path::PathBuf> {
+        if self.content_indexed {
+            Some(self.asset_db.root().to_path_buf())
+        } else {
+            self.content_root.clone()
+        }
+    }
+
+    /// A folder's path as the drawer names it: from the content folder down.
+    fn content_relative(&self, path: &std::path::Path) -> Option<String> {
+        let root = self.content_root_path()?;
+        path.strip_prefix(&root)
+            .ok()
+            .map(|relative| relative.to_string_lossy().into_owned())
+    }
+
     pub fn set_asset_snapshot(&mut self, snapshot: somnium_asset::database::AssetDbSnapshot) {
+        self.content_root = Some(snapshot.root().to_path_buf());
+        self.content_indexed = true;
+        self.content_scan_error = None;
         self.asset_db = snapshot;
         self.refresh_content_list();
         self.refresh_asset_pickers();
@@ -6976,18 +7362,28 @@ impl UiManager {
                 somnium_asset::database::AssetKind::Material.bit()
             }
         };
-        let mut entries: Vec<crate::metaphor::ContentEntry> = self
-            .asset_db
-            .query(&somnium_asset::database::AssetQuery {
-                parent: self.content_path.clone(),
-                text: self.content_filter.clone(),
-                kind_mask,
-                sort: self.content_sort,
-                descending: self.content_sort_descending,
+        let mut entries: Vec<crate::metaphor::ContentEntry> = if self.content_indexed {
+            self.asset_db
+                .query(&somnium_asset::database::AssetQuery {
+                    parent: self.content_path.clone(),
+                    text: self.content_filter.clone(),
+                    kind_mask,
+                    sort: self.content_sort,
+                    descending: self.content_sort_descending,
+                })
+                .into_iter()
+                .map(Into::into)
+                .collect()
+        } else {
+            // The inventory has not been read yet: the chosen folder as the disk has it, by name. The sort
+            // order, the previews and the tooltips come with the inventory.
+            self.content_root.as_deref().map_or_else(Vec::new, |root| {
+                crate::metaphor::list_folder(root, &self.content_path, &self.content_filter)
+                    .into_iter()
+                    .filter(|entry| self.content_kind.accepts(entry))
+                    .collect()
             })
-            .into_iter()
-            .map(Into::into)
-            .collect();
+        };
         if self.show_engine_content && self.content_path.is_empty() {
             entries.extend(
                 crate::metaphor::virtual_engine_content(&self.content_filter)
@@ -7014,23 +7410,37 @@ impl UiManager {
         }
         let normalise = |p: &str| p.replace('\\', "/").trim_matches('/').to_string();
         let current = normalise(&self.content_path);
+        // The inventory names folders in lower case and a tile click names them as the disk does.
+        let current_key = current.to_ascii_lowercase();
         let mut rows: Vec<(String, String, usize)> = Vec::new();
         let mut stack: Vec<(String, usize)> = vec![(String::new(), 0)];
         while let Some((parent, depth)) = stack.pop() {
-            let folders = self.asset_db.query(&somnium_asset::database::AssetQuery {
-                parent: parent.clone(),
-                text: String::new(),
-                kind_mask: somnium_asset::database::AssetKind::Folder.bit(),
-                sort: somnium_asset::database::AssetSort::Name,
-                descending: false,
-            });
+            // From the inventory once it is read, and from the disk until then.
+            let folders: Vec<(String, String)> = if self.content_indexed {
+                self.asset_db
+                    .query(&somnium_asset::database::AssetQuery {
+                        parent: parent.clone(),
+                        text: String::new(),
+                        kind_mask: somnium_asset::database::AssetKind::Folder.bit(),
+                        sort: somnium_asset::database::AssetSort::Name,
+                        descending: false,
+                    })
+                    .into_iter()
+                    .map(|folder| (folder.relative_path, folder.name))
+                    .collect()
+            } else {
+                self.content_root
+                    .as_deref()
+                    .map_or_else(Vec::new, |root| crate::metaphor::list_child_folders(root, &parent))
+            };
             // Depth-first, in name order: push children reversed so the first pops first.
             let at = rows.iter().position(|(p, _, _)| normalise(p) == normalise(&parent)).map_or(rows.len(), |i| i + 1);
             let mut children = Vec::new();
-            for folder in folders {
-                let relative = normalise(&folder.relative_path);
-                let open = current == relative || current.starts_with(&format!("{relative}/"));
-                children.push((relative.clone(), folder.name.clone(), depth));
+            for (relative, name) in folders {
+                let relative = normalise(&relative);
+                let key = relative.to_ascii_lowercase();
+                let open = current_key == key || current_key.starts_with(&format!("{key}/"));
+                children.push((relative.clone(), name, depth));
                 if open && depth < 8 {
                     stack.push((relative, depth + 1));
                 }
@@ -7044,7 +7454,7 @@ impl UiManager {
         let mut all = vec![(String::new(), "Content".to_string(), 0usize)];
         all.extend(rows.into_iter().map(|(rel, name, depth)| (rel, name, depth + 1)));
         for (relative, name, depth) in all {
-            let chosen = relative == current;
+            let chosen = relative.eq_ignore_ascii_case(&current);
             let button = self.native_ui.add_node(
                 ButtonBuilder::new(
                     WidgetBuilder::new()
@@ -7070,7 +7480,9 @@ impl UiManager {
                 .build(),
                 button,
             );
-            let open = chosen || current.starts_with(&format!("{relative}/")) || relative.is_empty();
+            let open = chosen
+                || current_key.starts_with(&format!("{}/", relative.to_ascii_lowercase()))
+                || relative.is_empty();
             self.native_ui.add_node(
                 crate::widgets::image::ImageBuilder::new(
                     WidgetBuilder::new().with_vertical_alignment(crate::types::VerticalAlignment::Center),
@@ -7120,6 +7532,12 @@ impl UiManager {
                 }
             }
             n => text.push_str(&format!(" · {n} selected")),
+        }
+        // Said where the count is read: until the inventory is in, search and the previews know nothing yet.
+        if let Some(error) = &self.content_scan_error {
+            text.push_str(&format!(" · The project's files could not be read ({error}). Trying again."));
+        } else if !self.content_indexed && self.content_root.is_some() {
+            text.push_str(" · Still reading the project's files: search and previews follow.");
         }
         self.native_ui.send(TextMessage::set_text(footer, text));
     }
@@ -7181,10 +7599,13 @@ impl UiManager {
         // different copy — offering "import a model" to someone who mistyped a
         // search would be the wrong advice.
         if self.content_all.is_empty() {
-            let state = if self.content_filter.is_empty() {
-                crate::metaphor::empty::CONTENT
-            } else {
+            let state = if !self.content_filter.is_empty() {
                 crate::metaphor::empty::CONTENT_FILTERED
+            } else if !self.content_indexed && self.content_root.is_none() {
+                // Nothing has been read yet, so nothing is known to be missing.
+                crate::metaphor::empty::CONTENT_READING
+            } else {
+                crate::metaphor::empty::CONTENT
             };
             // The height still gets set, to the nought rows an empty folder
             // is: the canvas does not clip, so the empty state is visible
@@ -7352,6 +7773,19 @@ impl UiManager {
     /// Returns true if a text-input widget (TextBox or NumericField) has keyboard focus.
     pub fn has_text_focus(&self) -> bool {
         self.native_ui.has_text_focus()
+    }
+
+    /// Text typed into the box with the keyboard focus, as a key press's text reaches it (the editor script's
+    /// `type=` step); false when no text box has the focus.
+    pub fn type_into_focus(&mut self, text: &str) -> bool {
+        self.native_ui.type_into_focus(text)
+    }
+
+    /// The keys in force: the developer's own bindings from Preferences > Keyboard over the declared defaults. The
+    /// engine's first key dispatcher asks this, so a key moved there is moved everywhere.
+    #[must_use]
+    pub fn keybindings(&self) -> &crate::commands::KeyBindings {
+        &self.keybindings
     }
 
     /// Whether a right-drag over the viewport is currently flying the camera.
@@ -7535,17 +7969,75 @@ impl UiManager {
         self.immersive = on;
         self.native_ui
             .send(ButtonMessage::set_selected(self.immersive_button, on));
+        // A background window (`background_window`) keeps its size and its place off the screens.
+        if background_window().is_some() {
+            if on {
+                self.set_play_overlays_hidden(true);
+            }
+            return;
+        }
         if on {
             self.set_play_overlays_hidden(true);
             self.immersive_restore_maximized = self.window.is_maximized();
             self.immersive_restore_fullscreen = self.window.fullscreen();
-            self.window
-                .set_fullscreen(Some(Fullscreen::Borderless(None)));
+            self.apply_player_display();
         } else {
+            // The editor's window draws its own title bar; a windowed player had the system's.
+            self.window.set_decorations(false);
             self.window
                 .set_fullscreen(self.immersive_restore_fullscreen.take());
             if self.immersive_restore_maximized {
                 self.window.set_maximized(true);
+            }
+        }
+    }
+
+    /// Show the window as a game's display options ask ([`request_window_display`]): now while immersive, and each
+    /// time it goes immersive after.
+    pub fn set_player_display(&mut self, display: WindowDisplay) {
+        self.player_display = display;
+        if self.immersive {
+            self.apply_player_display();
+        }
+    }
+
+    fn apply_player_display(&self) {
+        let monitor = self.window.current_monitor();
+        let native = monitor.as_ref().map(|m| [m.size().width, m.size().height]);
+        let mut sizes: Vec<[u32; 2]> = monitor.iter().flat_map(|m| m.video_modes()).map(|v| [v.size().width, v.size().height])
+            .chain(native).collect();
+        sizes.sort_by_key(|s| (s[0], s[1]));
+        sizes.dedup();
+        if let Ok(mut published) = DISPLAY_SIZES.lock() {
+            *published = (native, sizes);
+        }
+        // A background window (`background_window`) keeps its size and its place off the screens.
+        if background_window().is_some() {
+            return;
+        }
+        match self.player_display.mode {
+            WindowMode::Borderless => self.window.set_fullscreen(Some(Fullscreen::Borderless(monitor))),
+            WindowMode::Fullscreen => {
+                // At the screen's own size, borderless: it looks the same and asks the display for no mode change.
+                // A mode change can fail (a locked screen, a laptop's switched graphics), and winit then panics on it:
+                // a start at 4 a.m. on 23 Oct 2026 died on its `assert_eq!(res, DISP_CHANGE_SUCCESSFUL)`. Another size
+                // takes the screen's mode at that size, at the screen's own refresh rate where it has one (the
+                // smallest change to ask for); borderless if it has none.
+                let wanted = self.player_display.size.or(native);
+                let hz = monitor.as_ref().and_then(|m| m.refresh_rate_millihertz());
+                let mode = monitor.as_ref().filter(|_| wanted != native).and_then(|m| {
+                    m.video_modes().filter(|v| Some([v.size().width, v.size().height]) == wanted)
+                        .max_by_key(|v| (Some(v.refresh_rate_millihertz()) == hz, v.refresh_rate_millihertz(), v.bit_depth()))
+                });
+                self.window.set_fullscreen(Some(mode.map_or(Fullscreen::Borderless(monitor), Fullscreen::Exclusive)));
+            }
+            WindowMode::Windowed => {
+                self.window.set_fullscreen(None);
+                self.window.set_maximized(false);
+                self.window.set_decorations(true);
+                if let Some([w, h]) = self.player_display.size {
+                    let _ = self.window.request_inner_size(winit::dpi::PhysicalSize::new(w, h));
+                }
             }
         }
     }
@@ -7563,6 +8055,7 @@ impl UiManager {
                 locked: false,
                 script_error: false,
                 tags: Vec::new(),
+                asset: String::new(),
             })
             .collect();
         self.update_outliner_tree(&rows, selected);
@@ -7588,8 +8081,9 @@ impl UiManager {
             self.outliner_filter, self.persona.outliner_scope
         ));
         let mut items = Vec::new();
+        let mut visible = crate::outliner_filter::OutlinerVisibility::new(filter.is_empty());
         for row in entities {
-            if !filter.matches(row) {
+            if !filter.matches(row) || !visible.shows(row, &self.outliner_expanded) {
                 continue;
             }
             let expanded = self.outliner_expanded.contains(&row.id) || !row.has_children;
@@ -8319,7 +8813,7 @@ impl UiManager {
                 for (i, label) in h.terrain_palette_labels.iter().enumerate() {
                     self.native_ui.send(TextMessage::set_text(
                         *label,
-                        TERRAIN_LAYER_SHORT[i].to_string(),
+                        terrain_layer_label(&self.terrain_layer_names, i),
                     ));
                 }
                 for (i, &btn) in h.terrain_palette.iter().enumerate() {
@@ -9282,10 +9776,8 @@ impl UiManager {
                 }
                 if msg.destination == self.unsaved_save {
                     self.close_unsaved();
-                    self.editor_events.push_back(EditorEvent::SaveScene);
-                    if let Some(action) = self.pending_scene_action.take() {
-                        self.editor_events.push_back(action);
-                    }
+                    let action = self.pending_scene_action.take();
+                    self.editor_events.extend(events_after_save(action));
                     continue;
                 }
                 if msg.destination == self.unsaved_discard {
@@ -9405,6 +9897,11 @@ impl UiManager {
                         ));
                     }
                     self.close_all_menus();
+                    // A click on a disabled row used to do nothing at all: say why, as the palette does.
+                    if let Some(message) = crate::commands::disabled_message(id, &self.command_context()) {
+                        self.push_toast(&message);
+                        continue;
+                    }
                     self.run_command_id(id);
                     continue;
                 }
@@ -9668,16 +10165,12 @@ impl UiManager {
                     .cloned()
                 {
                     if entry.is_dir {
-                        let root = self.asset_db.root().to_path_buf();
                         // Through `navigate_content` so the move lands in
                         // history. Setting `content_path` directly is what would
                         // leave Back pointing at a folder the user never left.
-                        match entry.path.strip_prefix(&root) {
-                            Ok(rel) => {
-                                let rel = rel.to_string_lossy().into_owned();
-                                self.navigate_content(rel);
-                            }
-                            Err(_) => self.refresh_content_list(),
+                        match self.content_relative(&entry.path) {
+                            Some(rel) => self.navigate_content(rel),
+                            None => self.refresh_content_list(),
                         }
                     } else if entry.is_engine {
                         if let Some(kind) = match entry.name.as_str() {
@@ -10569,6 +11062,7 @@ mod elysium_tests {
             empty::OUTLINER,
             empty::DETAILS,
             empty::CONTENT,
+            empty::CONTENT_READING,
             empty::CONTENT_FILTERED,
             empty::LOG,
         ] {
@@ -10914,6 +11408,37 @@ mod dpi_tests {
         let mut ui = UserInterface::new(1280.0, 720.0);
         ui.draw_ctx.font_atlas.set_render_scale(2.0);
         assert_eq!(ui.draw_ctx.font_atlas.render_scale, 2.0);
+    }
+}
+
+/// What "Save" in "Save changes?" sends: the save, then the action that asked. Quitting saves inside the quit and
+/// any other action is wrapped, so a save that fails or is cancelled keeps the editor and the scene open.
+fn events_after_save(action: Option<EditorEvent>) -> Vec<EditorEvent> {
+    match action {
+        Some(EditorEvent::Quit { .. }) => vec![EditorEvent::Quit { after_save: true }],
+        Some(action) => vec![EditorEvent::AfterSave(Box::new(action))],
+        None => vec![EditorEvent::SaveScene],
+    }
+}
+
+#[cfg(test)]
+mod unsaved_prompt_tests {
+    use super::*;
+
+    #[test]
+    fn save_then_quit_is_one_quit_that_saves_first() {
+        let events = events_after_save(Some(EditorEvent::Quit { after_save: false }));
+        assert!(matches!(events.as_slice(), [EditorEvent::Quit { after_save: true }]));
+    }
+
+    #[test]
+    fn save_then_new_runs_the_action_only_after_a_save_that_held() {
+        let events = events_after_save(Some(EditorEvent::NewScene));
+        assert!(matches!(
+            events.as_slice(),
+            [EditorEvent::AfterSave(action)] if matches!(**action, EditorEvent::NewScene)
+        ));
+        assert!(matches!(events_after_save(None).as_slice(), [EditorEvent::SaveScene]));
     }
 }
 

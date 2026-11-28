@@ -98,15 +98,22 @@ pub fn shader_sources() -> Vec<(&'static str, String)> {
 }
 
 /// AMD's `fDeviceToViewDepth` from a column-major projection matrix (glam's
-/// `to_cols_array_2d`) with depth 0 at the near plane: view depth is
+/// `to_cols_array_2d`) of reversed depth, 1 at the near plane and 0 at the far
+/// one or at infinity (Somnium's scene depth since 6 Nov 2026): view depth is
 /// `[1] / (device_depth - [0])`, and `[2]`, `[3]` undo the x and y scale.
+///
+/// An infinite projection (`[2][2]` = 0) gives `near / depth`, infinite at the
+/// cleared 0, so `[0]` takes a hair off as AMD's `FLT_EPSILON` does for
+/// inverted infinite depth: here 1e-10, under a part in a thousand at 80 km for
+/// a 3.5 cm near plane, and a sky some 350 000 km off rather than at infinity.
 pub fn device_to_view_from_projection(m: [[f32; 4]; 4]) -> [f32; 4] {
-    [-m[2][2], m[3][2], 1.0 / m[0][0], 1.0 / m[1][1]]
+    let bias = if m[2][2] == 0.0 { -1e-10 } else { -m[2][2] };
+    [bias, m[3][2], 1.0 / m[0][0], 1.0 / m[1][1]]
 }
 
 /// What one generated frame is made from.
 pub struct Inputs<'a> {
-    /// Depth at render size (depth aspect of a `Depth32Float`), 0 near, 1 far.
+    /// Depth at render size (depth aspect of a `Depth32Float`), reversed: 1 near, 0 far.
     pub depth: &'a wgpu::TextureView,
     /// Motion at render size, `previous_uv - current_uv` once scaled, unjittered.
     pub motion_vectors: &'a wgpu::TextureView,

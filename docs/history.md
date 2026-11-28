@@ -146,8 +146,12 @@ RPG Rimeborn and, from late October, the first-person open world Sunscar. In rou
 - **Mid November:** rain, snow and hail near the eye, lightning channels and storm bodies in the cloud march (11 Nov);
   the missing-models count, a moving sun, the day clock's north offset and the sun forms of Sunscar's sky, switched
   lamps (12 Nov); real fire (13 Nov).
-- **Late November:** GPU grass (19 Nov); rain in nested boxes with gusts and splashes (26 Nov).
+- **Late November:** GPU grass (19 Nov); rain in nested boxes with gusts and splashes (26 Nov); precipitation and
+  dust drawn as lit sprites that take the sun through its cascades and the sky's light, and terrain holes for cave
+  mouths (27 Nov); embers on open fires and a glow round each lamp flame (28 Nov).
+- **The editor, 26 to 28 November:** search boxes that keep every key, the game's weather in the command palette, a
+  scene that opens at its first place, honest saves with twenty backups, undo that says what it undid, paste in place,
+  ground layers by their real names, G to carry things over the ground, and a Content Drawer that shows a large game's
+  folders at once. The editor's own list is [What's new](editor/whats_new.md).
 
-All of the above is on the `sunscar` branch; `main` holds Lucid as of 24 October. Work since 27 November (lit
-precipitation sprites, embers, the editor's level-design round) is not published yet. The commit log on `sunscar` is
-the full record.
+The commit log is the full record.

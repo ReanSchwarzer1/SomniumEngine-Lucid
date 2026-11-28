@@ -162,6 +162,17 @@ pub struct CellEntry {
     /// Its own load distance, for cells of big things seen from afar.
     #[serde(default)]
     pub reach: Option<f32>,
+    /// The cell this one stands in for from afar (a tile's far proxy), relative to the manifest. It is wanted
+    /// within its own reach once that cell is out of its reach or not yet in, and that cell keeps until this one is
+    /// installed: no gap while either installs, and at most a frame of both ([`plan_many`]).
+    #[serde(default)]
+    pub stands_for: Option<PathBuf>,
+    /// Index of `stands_for` in the manifest (`read_manifest`).
+    #[serde(skip)]
+    pub partner: Option<usize>,
+    /// Index of the cell standing in for this one (`read_manifest`).
+    #[serde(skip)]
+    pub stand_in: Option<usize>,
 }
 
 #[derive(serde::Deserialize)]
@@ -170,7 +181,11 @@ struct ManifestFile {
     cells: Vec<CellEntry>,
 }
 
-/// Read a manifest; cell files come back resolved against its folder.
+/// Read a manifest; cell files come back resolved against its folder. One bad entry does not cost the others (27 Nov
+/// 2026: a compose listed the 167 far tiles twice, the whole manifest was refused, and the play world was sky only for
+/// 32 minutes). An entry whose cell file is listed already, and a stand-in that cannot stand for its cell, are left
+/// out with one error line, `cells: manifest <path>: skipped <n> of <m> entries`, and the rest load. Launch checks
+/// count that line: reword it only with the sessions told.
 pub fn read_manifest(path: &Path) -> Result<Vec<CellEntry>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let file: ManifestFile = serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -178,7 +193,74 @@ pub fn read_manifest(path: &Path) -> Result<Vec<CellEntry>, String> {
         return Err(format!("{}: manifest version {} is not 1", path.display(), file.version));
     }
     let folder = path.parent().unwrap_or(Path::new("."));
-    Ok(file.cells.into_iter().map(|cell| CellEntry { file: folder.join(&cell.file), ..cell }).collect())
+    let listed = file.cells.len();
+    let mut cells: Vec<CellEntry> = Vec::with_capacity(listed);
+    let mut index = std::collections::HashMap::<PathBuf, usize>::new();
+    let (mut repeats, mut problems) = (0_usize, Vec::<String>::new());
+    for cell in file.cells {
+        let cell = CellEntry {
+            file: folder.join(&cell.file),
+            stands_for: cell.stands_for.as_ref().map(|other| folder.join(other)),
+            ..cell
+        };
+        match index.get(&cell.file) {
+            // The same entry again: nothing is lost by leaving it out.
+            Some(&first) if cells[first] == cell => repeats += 1,
+            // The same cell file with other bounds or another partner: the first entry stands.
+            Some(_) => problems.push(format!("{} is listed again with other values", cell.file.display())),
+            None => {
+                index.insert(cell.file.clone(), cells.len());
+                cells.push(cell);
+            }
+        }
+    }
+    problems.extend(link_stand_ins(&mut cells));
+    let skipped = repeats + problems.len();
+    if skipped > 0 {
+        tracing::error!(
+            "cells: manifest {}: skipped {skipped} of {listed} entries ({repeats} exact repeats), the rest load{}",
+            path.display(),
+            problems.first().map(|first| format!("; first: {first}")).unwrap_or_default()
+        );
+    }
+    Ok(cells)
+}
+
+/// Point each stand-in at its partner and back. One stand-in per cell; a stand-in stands for a cell that is not one.
+/// A stand-in that breaks this (its cell missing, a stand-in itself, or stood in for already) is removed, and why comes
+/// back, one line each: the rest link as if it had never been listed.
+fn link_stand_ins(cells: &mut Vec<CellEntry>) -> Vec<String> {
+    let mut problems = Vec::new();
+    loop {
+        for cell in cells.iter_mut() {
+            cell.partner = None;
+            cell.stand_in = None;
+        }
+        let index: std::collections::HashMap<PathBuf, usize> =
+            cells.iter().enumerate().map(|(i, cell)| (cell.file.clone(), i)).collect();
+        let mut out = Vec::new();
+        for i in 0..cells.len() {
+            let Some(other) = cells[i].stands_for.clone() else { continue };
+            let why = match index.get(&other) {
+                None => "is not in the manifest",
+                Some(&p) if p == i || cells[p].stands_for.is_some() => "is a stand-in itself",
+                Some(&p) if cells[p].stand_in.is_some() => "has a stand-in already",
+                Some(&p) => {
+                    cells[i].partner = Some(p);
+                    cells[p].stand_in = Some(i);
+                    continue;
+                }
+            };
+            problems.push(format!("{} stands for {}, which {why}", cells[i].file.display(), other.display()));
+            out.push(i);
+        }
+        if out.is_empty() {
+            return problems;
+        }
+        for i in out.into_iter().rev() {
+            cells.remove(i);
+        }
+    }
 }
 
 /// Distance in XZ from `point` to a cell's bounds (0 inside).
@@ -218,6 +300,10 @@ pub fn plan(
 /// [`plan`] for the view and the points held ([`hold`]), each held point with its own radius (`holds`: point and
 /// radius). A cell loads when it is within reach of the view (its own `reach`, else `radius`) or within a hold's
 /// radius, nearest first; it unloads only once it is past reach and `margin` from the view and every hold.
+///
+/// `is_resident`: in or being read. `is_installed`: in. A stand-in ([`CellEntry::stands_for`]) is wanted within its
+/// reach while its partner is out of the partner's reach or not installed, and goes once the partner is installed;
+/// the partner keeps past its reach and margin until its stand-in is installed (or out of the stand-in's reach).
 #[must_use]
 pub fn plan_many(
     cells: &[CellEntry],
@@ -226,31 +312,55 @@ pub fn plan_many(
     margin: f32,
     holds: &[([f32; 2], f32)],
     is_resident: impl Fn(usize) -> bool,
+    is_installed: impl Fn(usize) -> bool,
 ) -> (Vec<usize>, Vec<usize>) {
     let mut load = Vec::new();
     let mut unload = Vec::new();
+    // How far inside (negative) or outside its reach each cell is, from the view and from each hold; and nearest.
+    let reach: Vec<(f32, f32)> = cells
+        .iter()
+        .map(|cell| {
+            let view_distance = distance_to(cell, view);
+            let mut over = view_distance - cell.reach.unwrap_or(radius);
+            let mut nearest = view_distance;
+            for &(at, hold_radius) in holds {
+                let distance = distance_to(cell, at);
+                over = over.min(distance - hold_radius);
+                nearest = nearest.min(distance);
+            }
+            (over, nearest)
+        })
+        .collect();
     for (index, cell) in cells.iter().enumerate() {
-        // How far inside (negative) or outside its reach the cell is, from the view and from each hold.
-        let view_reach = cell.reach.unwrap_or(radius);
-        let view_distance = distance_to(cell, view);
-        let mut over = view_distance - view_reach;
-        let mut nearest = view_distance;
-        for &(at, hold_radius) in holds {
-            let distance = distance_to(cell, at);
-            over = over.min(distance - hold_radius);
-            nearest = nearest.min(distance);
-        }
+        let (over, nearest) = reach[index];
+        let wanted = over <= 0.0 && cell.partner.is_none_or(|p| reach[p].0 > 0.0 || !is_installed(p));
         if is_resident(index) {
-            if over > margin {
+            let gone = match cell.partner {
+                Some(p) => !wanted && (over > margin || is_installed(p)),
+                None => over > margin && cell.stand_in.is_none_or(|s| is_installed(s) || reach[s].0 > 0.0),
+            };
+            if gone {
                 unload.push(index);
             }
-        } else if over <= 0.0 {
-            load.push((nearest, index));
+        } else if wanted {
+            // A stand-in or a backdrop cell goes ahead of the near cells its distance would put it behind: it is
+            // one light mesh, and it is the far land. Nearest first alone, a start or a jump far from where the
+            // scene opens filled every near cell before any far one, and for minutes the far land was missing and
+            // its skirts hung in the sky as ribbons (Sunscar, the Vela rim: 3 of 103 far tiles in after four
+            // minutes, 11 Nov 2026).
+            let far = cell.partner.is_some() || cell.reach.is_some_and(|reach| reach >= FAR_REACH);
+            load.push((if far { nearest * FAR_AHEAD } else { nearest }, index));
         }
     }
     load.sort_by(|a, b| a.0.total_cmp(&b.0));
     (load.into_iter().map(|(_, index)| index).collect(), unload)
 }
+
+/// A cell that reaches this far (metres) is far land: a backdrop cell, a horizon ring. Stand-ins count whatever
+/// their reach.
+const FAR_REACH: f32 = 4000.0;
+/// Far land loads as if it stood at this share of its distance: 8 km away, it goes with the cells 160 m away.
+const FAR_AHEAD: f32 = 0.02;
 
 /// The most places held at once (DUAL_PROTAGONISTS needs two: a joint mission's two men). Each adds a disc of cells,
 /// and a region's first fills already reach the GPU's memory.
@@ -497,6 +607,8 @@ pub struct CellStreamer {
     pub(crate) failed: HashMap<usize, String>,
     /// The first fill (the view's cells taken in whole) has happened for this manifest.
     pub(crate) filled: bool,
+    /// A first fill is holding the frame now: readers of every kind may use the other cores (`fill_readers`).
+    pub(crate) filling: bool,
     /// Canonical sources each loaded cell draws, and how many loaded cells draw each source.
     pub(crate) cell_sources: HashMap<usize, Vec<PathBuf>>,
     pub(crate) source_users: HashMap<PathBuf, u32>,
@@ -512,6 +624,66 @@ pub struct CellStreamer {
     pub(crate) terrain_resets: u64,
     /// Cells whose ground did not read, read again after a pause ([`Self::ground_failed`]). Not in `failed`.
     pub(crate) ground_retries: HashMap<usize, GroundRetry>,
+    /// How many sources and grounds are read at once, over all the cells being read.
+    pub(crate) gate: std::sync::Arc<ReadGate>,
+    /// Main-thread time spent uploading sources and installing cells, then the install's steps (spawning, the
+    /// ground, the GPU state, the whole-world passes), for the first fill's log line.
+    pub(crate) spent: [std::time::Duration; 6],
+    /// Cells the plan wants that no reader has started yet (the reader limit, a retry's pause). With `reading`,
+    /// what a settled still waits for (26 Nov 2026).
+    pub(crate) queued: usize,
+    /// The counts last written to the log (loaded, reading, queued), and when.
+    pub(crate) logged: Option<((u32, u32, u32), std::time::Instant)>,
+}
+
+/// The readers' turnstile: a cell's sources are read side by side, and this bounds how many are being read at once
+/// over all cells (as many as cells are read at once). One cell with hundreds of sources then reads as fast as
+/// hundreds of cells with one: the Monargent piazza's own cell names 528 files, read them one after another on its
+/// one reader, and was the last thing in at a start, two minutes after the rest (Sunscar, 12 Nov 2026).
+pub(crate) struct ReadGate {
+    /// Turns taken, and how many may be taken.
+    turns: std::sync::Mutex<(usize, usize)>,
+    freed: std::sync::Condvar,
+}
+
+impl Default for ReadGate {
+    fn default() -> Self {
+        Self { turns: std::sync::Mutex::new((0, READERS)), freed: std::sync::Condvar::new() }
+    }
+}
+
+impl ReadGate {
+    fn turns(&self) -> std::sync::MutexGuard<'_, (usize, usize)> {
+        self.turns.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Let `limit` read at once from now on (those already reading finish).
+    pub(crate) fn set_limit(&self, limit: usize) {
+        let mut turns = self.turns();
+        if turns.1 != limit {
+            turns.1 = limit.max(1);
+            self.freed.notify_all();
+        }
+    }
+
+    /// Wait for a turn; it is given back when the value returned is dropped.
+    pub(crate) fn take(&self) -> ReadTurn<'_> {
+        let mut turns = self.turns();
+        while turns.0 >= turns.1 {
+            turns = self.freed.wait(turns).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        turns.0 += 1;
+        ReadTurn(self)
+    }
+}
+
+pub(crate) struct ReadTurn<'a>(&'a ReadGate);
+
+impl Drop for ReadTurn<'_> {
+    fn drop(&mut self) {
+        self.0.turns().0 -= 1;
+        self.0.freed.notify_one();
+    }
 }
 
 /// How long a streamed mesh no loaded cell uses stays uploaded (coming back soon costs nothing).
@@ -519,6 +691,39 @@ pub(crate) const COLD_SECONDS: u64 = 30;
 
 /// Most cells read at once.
 pub(crate) const READERS: usize = 4;
+
+/// Cells read at once while a first fill holds the frame: nothing is drawn then, so the other cores read too, two
+/// left for the rest of the machine. At four readers Monargent's 243 cells did not finish inside the fill's 90
+/// seconds, and the rest streamed in over the first minutes of play (Sunscar, 11 Nov 2026).
+pub(crate) fn fill_readers() -> usize {
+    std::thread::available_parallelism().map_or(READERS, |cores| cores.get().saturating_sub(2)).clamp(READERS, 12)
+}
+
+/// Free a value on a thread kept for it. A decoded source is tens to hundreds of megabytes of pixels and vertices,
+/// and a first fill takes thousands of them: giving that memory back is not the main thread's work.
+pub(crate) fn free_elsewhere<T: Send + 'static>(value: T) {
+    static FREES: std::sync::LazyLock<std::sync::mpsc::Sender<Box<dyn Send>>> = std::sync::LazyLock::new(|| {
+        let (send, receive) = std::sync::mpsc::channel::<Box<dyn Send>>();
+        std::thread::spawn(move || receive.into_iter().for_each(drop));
+        send
+    });
+    // With the thread gone the value is dropped here, as it would have been.
+    let _ = FREES.send(Box::new(value));
+}
+
+/// RGBA8 bytes of decoded images the readers share while anything is being read
+/// (`somnium_asset::share_decoded_images`): 2 GiB, about 120 images of 2K. `SOMNIUM_IMAGE_SHARE_MIB` sets it; 0 is
+/// off, and every source decodes its own images again. A Monargent start's first files read in 54 s with none
+/// shared, 38 s with 2 GiB, 26 s with 4 and 28 s with 8 (twelve to fourteen readers, 12 Nov 2026). With 4 GiB the
+/// game held 8 GB of memory more while it filled than after, on a machine with 12 free; and the fill then waited on
+/// its own uploads more than on its readers, so the smaller share costs little.
+pub(crate) fn image_share_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let mib = std::env::var("SOMNIUM_IMAGE_SHARE_MIB").ok().and_then(|mib| mib.trim().parse::<usize>().ok());
+        mib.unwrap_or(2048) << 20
+    })
+}
 
 /// Each source an entity list draws (`somnium.ImportedMesh` source -> node ordinals), from a scene document.
 #[must_use]
@@ -602,6 +807,7 @@ pub(crate) fn terrain_descriptor(
         grid_size: [component.grid_x, component.grid_z],
         cell_size: component.cell_size,
         height_scale: component.height_scale,
+        lod_base_range: lod_base_range(component.cell_size),
         virtual_texturing: component.virtual_texturing,
         ..Default::default()
     };
@@ -618,6 +824,14 @@ pub(crate) fn terrain_descriptor(
         && desc.height_scale > 0.0
         && desc.total_vertices_x().checked_mul(desc.total_vertices_z()).is_some();
     valid.then_some(desc)
+}
+
+/// How far a saved terrain's finest level reaches, metres: as many cells as on 1 m ground, so each level's cells are
+/// the same size on screen whatever the cell size. At the 96 m of 1 m ground a 2 m tile was drawn in 4 m cells from
+/// 192 m and in 16 m cells from 768 m: cliffs and ridgelines a kilometre off stood in 16 m teeth, coarser than the 8 m
+/// far stand-ins beyond them (Sunscar, 11 Nov 2026). Ground finer than a metre keeps the range it had.
+fn lod_base_range(cell_size: f32) -> f32 {
+    somnium_renderer::terrain::TerrainDescriptor::default().lod_base_range * cell_size.max(1.0)
 }
 
 impl CellStreamer {
@@ -674,7 +888,79 @@ mod tests {
     }
 
     fn cell(min: [f32; 2], max: [f32; 2], reach: Option<f32>) -> CellEntry {
-        CellEntry { file: PathBuf::from("c.json"), min, max, reach }
+        CellEntry { file: PathBuf::from("c.json"), min, max, reach, stands_for: None, partner: None, stand_in: None }
+    }
+
+    #[test]
+    fn far_land_loads_ahead_of_all_but_the_nearest_cells() {
+        // From (0, 500): a cell 200 m off, a backdrop cell 5 km off, a cell 10 m off.
+        let cells = vec![
+            cell([200.0, 490.0], [210.0, 510.0], None),
+            cell([5000.0, 0.0], [6000.0, 1000.0], Some(1.0e6)),
+            cell([10.0, 490.0], [20.0, 510.0], None),
+        ];
+        let (load, _) = plan_many(&cells, [0.0, 500.0], 600.0, 100.0, &[], |_| false, |_| false);
+        assert_eq!(load, vec![2, 1, 0], "what is underfoot, then the far land, then the rest");
+    }
+
+    #[test]
+    fn a_stand_in_covers_its_tile_from_afar_with_no_gap_either_way() {
+        // A 1 km tile with an 800 m reach, and its far proxy with a 6 km reach.
+        let mut cells = vec![cell([0.0, 0.0], [1000.0, 1000.0], Some(800.0)), cell([0.0, 0.0], [1000.0, 1000.0], Some(6000.0))];
+        cells[1].file = PathBuf::from("far.json");
+        cells[1].stands_for = Some(PathBuf::from("c.json"));
+        assert!(link_stand_ins(&mut cells).is_empty(), "linked");
+        assert_eq!((cells[0].stand_in, cells[1].partner), (Some(1), Some(0)));
+        let plan_at = |x: f32, resident: &[usize], installed: &[usize]| {
+            plan_many(&cells, [x, 500.0], 600.0, 100.0, &[], |i| resident.contains(&i), |i| installed.contains(&i))
+        };
+        // 3 km out: the proxy only.
+        assert_eq!(plan_at(-3000.0, &[], &[]), (vec![1], vec![]));
+        // Walking in: the tile loads at 800 m; the proxy holds while the tile is read, and goes once it is in.
+        assert_eq!(plan_at(-700.0, &[1], &[1]), (vec![0], vec![]));
+        assert_eq!(plan_at(-700.0, &[0, 1], &[1]), (vec![], vec![]), "the tile is being read: the proxy stays");
+        assert_eq!(plan_at(-700.0, &[0, 1], &[0, 1]), (vec![], vec![1]), "the tile is in: the proxy goes");
+        // Walking out: past the tile's reach the proxy loads; past reach and margin the tile holds until it is in.
+        assert_eq!(plan_at(-850.0, &[0], &[0]), (vec![1], vec![]));
+        assert_eq!(plan_at(-950.0, &[0, 1], &[0]), (vec![], vec![]), "the proxy is being read: the tile stays");
+        assert_eq!(plan_at(-950.0, &[0, 1], &[0, 1]), (vec![], vec![0]), "the proxy is in: the tile goes");
+        // Past the proxy's own reach and margin, nothing.
+        assert_eq!(plan_at(-6200.0, &[1], &[1]), (vec![], vec![1]));
+        // A stand-in for a cell that is not in the manifest is left out, and why comes back; its tile stays.
+        cells[1].stands_for = Some(PathBuf::from("nowhere.json"));
+        let problems = link_stand_ins(&mut cells);
+        assert_eq!((problems.len(), cells.len(), cells[0].stand_in), (1, 1, None));
+    }
+
+    #[test]
+    fn one_bad_entry_does_not_empty_the_world() {
+        // 27 Nov 2026: a compose listed the far tiles twice, and the whole manifest was refused (sky only, 32 minutes).
+        let folder = std::env::temp_dir().join(format!("cell_streaming_bad_{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let path = folder.join("world.cells.json");
+        let tile = r#"{"file": "t.json", "min": [0, 0], "max": [1000, 1000], "reach": 800}"#;
+        let far = r#"{"file": "far.json", "min": [0, 0], "max": [1000, 1000], "reach": 6000, "stands_for": "t.json"}"#;
+        let far2 = r#"{"file": "far2.json", "min": [0, 0], "max": [1000, 1000], "reach": 6000, "stands_for": "t.json"}"#;
+        let lost = r#"{"file": "lost.json", "min": [0, 0], "max": [10, 10], "stands_for": "nowhere.json"}"#;
+        let again = r#"{"file": "t.json", "min": [5, 5], "max": [9, 9]}"#;
+        let plain = r#"{"file": "p.json", "min": [0, 0], "max": [256, 256]}"#;
+        let body = [tile, far, far, far2, lost, again, plain].join(", ");
+        std::fs::write(&path, format!(r#"{{"version": 1, "cells": [{body}]}}"#)).unwrap();
+        let cells = read_manifest(&path).expect("the rest load");
+        let names: Vec<String> =
+            cells.iter().map(|cell| cell.file.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["t.json", "far.json", "p.json"], "the repeat, the second stand-in, the lost one, the clash go");
+        assert_eq!((cells[0].stand_in, cells[1].partner, cells[2].stand_in), (Some(1), Some(0), None));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&folder);
+    }
+
+    #[test]
+    fn a_world_with_no_cells_says_so_in_the_log() {
+        // Launch checks count this line (land_play.sh, launch_proof.ps1): reword it only with the sessions told. Three
+        // ways to no cells: the manifest's path, its reading, an empty list.
+        let streaming = include_str!("app_cell_streaming.rs");
+        assert_eq!(streaming.matches("tracing::error!(\"cells: manifest gives no cells: ").count(), 3);
     }
 
     #[test]
@@ -709,13 +995,13 @@ mod tests {
         ];
         let (view, held) = ([128.0, 128.0], ([5128.0, 128.0], HOLD_RADIUS));
         assert_eq!(
-            plan_many(&cells, view, 600.0, 100.0, &[], |_| false),
+            plan_many(&cells, view, 600.0, 100.0, &[], |_| false, |_| false),
             plan(&cells, view, 600.0, 100.0, |_| false),
             "no holds: the plan it always was"
         );
-        let (load, _) = plan_many(&cells, view, 600.0, 100.0, &[held], |_| false);
+        let (load, _) = plan_many(&cells, view, 600.0, 100.0, &[held], |_| false, |_| false);
         assert_eq!(load, vec![0, 1], "the other town's own cell, not its far edge, the landmark or the land between");
-        let (_, unload) = plan_many(&cells, view, 600.0, 100.0, &[held], |_| true);
+        let (_, unload) = plan_many(&cells, view, 600.0, 100.0, &[held], |_| true, |_| true);
         assert_eq!(unload, vec![2, 3, 4], "only what is near the view or inside the hold stays");
     }
 
@@ -751,6 +1037,36 @@ mod tests {
         release(&mut world, "caelan");
         assert!(held_points(&mut world).is_empty());
         assert!(hold(&mut world, "switch", glam::Vec3::X), "room again");
+    }
+
+    #[test]
+    fn the_gate_lets_only_its_limit_read_at_once_and_a_wider_limit_lets_the_waiting_in() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let gate = ReadGate::default();
+        gate.set_limit(2);
+        let (reading, most, done) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let _turn = gate.take();
+                    most.fetch_max(reading.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                    reading.fetch_sub(1, Ordering::SeqCst);
+                    done.fetch_add(1, Ordering::SeqCst);
+                });
+            }
+        });
+        assert_eq!((done.load(Ordering::SeqCst), most.load(Ordering::SeqCst)), (8, 2));
+        // Two hold their turns; a third waits until the limit is raised, not for either to finish.
+        let (first, second) = (gate.take(), gate.take());
+        std::thread::scope(|scope| {
+            let third = scope.spawn(|| drop(gate.take()));
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(!third.is_finished());
+            gate.set_limit(3);
+            third.join().unwrap();
+        });
+        drop((first, second));
     }
 
     #[test]
@@ -816,6 +1132,11 @@ mod tests {
         // A window naming one wears the project's layers instead, rather than reading from anywhere.
         let window = TerrainStreamingComponent { layer_set: "../../../elsewhere".into(), ..Default::default() };
         assert_eq!(window.layer_dir(root), root);
+    }
+
+    #[test]
+    fn the_finest_level_reaches_as_many_cells_on_coarser_ground_and_no_less_on_finer() {
+        assert_eq!((lod_base_range(1.0), lod_base_range(2.0), lod_base_range(0.5)), (96.0, 192.0, 96.0));
     }
 
     #[test]

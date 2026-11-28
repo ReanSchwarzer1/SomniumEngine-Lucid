@@ -269,6 +269,8 @@ pub struct OutlinerRow {
     /// Lowercase component tags — `light`, `mesh`, `terrain`, `script`, … —
     /// which is what makes `type:light` a filter rather than a name search.
     pub tags: Vec<&'static str>,
+    /// The mesh file (and material, when it has its own) it draws, for `asset:`.
+    pub asset: String,
 }
 
 /// `app.rs` drains these after each frame and applies them to the ECS world.
@@ -284,6 +286,8 @@ pub enum EditorEvent {
     CreateComponent(String),
     /// Native authoring actions shared by menus and the command palette.
     DesignerTool(DesignerTool),
+    /// Level editing on a generated world: drop, align, floating, hide, isolate, find, save as.
+    LevelTool(LevelTool),
     /// Prefab commands share one route from menus and the command palette.
     Prefab(PrefabAction),
     /// Export the selected authored blockout as a standard mesh asset.
@@ -382,6 +386,9 @@ pub enum EditorEvent {
     SetCameraBookmark(u8),
     /// Recall slot 1..=9.
     RecallCameraBookmark(u8),
+    /// Take the camera to a place of the open scene: the index of a row last given to
+    /// `UiManager::set_palette_places`.
+    GoToPlace(usize),
     /// Orbit around the selection rather than around the camera itself.
     ToggleOrbitSelection,
     /// `command()`+right-click: list everything selectable under the cursor.
@@ -567,6 +574,15 @@ pub enum EditorEvent {
     ToggleWaterUnderwater,
     /// Title-bar close — same path as the native window X.
     CloseWindow,
+    /// The answer to "Save changes?" on the way out: quit, saving first when `after_save` (a save that fails or is
+    /// cancelled keeps the editor open).
+    Quit {
+        /// Save before quitting.
+        after_save: bool,
+    },
+    /// The answer "Save" to "Save changes?" before New Scene or Open Scene: save, then run the action, but only when
+    /// the scene is saved afterwards (a save that fails, is refused or is cancelled keeps the scene open).
+    AfterSave(Box<EditorEvent>),
 
     // ── Phase 16-D: scripting ───────────────────────────────────────────
     /// Attach the `.luau` file at this path to the selected entity.
@@ -763,6 +779,45 @@ pub enum GraphToolAction {
     Quest,
     /// Check the open dialogue against the project and play it from the selected node.
     Play,
+}
+
+/// Level-editing actions on whatever world is open, generated or hand-made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LevelTool {
+    /// Move each selected object down (or up) until it rests on what is under it.
+    DropToGround,
+    /// Tilt each selected object to the surface under it, then drop it.
+    AlignToSurface,
+    /// Select every object near the camera that hangs in the air.
+    FindFloating,
+    /// Hide the selected objects, or show them again when they are all hidden.
+    ToggleHide,
+    /// Hide everything but the selection, for a while.
+    Isolate,
+    /// Show what Isolate hid.
+    EndIsolation,
+    /// Scroll the Outliner to the selection and open its parents.
+    FindInOutliner,
+    /// Select the parent of the selection.
+    SelectParent,
+    /// Write the whole scene to a file you choose.
+    SaveSceneAs,
+    /// Put the selection's identity card on the clipboard.
+    CopyIdentity,
+    /// Count what the loaded world is made of (painted kinds, the models objects draw) and write a report.
+    Census,
+    /// Select every object that draws the selection's model files.
+    SelectSameAsset,
+    /// Check the surface of every model the loaded objects draw (closed or open, and where) and write a report.
+    CheckMeshes,
+    /// Select the object at the centre of the view; in Play, stop first, so what you saw is what you fix.
+    SelectLookedAt,
+    /// Make the painted tree or shrub you clicked an object, to move, turn, delete and save like any prop.
+    MakeObject,
+    /// Pick up the selection: it follows the mouse over whatever is under it until a click puts it down.
+    Carry,
+    /// Copy and Move: make a copy of the selection and pick the copy up at once.
+    CopyAndCarry,
 }
 
 /// Designer actions whose implementation belongs to the engine host.

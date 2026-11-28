@@ -1,5 +1,6 @@
 // Somnium Engine — screen-space velocity (Phase 24AD).
 //!include "global_pool.wgsl"
+//!include "grass_pool.wgsl"
 //!include "wind.wgsl"
 //
 // Where each pixel was on the previous frame, in UV space. Written once and
@@ -36,7 +37,8 @@
 // reprojecting wrongly with a still camera when they were not.
 
 struct VelocityParams {
-    /// Un-jittered, current frame. Reconstructs world position from depth.
+    /// Un-jittered, current frame, camera-relative (projection x rotation alone): reconstructs the point
+    /// relative to `view.camera_pos`. `prev_view_proj` takes that same point (it carries the camera's step).
     inv_view_proj: mat4x4<f32>,
     /// Un-jittered, previous frame.
     prev_view_proj: mat4x4<f32>,
@@ -121,7 +123,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VertexOutput {
     return out;
 }
 
-/// Un-project an NDC point with the current inverse view-projection.
+/// Un-project an NDC point with the current inverse view-projection: camera-relative.
 fn world_from_ndc(ndc: vec3<f32>) -> vec3<f32> {
     let p = vp.inv_view_proj * vec4<f32>(ndc, 1.0);
     return p.xyz / p.w;
@@ -139,23 +141,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec2<f32> {
     let depth = textureLoad(depth_tex, coord, 0);
 
     var world: vec3<f32>;
-    if depth >= 1.0 {
+    if depth <= 0.0 {
         // No geometry. Take a point far along this pixel's ray rather than
         // returning zero: the sky does move on screen when the camera turns,
         // and a zero there would leave it the only unblurred part of a whip pan.
-        // Just inside the far plane, because exactly 1.0 un-projects to a point
-        // at infinity whose previous-frame projection is a division by ~0.
-        world = world_from_ndc(vec3<f32>(ndc_xy, 0.9999));
+        // At depth 1e-7, some 350 km out at the game's near plane: reversed-Z's
+        // 0 un-projects to a point at infinity whose w is 0 (Sunscar, 6 Nov 2026).
+        world = world_from_ndc(vec3<f32>(ndc_xy, 1e-7));
     } else {
         world = world_from_ndc(vec3<f32>(ndc_xy, depth));
     }
 
     // A point that moved on its own: where the same point of its triangle was last frame.
     var moved = false;
-    if depth < 1.0 {
+    if depth > 0.0 {
         let vis = textureLoad(vis_tex, coord, 0).xy;
         if vis.x != 0u && vis.x - 1u < arrayLength(&motion) && motion[vis.x - 1u].moving != 0u {
-            world = previous_world(vis.x - 1u, vis.y, world);
+            // ponytail: world space for the instance's matrices, ~1 mm steps 15 km out; fine for motion.
+            world = previous_world(vis.x - 1u, vis.y, world + view.camera_pos) - view.camera_pos;
             moved = true;
         }
     }
@@ -164,19 +167,30 @@ fn fs_main(in: VertexOutput) -> @location(0) vec2<f32> {
     // swayed position back to its rest pose (two fixed-point steps; the sway
     // barely depends on where along it the point is) and forward to where the
     // wind had it last frame. Same `wind_offset` as every raster pass.
-    if depth < 1.0 && !moved {
+    if depth > 0.0 && !moved {
         let vis = textureLoad(vis_tex, coord, 0).xy;
         if vis.x != 0u {
             let inst = instances[vis.x - 1u];
             let m = materials[inst.material_id];
             if m.terrain_index < 0 && (m.wind_bend > 0.0 || m.wind_flutter > 0.0) {
-                let pivot = inst.model[3].xyz;
-                var rest = world - wind_offset(world, pivot, m.wind_bend, m.wind_flutter,
+                var pivot = inst.model[3].xyz;
+                var bend = m.wind_bend;
+                var flutter = m.wind_flutter;
+                // A grass blade (grass_pool.wgsl) sways about its own root, by its own stiffness.
+                if grass_material(m) {
+                    let blade = grass_load(inst.vertex_offset + (vis.y >> GRASS_TRI_BITS));
+                    pivot = blade.root;
+                    let w = grass_wind(blade, m.wind_bend, m.wind_flutter);
+                    bend = w.x;
+                    flutter = w.y;
+                }
+                let here = world + view.camera_pos;
+                var rest = here - wind_offset(here, pivot, bend, flutter,
                                                view.wind_time.x, view.wind, view.camera_pos);
-                rest = world - wind_offset(rest, pivot, m.wind_bend, m.wind_flutter,
+                rest = here - wind_offset(rest, pivot, bend, flutter,
                                            view.wind_time.x, view.wind, view.camera_pos);
-                world = rest + wind_offset(rest, pivot, m.wind_bend, m.wind_flutter,
-                                           view.wind_time.y, view.wind, view.camera_pos);
+                world = rest + wind_offset(rest, pivot, bend, flutter,
+                                           view.wind_time.y, view.wind, view.camera_pos) - view.camera_pos;
             }
         }
     }

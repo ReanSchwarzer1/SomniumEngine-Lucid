@@ -4,7 +4,7 @@
 // full raster terrain material so backend compilers never see the painted
 // weight-noise, hex-tiling, or parallax call graphs while compiling a ray hit.
 
-// Mirrors `terrain::GpuTerrainMaterial` (2080 bytes). Every vec4 sits on a
+// Mirrors `terrain::GpuTerrainMaterial` (2096 bytes). Every vec4 sits on a
 // 16-byte offset; `tests/shaders_validate.rs` pins the complete layout.
 struct TerrainMaterial {
     layer_tiling: array<vec4<f32>, 8>,
@@ -63,6 +63,12 @@ struct TerrainMaterial {
     weight_noise_strength: f32,
     weight_noise_scale: f32,
     macro_octave_strength: vec4<f32>,
+    /// Steepness where the projected cliff layer starts and is whole (`TerrainData::cliff_band`), then the rock layers'
+    /// mask as two 16-bit halves (`Terrain::rock_mask`, `terrain_wall_layer`).
+    cliff_band: vec4<f32>,
+    /// Strata by height (`GpuTerrainMaterial::strata`, `terrain_strata_beds`): the datum's bindless id, the terrain
+    /// origin's height, 1 where the tile has a datum, unused.
+    strata: vec4<f32>,
 }
 
 @group(0) @binding(11) var<storage, read> terrain_materials: array<TerrainMaterial>;

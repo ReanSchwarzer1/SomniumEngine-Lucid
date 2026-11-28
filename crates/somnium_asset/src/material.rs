@@ -399,7 +399,9 @@ pub fn save_material(
     let path = path.as_ref();
     asset.set_preview_rgba(preview_rgba)?;
     let text = serde_json::to_string_pretty(asset).map_err(|error| error.to_string())?;
-    fs::write(path, format!("{text}\n")).map_err(|error| format!("{}: {error}", path.display()))
+    // Written whole (a new file renamed over the old): a material hard-linked into another game folder or test copy
+    // is replaced here only.
+    crate::write_atomic(path, format!("{text}\n").as_bytes()).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 /// Create a new material without ever overwriting an existing asset.
@@ -742,6 +744,8 @@ mod tests {
                 subsurface: 0.0,
                 eye: false,
                 hair: false,
+                hashed_alpha: false,
+                far_ground: false,
                 foliage_card: false,
                 emissive: [0.0; 3],
                 emissive_intensity: 1.0,

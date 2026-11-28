@@ -10,9 +10,11 @@
 //   reconstructed depths, the two motion vector fields) lives in storage
 //   buffers indexed `y * width + x`, so atomics and read-write need no format
 //   features. Out-of-range reads return zero, as D3D's do.
-// - Reconstructed depths are stored as `1 - depth` and merged with atomicMax, so
-//   a cleared (zero) buffer means the far plane. Somnium's depth is standard
-//   (near 0, far 1), the option AMD merges with InterlockedMin.
+// - Reconstructed depths are stored as their bits and merged with atomicMax
+//   (a non-negative float's bits order as it does), so a cleared (zero) buffer
+//   means the far plane. Somnium's depth is reversed (near 1, far or infinity
+//   0, since 6 Nov 2026), AMD's inverted-depth option, which merges with
+//   InterlockedMax.
 // - The back buffer is LDR sRGB (transfer function 0), so the HDR transfer
 //   functions are not translated. No distortion field, no HUD-less present.
 
@@ -127,13 +129,13 @@ fn pixel_index(pos: vec2<i32>, width: i32) -> u32 {
     return u32(pos.y) * u32(width) + u32(pos.x);
 }
 
-// `1 - depth` keeps the far plane at the cleared zero; see the header.
+// Reversed depth keeps the far plane at the cleared zero; see the header.
 fn depth_to_store(depth: f32) -> u32 {
-    return bitcast<u32>(1.0 - depth);
+    return bitcast<u32>(max(depth, 0.0));
 }
 
 fn depth_from_store(bits: u32) -> f32 {
-    return 1.0 - bitcast<f32>(bits);
+    return bitcast<f32>(bits);
 }
 
 // ── Motion vector field ─────────────────────────────────────────────────────

@@ -2,8 +2,8 @@
 //!
 //! Owns an R32Float mip chain the size of the viewport. Level 0 is a copy of the
 //! visibility pass's depth buffer; every level above holds the furthest depth of
-//! the four texels below it. See `shaders/hiz.wgsl` for why `max` is the correct
-//! reduction and how odd mip sizes are handled.
+//! the four texels below it. See `shaders/hiz.wgsl` for why `min` (reversed-Z)
+//! is the correct reduction and how odd mip sizes are handled.
 //!
 //! The pyramid is rebuilt whenever the viewport resizes, which is also when the
 //! per-mip views and bind groups have to be recreated — they are cached rather

@@ -22,8 +22,8 @@ use somnium_ui::{EditorEvent, GestureId, TerrainInspectorState, UiManager};
 use crate::config::EngineConfig;
 use crate::context::{EngineContext, SimulationClock, SimulationState};
 use crate::editor_commands::{
-    AssignMaterialCmd, CreateEntityCmd, CreateLandscapeCmd, DeleteEntityCmd, EntitySnapshot,
-    FieldUndoSnapshot, SetFieldCmd, SetTransformCmd, TerrainEditCmd, TerrainRestoreOp,
+    AssignMaterialCmd, CommandGroup, CreateEntityCmd, CreateLandscapeCmd, EditorCommand, EntitySnapshot,
+    FieldUndoSnapshot, SetEditorFlagsCmd, SetFieldCmd, SetTransformCmd, TerrainEditCmd, TerrainRestoreOp,
     TerrainRestoreQueue, UndoStack,
 };
 use crate::editor_gizmo::{
@@ -109,25 +109,99 @@ fn synchronize_path_trace_pause(
 /// runs **before** the UI is consulted and every arm of it returns, so a key it
 /// claims never reaches the game — which is why `game_owns_keyboard` has to be
 /// part of the decision rather than a check somewhere downstream.
+#[cfg(test)]
 fn shortcut_action_for(
     code: winit::keyboard::KeyCode,
     modifiers: somnium_ui::message::Modifiers,
     game_owns_keyboard: bool,
 ) -> Option<somnium_ui::commands::CommandAction> {
-    somnium_ui::commands::Chord::from_winit(
+    shortcut_action_bound(code, modifiers, game_owns_keyboard, None)
+}
+
+/// [`shortcut_action_for`] with the keys as the developer bound them in Preferences > Keyboard. With `bindings` the
+/// chord is looked up the way the UI's own dispatcher does it (`KeyBindings::command_for`): a command he moved to
+/// another key runs from that key only, and one he unbound has no key. Without them the declared defaults apply.
+/// This dispatcher used to ask the registry for the DEFAULT chord, so Scale moved to K still scaled on S as well, and
+/// twelve keys (New, Save, Undo, Redo, Delete, Duplicate, the three gizmo tools, F5, F6, F8) ignored Preferences.
+fn shortcut_action_bound(
+    code: winit::keyboard::KeyCode,
+    modifiers: somnium_ui::message::Modifiers,
+    game_owns_keyboard: bool,
+    bindings: Option<&somnium_ui::commands::KeyBindings>,
+) -> Option<somnium_ui::commands::CommandAction> {
+    use somnium_ui::{commands::CommandAction as A, editor_event::LevelTool as L};
+    let chord = somnium_ui::commands::Chord::from_winit(
         code,
         modifiers.command(),
         modifiers.shift,
         modifiers.alt,
         false,
-    )
+    )?;
+    let registry = somnium_ui::commands::registry();
+    let action = match bindings {
+        Some(bindings) => registry.get(bindings.command_for(chord)?)?.action,
+        None => registry.binding(chord)?.action,
+    };
     // While the game owns the keyboard — flying the viewport, or in a play
     // session — an unmodified shortcut stands down and the key falls through.
     // Modified chords are unaffected: `Ctrl+S` is unambiguous and should still
-    // save mid-flight and mid-play.
-    .filter(|chord| !game_owns_keyboard || chord.has_modifier())
-    .and_then(|chord| somnium_ui::commands::registry().binding(chord))
-    .map(|command| command.action)
+    // save mid-flight and mid-play. The level tools are edit-mode tools,
+    // modified or not (Shift+F mid-play is a sprinting player's key), except
+    // Select What You Look At (F4), which is made for Play.
+    if game_owns_keyboard && !matches!(action, A::LevelTool(L::SelectLookedAt)) {
+        if !chord.has_modifier() || matches!(action, A::LevelTool(_)) {
+            return None;
+        }
+    }
+    Some(action)
+}
+
+/// The same decision with the UI's keyboard focus in it: while a text box (a search box, the command palette, a
+/// Details field) has the focus it gets every key. A bare `S`, `R` or `T` is a letter there, not the Scale, Rotate
+/// or Terrain tool, Delete takes a character and not the selection, and Ctrl+D is not Duplicate. Only Ctrl+S still
+/// saves. The UI's own dispatcher keeps the same rule (`has_text_focus`); this one runs first and every arm of it
+/// returns, so a key it claimed never reached the box: typing "sunscar" in the palette gave "unca" (20 Nov report).
+#[cfg(test)]
+fn shortcut_action_with_focus(
+    code: winit::keyboard::KeyCode,
+    modifiers: somnium_ui::message::Modifiers,
+    game_owns_keyboard: bool,
+    text_focus: bool,
+) -> Option<somnium_ui::commands::CommandAction> {
+    shortcut_action_live(code, modifiers, game_owns_keyboard, text_focus, None)
+}
+
+/// [`shortcut_action_with_focus`] with the developer's own key bindings: what the running editor asks.
+fn shortcut_action_live(
+    code: winit::keyboard::KeyCode,
+    modifiers: somnium_ui::message::Modifiers,
+    game_owns_keyboard: bool,
+    text_focus: bool,
+    bindings: Option<&somnium_ui::commands::KeyBindings>,
+) -> Option<somnium_ui::commands::CommandAction> {
+    shortcut_action_bound(code, modifiers, game_owns_keyboard, bindings)
+        .filter(|&action| !text_focus || matches!(action, somnium_ui::commands::CommandAction::SaveScene))
+}
+
+/// The key a typed character comes from on a US layout, for the editor script's `type=` step: letters and digits
+/// (a capital is judged as its bare key), space; anything else has no shortcut and is simply typed.
+fn key_code_for_char(c: char) -> Option<winit::keyboard::KeyCode> {
+    use winit::keyboard::KeyCode as K;
+    const LETTERS: [K; 26] = [
+        K::KeyA, K::KeyB, K::KeyC, K::KeyD, K::KeyE, K::KeyF, K::KeyG, K::KeyH, K::KeyI, K::KeyJ, K::KeyK, K::KeyL,
+        K::KeyM, K::KeyN, K::KeyO, K::KeyP, K::KeyQ, K::KeyR, K::KeyS, K::KeyT, K::KeyU, K::KeyV, K::KeyW, K::KeyX,
+        K::KeyY, K::KeyZ,
+    ];
+    const DIGITS: [K; 10] = [
+        K::Digit0, K::Digit1, K::Digit2, K::Digit3, K::Digit4, K::Digit5, K::Digit6, K::Digit7, K::Digit8, K::Digit9,
+    ];
+    match c {
+        'a'..='z' => Some(LETTERS[c as usize - 'a' as usize]),
+        'A'..='Z' => Some(LETTERS[c as usize - 'A' as usize]),
+        '0'..='9' => Some(DIGITS[c as usize - '0' as usize]),
+        ' ' => Some(K::Space),
+        _ => None,
+    }
 }
 
 fn shortcut_preserves_game_key(action: somnium_ui::commands::CommandAction) -> bool {
@@ -140,6 +214,33 @@ mod shortcut_input_tests {
     use somnium_ui::commands::CommandAction;
     use somnium_ui::message::Modifiers;
     use winit::keyboard::KeyCode;
+
+    /// A key the developer moved in Preferences > Keyboard is the only key of its command, here as in the UI's own
+    /// dispatcher: Scale moved from S to K scales on K and no longer on S, and an unbound Delete deletes nothing.
+    /// (K, because no command has it. G was free when this was written and is Move on the Ground now.)
+    #[test]
+    fn the_first_dispatcher_honours_the_keys_bound_in_preferences() {
+        use somnium_ui::commands::{Chord, CommandKey, KeyBindings};
+        let none = Modifiers::default();
+        let scale = shortcut_action_for(KeyCode::KeyS, none, false);
+        assert!(scale.is_some(), "S is Scale by default");
+        let delete = shortcut_action_for(KeyCode::Delete, none, false);
+        assert!(delete.is_some(), "Delete deletes by default");
+
+        // With nothing changed, the live lookup and the declared defaults agree.
+        let untouched = KeyBindings::default();
+        assert_eq!(super::shortcut_action_bound(KeyCode::KeyS, none, false, Some(&untouched)), scale);
+        assert_eq!(super::shortcut_action_bound(KeyCode::Delete, none, false, Some(&untouched)), delete);
+
+        let mut bound = KeyBindings::default();
+        bound.bind("editor.gizmo.scale", Some(Chord::press(CommandKey::Letter('K'))));
+        bound.bind("editor.edit.delete", None);
+        assert_eq!(super::shortcut_action_bound(KeyCode::KeyK, none, false, Some(&bound)), scale, "K scales now");
+        assert_eq!(super::shortcut_action_bound(KeyCode::KeyS, none, false, Some(&bound)), None, "S no longer does");
+        assert_eq!(super::shortcut_action_bound(KeyCode::Delete, none, false, Some(&bound)), None, "Delete is unbound");
+        // The rules of the default lookup still hold for a moved key: it stands down while the game owns the keyboard.
+        assert_eq!(super::shortcut_action_bound(KeyCode::KeyK, none, true, Some(&bound)), None);
+    }
 
     #[test]
     fn save_keeps_the_physical_s_transition_for_viewport_flight() {
@@ -182,6 +283,31 @@ mod shortcut_input_tests {
         assert_eq!(
             shortcut_action_for(KeyCode::KeyS, ctrl, true),
             Some(CommandAction::SaveScene),
+        );
+    }
+
+    /// The level tools never take a key from the game: Shift is a sprint, and Shift+F mid-play is the player's.
+    #[test]
+    fn level_tools_stand_down_while_the_game_owns_the_keyboard() {
+        use somnium_ui::editor_event::LevelTool;
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            shortcut_action_for(KeyCode::KeyF, shift, false),
+            Some(CommandAction::LevelTool(LevelTool::FindInOutliner))
+        );
+        assert_eq!(shortcut_action_for(KeyCode::KeyF, shift, true), None);
+        assert_eq!(
+            shortcut_action_for(KeyCode::End, Modifiers::default(), false),
+            Some(CommandAction::LevelTool(LevelTool::DropToGround))
+        );
+        assert_eq!(shortcut_action_for(KeyCode::End, Modifiers::default(), true), None);
+        assert_eq!(
+            shortcut_action_for(KeyCode::F4, Modifiers::default(), true),
+            Some(CommandAction::LevelTool(LevelTool::SelectLookedAt)),
+            "F4 is made for Play: what you see, stopped and selected"
         );
     }
 
@@ -245,6 +371,45 @@ mod shortcut_input_tests {
                 "{key:?} is a fly-cam key and must fall through while flying"
             );
         }
+    }
+
+    /// The developer's report of 20 Nov, as a test: Ctrl+P's place search (and most search boxes) missed key
+    /// presses. The keys a bare shortcut owns never reached a focused box. With the focus in a text box, every key
+    /// is the box's; only Ctrl+S still saves.
+    #[test]
+    fn a_focused_text_box_keeps_every_key_but_save() {
+        use super::{key_code_for_char, shortcut_action_with_focus};
+        let none = Modifiers::default();
+        let ctrl = Modifiers {
+            ctrl: true,
+            ..Modifiers::default()
+        };
+        // Grounded: without the focus these keys are shortcuts, or the test measures nothing.
+        assert_eq!(
+            shortcut_action_with_focus(KeyCode::KeyS, none, false, false),
+            Some(CommandAction::SetGizmoMode(2))
+        );
+        assert_eq!(
+            shortcut_action_with_focus(KeyCode::KeyD, ctrl, false, false),
+            Some(CommandAction::DuplicateSelected)
+        );
+        // Typing "sunscar": no letter is taken, and neither is Delete or Ctrl+D.
+        for c in "sunscar trees 0123456789".chars() {
+            let key = key_code_for_char(c).expect("a letter, digit or space has a key");
+            assert_eq!(
+                shortcut_action_with_focus(key, none, false, true),
+                None,
+                "{c:?} must reach the focused box"
+            );
+        }
+        for key in [KeyCode::Delete, KeyCode::Backspace, KeyCode::End, KeyCode::Home] {
+            assert_eq!(shortcut_action_with_focus(key, none, false, true), None, "{key:?} is the box's");
+        }
+        assert_eq!(shortcut_action_with_focus(KeyCode::KeyD, ctrl, false, true), None);
+        assert_eq!(
+            shortcut_action_with_focus(KeyCode::KeyS, ctrl, false, true),
+            Some(CommandAction::SaveScene)
+        );
     }
 }
 
@@ -436,6 +601,9 @@ struct GizmoDragState {
     parent_world_inverse: glam::Mat4,
     /// The selected entity's world rotation at drag start, for local axes.
     start_world_rotation: glam::Quat,
+    /// The handle is the middle of a part's mesh, not the entity's origin ([`part_handle`]): the body moves, turns and
+    /// grows about `gizmo_pos`, and its origin follows.
+    part_handle: bool,
     /// The rest of the selection, with the transform each started at.
     ///
     /// CONTROL-F made the selection a set; a gizmo that still moved one thing
@@ -569,11 +737,16 @@ pub trait GameApp {
 /// a trait object it *can* name and this is the six lines that satisfy it.
 struct GameUiAdapter<'g, G: GameApp + ?Sized> {
     game: &'g mut G,
+    /// The standalone game's line for models that did not load (`model_faults`), drawn over the game's own UI.
+    notice: Option<(&'g mut crate::model_faults::Notice, String)>,
 }
 
 impl<G: GameApp + ?Sized> somnium_ui::GameUi for GameUiAdapter<'_, G> {
     fn draw_ui(&mut self, frame: &mut somnium_ui::GameUiFrame) {
         self.game.on_render_ui(frame);
+        if let Some((notice, line)) = self.notice.as_mut() {
+            notice.draw(frame, line);
+        }
     }
 }
 
@@ -1036,6 +1209,8 @@ pub struct Engine<G: GameApp> {
     cell_streamer: crate::cell_streaming::CellStreamer,
     /// Grass and flowers generated round the camera for `ground_cover` foliage kinds.
     ground_cover: crate::ground_cover::GroundCover,
+    /// Ground cover's cells as instanced batches (`SOMNIUM_FOLIAGE_BATCHES=1`).
+    cover_batches: crate::ground_cover::CoverBatches,
     /// The inventory and the reference graph travel together, because they
     /// are two readings of the same disk and a panel showing one against the
     /// other's assets is worse than no panel (MORROWIND-M item 3).
@@ -1128,6 +1303,8 @@ pub struct Engine<G: GameApp> {
     /// resolved against the order the user can actually see.
     outliner_order: Vec<somnium_ecs::entity::Entity>,
     outliner_hierarchy: crate::outliner_hierarchy::OutlinerHierarchy,
+    /// The open scene's edit layer, the selection card and the level tools (`app_editing.rs`).
+    editing: editing_host::EditingState,
     /// TOWN-PERF: when the outliner rows were last gathered, and the entity
     /// count and primary selection they were gathered for. See `OUTLINER_REFRESH`.
     outliner_refreshed: Option<std::time::Instant>,
@@ -1156,6 +1333,8 @@ pub struct Engine<G: GameApp> {
     autosave: crate::autosave::AutosaveClock,
     /// A recoverable autosave found at launch, until the person answers.
     pending_recovery: Option<crate::autosave::Recovery>,
+    /// This session wrote an autosave: a clean close takes it away (nothing is left to recover).
+    autosave_written: bool,
     /// Most-recently-opened scenes, newest first.
     recent_scenes: Vec<std::path::PathBuf>,
     /// The project's levels (`ProjectPaths::level_scenes`), listed in the File
@@ -1194,10 +1373,17 @@ pub struct Engine<G: GameApp> {
     /// startup for meshes the user may never place. `FOLIAGE_KINDS` long, by kind.
     foliage_meshes: Vec<Option<Vec<FoliagePart>>>,
     foliage_lod_meshes: Vec<Option<Vec<FoliagePart>>>,
+    /// A project entry's impostor past its LOD mesh (`ProjectEntry::impostor`): instance batches only.
+    foliage_impostor_meshes: Vec<Option<Vec<FoliagePart>>>,
     /// Palette entries whose import failed, so we stop retrying them.
     foliage_failed: Vec<bool>,
     project_foliage: std::collections::BTreeMap<u16, crate::foliage_palette::ProjectEntry>,
     project_foliage_sources: std::collections::HashMap<std::path::PathBuf, Vec<FoliagePart>>,
+    /// Palette sources a streamed world is reading off the main thread (`palette_source`), each with whether its
+    /// parts are leaves by their materials (a kind's own mesh) or never (a level of detail, an impostor).
+    palette_reads: std::collections::HashMap<std::path::PathBuf, (std::sync::mpsc::Receiver<PaletteRead>, bool)>,
+    /// Palette sources that did not read: not asked for again.
+    palette_failed: std::collections::HashSet<std::path::PathBuf>,
     /// Phase 17F: the foliage brush.
     foliage_brush: somnium_renderer::terrain::foliage_paint::FoliageBrush,
     /// When true, dragging in the viewport paints foliage instead of sculpting.
@@ -1287,6 +1473,7 @@ pub struct Engine<G: GameApp> {
     /// enabled. Recomputed every frame and never persisted — it is a cache of
     /// one evaluation, not state.
     day_state: Option<crate::time_of_day::DayState>,
+    /// The day clock's hour last frame: the planet over the horizon counts the hours it moves (`apply_sky`).
     /// Fingerprint of the content root at the last inventory scan. `None`
     /// forces one, which is what every explicit invalidation point sets.
     asset_scan_stamp: Option<(u64, u64)>,
@@ -1300,6 +1487,8 @@ pub struct Engine<G: GameApp> {
     precipitation_entity: Option<somnium_ecs::Entity>,
     /// Title-bar close requested a shutdown.
     ui_wants_exit: bool,
+    /// The author answered "Save changes?" on the way out, so closing no longer asks.
+    quit_confirmed: bool,
     /// Map load completed this frame; game code seeds fly-cam / boat after ECS reset.
     pending_map_load: Option<crate::MapLoadResult>,
     // ── Phase 16-C: scripting ────────────────────────────────────────────
@@ -1332,6 +1521,16 @@ pub struct Engine<G: GameApp> {
     /// step it pays for actually runs: deriving the flag from it made
     /// `stepping` false during the very step it describes.
     stepping_now: bool,
+    /// Models that did not load this run: for the status bar, the game's screen and the run's last log line.
+    model_faults: crate::model_faults::ModelFaults,
+    /// The standalone game's line for them.
+    model_notice: crate::model_faults::Notice,
+    /// Every imported source's made flames by node (`fire.rs`), by its resolved file (the upload cache's key), kept
+    /// from its first load, a cell reader's included, for every entity that reuses the upload.
+    pub(crate) flame_nodes:
+        std::collections::HashMap<std::path::PathBuf, std::collections::HashMap<u32, std::sync::Arc<[crate::fire::Flame]>>>,
+    /// The level portals the eye stands in (`level_portal.rs`), so an entry is logged once.
+    portals: crate::level_portal::Portals,
 }
 
 /// One floating window's swapchain image, acquired before the frame that fills
@@ -1422,6 +1621,70 @@ fn own_window(attrs: WindowAttributes, owner: &Window) -> WindowAttributes {
 fn own_window(attrs: WindowAttributes, _owner: &Window) -> WindowAttributes {
     attrs
 }
+
+/// The project at `root`, opened once per root: `imported_source_path` runs for every imported source of every
+/// streamed cell, two or three times each, and opening reads the manifest and resolves its eleven folders (Sunscar,
+/// 30 Oct 2026: with the source stamps, most of a cell install's "GPU restore"). Resolving a source still checks it
+/// against the project each time.
+fn opened_project(root: &std::path::Path) -> Result<crate::authoring::project::ProjectPaths, String> {
+    static OPEN: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, crate::authoring::project::ProjectPaths>>,
+    > = std::sync::LazyLock::new(Default::default);
+    if let Some(project) = OPEN.lock().ok().and_then(|open| open.get(root).cloned()) {
+        return Ok(project);
+    }
+    let project = crate::authoring::project::ProjectPaths::open(root)?;
+    if let Ok(mut open) = OPEN.lock() {
+        open.insert(root.to_path_buf(), project.clone());
+    }
+    Ok(project)
+}
+
+/// A source resolved against the project at `root`, remembered: a streamed cell resolves each of its sources two or
+/// three times, and resolving canonicalizes. A project's folders don't move under a running engine; the first
+/// resolve still checks the source against the project.
+fn resolved_source(root: &std::path::Path, source: &str) -> Result<std::path::PathBuf, String> {
+    type Resolved = std::collections::HashMap<(std::path::PathBuf, String), std::path::PathBuf>;
+    static RESOLVED: std::sync::LazyLock<std::sync::Mutex<Resolved>> = std::sync::LazyLock::new(Default::default);
+    let key = (root.to_path_buf(), source.to_owned());
+    if let Some(path) = RESOLVED.lock().ok().and_then(|resolved| resolved.get(&key).cloned()) {
+        return Ok(path);
+    }
+    let path = opened_project(root)?.resolve(std::path::Path::new(source))?;
+    if let Ok(mut resolved) = RESOLVED.lock() {
+        resolved.insert(key, path.clone());
+    }
+    Ok(path)
+}
+
+/// A background window (`somnium_ui::background_window`) after it is shown: a tool window that is never activated,
+/// so it has no taskbar button, is not in Alt+Tab and a click can't bring it forward. winit has neither style for a
+/// main window, and rewrites the extended style when its own flags change, hence after `set_visible`.
+#[cfg(target_os = "windows")]
+fn keep_off_the_desktop(window: &Window) {
+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetWindowLongPtrW(hwnd: isize, index: i32) -> isize;
+        fn SetWindowLongPtrW(hwnd: isize, index: i32, value: isize) -> isize;
+    }
+    const GWL_EXSTYLE: i32 = -20;
+    const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
+    const WS_EX_NOACTIVATE: isize = 0x0800_0000;
+    if let Ok(handle) = window.window_handle()
+        && let RawWindowHandle::Win32(win32) = handle.as_raw()
+    {
+        let hwnd = win32.hwnd.get();
+        // SAFETY: the handle is this live window's own; only its extended style changes.
+        unsafe {
+            let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+            SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn keep_off_the_desktop(_window: &Window) {}
 
 /// Whether a point on the desktop falls inside a window's client area.
 ///
@@ -1640,13 +1903,31 @@ impl FloatingWindow {
 
 impl<G: GameApp + 'static> Engine<G> {
     /// Start the engine loop. This will take control of the current thread.
-    pub fn run(mut config: EngineConfig, mut game: G) -> Result<(), EngineError> {
+    ///
+    /// A panic leaves a crash report under the project's `logs` and, on this thread, says so in a box; an error that
+    /// stops the start gets a box too, and the log is kept in `logs/editor.log` or `logs/game.log` (`crash_report.rs`).
+    pub fn run(config: EngineConfig, game: G) -> Result<(), EngineError> {
+        crate::crash_report::install(&config.window_title, config.project_root.as_deref());
+        let program = config.window_title.clone();
+        let result = Self::run_engine(config, game);
+        if let Err(error) = &result {
+            crate::crash_report::could_not_start(&program, error);
+        }
+        result
+    }
+
+    fn run_engine(mut config: EngineConfig, mut game: G) -> Result<(), EngineError> {
         // Phase 11.5M: install both the fmt layer and the log-capture layer.
         let (capture_layer, log_rx) = crate::log_capture::make_log_capture();
         {
             use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+            // The log in a file as well, plain text, beside the project: a console that closes with the program keeps
+            // nothing.
+            let log_file = crate::crash_report::open_log(config.project_root.as_deref(), config.player_mode)
+                .map(|file| tracing_subscriber::fmt::layer().with_ansi(false).with_writer(std::sync::Mutex::new(file)));
             tracing_subscriber::registry()
                 .with(tracing_subscriber::fmt::layer())
+                .with(log_file)
                 .with(
                     tracing_subscriber::EnvFilter::try_from_default_env()
                         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
@@ -1753,6 +2034,7 @@ impl<G: GameApp + 'static> Engine<G> {
             world_partition_pin: None,
             cell_streamer: crate::cell_streaming::CellStreamer::default(),
             ground_cover: crate::ground_cover::GroundCover::default(),
+            cover_batches: crate::ground_cover::CoverBatches::default(),
             asset_scan: None,
             asset_gate: somnium_asset::database::DebouncedAssetDb::default(),
             locale_catalog: None,
@@ -1780,6 +2062,7 @@ impl<G: GameApp + 'static> Engine<G> {
             selection: crate::selection::Selection::default(),
             outliner_order: Vec::new(),
             outliner_hierarchy: crate::outliner_hierarchy::OutlinerHierarchy::default(),
+            editing: editing_host::EditingState::default(),
             outliner_refreshed: None,
             outliner_seen: (0, None),
             settings: settings_store,
@@ -1792,6 +2075,7 @@ impl<G: GameApp + 'static> Engine<G> {
             hover_picked_at: std::time::Instant::now(),
             autosave: crate::autosave::AutosaveClock::new(autosave_interval),
             pending_recovery: None,
+            autosave_written: false,
             recent_scenes: crate::settings::load_recent_scenes(),
             level_scenes,
             entity_clipboard: crate::clipboard::EntityClipboard::default(),
@@ -1805,9 +2089,12 @@ impl<G: GameApp + 'static> Engine<G> {
             marquee: None,
             foliage_meshes: vec![None; FOLIAGE_KINDS],
             foliage_lod_meshes: vec![None; FOLIAGE_KINDS],
+            foliage_impostor_meshes: vec![None; FOLIAGE_KINDS],
             foliage_failed: vec![false; FOLIAGE_KINDS],
             project_foliage,
             project_foliage_sources: std::collections::HashMap::new(),
+            palette_reads: std::collections::HashMap::new(),
+            palette_failed: std::collections::HashSet::new(),
             foliage_brush: somnium_renderer::terrain::foliage_paint::FoliageBrush::default(),
             foliage_paint_active: false,
             foliage_erase: false,
@@ -1855,6 +2142,7 @@ impl<G: GameApp + 'static> Engine<G> {
             weather_state: crate::weather::WeatherState::default(),
             precipitation_entity: None,
             ui_wants_exit: false,
+            quit_confirmed: false,
             pending_map_load: None,
             scripts: crate::script_host::ScriptHost::default(),
             script_input: crate::script_input::ScriptInputTracker::new(),
@@ -1863,6 +2151,10 @@ impl<G: GameApp + 'static> Engine<G> {
             pending_steps: 0,
             stepping_now: false,
             script_step: 0,
+            model_faults: crate::model_faults::ModelFaults::default(),
+            model_notice: crate::model_faults::Notice::default(),
+            flame_nodes: std::collections::HashMap::new(),
+            portals: crate::level_portal::Portals::default(),
         };
 
         engine.foliage_erase = crate::authoring_settings::BrushPreferences::load()
@@ -1871,7 +2163,8 @@ impl<G: GameApp + 'static> Engine<G> {
             .run_app(&mut engine)
             .map_err(|e| EngineError::EventLoop(e.to_string()))?;
 
-        info!("Somnium Engine shut down cleanly");
+        // The run's last line says what did not load, so a launch can be judged by the end of its log alone.
+        info!("Somnium Engine shut down cleanly: {}", crate::model_faults::counted(engine.model_faults.counts()));
         Ok(())
     }
 }
@@ -2355,7 +2648,14 @@ impl<G: GameApp> Engine<G> {
             &self.type_registry,
             &path.to_string_lossy(),
         ) {
-            Ok(()) => info!(?reason, "autosaved"),
+            Ok(()) => {
+                self.autosave_written = true;
+                // The note names the scene this copies, so the next start holds it against that scene's own save.
+                match crate::autosave::note_scene(&path, self.open_scene_file().as_deref()) {
+                    Ok(()) => info!(?reason, "autosaved"),
+                    Err(error) => warn!(%error, "autosaved, but the note naming its scene was not written: it will not be offered"),
+                }
+            }
             Err(error) => warn!(%error, "autosave failed"),
         }
     }
@@ -2444,17 +2744,26 @@ impl<G: GameApp> Engine<G> {
         if self.config.player_mode {
             return;
         }
-        let scene = std::path::PathBuf::from("scene.somnium");
-        self.pending_recovery = crate::autosave::find_recovery(&self.config.content_root, &scene);
+        // Each autosave is held against the scene its note names (`autosave::find_recovery`), not a fixed name.
+        self.pending_recovery = crate::autosave::find_recovery(&self.config.content_root);
         if let Some(recovery) = &self.pending_recovery {
             let reason = match recovery.reason {
                 crate::autosave::AutosaveReason::BeforePlay => "before Play",
                 crate::autosave::AutosaveReason::Interval => "autosave",
             };
-            let message = format!("Unsaved work was recovered ({reason}) — File > Open it");
+            let scene = recovery
+                .scene
+                .as_deref()
+                .and_then(std::path::Path::file_name)
+                .map_or_else(|| "an unsaved scene".to_owned(), |n| n.to_string_lossy().into_owned());
+            let file = recovery.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            let message = format!(
+                "Unsaved work on {scene} was kept ({reason}): File > Open {}/{file} in the content folder",
+                crate::autosave::AUTOSAVE_DIR
+            );
             if let Some(ui) = self.ui_manager.as_mut() {
                 ui.append_log(&format!(
-                    "[scene] recovered {} ({reason})",
+                    "[scene] recovered {} ({reason}), unsaved work on {scene}",
                     recovery.path.display()
                 ));
                 ui.push_toast(&message);
@@ -2503,6 +2812,7 @@ impl<G: GameApp> Engine<G> {
 
         match kind {
             SceneKind::MapRecipe | SceneKind::LegacyDump => {
+                self.reset_editing(None);
                 let Some((renderer, render_ctx)) =
                     self.renderer.as_mut().zip(self.render_ctx.as_ref())
                 else {
@@ -2549,6 +2859,9 @@ impl<G: GameApp> Engine<G> {
             self.world.despawn(entity);
         }
 
+        // The edit layer beside the scene: the author's own changes, applied before anything spawns.
+        let edited = self.edits_before_scene_spawn(path, document);
+        let document = edited.as_ref().unwrap_or(document);
         let report = match crate::scene_schema::scene_from_json(
             &mut self.world,
             &self.type_registry,
@@ -2577,14 +2890,14 @@ impl<G: GameApp> Engine<G> {
             report.warnings.len()
         );
         self.after_scene_load(path);
+        self.edits_after_scene_spawn();
     }
 
     /// Where an `ImportedMesh.source` lives on disk, contained by the project.
     fn imported_source_path(&self, source: &str) -> Result<std::path::PathBuf, String> {
         let source_path = std::path::Path::new(source);
         match self.config.project_root.as_ref() {
-            Some(root) => crate::authoring::project::ProjectPaths::open(root)
-                .and_then(|project| project.resolve(source_path)),
+            Some(root) => resolved_source(root, source),
             None => Ok(source_path.to_path_buf()),
         }
     }
@@ -2642,6 +2955,7 @@ impl<G: GameApp> Engine<G> {
             .flat_map(|(_, parts)| parts)
             .chain(self.foliage_meshes.iter_mut().filter_map(Option::take).flatten())
             .chain(self.foliage_lod_meshes.iter_mut().filter_map(Option::take).flatten())
+            .chain(self.foliage_impostor_meshes.iter_mut().filter_map(Option::take).flatten())
             .collect::<Vec<_>>();
         self.foliage_failed.fill(false);
         self.ground_cover.clear();
@@ -2762,6 +3076,7 @@ impl<G: GameApp> Engine<G> {
         // textures: a bank of 172 parts of which a level draws five no longer
         // uploads, or decodes, all 172 parts' maps.
         let drawing = self.renderer.is_some() && self.render_ctx.is_some();
+        self.zone_begin("Restore stamps");
         let mut restores = Vec::new();
         for (source, entities) in imported {
             let resolved = match self.imported_source_path(&source) {
@@ -2785,9 +3100,12 @@ impl<G: GameApp> Engine<G> {
                 (Some(_), None) => None,
                 (None, _) => Some(parts.clone()),
             };
+            let key = resolved.clone();
             let load = load.filter(|_| drawing).map(|parts| (resolved, parts));
-            restores.push((source, entities, stamp, cached, load, parts));
+            restores.push((source, entities, stamp, cached, load, parts, key));
         }
+        self.zone_end();
+        self.zone_begin("Restore uploads");
         // Each bank is read and decoded on a loader thread (its images on
         // every core, `load_gltf_for`) while this one uploads the bank before
         // it, in the same order. Two loaders take every other bank: a bank of
@@ -2815,7 +3133,7 @@ impl<G: GameApp> Engine<G> {
                 })
                 .collect();
             let mut next = 0;
-            for (source, entities, stamp, cached, load, parts) in restores {
+            for (source, entities, stamp, cached, load, parts, key) in restores {
                 let waited = std::time::Instant::now();
                 let loaded = load.as_ref().map(|_| {
                     next += 1;
@@ -2845,10 +3163,15 @@ impl<G: GameApp> Engine<G> {
                         Some(Ok(scene)) => scene,
                         Some(Err(error)) => {
                             warn!(%error,%source,"Imported mesh could not be restored");
+                            self.model_faults.unrestored(&source.to_string());
                             continue;
                         }
                         None => continue,
                     };
+                    // The made flames in this source, kept for every later cell that uses it (`fire.rs`).
+                    if crate::fire::rule_on() {
+                        self.flame_nodes.insert(key.clone(), crate::fire::scene_flames(&scene));
+                    }
                     let nodes = renderer.upload_scene_for(ctx, &scene, Some(&parts));
                     if let Some(stamp) = stamp {
                         self.imported_uploads.insert(stamp, &nodes, Some(parts));
@@ -2856,6 +3179,12 @@ impl<G: GameApp> Engine<G> {
                     nodes
                 };
                 for (entity, ordinal) in entities {
+                    // A made flame is not drawn: the shell burns it in its place (`fire.rs`).
+                    if let Some(flames) = self.flame_nodes.get(&key).and_then(|nodes| nodes.get(&ordinal)) {
+                        let _ = self.world.remove_component::<MeshComponent>(entity);
+                        let _ = self.world.insert_component(entity, crate::fire::FlameSource { flames: flames.clone() });
+                        continue;
+                    }
                     if let Some(node) = uploaded.get(ordinal as usize) {
                         let _ = self.world.insert_component(
                             entity,
@@ -2875,6 +3204,7 @@ impl<G: GameApp> Engine<G> {
                 upload_time += uploading.elapsed();
             }
         });
+        self.zone_end();
 
         if let Some(renderer) = self.renderer.as_ref() {
             // One line per load, so a slow open says whether textures were
@@ -3212,9 +3542,11 @@ impl<G: GameApp> Engine<G> {
     /// comes from how far apart they are, so `F` on one object and `F` on
     /// twelve both end up looking at the thing the user meant.
     fn focus_camera_on_selection(&mut self) {
-        // The minimum radius inside `focus_target` keeps a single point from
-        // putting the camera inside the object it was asked to look at.
-        let Some((centre, radius)) = self.focus_target() else {
+        // The sphere round the selection's real size (its meshes' world box);
+        // the origin points stand in when nothing can be measured, and their
+        // minimum radius keeps a single point from putting the camera inside
+        // the object it was asked to look at.
+        let Some((centre, radius)) = self.selection_focus().or_else(|| self.focus_target()) else {
             return;
         };
         // The editor camera belongs to the game layer, so this is a request
@@ -3242,7 +3574,68 @@ impl<G: GameApp> Engine<G> {
             self.terrain_edit_active = false;
             self.terrain_stroke = None;
         }
+        self.select_lod_twins();
         self.refresh_gizmo_anchor();
+        self.touch_selection();
+    }
+
+    /// The pointer went down: take hold of the gizmo handle under it, if there is one. True when a drag began.
+    fn begin_gizmo_drag(&mut self) -> bool {
+        let started = try_start_gizmo_drag(
+            self.renderer.as_ref(),
+            &self.world,
+            &self.selection.primary,
+            self.cursor_pos,
+            self.viewport_size(),
+            self.settings.editor().gizmo_local_space,
+        );
+        let blocked = started.is_some() && self.settings.editor().select_only;
+        if blocked {
+            let message = "Select Only is on — click it in the toolbar to move, rotate and scale";
+            info!("{message}");
+            if let Some(ui) = self.ui_manager.as_mut() {
+                ui.push_toast(message);
+            }
+        }
+        let drag = if blocked {
+            None
+        } else {
+            started.and_then(|mut drag| {
+                drag.followers = capture_followers(&self.world, self.selection.as_slice(), drag.entity_index)?;
+                Some(drag)
+            })
+        };
+        let began = drag.is_some();
+        if began {
+            self.gizmo_drag = drag;
+        }
+        began
+    }
+
+    /// The pointer came up: the drag in hand, if any, becomes one undoable step. True when there was one.
+    fn end_gizmo_drag(&mut self) -> bool {
+        let Some(drag) = self.gizmo_drag.take() else {
+            return false;
+        };
+        // Every moved entity, the followers too: undo used to put back only the primary.
+        let starts = std::iter::once((drag.entity_index, drag.start_transform))
+            .chain(drag.followers.iter().map(|f| (f.entity_index, f.start_transform)));
+        let mut moves: Vec<Box<dyn EditorCommand>> = Vec::new();
+        for (index, start) in starts {
+            let Some(entity) = self.world.find_entity_by_index(index) else {
+                continue;
+            };
+            let end = self.world.get::<Transform>(entity).copied().unwrap_or(start);
+            if end.translation != start.translation || end.rotation != start.rotation || end.scale != start.scale {
+                moves.push(Box::new(SetTransformCmd::new(index, start, end)));
+            }
+        }
+        if !moves.is_empty() {
+            self.undo_stack
+                .push_silent(Box::new(CommandGroup::named("Transform".to_owned(), moves)));
+            self.scene_dirty = true;
+        }
+        true
     }
 
     /// Put the transform gizmo where the primary selection actually is.
@@ -3275,7 +3668,21 @@ impl<G: GameApp> Engine<G> {
         {
             return;
         }
-        let anchor = gizmo_anchor(&self.world, self.selection.primary);
+        // Carrying (Move on the Ground) hides the gizmo: the thing follows the mouse, not a handle.
+        if self.carrying() {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.clear_gizmo();
+            }
+            return;
+        }
+        // A part of a merged model is handled at the middle of its mesh, not at the model's origin.
+        let anchor = gizmo_anchor(&self.world, self.selection.primary).map(|origin| {
+            self.selection
+                .primary
+                .zip(self.renderer.as_ref())
+                .and_then(|(entity, renderer)| part_handle(&self.world, renderer, entity))
+                .unwrap_or(origin)
+        });
         if let Some(renderer) = self.renderer.as_mut() {
             match anchor {
                 Some(pos) => {
@@ -3765,7 +4172,10 @@ fn copy_content(from: &std::path::Path, to: &std::path::Path) -> std::io::Result
     }
 }
 
-/// Send a file or folder to the Recycle Bin through the shell, so it can be restored. Nothing is ever erased here.
+/// Send a file or folder to the Recycle Bin through the shell, so it can be restored. The bin refuses what is
+/// larger than its share of the drive, and the shell then erases it for good: with FOF_NOCONFIRMATION alone it
+/// did so without a word (a 56 GB tree was lost that way on this machine). FOF_WANTNUKEWARNING makes the shell
+/// ask first; No keeps the file, and this reports that the bin did not take it.
 #[cfg(target_os = "windows")]
 fn move_to_recycle_bin(path: &std::path::Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
@@ -3790,6 +4200,7 @@ fn move_to_recycle_bin(path: &std::path::Path) -> Result<(), String> {
     const FOF_NOCONFIRMATION: u16 = 0x0010;
     const FOF_ALLOWUNDO: u16 = 0x0040;
     const FOF_NOERRORUI: u16 = 0x0400;
+    const FOF_WANTNUKEWARNING: u16 = 0x4000;
     if !path.exists() {
         return Err("that file is no longer there".to_string());
     }
@@ -3801,7 +4212,7 @@ fn move_to_recycle_bin(path: &std::path::Path) -> Result<(), String> {
         func: FO_DELETE,
         from: from.as_ptr(),
         to: std::ptr::null(),
-        flags: FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI,
+        flags: FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_WANTNUKEWARNING | FOF_SILENT | FOF_NOERRORUI,
         aborted: 0,
         mappings: std::ptr::null_mut(),
         title: std::ptr::null(),
@@ -3897,10 +4308,22 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             self.physics = Some(PhysicsWorld::new(PhysicsConfig::default()));
         }
 
+        // SOMNIUM_NO_AUDIO=1 runs silent on purpose: capture runs, and the proof that a machine with no sound device
+        // still runs.
+        let no_audio = std::env::var("SOMNIUM_NO_AUDIO").is_ok_and(|v| !matches!(v.trim(), "" | "0" | "false" | "off"));
+        if self.audio.is_none() && no_audio {
+            info!("SOMNIUM_NO_AUDIO: running without sound");
+            self.audio = Some(AudioEngine::silent());
+        }
         if self.audio.is_none() {
             match AudioEngine::new() {
                 Ok(engine) => self.audio = Some(engine),
-                Err(e) => tracing::error!("Failed to initialize audio: {}", e),
+                Err(e) => {
+                    // No device (off, missing, or held by another program): run silent rather than
+                    // panic at the first frame, which unwraps the engine in a dozen places.
+                    tracing::error!("Failed to initialize audio: {e}; running without sound");
+                    self.audio = Some(AudioEngine::silent());
+                }
             }
         }
 
@@ -3930,7 +4353,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
 
         let size = LogicalSize::new(self.config.window_size.0, self.config.window_size.1);
         let mut attrs = WindowAttributes::default()
-            .with_title("Somnium Engine")
+            .with_title("Lucid")
             .with_inner_size(size)
             .with_resizable(self.config.resizable)
             // MORROWIND-I. Created invisible and shown at the end of this
@@ -3949,6 +4372,21 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
         {
             attrs = attrs.with_undecorated_shadow(true);
         }
+        // A background window (`somnium_ui::background_window`): off every screen, shown without being activated,
+        // off the taskbar, at the size asked for. Nothing on the desktop changes and the pointer stays where it is.
+        if let Some([w, h]) = somnium_ui::background_window() {
+            attrs = attrs
+                .with_inner_size(winit::dpi::PhysicalSize::new(w, h))
+                .with_position(winit::dpi::PhysicalPosition::new(-30000, -30000))
+                .with_resizable(false)
+                .with_active(false);
+            #[cfg(target_os = "windows")]
+            {
+                use winit::platform::windows::WindowAttributesExtWindows;
+                attrs = attrs.with_skip_taskbar(true);
+            }
+            info!(width = w, height = h, "background window (SOMNIUM_BACKGROUND_WINDOW): off screen, never focused");
+        }
 
         match event_loop.create_window(attrs) {
             Ok(window) => {
@@ -3956,15 +4394,20 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 self.a11y = Some(crate::a11y_bridge::A11yBridge::new(event_loop, &window));
 
                 let window = Arc::new(window);
-                if std::env::var("SOMNIUM_MAXIMIZE").as_deref() == Ok("1") {
+                if std::env::var("SOMNIUM_MAXIMIZE").as_deref() == Ok("1") && somnium_ui::background_window().is_none() {
                     window.set_maximized(true);
                     info!("Window maximized (SOMNIUM_MAXIMIZE=1)");
                 }
                 self.window = Some(Arc::clone(&window));
 
                 info!("Initializing rendering subsystems...");
+                // A GPU error stops the game, with the GPU named for its crash report; the editor logs it and stays
+                // up, so a bad shader edit can be saved around and fixed.
+                somnium_renderer::context::set_gpu_errors_fatal(self.config.player_mode);
                 let render_ctx = pollster::block_on(RenderContext::new(Arc::clone(&window)));
+                let started = std::time::Instant::now();
                 let renderer = SomniumRenderer::new(&render_ctx);
+                info!(ms = started.elapsed().as_millis() as u64, "renderer built (every startup pipeline)");
 
                 // Phase ALYX-D: the Theme and Density preferences, chosen before any widget takes its colours.
                 // `SOMNIUM_UI_THEME` / `SOMNIUM_UI_DENSITY` win (UiManager::new reads them next).
@@ -3996,8 +4439,11 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 self.render_ctx = Some(render_ctx);
                 self.imported_uploads.clear();
                 self.project_foliage_sources.clear();
+                self.palette_reads.clear();
+                self.palette_failed.clear();
                 self.foliage_meshes.fill(None);
                 self.foliage_lod_meshes.fill(None);
+                self.foliage_impostor_meshes.fill(None);
                 self.foliage_failed.fill(false);
                 // A new renderer holds no batches.
                 self.foliage_batches = Default::default();
@@ -4023,6 +4469,9 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
 
                 // MORROWIND-I. Everything is initialised; show the window.
                 window.set_visible(true);
+                if somnium_ui::background_window().is_some() {
+                    keep_off_the_desktop(&window);
+                }
 
                 self.state = LifecycleState::Running;
                 // Craft defect C11's other half: work that survived a crash is
@@ -4071,11 +4520,19 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                     }
                     self.handle_editor_event(EditorEvent::PlaySimulation);
                 } else {
+                    // Help > This Project's Guide looks for EDITOR_GUIDE.md in this folder.
+                    if let Some(ui) = self.ui_manager.as_mut() {
+                        ui.set_project_root(self.config.project_root.clone());
+                    }
                     // Recent Projects gains this project, or, with none open, the welcome screen shows.
                     self.welcome_at_startup();
                 }
                 if let Some(ui) = self.ui_manager.as_mut() {
                     ui.finish_splash();
+                    if !self.config.player_mode {
+                        // Once per change of the What's New text: one toast saying where to read it.
+                        ui.announce_whats_new();
+                    }
                 }
             }
             Err(err) => {
@@ -4209,11 +4666,9 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
         //
         // `play_session_active` is read from the engine's own flag rather than
         // the UI's, so the rule still holds in a headless or UI-less run.
-        let game_owns_keyboard = self.play_session_active
-            || self
-                .ui_manager
-                .as_ref()
-                .is_some_and(somnium_ui::UiManager::viewport_camera_active);
+        // The whole decision, the text box's focus in it, is `editor_shortcut_for_key` (the editor script's `type=`
+        // step asks the same one).
+        let text_focus = self.ui_manager.as_ref().is_some_and(somnium_ui::UiManager::has_text_focus);
         if let WindowEvent::KeyboardInput { event: key_ev, .. } = &event {
             if key_ev.state == winit::event::ElementState::Pressed && !key_ev.repeat {
                 use winit::keyboard::PhysicalKey;
@@ -4222,11 +4677,11 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                         self.cancel_persona_stroke();
                         return;
                     }
-                    let action = if self.config.player_mode {
-                        None
-                    } else {
-                        shortcut_action_for(code, self.shortcut_modifiers, game_owns_keyboard)
-                    };
+                    // Carrying: Esc puts it back and Enter puts it down, before the UI's own Esc chain.
+                    if !text_focus && self.carry_key(code) {
+                        return;
+                    }
+                    let action = self.editor_shortcut_for_key(code);
                     use somnium_ui::commands::CommandAction as A;
                     match action {
                         Some(A::NewScene) => {
@@ -4286,8 +4741,9 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
         }
 
         // ── 2. Other shortcuts (non-Ctrl) ──────────────────────────────────────
+        // A text box with the focus keeps these too: `[`, `-` or `1` is a character there, not the terrain brush.
         if let WindowEvent::KeyboardInput { event: key_ev, .. } = &event {
-            if key_ev.state == winit::event::ElementState::Pressed && !key_ev.repeat {
+            if key_ev.state == winit::event::ElementState::Pressed && !key_ev.repeat && !text_focus {
                 use winit::keyboard::{KeyCode as WKC, PhysicalKey};
                 if let PhysicalKey::Code(code) = key_ev.physical_key {
                     match code {
@@ -4365,6 +4821,11 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             _ => false,
         };
         if ui_consumed {
+            return;
+        }
+
+        // Carrying (Move on the Ground): the viewport's left button puts it down and the wheel turns it.
+        if !self.play_session_active && self.carry_mouse_event(&event) {
             return;
         }
 
@@ -4501,37 +4962,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 // anywhere said why. A mode that refuses a gesture has to
                 // admit it at the moment it refuses, or it is indistinguishable
                 // from a broken feature.
-                let started = try_start_gizmo_drag(
-                    self.renderer.as_ref(),
-                    &self.world,
-                    &self.selection.primary,
-                    self.cursor_pos,
-                    self.viewport_size(),
-                    self.settings.editor().gizmo_local_space,
-                );
-                let blocked = started.is_some() && self.settings.editor().select_only;
-                if blocked {
-                    let message =
-                        "Select Only is on — click it in the toolbar to move, rotate and scale";
-                    info!("{message}");
-                    if let Some(ui) = self.ui_manager.as_mut() {
-                        ui.push_toast(message);
-                    }
-                }
-                let drag = if blocked {
-                    None
-                } else {
-                    started.and_then(|mut drag| {
-                        drag.followers = capture_followers(
-                            &self.world,
-                            self.selection.as_slice(),
-                            drag.entity_index,
-                        )?;
-                        Some(drag)
-                    })
-                };
-                if drag.is_some() {
-                    self.gizmo_drag = drag;
+                if self.begin_gizmo_drag() {
                     gizmo_consumed = true;
                 } else {
                     // No gizmo axis under the pointer, so a left press in the
@@ -4551,26 +4982,11 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                     if band.is_dragged() {
                         self.apply_marquee(band);
                     } else {
-                        let hit = self.entities_under_cursor().into_iter().next();
-                        self.selection.set_single(hit);
-                        self.after_selection_change();
+                        self.viewport_click();
                     }
                     gizmo_consumed = true;
                 }
-                if let Some(drag) = self.gizmo_drag.take() {
-                    if let Some(entity) = self.world.find_entity_by_index(drag.entity_index) {
-                        let final_t = self
-                            .world
-                            .get::<Transform>(entity)
-                            .copied()
-                            .unwrap_or(drag.start_transform);
-                        let cmd = Box::new(SetTransformCmd::new(
-                            drag.entity_index,
-                            drag.start_transform,
-                            final_t,
-                        ));
-                        self.undo_stack.push_silent(cmd);
-                    }
+                if self.end_gizmo_drag() {
                     gizmo_consumed = true;
                 }
             }
@@ -4816,7 +5232,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 && self
                     .gizmo_drag
                     .as_ref()
-                    .is_some_and(|drag| drag.mode == GizmoMode::Translate)
+                    .is_some_and(|drag| drag.mode == GizmoMode::Translate && !drag.part_handle)
                 && let Some(mut world_position) = self
                     .gizmo_drag
                     .as_ref()
@@ -4827,6 +5243,27 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 if let Some(drag) = self.gizmo_drag.as_ref() {
                     new_t.translation = drag.parent_world_inverse.transform_point3(world_position);
                 }
+            } else if self.settings.editor().snap_to_surface
+                && let Some((start, arm, parent_inverse)) = self
+                    .gizmo_drag
+                    .as_ref()
+                    .filter(|drag| drag.mode == GizmoMode::Translate && drag.part_handle)
+                    .map(|drag| {
+                        let origin = drag.parent_world.transform_point3(drag.start_transform.translation);
+                        (drag.gizmo_pos, origin - drag.gizmo_pos, drag.parent_world_inverse)
+                    })
+                && let Some(origin) = self
+                    .gizmo_drag
+                    .as_ref()
+                    .map(|drag| drag.parent_world.transform_point3(new_t.translation))
+                && let Some(ground_then) = self.surface_height_at(start)
+                && let Some(ground_now) = self.surface_height_at(origin - arm)
+            {
+                // A part handled at its middle has its origin at the model's corner, so it is not the origin that
+                // goes on the ground: the part keeps the height it stood at over the ground as it is moved.
+                let mut handle = origin - arm;
+                handle.y = ground_now + (start.y - ground_then);
+                new_t.translation = parent_inverse.transform_point3(handle + arm);
             }
             let start = self
                 .gizmo_drag
@@ -4840,22 +5277,49 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             // The same delta, applied to every follower's own starting
             // transform. Rotation composes and scale multiplies, because that
             // is what those operations mean; translation adds.
-            let world_offset = self.gizmo_drag.as_ref().map_or_else(
+            // Where the handle is now. On the origin it goes where the origin goes; on a part's middle a turn or a
+            // scale leaves it where it is and a move carries it along.
+            let handle = self.gizmo_drag.as_ref().map(|drag| {
+                let origin = drag.parent_world.transform_point3(new_t.translation);
+                match (drag.part_handle, drag.mode) {
+                    (false, _) => origin,
+                    (true, GizmoMode::Translate) => {
+                        origin - drag.parent_world.transform_point3(drag.start_transform.translation) + drag.gizmo_pos
+                    }
+                    (true, _) => drag.gizmo_pos,
+                }
+            });
+            let world_offset = self.gizmo_drag.as_ref().zip(handle).map_or_else(
                 || new_t.translation - start.translation,
-                |drag| drag.parent_world.transform_point3(new_t.translation) - drag.gizmo_pos,
+                |(drag, handle)| handle - drag.gizmo_pos,
             );
-            let spin = new_t.rotation * start.rotation.inverse();
+            // The followers take the turn in world space (each writes it into its own parent's frame).
+            let spin = self.gizmo_drag.as_ref().map_or_else(
+                || new_t.rotation * start.rotation.inverse(),
+                |drag| {
+                    let parent = drag.parent_world.to_scale_rotation_translation().1;
+                    parent * new_t.rotation * start.rotation.inverse() * parent.inverse()
+                },
+            );
             let growth = glam::Vec3::new(
                 safe_ratio(new_t.scale.x, start.scale.x),
                 safe_ratio(new_t.scale.y, start.scale.y),
                 safe_ratio(new_t.scale.z, start.scale.z),
             );
+            // The rest of the selection turns with a part about the part's handle (its far twin most of all, which
+            // must stay on it); otherwise each about itself, or all about the selection's middle if that is set.
             let pivot = self
-                .settings
-                .editor()
-                .gizmo_pivot_centre
-                .then(|| self.focus_target().map(|(centre, _)| centre))
-                .flatten();
+                .gizmo_drag
+                .as_ref()
+                .filter(|drag| drag.part_handle)
+                .map(|drag| drag.gizmo_pos)
+                .or_else(|| {
+                    self.settings
+                        .editor()
+                        .gizmo_pivot_centre
+                        .then(|| self.focus_target().map(|(centre, _)| centre))
+                        .flatten()
+                });
             let followers = self
                 .gizmo_drag
                 .as_ref()
@@ -4868,14 +5332,14 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 spin,
                 growth,
                 pivot,
+                new_t,
             );
             if let Some(r) = &mut self.renderer {
-                let world_position = self.gizmo_drag.as_ref().map_or(new_t.translation, |drag| {
-                    drag.parent_world.transform_point3(new_t.translation)
-                });
-                r.set_gizmo_world_pos(world_position);
+                r.set_gizmo_world_pos(handle.unwrap_or(new_t.translation));
             }
         }
+        // Move on the Ground: the carried things follow the cursor over the surface under it.
+        self.update_carry();
 
         let scene_request = {
             // Computed before the context borrows the world, because the
@@ -5067,6 +5531,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                     row.locked = flags.locked;
                 }
                 entity_tags(&self.world, entity, &mut row.tags);
+                self.decorate_outliner_row(entity, row);
                 if self
                     .world
                     .get::<crate::prefab::PrefabMember>(entity)
@@ -5186,7 +5651,10 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             // Phase 16-D: the Scripts section, built from what each
             // attached script declared. Computed before the `ui` borrow
             // because it reads the world and the script host.
-            let tool_context = self.persona_tool_context();
+            // The selected terrain's own names for its ground slots, for both paint palettes.
+            let layer_names = self.selected_terrain_layer_names();
+            let mut tool_context = self.persona_tool_context();
+            tool_context.layer_names = layer_names.clone();
             let animation_transport = self.animation_transport();
             let sel_scripts = self.script_inspector_state();
             self.zone_end();
@@ -5360,7 +5828,13 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 (None, None)
             };
             self.zone_end();
+            self.run_editor_script();
+            self.report_refused_models();
+            self.settle_places();
+            self.touch_selection();
+            let selection_card = self.selection_card();
             self.zone_begin("Panel: hand to UI");
+            let picked_copy = self.has_picked_copy();
             if let Some(ui) = &mut self.ui_manager {
                 if refresh {
                     ui.update_outliner_tree(tree, selected_idx);
@@ -5368,6 +5842,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 }
                 ui.set_outliner_selection(selected_ids);
                 ui.set_clipboard_filled(!self.entity_clipboard.is_empty());
+                ui.set_picked_copy(picked_copy);
                 ui.set_history(history_entries, history_position);
                 ui.set_viewport_statistics(viewport_statistics);
                 ui.set_axis_widget(axis_directions);
@@ -5422,6 +5897,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                         .and_then(|idx| tree.iter().find(|row| row.id == idx))
                         .map(|row| row.name.as_str()),
                 );
+                ui.set_selection_card(selection_card.as_deref());
                 if let Some(t) = sel_t {
                     let (rx, ry, rz) = t.rotation.to_euler(glam::EulerRot::XYZ);
                     ui.update_inspector(
@@ -5439,6 +5915,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                         .filter(|e| self.world.is_alive(*e)),
                 );
                 ui.update_generated_details(self.selection.primary, generated_panels);
+                ui.set_terrain_layer_names(layer_names);
                 ui.update_terrain_inspector(sel_terrain);
                 ui.update_foliage_inspector(sel_foliage);
                 ui.update_tool_context(tool_context);
@@ -5643,7 +6120,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             );
             self.game.on_render(&mut ctx);
 
-            if ctx.should_exit {
+            if ctx.should_exit && self.may_quit() {
                 self.initiate_shutdown(event_loop);
                 return;
             }
@@ -5655,8 +6132,19 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
         // `on_render` is where a game publishes its active editor/player view
         // through `renderer.set_view`. Stream from that same-frame position,
         // not from a stale ECS settings transform or last frame's renderer.
+        // Named apart, and the cell installs inside (app_cell_streaming.rs), so a streaming hitch says where it went
+        // (Sunscar, 30 Oct 2026: the whole scope was 50-280 ms with nothing below it).
+        // Source stamps are checked once a frame (`SourceStamp::read`), in the editor: a standalone game's sources
+        // don't change under it, so it checks each once and trusts it for the session.
+        if !self.config.player_mode {
+            import_cache::SourceStamp::next_frame();
+        }
+        self.zone_begin("World partition");
         self.update_world_partition();
+        self.zone_end();
+        self.zone_begin("Cell streaming");
         self.update_cell_streaming();
+        self.zone_end();
 
         // The active camera is the listener. Reconcile authored emitters only
         // after `on_render` publishes that same-frame view.
@@ -5731,6 +6219,13 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             );
             if let Some(r) = &mut self.renderer {
                 r.set_particles(gpu_particles);
+            }
+        }
+
+        // Level portals (`level_portal.rs`): while the game plays, the eye entering one is logged once per entry.
+        if self.play_session_active || self.config.player_mode {
+            if let Some(eye) = self.renderer.as_ref().map(|r| r.camera_pos) {
+                self.portals.update(&self.world, eye);
             }
         }
 
@@ -5847,8 +6342,11 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             // MORROWIND-E2. `self.game` is a disjoint field from the four
             // borrowed above, so the game can be handed to the renderer as a
             // callback without any of this becoming a `RefCell`.
+            // The game alone has no status bar: what did not load is one line on its screen.
+            let notice = if self.config.player_mode { self.model_faults.line() } else { None };
             let mut adapter = GameUiAdapter {
                 game: self.game.as_mut(),
+                notice: notice.map(|line| (&mut self.model_notice, line)),
             };
             r.render_with_game_ui(c, ui, window, Some(&mut adapter), scene_target);
         }
@@ -5931,7 +6429,7 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
                 self.game.on_map_loaded(&mut ctx, &result);
             }
         }
-        if self.ui_wants_exit {
+        if std::mem::take(&mut self.ui_wants_exit) && self.may_quit() {
             self.initiate_shutdown(event_loop);
             return;
         }
@@ -5958,6 +6456,12 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
         }
 
         frame_timings[5] = frame_body_started.elapsed().as_secs_f64() * 1000.0;
+        // A frame over a quarter second is a stall someone will feel (a load, a shader compile): say where it went.
+        if frame_timings[5] > 250.0 {
+            let t = frame_timings;
+            info!(ms = t[5] as u32, simulation = t[0] as u32, panels = (t[1] - t[0]) as u32, game = (t[2] - t[1]) as u32,
+                render = (t[3] - t[2]) as u32, authoring = (t[4] - t[3]) as u32, "long frame");
+        }
         self.authoring_frame_timings = frame_timings;
         // PORTAL-0-B: before the limiter, so this is engine work and not sleep.
         if let Some(r) = &mut self.renderer {
@@ -6012,6 +6516,14 @@ impl<G: GameApp> ApplicationHandler for Engine<G> {
             if let Some(render_ctx) = self.render_ctx.as_mut() {
                 render_ctx.set_vsync(vsync);
             }
+        }
+        // The window's mode and size asked for by the game's options: a shipped player's only (the editor keeps its
+        // own window, and its immersive view stays borderless).
+        if let Some(display) = somnium_ui::take_window_display_request()
+            && self.config.player_mode
+            && let Some(ui) = &mut self.ui_manager
+        {
+            ui.set_player_display(display);
         }
         self.movie_frame();
         self.time.wait_for_frame_budget();
@@ -6473,6 +6985,9 @@ impl<G: GameApp> Engine<G> {
             self.asset_scan = None;
             match result {
                 Ok((snapshot, index)) => {
+                    if let Some(ui) = self.ui_manager.as_mut() {
+                        ui.set_content_scan_error(None);
+                    }
                     if let Some(published) = self.asset_gate.stage(snapshot) {
                         if let Some(ui) = self.ui_manager.as_mut() {
                             ui.set_asset_snapshot(published);
@@ -6480,8 +6995,24 @@ impl<G: GameApp> Engine<G> {
                         }
                     }
                 }
-                Err(error) => warn!(?error, "asset inventory scan failed"),
+                Err(error) => {
+                    warn!(?error, "asset inventory scan failed");
+                    // Said in the drawer, and tried again in a while even if nothing on disk moves: the drawer,
+                    // search and the pickers must not stay without their inventory for the rest of the session.
+                    let said = format!("{error:?}");
+                    let said = said.trim_matches('"').replace("\\\\", "\\");
+                    if let Some(ui) = self.ui_manager.as_mut() {
+                        ui.set_content_scan_error(Some(said));
+                    }
+                    self.asset_scan_stamp = None;
+                    self.next_asset_scan = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                }
             }
+        }
+
+        // The drawer shows folders from the disk until the first inventory is in: it must know where they are.
+        if let Some(ui) = self.ui_manager.as_mut() {
+            ui.set_content_root(&self.config.content_root);
         }
 
         let now = std::time::Instant::now();
@@ -6501,7 +7032,13 @@ impl<G: GameApp> Engine<G> {
         // A guard, not an early return: everything below this block —
         // thumbnail requests, preview jobs, external imports — has to keep
         // running on a frame where the inventory has nothing to do.
-        let due = self.asset_scan.is_none() && now >= self.next_asset_scan;
+        let due = inventory_poll_due(
+            self.config.player_mode,
+            self.asset_gate.published().is_some(),
+            self.asset_scan_stamp.is_some(),
+            self.asset_scan.is_some(),
+            now >= self.next_asset_scan,
+        );
         let changed = due && {
             let stamp = content_root_stamp(&self.config.content_root);
             let moved = self.asset_scan_stamp != Some(stamp);
@@ -6516,7 +7053,13 @@ impl<G: GameApp> Engine<G> {
                 .submit("Asset inventory", JobPriority::Background, move |ctx| {
                     ctx.check_cancelled()
                         .map_err(|error| format!("{error:?}"))?;
+                    let started = std::time::Instant::now();
                     let snapshot = somnium_asset::database::AssetDb::scan(root)?;
+                    let seconds = started.elapsed().as_secs_f32();
+                    if seconds >= 2.0 {
+                        // A slow read is the time the drawer, search and the pickers wait: worth a line.
+                        info!(files = snapshot.records().len(), seconds, "asset inventory: the project's files were read");
+                    }
                     ctx.set_progress(0.8);
                     // On the job, not on the frame: this opens every scene,
                     // prefab, material and document in the project.
@@ -6762,14 +7305,16 @@ impl<G: GameApp> Engine<G> {
         self.game.on_event(&mut ctx, &engine_event);
         let speed_request = ctx.camera_speed_request;
 
-        if ctx.should_exit {
+        if ctx.should_exit && self.may_quit() {
             self.initiate_shutdown(event_loop);
             return;
         }
 
         if matches!(engine_event, EngineEvent::WindowCloseRequested) {
             self.floating_layout.flush(true);
-            self.initiate_shutdown(event_loop);
+            if self.may_quit() {
+                self.initiate_shutdown(event_loop);
+            }
         }
 
         // Phase 20B: apply a camera-speed change requested by game code
@@ -6783,12 +7328,42 @@ impl<G: GameApp> Engine<G> {
         }
     }
 
+    /// Whether the editor may close now. With unsaved changes it asks "Save changes?" first and says no; the answer
+    /// comes back as `EditorEvent::Quit`. A game run as a game, an automated capture run (`SOMNIUM_CAPTURE_QUIT`) and
+    /// an answered question close at once.
+    fn may_quit(&mut self) -> bool {
+        if self.config.player_mode
+            || self.quit_confirmed
+            || !self.scene_dirty
+            || std::env::var_os("SOMNIUM_CAPTURE_QUIT").is_some()
+        {
+            return true;
+        }
+        if self.ui_manager.is_none() {
+            return true;
+        }
+        if self.play_session_active {
+            // Back to the editor first, so the question is on screen.
+            self.handle_editor_event(EditorEvent::StopSimulation);
+        }
+        if let Some(ui) = self.ui_manager.as_mut() {
+            ui.set_scene_dirty(true);
+            ui.prompt_unsaved_quit();
+        }
+        false
+    }
+
     fn initiate_shutdown(&mut self, event_loop: &ActiveEventLoop) {
         if self.state == LifecycleState::ShuttingDown {
             return;
         }
         info!("Initiating engine shutdown");
         self.release_play_cursor();
+        // A close the person chose (every path here passed `may_quit`, which asks about unsaved work): what this
+        // session autosaved is either saved or let go, so the next start offers nothing. A crash never comes here.
+        if self.autosave_written && !self.config.player_mode {
+            crate::autosave::clear(&self.config.content_root);
+        }
         self.state = LifecycleState::ShuttingDown;
         self.game.on_shutdown();
         event_loop.exit();
@@ -7247,6 +7822,8 @@ impl<G: GameApp> Engine<G> {
                 .selected_terrain()
                 .and_then(|tc| self.renderer.as_ref()?.terrain(tc.terrain_id))
                 .map_or(0, |t| t.layers.len()),
+            // Filled by the caller, which may read the ground sets' files (`selected_terrain_layer_names`).
+            layer_names: Vec::new(),
         }
     }
     /// Publish changed paint to the renderer, with each layer's material
@@ -7714,6 +8291,9 @@ impl<G: GameApp> Engine<G> {
         let Some(region) = stroke.region else {
             return true;
         };
+        // The stroke changed the ground: the scene has unsaved work, and Ctrl+S cannot keep the ground.
+        self.note_terrain_edit();
+        self.scene_dirty = true;
         let Some(renderer) = self.renderer.as_ref() else {
             return true;
         };
@@ -8094,6 +8674,13 @@ impl<G: GameApp> Engine<G> {
     /// before `apply_post_process` pushes the authored values they replace.
     fn apply_time_of_day(&mut self, dt: f32) {
         self.day_state = None;
+        // Set below only by a day clock that moves the sun; every other scene keeps the renderer's defaults.
+        if let Some(r) = self.renderer.as_mut() {
+            r.sun_moving = false;
+            r.snow_sun = None;
+            r.sky_above_air = false;
+            r.sun_wreck = None;
+        }
         let Some(entity) = self
             .world
             .entities_with::<crate::time_of_day::TimeOfDayComponent>()
@@ -8127,6 +8714,31 @@ impl<G: GameApp> Engine<G> {
             return;
         }
         let mut state = tod.evaluate();
+        // A sun on the solar clock: the snow turns from the climate's sun (the fixed-sun fields), not the hour's, and
+        // while the clock runs the sky light and the clouds' capture follow the sun in small steps (renderer.rs).
+        // The sun seen through the Lid's wreck: its form from the clock, or `SOMNIUM_SUN_FORM` (0..2, -1 whole).
+        static FORM: std::sync::LazyLock<Option<i32>> =
+            std::sync::LazyLock::new(|| std::env::var("SOMNIUM_SUN_FORM").ok().and_then(|v| v.trim().parse().ok()));
+        let form = FORM.unwrap_or(tod.sun_wreck);
+        if let Some(r) = self.renderer.as_mut() {
+            #[allow(clippy::cast_sign_loss)]
+            let wreck = (form >= 0).then(|| (form.min(2) as u32, tod.latitude, tod.north_offset));
+            r.sun_wreck = wreck;
+            r.sun_wreck_span_deg = tod.sun_wreck_span_deg;
+            // The light is the form's disc, so the shadows' penumbra follows it: the cut sun a degree wide (1.75 cm a
+            // metre), the five shards' Heart 0.55 degrees, the whole and the true-size sun 0.53.
+            r.sun_angular_radius = match wreck {
+                Some((0, ..)) => 0.5_f32.to_radians(),
+                Some((1, ..)) => 0.275_f32.to_radians(),
+                _ => 0.004_654,
+            };
+        }
+        if !tod.fixed_sun && let Some(r) = self.renderer.as_mut() {
+            r.sun_moving = self.play_session_active && tod.timescale != 0.0;
+            r.snow_sun = Some(tod.climate_sun());
+            // The sky, clouds and fog take the sun above the air and do their own transmittance: twilight.
+            r.sky_above_air = true;
+        }
 
         // Seam 4: the environment variable is an override of a real system now,
         // not the only way to place the sun. It still wins, because every
@@ -8175,6 +8787,41 @@ impl<G: GameApp> Engine<G> {
         self.day_state = Some(state);
     }
 
+    /// The planet over the horizon (`somnium.SkyPlanet`): the day clock carries it, and its own count of days takes
+    /// every hour the clock moves (running, a key, a script's `hour=`), so its slow path survives midnight and a jump.
+    /// Its parameters (where it is, its phase, its light above the air and on the ground) go to the renderer, which
+    /// draws it and lights the night with it. None, or no clock: no planet, and the moon as it was.
+    fn apply_planet(&mut self) {
+        let clock = self
+            .world
+            .entities_with::<crate::time_of_day::TimeOfDayComponent>()
+            .find_map(|e| self.world.get::<crate::time_of_day::TimeOfDayComponent>(e).cloned());
+        let planet = self
+            .world
+            .entities_with::<crate::sky::SkyPlanetComponent>()
+            .find(|e| !crate::is_hidden(&self.world, *e));
+        let (Some(entity), Some(_), Some(state)) = (planet, clock, self.day_state) else {
+            if let Some(renderer) = self.renderer.as_mut() {
+                renderer.planet = somnium_renderer::PlanetParams::default();
+            }
+            return;
+        };
+        let Some(p) = self.world.get::<crate::sky::SkyPlanetComponent>(entity).copied() else {
+            return;
+        };
+        if let Some(renderer) = self.renderer.as_mut() {
+            // ponytail: the true-size sun's alternative brings its own planet (the design's physics proposal: 7 degrees
+            // wide, 9 up at bearing 76, beside the sunrise); it goes with the alternatives once the developer picks.
+            let p = if matches!(renderer.sun_wreck, Some((2, ..))) {
+                crate::sky::SkyPlanetComponent { azimuth_deg: 104.0, elevation_deg: 9.0, diameter_deg: 7.0, ..p }
+            } else {
+                p
+            };
+            let sun = -(state.rotation * glam::Vec3::NEG_Z);
+            renderer.planet = p.to_params(sun, renderer.sun_above_air);
+        }
+    }
+
     /// CONTROL-M: push the authored sky to the renderer.
     ///
     /// Runs after [`Self::apply_time_of_day`] so the day cycle's cloud-coverage
@@ -8192,6 +8839,7 @@ impl<G: GameApp> Engine<G> {
         if let Some(renderer) = self.renderer.as_mut() {
             renderer.sky_eye = eye.map_or_else(somnium_renderer::SkyEyeParams::default, |e| e.to_params());
         }
+        self.apply_planet();
         let sky = self
             .world
             .entities_with::<crate::sky::SkyComponent>()
@@ -8200,6 +8848,8 @@ impl<G: GameApp> Engine<G> {
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
+        // The air's aerosols ride the Sky whether its cloud layer is on or not; a scene without one has the engine's own.
+        renderer.aerosol = sky.map_or(1.0, |s| s.aerosol);
         let Some(sky) = sky else {
             // No Environment: the pass stays exactly as the environment
             // variable left it, which is how a scene with no sky component
@@ -8595,6 +9245,53 @@ impl<G: GameApp> Engine<G> {
                 pp
             });
         if let (Some(pp), Some(r)) = (settings, self.renderer.as_mut()) {
+            // The grading LUT: read when its path changes, kept until it does again.
+            let lut = pp.grade_lut.trim();
+            if r.grade_lut_source != lut {
+                r.grade_lut_source = lut.to_owned();
+                r.grade_lut_ready = false;
+                if !lut.is_empty() {
+                    let read = match self.config.project_root.as_ref() {
+                        Some(root) => resolved_source(root, lut),
+                        None => Ok(std::path::PathBuf::from(lut)),
+                    }
+                    .and_then(|path| std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display())))
+                    .and_then(|text| somnium_renderer::pass::postprocess::parse_cube(&text));
+                    match (read, self.render_ctx.as_ref()) {
+                        (Ok((size, texels)), Some(ctx)) => {
+                            r.set_grade_lut(ctx, size, &texels);
+                            r.grade_lut_ready = true;
+                        }
+                        (Err(e), _) => warn!("grading LUT {lut}: {e}"),
+                        _ => {}
+                    }
+                }
+            }
+            // The snowline map: read when its path changes, kept until it does again; none when empty or unreadable.
+            let snow_map = pp.snow_map.trim();
+            if r.snow_map_source != snow_map {
+                if let Some(ctx) = self.render_ctx.as_ref() {
+                    r.snow_map_source = snow_map.to_owned();
+                    let read = if snow_map.is_empty() {
+                        Ok(None)
+                    } else {
+                        match self.config.project_root.as_ref() {
+                            Some(root) => resolved_source(root, snow_map),
+                            None => Ok(std::path::PathBuf::from(snow_map)),
+                        }
+                        .and_then(|path| std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display())))
+                        .and_then(|bytes| somnium_renderer::snow_map::parse(&bytes))
+                        .map(Some)
+                    };
+                    match read {
+                        Ok(map) => r.set_snow_map(ctx, map.as_ref()),
+                        Err(e) => {
+                            warn!("snowline map {snow_map}: {e}");
+                            r.set_snow_map(ctx, None);
+                        }
+                    }
+                }
+            }
             // The player's graphics tier: gates and scales what the scene
             // authored, never enables what it left off (see `quality`).
             let budget = r.graphics_budget();
@@ -8604,6 +9301,16 @@ impl<G: GameApp> Engine<G> {
             // and the fallback if metering has not produced a reading yet.
             r.exposure = pp.exposure_multiplier();
             r.auto_exposure = pp.auto_exposure;
+            r.eye_adaptation = somnium_renderer::pass::auto_exposure::EyeAdaptation {
+                min_ev100: pp.exposure_min_ev.min(pp.exposure_max_ev),
+                max_ev100: pp.exposure_max_ev.max(pp.exposure_min_ev),
+                to_bright: pp.adapt_to_bright.max(0.0),
+                to_dark: pp.adapt_to_dark.max(0.0),
+                adaptation: pp.exposure_adaptation.clamp(0.0, 1.0),
+                anchor_ev: pp.exposure_anchor_ev,
+                sky_weight: pp.exposure_sky_weight.clamp(0.0, 1.0),
+                adaptation_bright: pp.exposure_adaptation_bright.clamp(0.0, 1.0),
+            };
             // Adaptation is per second, so it needs the real frame time or the
             // eye adjusts at a rate that depends on frame rate.
             r.frame_delta_time = self.time.delta_time().as_secs_f32();
@@ -8659,14 +9366,23 @@ impl<G: GameApp> Engine<G> {
             let fsr_fallback = pp.fsr_enabled() && !fsr_active;
             r.taa_pass
                 .set_enabled((pp.taa_enabled() || fsr_fallback) && !fsr_active && !retro);
-            r.gtao_pass.enabled = pp.gtao_enabled && budget.gtao && !path_active && !retro;
+            // On under the path tracer too: the raster keeps the sky's fill there, and its contact shadows with it.
+            r.gtao_pass.enabled = pp.gtao_enabled && budget.gtao && !retro;
             r.bloom_pass.enabled = pp.bloom_enabled;
-            r.bloom_pass.intensity = pp.bloom_intensity;
+            // Under the photographic camera the chain is the lens's glare: a share of the light, over the chain's
+            // level count (each level holds the whole light, blurred wider), mixed in with energy kept and no
+            // threshold, as a lens scatters all light alike.
+            let glare = pp.lens_glare.clamp(0.0, 0.2);
+            r.bloom_pass.intensity =
+                if pp.photographic { glare / r.bloom_pass.levels() as f32 } else { pp.bloom_intensity };
+            r.bloom_pass.threshold_ev = if pp.photographic { 0.0 } else { pp.bloom_threshold.max(0.0) };
             r.bloom_pass.lens_flare = pp.lens_flare.max(r.lens_flare_requested).max(0.0);
             r.dof_pass.enabled = pp.dof_enabled && budget.camera_effects && !retro;
             r.dof_pass.focus_distance = pp.dof_focus_distance;
             r.dof_pass.f_stop = pp.aperture_f_stops;
-            r.restir_pass.enabled = pp.restir_enabled && budget.traced_direct && !path_active && !retro;
+            // The path tracer traces only the bounced light (29 Oct 2026): the direct light stays the raster's, so its
+            // traced shadows (the sun's visibility here, the lamps' rays in shading) stay on under it, at any tier.
+            r.restir_pass.enabled = (pp.restir_enabled && budget.traced_direct || path_active) && !retro;
             let restir_gi_active = pp.restir_gi_enabled
                 && budget.traced_gi
                 && r.restir_gi_pass.supported()
@@ -8715,10 +9431,15 @@ impl<G: GameApp> Engine<G> {
                 .and_then(|state| state.fog_density)
                 .unwrap_or(pp.fog_density);
             r.volumetric_pass.fog.height_falloff = pp.fog_height_falloff;
+            r.volumetric_pass.fog.base_height = pp.fog_base_height;
+            r.volumetric_pass.fog.top_height = pp.fog_top_height;
+            r.volumetric_pass.fog.top_softness = pp.fog_top_softness.max(0.1);
             r.volumetric_pass.fog.asymmetry = pp.fog_asymmetry;
             r.volumetric_pass.fog.shafts = pp.light_shafts && budget.light_shafts;
             r.volumetric_pass.fog.shaft_intensity = pp.shaft_intensity;
             r.volumetric_pass.fog.sky_occlusion = pp.fog_sky_occlusion;
+            r.volumetric_pass.max_distance = pp.fog_range.max(10.0);
+            r.volumetric_pass.fog.skylight = pp.fog_skylight;
             r.vertex_paint.fade = pp.paint_fade;
             r.vertex_paint.green = pp.foliage_green;
             r.vertex_paint.fog = [pp.retro_fog[0], pp.retro_fog[1], pp.retro_fog_color[0], pp.retro_fog_color[1], pp.retro_fog_color[2]];
@@ -8736,8 +9457,9 @@ impl<G: GameApp> Engine<G> {
                 r.path_tracer_pass.reflections = traced_reflections;
                 r.path_tracer_pass.reflection_roughness = pp.traced_reflection_roughness;
                 if path_active {
-                    // Path tracing replaces the frame (renderer `path_tracer`, which sets shading's path-mode bit).
-                    // Baking caches/probes or tracing the separate specular buffer underneath it only wastes work.
+                    // Path tracing replaces the bounced light and the reflections (renderer `path_tracer`, which sets
+                    // shading's path-mode bit). Baking caches/probes or tracing the separate specular buffer under it
+                    // only wastes work.
                     flags = 0;
                 } else {
                     if pp.world_cache && budget.traced_gi && rt && !ddgi_active {
@@ -8790,6 +9512,38 @@ impl<G: GameApp> Engine<G> {
                     table
                 }),
                 stylise: [pp.painterly.clamp(0.0, 1.0), pp.ink_lines.clamp(0.0, 1.0), 0.0, 0.0],
+                lut_strength: if r.grade_lut_ready { pp.grade_lut_strength.clamp(0.0, 1.0) } else { 0.0 },
+                low_light: pp.low_light_vision.clamp(0.0, 1.0),
+                photographic: pp.photographic,
+                // The glare's share leaves the image only where the chain brings it back (bloom on).
+                lens_glare: if pp.bloom_enabled { pp.lens_glare.clamp(0.0, 0.2) } else { 0.0 },
+                sensor_noise: pp.sensor_noise.clamp(0.0, 4.0),
+                white_balance: somnium_renderer::pass::postprocess::white_balance_matrix(
+                    if pp.photographic { pp.white_balance } else { 0.0 },
+                ),
+                lens: [0.5, 16.0 / 9.0],
+                heat: [
+                    pp.heat_shimmer.max(0.0),
+                    pp.mirage.max(0.0),
+                    pp.mirage_dip_deg.clamp(0.0, 5.0).to_radians().sin(),
+                ],
+                view_proj: glam::Mat4::IDENTITY.to_cols_array(),
+            };
+            // Snow lying on surfaces (snow.wgsl's uniform, shading group 1 binding 34); all zero is none. The renderer
+            // fills the direction toward the sun itself.
+            r.snow = if pp.snow {
+                let wind = pp.snow_wind_deg.to_radians();
+                [
+                    1.0, pp.snowline_m, pp.snow_full_m.max(pp.snowline_m + 1.0),
+                    pp.snow_max_slope_deg.clamp(0.0, 90.0).to_radians().cos(),
+                    pp.snow_shade_bias.clamp(0.0, 1.0),
+                    pp.snow_bare_slope_deg.max(pp.snow_max_slope_deg.clamp(0.0, 87.0) + 3.0).min(90.0).to_radians().cos(),
+                    pp.snow_age.clamp(0.0, 1.0), 0.0,
+                    0.0, 0.0, 0.0, 0.0,
+                    wind.sin(), wind.cos(), pp.snow_scour.clamp(0.0, 1.0), 0.0,
+                ]
+            } else {
+                [0.0; 16]
             };
             r.authored_picture_shift = somnium_renderer::pass::postprocess::PictureShift {
                 kind: if pp.picture_shift <= 3 { pp.picture_shift } else { 0 },
@@ -8961,6 +9715,7 @@ impl<G: GameApp> Engine<G> {
             somnium_ecs::curve::Curve,
             Option<glam::Vec4>,
             Option<u64>,
+            String,
         )> = self
             .world
             .entities_with::<TerrainComponent>()
@@ -8996,16 +9751,45 @@ impl<G: GameApp> Engine<G> {
                         .map(|s| s.own_area)
                         .filter(|a| *a != glam::Vec4::ZERO),
                     seed_key,
+                    // The tile's ground layer set, which says which ground-cover kinds may grow on it.
+                    self.world
+                        .get::<crate::cell_streaming::TerrainStreamingComponent>(e)
+                        .map(|s| s.layer_set.clone())
+                        .unwrap_or_default(),
                 ))
             })
             .collect();
 
+        // GPU grass (somnium_renderer `pass/grass.rs`): built once from the project's habitat table, then told each
+        // terrain's ground layer set, which names the habitats it grows. A project without the table has none.
+        if let Some((r, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref()) {
+            r.ensure_grass(ctx, self.config.project_root.as_deref());
+            if r.grass.is_some() {
+                // Each tile's scene file, for its cover class map (habitat by place).
+                let world = &self.world;
+                let cells = &self.cell_streamer.cells;
+                for e in world.entities_with::<TerrainComponent>() {
+                    let Some(tc) = world.get::<TerrainComponent>(e) else { continue };
+                    let Some(terrain) = terrains.iter().find(|t| t.0 == tc.terrain_id) else { continue };
+                    let tile = world
+                        .get::<crate::cell_streaming::Streamed>(e)
+                        .and_then(|s| cells.get(s.cell as usize))
+                        .and_then(|c| c.file.file_name())
+                        .and_then(|n| n.to_str());
+                    r.grass_terrain_set(tc.terrain_id, &terrain.9, tile);
+                }
+            }
+        }
+
         if let Some(r) = self.renderer.as_mut() {
             r.profiler.cpu_begin("Foliage");
         }
+        // Palette sources read off the main thread since the last frame go up now, within the streaming budget.
+        self.pump_palette_reads(Some(std::time::Duration::from_millis(6)));
         let batched = crate::foliage_batches::enabled();
         if batched {
             self.foliage_batches.begin_frame();
+            self.cover_batches.begin_frame();
         }
 
         for (
@@ -9018,6 +9802,7 @@ impl<G: GameApp> Engine<G> {
             lod_falloff,
             own_area,
             seed_key,
+            layer_set,
         ) in terrains
         {
             // Which palette entries this terrain actually uses, so nothing is
@@ -9028,12 +9813,20 @@ impl<G: GameApp> Engine<G> {
                     continue;
                 };
                 let grid = self.foliage_grids.entry(terrain_id).or_default();
+                let since = std::time::Instant::now();
                 grid.refresh(t.edit_revision, &t.painted_foliage);
+                slow_foliage_step(terrain_id, "painted grid", since);
                 grid.kinds.clone()
             };
-            // Kinds generated round the camera need their meshes as painted ones do.
-            let cover_kinds: Vec<u16> =
-                self.project_foliage.iter().filter(|(_, e)| e.ground_cover.is_some()).map(|(k, _)| *k).collect();
+            // Kinds generated round the camera need their meshes as painted ones do: the ones this terrain's ground
+            // set grows. Every cover kind was loaded for every terrain: Sunscar has 1,142, Monargent's ground grows
+            // 707 of them, and the rest were part of a minute of half-second frames after a start (11 Nov 2026).
+            let cover_kinds: Vec<u16> = self
+                .project_foliage
+                .iter()
+                .filter(|(_, e)| e.ground_cover.as_ref().is_some_and(|cover| cover.grows_on(&layer_set)))
+                .map(|(k, _)| *k)
+                .collect();
             for kind in kinds.iter().chain(&cover_kinds) {
                 self.ensure_palette_mesh(*kind);
             }
@@ -9062,9 +9855,13 @@ impl<G: GameApp> Engine<G> {
             let mut kind_cull = vec![cull_sq; span];
             let mut kind_shadow = vec![shadow_sq; span];
             let mut kind_lod = vec![f32::INFINITY; span];
+            let mut kind_impostor = vec![f32::INFINITY; span];
             let mut kind_reach = vec![cull_distance; span];
+            // A kind that grows on others (mistletoe on its trees) waits while one of them is refused or still read.
+            let mut kind_unhosted = vec![false; span];
             for (kind, entry) in &self.project_foliage {
                 let k = *kind as usize;
+                kind_unhosted[k] = entry.hosts.is_some() && !self.hosts_drawn(*kind);
                 // Ground cover draws as far as it is generated unless told otherwise.
                 if let Some(d) = entry.draw_distance.or(entry.ground_cover.as_ref().map(|g| g.radius)) {
                     (kind_cull[k], kind_reach[k]) = (d * d, d);
@@ -9074,6 +9871,9 @@ impl<G: GameApp> Engine<G> {
                 }
                 if let Some(lod) = &entry.lod {
                     kind_lod[k] = lod.distance * lod.distance;
+                }
+                if let Some(impostor) = &entry.impostor {
+                    kind_impostor[k] = impostor.distance * impostor.distance;
                 }
             }
             // `SOMNIUM_FOLIAGE_BATCHES=1`: this terrain's foliage as instance batches, one per ground cell and kind,
@@ -9093,24 +9893,29 @@ impl<G: GameApp> Engine<G> {
                 let mut parts: Vec<Option<Vec<somnium_renderer::instance_batch::BatchPart>>> = vec![None; span];
                 for &kind in kinds.iter().filter(|&&kind| usize::from(kind) < span) {
                     let k = kind as usize;
-                    let Some(Some(near)) = self.foliage_meshes.get(k) else {
+                    let Some(Some(near)) = self.foliage_meshes.get(k).filter(|_| !kind_unhosted[k]) else {
                         continue;
                     };
                     let near: Vec<_> = near.iter().map(piece).collect();
                     let lod: Option<Vec<_>> = self.foliage_lod_meshes[k].as_ref().map(|m| m.iter().map(piece).collect());
+                    let impostor: Option<Vec<_>> =
+                        self.foliage_impostor_meshes[k].as_ref().map(|m| m.iter().map(piece).collect());
                     parts[k] = Some(crate::foliage_batches::kind_parts(
                         kind,
                         &near,
                         lod.as_deref(),
+                        impostor.as_deref(),
                         crate::foliage_batches::KindDistances {
                             cull_sq: kind_cull[k],
                             shadow_sq: kind_shadow[k],
                             lod_sq: kind_lod[k],
+                            impostor_sq: kind_impostor[k],
                             legacy_lod: lod_distance,
                             legacy_impostor: impostor_distance,
                         },
                     ));
                 }
+                let since = std::time::Instant::now();
                 let copies = self.foliage_batches.terrain(
                     terrain_id,
                     t.edit_revision,
@@ -9119,6 +9924,7 @@ impl<G: GameApp> Engine<G> {
                     camera_local,
                     &parts,
                 );
+                slow_foliage_step(terrain_id, "painted batches", since);
                 counts.submitted_instances = counts.submitted_instances.saturating_add(copies);
             }
             // Only the ground cells within the farthest kind's reach are visited.
@@ -9132,17 +9938,85 @@ impl<G: GameApp> Engine<G> {
                 camera_local,
                 model.inverse().transform_vector3(forward_ws).normalize_or(glam::Vec3::NEG_Z),
                 t.world_height_at(camera_local.x, camera_local.z),
-                400.0,
+                crate::ground_cover::focus_reach(),
             );
+            let since = std::time::Instant::now();
             match seed_key {
                 Some(key) => {
-                    self.ground_cover.update_seeded(terrain_id, key, t, &self.project_foliage, focus_local, own_area);
+                    // A tile's drifts follow the world, so they carry across its seams.
+                    let origin = glam::Vec2::new(model.w_axis.x, model.w_axis.z);
+                    self.ground_cover.update_seeded(
+                        terrain_id, key, t, &self.project_foliage, focus_local, own_area, origin, &layer_set,
+                    );
                 }
                 None => self.ground_cover.update(terrain_id, t, &self.project_foliage, focus_local, own_area),
             }
+            slow_foliage_step(terrain_id, "cover generate", since);
+            // Batched, ground cover is one instanced batch per kind and cell (`CoverBatches`), not a draw per copy.
+            if painted_batched {
+                let mut parts: Vec<Option<Vec<somnium_renderer::instance_batch::BatchPart>>> = vec![None; span];
+                // GPU grass draws the sward itself: the kinds it replaces are not drawn while it does.
+                let replaced: Vec<String> =
+                    self.renderer.as_ref().map(|r| r.grass_replaces().to_vec()).unwrap_or_default();
+                for (&kind, entry) in self.project_foliage.iter().filter(|(_, e)| e.ground_cover.is_some()) {
+                    // Only where blades grow: a sward kind on a slot no habitat claims (a wood floor) stays.
+                    if !replaced.is_empty()
+                        && entry
+                            .source
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .is_some_and(|stem| replaced.iter().any(|p| stem.starts_with(p.as_str())))
+                        && self.renderer.as_ref().is_some_and(|r| r.grass_grows_on(&layer_set, entry.brush.layer))
+                    {
+                        continue;
+                    }
+                    let k = usize::from(kind);
+                    let Some(Some(near)) = self.foliage_meshes.get(k) else { continue };
+                    let near: Vec<_> = near
+                        .iter()
+                        .map(|p| crate::foliage_batches::Piece {
+                            vertex_offset: p.vertex_offset,
+                            index_offset: p.index_offset,
+                            index_count: p.index_count,
+                            material_id: p.material_id,
+                            local: p.local,
+                            is_leaf: p.is_leaf,
+                        })
+                        .collect();
+                    // Drawn as far as its cells reach; the copies of a run are culled as one.
+                    parts[k] = Some(crate::foliage_batches::kind_parts(
+                        kind,
+                        &near,
+                        None,
+                        None,
+                        crate::foliage_batches::KindDistances {
+                            cull_sq: f32::MAX,
+                            shadow_sq: kind_shadow[k],
+                            lod_sq: f32::INFINITY,
+                            impostor_sq: f32::INFINITY,
+                            legacy_lod: 0.0,
+                            legacy_impostor: 0.0,
+                        },
+                    ));
+                }
+                let since = std::time::Instant::now();
+                let copies = self.cover_batches.terrain(
+                    terrain_id,
+                    &self.ground_cover,
+                    &self.project_foliage,
+                    &parts,
+                    model,
+                    focus_local,
+                );
+                slow_foliage_step(terrain_id, "cover batches", since);
+                counts.submitted_instances = counts.submitted_instances.saturating_add(copies);
+            }
             self.foliage_batch.clear();
+            let per_copy = std::time::Instant::now();
             let painted = self.foliage_visit.iter().map(|&index| (&t.painted_foliage[index], None));
-            let cover = self.ground_cover.instances(terrain_id).iter().map(|c| (&c.instance, Some(c.rotation)));
+            let unbatched_cover: &[crate::ground_cover::Cover] =
+                if painted_batched { &[] } else { self.ground_cover.instances(terrain_id) };
+            let cover = unbatched_cover.iter().map(|c| (&c.instance, Some(c.rotation)));
             for (inst, cover_rotation) in painted.chain(cover) {
                 let k = inst.kind as usize;
                 counts.candidates = counts.candidates.saturating_add(1);
@@ -9159,7 +10033,7 @@ impl<G: GameApp> Engine<G> {
                     counts.distance_culled = counts.distance_culled.saturating_add(1);
                     continue;
                 }
-                let Some(Some(parts)) = self.foliage_meshes.get(inst.kind as usize) else {
+                let Some(Some(parts)) = self.foliage_meshes.get(k).filter(|_| !kind_unhosted[k]) else {
                     counts.unavailable_mesh = counts.unavailable_mesh.saturating_add(1);
                     continue;
                 };
@@ -9268,6 +10142,7 @@ impl<G: GameApp> Engine<G> {
             self.foliage_batch.sort_by_key(|(part, _, _)| {
                 (part.vertex_offset, part.index_offset, part.material_id)
             });
+            slow_foliage_step(terrain_id, "per-copy draws", per_copy);
 
             if let Some(r) = self.renderer.as_mut() {
                 // Kinds kept out of the ray-traced scene (ground cover by default): their meshes still rasterise.
@@ -9312,15 +10187,22 @@ impl<G: GameApp> Engine<G> {
         }
         if batched {
             self.foliage_batches.end_frame();
+            self.cover_batches.end_frame();
             let changes = std::mem::take(&mut self.foliage_batches.changes);
+            let since = std::time::Instant::now();
             if let Some(r) = self.renderer.as_mut() {
-                for id in changes.remove {
-                    r.remove_instance_batch(id);
+                for id in changes.remove.iter().chain(&self.cover_batches.remove) {
+                    r.remove_instance_batch(*id);
                 }
                 for (id, batch) in &changes.set {
-                    r.set_instance_batch(*id, batch);
+                    // Painted foliage as runs too (`foliage_batches.rs`): a forest is too many copies for a draw each.
+                    r.set_instanced_batch(*id, batch);
+                }
+                for (id, batch) in &self.cover_batches.set {
+                    r.set_instanced_batch(*id, batch);
                 }
             }
+            slow_foliage_step(u32::MAX, "batch sets", since);
         }
         if let Some(r) = self.renderer.as_mut() {
             r.foliage_submission = counts;
@@ -9588,6 +10470,8 @@ impl<G: GameApp> Engine<G> {
                         self.terrain_restore_queue.clone(),
                     )));
                 self.scene_dirty = true;
+                // The edit layer does not keep painted foliage: Save must say so, as it does for sculpting.
+                self.editing.terrain_touched = true;
             }
             return true;
         }
@@ -9614,6 +10498,7 @@ impl<G: GameApp> Engine<G> {
                     self.terrain_restore_queue.clone(),
                 )));
             self.scene_dirty = true;
+            self.editing.terrain_touched = true;
         }
         let total = terrain.painted_foliage.len();
         let entry_name = self.foliage_kind_name(brush.kind).to_owned();
@@ -10478,6 +11363,43 @@ impl<G: GameApp> Engine<G> {
     fn handle_editor_event_inner(&mut self, ev: EditorEvent) {
         use somnium_ui::{CreateKind, FoliageBrushField as FB, TerrainToolField as TT};
 
+        // A carry in hand (Move on the Ground) is put back, as Esc does, before a tool key, an edit of the objects or
+        // a scene change; Undo and Redo only put it back.
+        if self.carrying() {
+            use somnium_ui::editor_event::LevelTool as L;
+            // Saving, Play and closing take what is seen: the thing is put down first, as its one undo step.
+            if matches!(
+                ev,
+                EditorEvent::SaveScene
+                    | EditorEvent::LevelTool(L::SaveSceneAs)
+                    | EditorEvent::AfterSave(_)
+                    | EditorEvent::PlaySimulation
+                    | EditorEvent::CloseWindow
+                    | EditorEvent::Quit { .. }
+            ) {
+                self.put_down_carry();
+            }
+            let ends = matches!(
+                ev,
+                EditorEvent::SetGizmoMode(_)
+                    | EditorEvent::ToggleTerrainEdit
+                    | EditorEvent::ToggleFoliagePaint
+                    | EditorEvent::DeleteSelected
+                    | EditorEvent::DuplicateSelected
+                    | EditorEvent::PasteClipboard
+                    | EditorEvent::NewScene
+                    | EditorEvent::LoadScene(_)
+                    | EditorEvent::Undo
+                    | EditorEvent::Redo
+            ) || matches!(ev, EditorEvent::LevelTool(tool) if !matches!(tool, L::Carry | L::CopyAndCarry));
+            if ends {
+                self.cancel_carry();
+                if matches!(ev, EditorEvent::Undo | EditorEvent::Redo) {
+                    return;
+                }
+            }
+        }
+
         match ev {
             EditorEvent::AuthoringRequest { method, params } => {
                 let result = self.authoring_request(&method, params);
@@ -10795,8 +11717,9 @@ impl<G: GameApp> Engine<G> {
                 if self.selection.is_empty() {
                     return;
                 }
+                // Recorded with each root's parent, so a paste lands beside the original.
                 self.entity_clipboard =
-                    crate::clipboard::EntityClipboard::copy(&self.world, self.selection.as_slice());
+                    crate::clipboard::EntityClipboard::duplicate(&self.world, self.selection.as_slice());
                 let count = self.entity_clipboard.root_count();
                 if let Some(ui) = self.ui_manager.as_mut() {
                     ui.push_toast(&format!("Copied {count}"));
@@ -10807,19 +11730,29 @@ impl<G: GameApp> Engine<G> {
                 if self.entity_clipboard.is_empty() {
                     return;
                 }
-                // Pasting with something selected pastes *into* it, which is
-                // what makes Copy/Paste usable for building a hierarchy rather
-                // than only for cloning one.
-                let parent = self.selection.primary;
+                // Not into whatever happens to be selected: each copy goes
+                // under the parent its original had (the scene root when that
+                // is gone), where the original stood, and becomes the selection.
                 use crate::editor_commands::EditorCommand as _;
                 let mut command =
-                    crate::clipboard::PasteEntitiesCmd::new(self.entity_clipboard.clone(), parent);
+                    crate::clipboard::PasteEntitiesCmd::new(self.entity_clipboard.clone(), None);
                 command.execute(&mut self.world, &mut self.selection.primary);
                 let roots = command.roots().to_vec();
                 self.undo_stack.push_silent(Box::new(command));
+                let message = match roots.as_slice() {
+                    [only] => {
+                        let name = self
+                            .world
+                            .get::<Name>(*only)
+                            .map_or_else(|| "object".to_owned(), |name| name.as_str().to_owned());
+                        format!("Pasted {name}.")
+                    }
+                    many => format!("Pasted {} objects.", many.len()),
+                };
                 self.selection.set_many(roots);
                 self.after_selection_change();
                 self.scene_dirty = true;
+                self.toast(&message);
             }
 
             EditorEvent::ToggleEntityFlag {
@@ -10961,7 +11894,10 @@ impl<G: GameApp> Engine<G> {
             EditorEvent::ViewPreset(index) => {
                 // A preset frames the selection when there is one and the
                 // origin otherwise, so "Top" always looks at something.
-                let (centre, radius) = self.focus_target().unwrap_or((glam::Vec3::ZERO, 20.0));
+                let (centre, radius) = self
+                    .selection_focus()
+                    .or_else(|| self.focus_target())
+                    .unwrap_or((glam::Vec3::ZERO, 20.0));
                 // The offset direction, from the subject toward the camera.
                 let direction = match index {
                     // Straight down is a degenerate yaw, so Top is nudged a
@@ -10972,7 +11908,8 @@ impl<G: GameApp> Engine<G> {
                     2 => glam::Vec3::X,
                     _ => glam::Vec3::new(0.6, 0.5, 0.6).normalize(),
                 };
-                let position = centre + direction * (radius * 3.0);
+                let fov_y = crate::EDITOR_CAMERA_FOV_Y_DEGREES.to_radians();
+                let position = centre + direction * crate::camera_focus_distance(radius, fov_y);
                 let look = (centre - position).normalize_or_zero();
                 self.camera_pose_request = Some((
                     position,
@@ -11004,6 +11941,8 @@ impl<G: GameApp> Engine<G> {
                     ui.push_toast(&format!("Bookmark {slot} set"));
                 }
             }
+
+            EditorEvent::GoToPlace(index) => self.go_to_place(index),
 
             EditorEvent::RecallCameraBookmark(slot) => {
                 let Some(index) = slot.checked_sub(1).map(usize::from) else {
@@ -11137,6 +12076,28 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::FocusSelection => self.focus_camera_on_selection(),
+            EditorEvent::LevelTool(tool) => {
+                use somnium_ui::editor_event::LevelTool as L;
+                match tool {
+                    L::DropToGround => self.drop_selection_to_ground(false),
+                    L::AlignToSurface => self.drop_selection_to_ground(true),
+                    L::FindFloating => self.find_floating_objects(),
+                    L::ToggleHide => self.toggle_hide_selection(),
+                    L::Isolate => self.isolate_selection(),
+                    L::EndIsolation => self.end_isolation(),
+                    L::FindInOutliner => self.reveal_selection_in_outliner(false),
+                    L::SelectParent => self.select_parent(),
+                    L::SaveSceneAs => self.save_scene_as(),
+                    L::CopyIdentity => self.copy_identity(),
+                    L::SelectLookedAt => self.select_looked_at(),
+                    L::Census => self.census(),
+                    L::CheckMeshes => self.check_meshes(),
+                    L::SelectSameAsset => self.select_same_asset(),
+                    L::MakeObject => self.make_painted_object(),
+                    L::Carry => self.toggle_carry(),
+                    L::CopyAndCarry => self.copy_and_carry(),
+                }
+            }
 
             EditorEvent::RenameSelected => {}
 
@@ -11563,10 +12524,20 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::DeleteSelected => {
-                if let Some(entity) = self.selection.primary {
-                    let cmd = Box::new(DeleteEntityCmd::new(entity.index()));
+                // A painted copy picked (nothing selected, its card showing) is taken out of its ground.
+                if self.selection.is_empty() && self.delete_painted_copy() {
+                    return;
+                }
+                // Every selected entity with every part under it. Deleting the primary alone left the rest of a
+                // multi-selection, and walking `Children` (sixteen slots) left parts seventeen on standing.
+                let roots = self.selection.as_slice().to_vec();
+                if !roots.is_empty() {
+                    let cmd = Box::new(crate::editor_commands::DeleteSubtreesCmd::new(&mut self.world, &roots));
                     self.undo_stack
                         .push(cmd, &mut self.world, &mut self.selection.primary);
+                    self.selection.retain_alive(&self.world);
+                    self.selection.reconcile();
+                    self.scene_dirty = true;
                     if let Some(r) = &mut self.renderer {
                         r.clear_gizmo();
                     }
@@ -11574,13 +12545,32 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::Undo => {
-                self.undo_stack
-                    .undo(&mut self.world, &mut self.selection.primary);
+                // The name is read first: once undone, the step is on the redo side.
+                let step = self.undo_stack.next_undo_name().unwrap_or("").to_owned();
+                if self.undo_stack.undo(&mut self.world, &mut self.selection.primary) {
+                    self.scene_dirty = true;
+                    if step.is_empty() {
+                        self.toast("Undid the last change.");
+                    } else {
+                        self.toast(&format!("Undid: {step}"));
+                    }
+                } else {
+                    self.toast("Nothing to undo.");
+                }
             }
 
             EditorEvent::Redo => {
-                self.undo_stack
-                    .redo(&mut self.world, &mut self.selection.primary);
+                let step = self.undo_stack.next_redo_name().unwrap_or("").to_owned();
+                if self.undo_stack.redo(&mut self.world, &mut self.selection.primary) {
+                    self.scene_dirty = true;
+                    if step.is_empty() {
+                        self.toast("Redid the last change.");
+                    } else {
+                        self.toast(&format!("Redid: {step}"));
+                    }
+                } else {
+                    self.toast("Nothing to redo.");
+                }
             }
 
             EditorEvent::ToggleShadingMode => {
@@ -11616,10 +12606,18 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::OpenScenePicker => {
+                // Both games keep their levels as `scenes/*.scene.json`, which a `.somnium`-only filter hid.
+                let start = self
+                    .config
+                    .project_root
+                    .as_ref()
+                    .map(|root| root.join("scenes"))
+                    .filter(|scenes| scenes.is_dir())
+                    .unwrap_or_else(|| self.config.content_root.clone());
                 let Some(path) = rfd::FileDialog::new()
                     .set_title("Open Scene")
-                    .add_filter("Somnium scene", &["somnium"])
-                    .set_directory(&self.config.content_root)
+                    .add_filter("Scene", &["json", "somnium"])
+                    .set_directory(&start)
                     .pick_file()
                 else {
                     return;
@@ -11986,71 +12984,10 @@ impl<G: GameApp> Engine<G> {
                 }
             }
 
-            EditorEvent::SaveScene => {
-                self.flush_material_assets();
-                let path = "scene.somnium";
-                // Phase 16-A: the schema-driven format (`version: 3`).
-                // It writes whatever the registry describes, which is how
-                // script attachments and their authored properties reach
-                // the file at all — the hand-written version-1 walk has no
-                // way to express them.
-                match crate::scene_schema::save_scene_schema(
-                    &mut self.world,
-                    &self.type_registry,
-                    path,
-                ) {
-                    Ok(()) => {
-                        info!("Scene saved to {}", path);
-                        self.scene_dirty = false;
-                        // A clean manual save is the moment there is nothing
-                        // left to recover, so the autosaves go with it. Leaving
-                        // them would offer the person older work next launch.
-                        self.autosave.saved();
-                        crate::autosave::clear(&self.config.content_root);
-                        self.remember_recent_scene(std::path::Path::new(path));
-                        if let Some(ui) = self.ui_manager.as_mut() {
-                            ui.set_scene_name(Some(path.to_string()));
-                        }
-                        if let Some(ui) = &mut self.ui_manager {
-                            ui.push_toast("Scene saved");
-                            // Saving is what "modified" was measured against.
-                            ui.reset_inspector_baseline();
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to save scene: {}", e);
-                        if let Some(ui) = &mut self.ui_manager {
-                            ui.push_toast("Save failed");
-                        }
-                    }
-                }
-                // Phase 14F-3: heightmap + splatmap sidecars, one per terrain.
-                if let Some(r) = &self.renderer {
-                    // Streamed tiles have their own sidecars beside their cells; Save never writes them.
-                    let terrain_ids: Vec<u32> = self
-                        .world
-                        .entities()
-                        .filter(|&e| self.world.get::<crate::cell_streaming::Streamed>(e).is_none())
-                        .filter_map(|e| {
-                            self.world
-                                .get::<TerrainComponent>(e)
-                                .map(|tc| tc.terrain_id)
-                        })
-                        .collect();
-                    for id in terrain_ids {
-                        if let Some(t) = r.terrain(id) {
-                            let sidecar = format!("{path}.terrain{id}.bin");
-                            match t.save_binary(&sidecar) {
-                                Ok(()) => info!("Terrain {} data saved to {}", id, sidecar),
-                                Err(e) => warn!("Failed to save terrain {}: {}", id, e),
-                            }
-                        }
-                    }
-                }
-            }
-
+            EditorEvent::SaveScene => self.save_scene_edits(),
             EditorEvent::NewScene => {
                 info!("Creating new scene");
+                self.reset_editing(None);
                 self.animation_authoring
                     .clear(&mut self.world, self.physics.as_mut());
                 self.navigation_editor.clear(&mut self.world);
@@ -12111,83 +13048,33 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::DuplicateSelected => {
-                if let Some(entity) = self.selection.primary {
-                    let transform = self
-                        .world
-                        .get::<Transform>(entity)
-                        .copied()
-                        .unwrap_or_else(|| Transform::from_translation(glam::Vec3::ZERO));
-                    let name = self
-                        .world
-                        .get::<Name>(entity)
-                        .map(|n| Name::new(&format!("{}_copy", n.as_str())))
-                        .unwrap_or_else(|| Name::new("Entity_copy"));
-                    let light = self.world.get::<LightComponent>(entity).copied();
-                    let audio = self
-                        .world
-                        .get::<crate::AudioEmitterComponent>(entity)
-                        .cloned();
-                    let mesh = self.world.get::<MeshComponent>(entity).copied();
-                    let mat = self.world.get::<MaterialComponent>(entity).copied();
-                    let mesh_kind = self.world.get::<MeshKind>(entity).copied();
-                    let mut water = self.world.get::<WaterComponent>(entity).copied();
-                    if let Some(component) = water.as_mut() {
-                        if let (Some(renderer), Some(render_ctx)) =
-                            (&mut self.renderer, &self.render_ctx)
-                        {
-                            component.water_id = renderer.allocate_water_body_id();
-                            if let Err(error) =
-                                renderer.ensure_water_body(render_ctx, component.descriptor())
-                            {
-                                warn!("Failed to duplicate water data: {error}");
-                            }
-                        }
-                    }
-                    let parent = self.world.get::<Parent>(entity).copied();
-                    let is_particle_emitter =
-                        self.world.get::<crate::ParticleEmitter>(entity).is_some();
-                    // Offset the duplicate slightly so it's visible
-                    let mut dup_transform = transform;
-                    dup_transform.translation += glam::Vec3::new(1.0, 0.0, 0.0);
-                    let snapshot = EntitySnapshot {
-                        reflected: EntitySnapshot::capture(&self.world, entity).reflected,
-                        spline: self.world.get::<crate::SplineComponent>(entity).cloned(),
-                        blockout: self
-                            .world
-                            .get::<crate::blockout::BlockoutComponent>(entity)
-                            .copied(),
-                        prefab: None,
-                        persistent_id: Some(somnium_ecs::PersistentId::mint()),
-                        surface_tags: self
-                            .world
-                            .get::<crate::scatter_scene::SurfaceTagsComponent>(entity)
-                            .cloned(),
-                        transform: Some(dup_transform),
-                        name: Some(name),
-                        light,
-                        audio,
-                        mesh,
-                        mat,
-                        wt: Some(WorldTransform::identity()),
-                        environment: false,
-                        decal: None,
-                        mesh_kind,
-                        is_particle_emitter,
-                        // Terrains are not duplicated — two entities sharing
-                        // one terrain_id would draw the same terrain twice.
-                        terrain: None,
-                        world_partition: None,
-                        ui_canvas: None,
-                        voxel_terrain: None,
-                        foliage: None,
-                        water,
-                        parent,
-                        children: None,
-                    };
-                    let cmd = Box::new(CreateEntityCmd::new(snapshot));
-                    self.undo_stack
-                        .push(cmd, &mut self.world, &mut self.selection.primary);
-                    info!("Duplicated entity {}", entity.index());
+                if self.selection.is_empty() {
+                    return;
+                }
+                // The whole object, every part (an imported model's root alone is an empty shell), beside its
+                // original (a metre along x, so it is seen): the clipboard's subtree copy, under the original's
+                // parent, as one undo step.
+                // Named for the original, read before the selection moves to the copy.
+                let original = self
+                    .selection
+                    .as_slice()
+                    .first()
+                    .and_then(|entity| self.world.get::<Name>(*entity))
+                    .map(|name| name.as_str().to_owned());
+                use crate::editor_commands::EditorCommand as _;
+                let mut command = self.duplicate_paste(glam::Vec3::X, "Duplicate");
+                command.execute(&mut self.world, &mut self.selection.primary);
+                let roots = command.roots().to_vec();
+                let count = roots.len();
+                self.undo_stack.push_silent(Box::new(command));
+                self.selection.set_many(roots);
+                self.after_selection_change();
+                self.scene_dirty = true;
+                info!("Duplicated {count} object(s) with their parts");
+                match original {
+                    Some(name) if count == 1 && !name.is_empty() => self.toast(&format!("Duplicated {name}.")),
+                    _ if count == 1 => self.toast("Duplicated 1 object."),
+                    _ => self.toast(&format!("Duplicated {count} objects.")),
                 }
             }
 
@@ -12668,6 +13555,7 @@ impl<G: GameApp> Engine<G> {
             }
 
             EditorEvent::PlaySimulation => {
+                self.end_isolation();
                 // Phase 16-D: the authored world is captured on the way in,
                 // once per session. Resuming from Pause must not recapture
                 // it — that would silently make everything a script has
@@ -12831,6 +13719,27 @@ impl<G: GameApp> Engine<G> {
                 self.ui_wants_exit = true;
             }
 
+            EditorEvent::AfterSave(action) => {
+                self.save_scene_edits();
+                if self.scene_dirty {
+                    self.toast("Not saved, so the scene stays open.");
+                    return;
+                }
+                self.handle_editor_event(*action);
+            }
+
+            EditorEvent::Quit { after_save } => {
+                if after_save {
+                    self.save_scene_edits();
+                    if self.scene_dirty {
+                        self.toast("Not saved, so the editor stays open");
+                        return;
+                    }
+                }
+                self.quit_confirmed = true;
+                self.ui_wants_exit = true;
+            }
+
             // Phase 29. The toggle drives collection as well as visibility: a
             // hidden profiler that keeps writing timestamps is paying for a
             // measurement nobody reads.
@@ -12921,6 +13830,7 @@ impl<G: GameApp> Engine<G> {
                     pp.tonemapper = match idx {
                         1 => crate::Tonemapper::Aces,
                         2 => crate::Tonemapper::Reinhard,
+                        3 => crate::Tonemapper::Photographic,
                         _ => crate::Tonemapper::AgX,
                     };
                     info!("Tonemapper: {}", pp.tonemapper.label());
@@ -12967,6 +13877,39 @@ fn content_root_stamp(root: &std::path::Path) -> (u64, u64) {
     let (mut count, mut newest) = (0_u64, 0_u64);
     fold(root, 2, &mut count, &mut newest);
     (count, newest)
+}
+
+/// Whether the asset inventory's poll walks the content root (`content_root_stamp`) on this frame. A game alone
+/// (`player_mode`) walks it until its first inventory is published, and after that only when an explicit invalidation
+/// clears the stamp: its files do not change under it. In Sunscar the walk read three folder levels of `assets\` on
+/// the frame thread every 350 ms for the whole game (editor-ux, 28 Nov 2026). The editor keeps polling. The first
+/// scan still runs in a game: its sounds and material textures are found through that inventory.
+fn inventory_poll_due(player_mode: bool, published: bool, stamp_known: bool, scan_running: bool, time_due: bool) -> bool {
+    !scan_running && time_due && !(player_mode && published && stamp_known)
+}
+
+#[cfg(test)]
+mod inventory_poll_tests {
+    use super::inventory_poll_due;
+
+    #[test]
+    fn a_game_stops_walking_the_content_root_once_its_inventory_is_published() {
+        // Before the first inventory: a game polls like the editor.
+        assert!(inventory_poll_due(true, false, false, false, true));
+        assert!(inventory_poll_due(true, false, true, false, true));
+        // Published, and the stamp known: a game no longer walks; the editor still does.
+        assert!(!inventory_poll_due(true, true, true, false, true));
+        assert!(inventory_poll_due(false, true, true, false, true));
+        // An explicit invalidation clears the stamp: one more walk, in a game too.
+        assert!(inventory_poll_due(true, true, false, false, true));
+    }
+
+    #[test]
+    fn nobody_walks_while_a_scan_runs_or_before_its_time() {
+        assert!(!inventory_poll_due(false, true, true, true, true));
+        assert!(!inventory_poll_due(false, true, true, false, false));
+        assert!(!inventory_poll_due(true, false, false, true, true));
+    }
 }
 
 fn camera_spawn_basis(
@@ -13148,6 +14091,7 @@ fn try_start_gizmo_drag(
         parent_world,
         parent_world_inverse,
         start_world_rotation,
+        part_handle: part_handle(world, renderer, entity).is_some(),
     })
 }
 
@@ -13307,6 +14251,42 @@ fn gizmo_anchor(
         })
 }
 
+/// The handle of `entity` when it is a part of a merged model whose origin lies off its mesh
+/// ([`crate::editor_gizmo::part_pivot`]): the middle of its mesh, in world space. `None` for an object handled at its
+/// origin.
+fn part_handle(
+    world: &somnium_ecs::World,
+    renderer: &SomniumRenderer,
+    entity: somnium_ecs::entity::Entity,
+) -> Option<glam::Vec3> {
+    let mesh = world.get::<MeshComponent>(entity)?;
+    let (min, max) = renderer.geometry.mesh_aabb(mesh.vertex_offset)?;
+    let model = crate::editor_gizmo::entity_world_matrix(world, entity)?;
+    crate::editor_gizmo::part_pivot(model, glam::Vec3::from_array(min), glam::Vec3::from_array(max))
+}
+
+/// Where a handle dragged along one axis from `from` to `moved` lands with a grid of `step` metres.
+///
+/// It lands on the grid along the axis it is dragged on: an object already off the grid ends on it in that direction,
+/// which is what snapping to a grid means. The other two directions are left as they were. Snapping those as well
+/// threw a prop up to half a step sideways, and up or down, on every one-axis move: with a one-metre grid a bench
+/// nudged along a wall jumped into the wall and off the ground (Sunscar, 12 Nov 2026). A turned (local) axis crosses
+/// no world grid line squarely, so there the distance travelled is what snaps.
+fn snapped_along(from: glam::Vec3, moved: glam::Vec3, axis: GizmoAxis, local_space: bool, step: f32) -> glam::Vec3 {
+    if local_space {
+        let travel = moved - from;
+        let length = travel.length();
+        return if length > 0.0 { from + travel * (SnapSettings::quantise(length, step) / length) } else { from };
+    }
+    let mut at = moved;
+    match axis {
+        GizmoAxis::X => at.x = SnapSettings::quantise(moved.x, step),
+        GizmoAxis::Y => at.y = SnapSettings::quantise(moved.y, step),
+        GizmoAxis::Z => at.z = SnapSettings::quantise(moved.z, step),
+    }
+    at
+}
+
 fn apply_gizmo_drag(
     drag: &GizmoDragState,
     camera_pos: glam::Vec3,
@@ -13339,16 +14319,13 @@ fn apply_gizmo_drag(
         GizmoMode::Translate => {
             if let Some(s) = ray_axis_param(camera_pos, ray_dir, drag.gizmo_pos, axis_dir) {
                 let moved = drag.gizmo_pos + (s - drag.start_axis_param) * axis_dir;
-                // Snap the *result*, not the delta: an object already off the
-                // grid should land on it, which is what "snap to grid" means
-                // to everyone who has used one.
-                let snapped_world = glam::Vec3::new(
-                    SnapSettings::quantise(moved.x, snap.translate_m),
-                    SnapSettings::quantise(moved.y, snap.translate_m),
-                    SnapSettings::quantise(moved.z, snap.translate_m),
-                );
-                result.translation =
-                    world_to_local_translation(drag.parent_world_inverse, snapped_world);
+                let snapped_world = snapped_along(drag.gizmo_pos, moved, drag.axis, drag.local_space, snap.translate_m);
+                let origin = if drag.part_handle {
+                    snapped_world + drag.parent_world.transform_point3(drag.start_transform.translation) - drag.gizmo_pos
+                } else {
+                    snapped_world
+                };
+                result.translation = world_to_local_translation(drag.parent_world_inverse, origin);
             }
         }
         GizmoMode::Scale => {
@@ -13362,6 +14339,14 @@ fn apply_gizmo_drag(
                         GizmoAxis::Z => sc.z = SnapSettings::quantise(sc.z * factor, snap.scale),
                     }
                     result.scale = sc;
+                    if drag.part_handle {
+                        result.translation = crate::editor_gizmo::scaled_about(
+                            drag.parent_world_inverse,
+                            &drag.start_transform,
+                            drag.gizmo_pos,
+                            sc,
+                        );
+                    }
                 }
             }
         }
@@ -13379,8 +14364,20 @@ fn apply_gizmo_drag(
                     snap.rotate_deg,
                 )
                 .to_radians();
+                // The turn is about a world axis; the authored rotation is in the parent's frame.
+                let turn = glam::Quat::from_axis_angle(axis_dir, delta);
+                let parent = drag.parent_world.to_scale_rotation_translation().1;
                 result.rotation =
-                    glam::Quat::from_axis_angle(axis_dir, delta) * drag.start_transform.rotation;
+                    crate::editor_gizmo::spin_in_parent(parent, turn) * drag.start_transform.rotation;
+                if drag.part_handle {
+                    result.translation = crate::editor_gizmo::turned_about(
+                        drag.parent_world,
+                        drag.parent_world_inverse,
+                        drag.start_transform.translation,
+                        drag.gizmo_pos,
+                        turn,
+                    );
+                }
             }
         }
     }
@@ -14054,6 +15051,21 @@ mod viewport_control_tests {
         );
     }
 
+    /// Dragged along x with a one-metre grid, a handle lands on the grid in x and keeps its y and z; on a turned
+    /// axis it is the distance that snaps.
+    #[test]
+    fn a_one_axis_move_snaps_along_that_axis_only() {
+        let from = glam::Vec3::new(-15456.6, 28.733, 288.671);
+        let moved = from + glam::Vec3::X * 0.8;
+        let at = super::snapped_along(from, moved, super::GizmoAxis::X, false, 1.0);
+        assert_eq!((at.x, at.y, at.z), (-15456.0, from.y, from.z));
+        assert_eq!(super::snapped_along(from, moved, super::GizmoAxis::X, false, 0.0), moved, "no grid, no snap");
+        let slant = glam::Vec3::new(0.6, 0.0, 0.8);
+        let turned = super::snapped_along(from, from + slant * 1.4, super::GizmoAxis::X, true, 1.0);
+        assert!(turned.abs_diff_eq(from + slant, 2e-3), "a turned axis snaps the distance: {turned}");
+        assert_eq!(super::snapped_along(from, from, super::GizmoAxis::Z, true, 1.0), from);
+    }
+
     /// A world-space gizmo result must cross the inverse parent transform
     /// before it is stored in the child's local `Transform`. Translation-only
     /// parents hid this bug; rotation and non-uniform scale expose it.
@@ -14443,5 +15455,15 @@ mod story_host;
 mod cell_streaming_host;
 #[path = "app_prop_sets.rs"]
 mod prop_sets_host;
+#[path = "app_editing.rs"]
+mod editing_host;
 
 include!("app_project_foliage.rs");
+
+/// Says which foliage step took a frame's time when one passes 20 ms (Sunscar's tile-arrival hitches, 30 Oct 2026).
+fn slow_foliage_step(terrain: u32, what: &str, since: std::time::Instant) {
+    let ms = since.elapsed().as_secs_f32() * 1000.0;
+    if ms > 20.0 {
+        tracing::warn!(terrain, step = what, ms, "slow foliage step");
+    }
+}

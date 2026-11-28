@@ -665,9 +665,67 @@ impl ClusterGrid {
     }
 }
 
+/// Past [`MAX_LOCAL_LIGHTS`] the lights that matter most at `eye` stay, in the order they were submitted: the nearest
+/// and the brightest, by a light's output times the share of the view its reach fills. One just inside the cut is
+/// faded (to nothing at the level of the first light left out), so no lamp pops on or off as the eye moves and the
+/// order changes. The first 256 submitted were kept before, which is the order entities happen to be stored in: a
+/// town's far side stayed lit while the lantern at the player's door went dark (Sunscar, 11 Nov 2026).
+pub fn keep_most_seen(lights: &mut Vec<GpuLocalLight>, eye: glam::Vec3) {
+    if lights.len() <= MAX_LOCAL_LIGHTS {
+        return;
+    }
+    let seen = |light: &GpuLocalLight| {
+        let reach = light.range.max(0.01);
+        let near = reach / glam::Vec3::from(light.position_ws).distance(eye).max(reach);
+        (light.color[0] * 0.2126 + light.color[1] * 0.7152 + light.color[2] * 0.0722) * near * near
+    };
+    let mut scored: Vec<(f32, usize, GpuLocalLight)> =
+        lights.drain(..).enumerate().map(|(index, light)| (seen(&light), index, light)).collect();
+    scored.select_nth_unstable_by(MAX_LOCAL_LIGHTS, |a, b| b.0.total_cmp(&a.0));
+    let cut = scored[MAX_LOCAL_LIGHTS].0.max(f32::MIN_POSITIVE);
+    scored.truncate(MAX_LOCAL_LIGHTS);
+    scored.sort_unstable_by_key(|kept| kept.1);
+    lights.extend(scored.into_iter().map(|(score, _, mut light)| {
+        // Whole at half as much again as the cut.
+        let fade = ((score / cut - 1.0) * 2.0).clamp(0.0, 1.0);
+        light.color = light.color.map(|channel| channel * fade);
+        light
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 300 equal lanterns in a row, 10 m apart, the eye at the first: the nearest 256 stay in their order, the
+    /// nearest whole and the last of them faded out; a list within the cap is left as it is.
+    #[test]
+    fn past_the_cap_the_nearest_lights_stay_and_the_last_of_them_fade() {
+        let lantern = |i: usize| GpuLocalLight {
+            position_ws: [i as f32 * 10.0, 2.0, 0.0],
+            range: 6.0,
+            color: [2.0, 1.2, 0.5],
+            light_type: 0,
+            direction_ws: [0.0, -1.0, 0.0],
+            spot_cos_outer: 0.0,
+            spot_cos_inner: 0.0,
+            radius: 0.03,
+            _pad: [0.0; 2],
+        };
+        // Submitted farthest first, as an archetype might hold them.
+        let mut lights: Vec<GpuLocalLight> = (0..300).rev().map(lantern).collect();
+        keep_most_seen(&mut lights, glam::Vec3::new(0.0, 1.7, 0.0));
+        assert_eq!(lights.len(), MAX_LOCAL_LIGHTS);
+        let xs: Vec<f32> = lights.iter().map(|light| light.position_ws[0]).collect();
+        assert_eq!((xs[0], xs[255]), (2550.0, 0.0), "the 256 nearest, still farthest first");
+        assert!(xs.windows(2).all(|pair| pair[0] > pair[1]));
+        assert_eq!(lights[255].color, [2.0, 1.2, 0.5], "the lantern at the eye is whole");
+        assert!(lights[0].color[0] < 0.05, "the last one kept is all but out: {:?}", lights[0].color);
+        assert!(lights.windows(2).all(|pair| pair[0].color[0] <= pair[1].color[0]), "nearer is never dimmer");
+        let mut few: Vec<GpuLocalLight> = (0..256).map(lantern).collect();
+        keep_most_seen(&mut few, glam::Vec3::ZERO);
+        assert!(few.iter().all(|light| light.color == [2.0, 1.2, 0.5]) && few[0].position_ws[0] == 0.0);
+    }
 
     fn test_view_proj() -> (glam::Mat4, glam::Mat4) {
         let view = glam::Mat4::look_at_rh(

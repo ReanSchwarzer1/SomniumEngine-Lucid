@@ -140,8 +140,9 @@ impl TransparentPass {
                 format: wgpu::TextureFormat::Depth32Float,
                 // Test against opaque depth, but never write: blended surfaces
                 // must not occlude each other or anything drawn later.
+                // Reversed-Z: nearer is larger (renderer.rs `set_view`).
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -187,7 +188,7 @@ impl TransparentPass {
                 // never write. Order independence is about *blending*, and a
                 // blended surface still must not draw through a wall.
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),

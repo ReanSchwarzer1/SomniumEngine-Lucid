@@ -1,3 +1,4 @@
+//!include "depth_tie.wgsl"
 // Phase 15B: GPU instance frustum culling.
 // Phase 15E2: plus two-phase Hi-Z occlusion culling.
 //
@@ -87,7 +88,9 @@ fn emit_visible(i: u32) {
 fn is_occluded(world_min: vec3<f32>, world_max: vec3<f32>) -> bool {
     var lo = vec2<f32>(1e30);
     var hi = vec2<f32>(-1e30);
-    var min_z = 1e30;
+    // Nearest NDC depth: the largest, under reversed-Z (Sunscar, 6 Nov 2026).
+    var max_z = -1e30;
+    var min_w = 1e30;
 
     for (var c = 0u; c < 8u; c = c + 1u) {
         let corner = vec3<f32>(
@@ -106,12 +109,13 @@ fn is_occluded(world_min: vec3<f32>, world_max: vec3<f32>) -> bool {
         let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 1.0 - (ndc.y * 0.5 + 0.5));
         lo = min(lo, uv);
         hi = max(hi, uv);
-        min_z = min(min_z, ndc.z);
+        max_z = max(max_z, ndc.z);
+        min_w = min(min_w, clip.w);
     }
 
     lo = clamp(lo, vec2<f32>(0.0), vec2<f32>(1.0));
     hi = clamp(hi, vec2<f32>(0.0), vec2<f32>(1.0));
-    min_z = max(min_z, 0.0);
+    max_z = min(max_z, 1.0);
 
     // A tree filling the view (camera in the canopy, or standing next to a
     // scaled sapling) covers most of the screen. Four coarse Hi-Z samples
@@ -131,17 +135,20 @@ fn is_occluded(world_min: vec3<f32>, world_max: vec3<f32>) -> bool {
     let t0 = vec2<i32>(clamp(lo * dims, vec2<f32>(0.0), dims - vec2<f32>(1.0)));
     let t1 = vec2<i32>(clamp(hi * dims, vec2<f32>(0.0), dims - vec2<f32>(1.0)));
 
-    var furthest = 0.0;
-    furthest = max(furthest, textureLoad(hiz, vec2<i32>(t0.x, t0.y), level).r);
-    furthest = max(furthest, textureLoad(hiz, vec2<i32>(t1.x, t0.y), level).r);
-    furthest = max(furthest, textureLoad(hiz, vec2<i32>(t0.x, t1.y), level).r);
-    furthest = max(furthest, textureLoad(hiz, vec2<i32>(t1.x, t1.y), level).r);
+    var furthest = 1.0;
+    furthest = min(furthest, textureLoad(hiz, vec2<i32>(t0.x, t0.y), level).r);
+    furthest = min(furthest, textureLoad(hiz, vec2<i32>(t1.x, t0.y), level).r);
+    furthest = min(furthest, textureLoad(hiz, vec2<i32>(t0.x, t1.y), level).r);
+    furthest = min(furthest, textureLoad(hiz, vec2<i32>(t1.x, t1.y), level).r);
 
-    // A region still at the far plane records no occluder at all.
-    if furthest >= 1.0 {
+    // A region still at infinity (the cleared 0) records no occluder at all.
+    if furthest <= 0.0 {
         return false;
     }
-    return min_z > furthest;
+    // A draw's depth tie (depth_tie.wgsl) can draw it up to `DEPTH_TIE_REACH` nearer than its box, in front of what
+    // the pyramid recorded, so it is kept until it is behind by more than that; ties fade out by 24 m, and so does the
+    // allowance, from the box's nearest point (F's check, 29 Oct: a constant one cost far culling metres of depth).
+    return max_z + DEPTH_TIE_REACH * depth_tie_fade(min_w) < furthest;
 }
 
 // Both phases run this entry point; `params.phase` selects the behaviour.
@@ -174,11 +181,15 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
 
+    // Phase two revives a draw with the copies phase one had (its flag): an instance batch's run (`make_run`) is
+    // one argument for many copies, and reviving it as one would draw only its first.
+    var revive = 1u;
     if params.phase == 1u {
         if occluded_flags[i] == 0u {
             draws[i].instance_count = 0u;
             return;
         }
+        revive = occluded_flags[i];
         occluded_flags[i] = 0u;
     }
 
@@ -287,20 +298,19 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
         hidden = is_occluded(world_min, world_max);
     }
 
+    if params.phase == 0u {
+        // Remember it for phase two, which re-tests against a fresher pyramid: its copies, so it comes back whole.
+        occluded_flags[i] = select(0u, max(draws[i].instance_count, 1u), hidden);
+    }
     // Zero to skip the draw. Do not replace a live count with 1: batched
     // copies share one argument and would all vanish except the first.
     if hidden {
         draws[i].instance_count = 0u;
     } else if params.phase == 1u {
-        // Phase one left this at 0. Revival is always a single instance;
-        // the CPU no longer collapses copies into instance_count > 1.
-        draws[i].instance_count = 1u;
+        // Phase one left this at 0: back to the copies it had.
+        draws[i].instance_count = revive;
     }
     if !hidden {
         emit_visible(i);
-    }
-    if params.phase == 0u {
-        // Remember it for phase two, which re-tests against a fresher pyramid.
-        occluded_flags[i] = select(0u, 1u, hidden);
     }
 }

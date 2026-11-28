@@ -16,6 +16,7 @@
 // lines, so a module that includes this one inherits it.
 enable wgpu_binding_array;
 //!include "wind.wgsl"
+//!include "terrain_morph.wgsl"
 
 struct Vertex {
     pos_x: f32, pos_y: f32, pos_z: f32,
@@ -124,6 +125,17 @@ struct View {
 // @group(2) — sampler for the alpha-cutout test (Phase 17E)
 @group(2) @binding(0) var cutout_sampler: sampler;
 
+// LOD hand-over of instance-batch copies (instance.rs `foliage_fade`; visibility.wgsl dithers the same copies).
+// Shadows switch whole at the edge: both copies casting across the dither band would darken it.
+fn foliage_fade_word(packed: u32) -> bool {
+    return (packed >> 14u) != 0u && packed != 0x80000000u && ((packed >> 4u) & 1023u) == 0u;
+}
+
+fn foliage_fade_shown(packed: u32, d: f32) -> bool {
+    let edge = f32((packed >> 14u) & 65535u) / 16.0;
+    return select((d < edge), (d >= edge), (packed & 1u) == 1u);
+}
+
 struct VOut {
     @builtin(position) clip: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -138,7 +150,10 @@ fn vs_main(
     let instance  = instances[inst_idx];
     let index     = indices[instance.index_offset + v_idx];
     let vert      = vertices[instance.vertex_offset + index];
-    var world_pos = instance.model * vec4<f32>(vert.pos_x, vert.pos_y, vert.pos_z, 1.0);
+    // A terrain chunk casts the ground the camera sees, morph included (terrain_morph.wgsl).
+    let local     = terrain_morph(vec3<f32>(vert.pos_x, vert.pos_y, vert.pos_z), index, instance.vertex_offset,
+                                  instance._padding, instance.model, view.camera_pos);
+    var world_pos = instance.model * vec4<f32>(local, 1.0);
     // Terrain draws through its own pass; everything here may carry wind.
     let m = materials[instance.material_id];
     world_pos = vec4<f32>(world_pos.xyz + wind_offset(world_pos.xyz, instance.model[3].xyz, m.wind_bend,
@@ -150,6 +165,10 @@ fn vs_main(
 
     var out: VOut;
     out.clip = vp * world_pos;
+    let packed = instance._padding;
+    if foliage_fade_word(packed) && !foliage_fade_shown(packed, distance(instance.model[3].xz, view.camera_pos.xz)) {
+        out.clip = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+    }
     out.uv = vec2<f32>(vert.u, vert.v);
     out.material_id = instance.material_id;
     return out;

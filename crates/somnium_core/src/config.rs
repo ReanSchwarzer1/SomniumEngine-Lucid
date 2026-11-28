@@ -81,7 +81,7 @@ impl Default for EngineConfig {
             content_root: std::env::var_os("SOMNIUM_CONTENT_ROOT")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::path::PathBuf::from("assets")),
-            window_title: "Somnium Engine".into(),
+            window_title: "Lucid".into(),
             window_size: (1280, 720),
             target_fps: Some(60),
             vsync: true,

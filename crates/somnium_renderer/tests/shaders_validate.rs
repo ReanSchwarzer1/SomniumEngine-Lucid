@@ -70,6 +70,9 @@ fn every_composed_root_validates() {
     for root in [
         "shading.wgsl",
         "restir_gi.wgsl",
+        "restir_di.wgsl",
+        // 11 Nov 2026: GI averaged over neighbours and time on its own grid before the upsample.
+        "gi_accumulate.wgsl",
         "lighting_extra.wgsl",
         // 17 Oct 2026: the real-time path tracer and its denoiser.
         "path_tracer.wgsl",
@@ -85,6 +88,9 @@ fn every_composed_root_validates() {
         "clipmap_gen.wgsl",
         "volumetric.wgsl",
         "clouds.wgsl",
+        // 11 Nov 2026: lightning's channels (Sunscar weather).
+        "lightning.wgsl",
+        "precipitation.wgsl",
         "atmosphere_lut.wgsl",
         "ibl_gen.wgsl",
         "dof.wgsl",
@@ -105,6 +111,10 @@ fn every_composed_root_validates() {
         "scene_capture.wgsl",
         // The editor's preview studio (a material's turning sphere, an asset's thumbnail).
         "preview_studio.wgsl",
+        // 19 Nov 2026: GPU grass, laid out (compute) and drawn into the visibility buffer; the bare-share census.
+        "grass_gen.wgsl",
+        "grass_vis.wgsl",
+        "cover_census.wgsl",
     ] {
         check(root, &shaders.source_or_panic(root));
     }
@@ -194,7 +204,7 @@ fn fog_skylight_follows_the_sun_shadow_when_asked() {
     let vol = include_str!("../src/shaders/volumetric.wgsl");
     assert!(vol.contains("if vol.shafts_enabled != 0u || vol.fog_sky_occlusion > 0.0 {"), "lookup gate");
     assert!(vol.contains("sky_vis = mix(1.0, shadow_vis, saturate(vol.fog_sky_occlusion));"));
-    assert!(vol.contains("+ vec3<f32>(fog) * multiscatter * sky_vis;"), "fog skylight term");
+    assert!(vol.contains("+ vec3<f32>(fog) * multiscatter * sky_vis * vol.fog_skylight;"), "fog skylight term");
 }
 
 /// Phase 24L. The GI pass binds the same `@group(0)` pool the shading pass
@@ -323,7 +333,9 @@ fn material_mirrors_and_the_view_carry_the_wind_where_rust_puts_it() {
         assert_eq!((mat, bend, flutter), (112, Some(96), Some(100)), "{root} Material");
         if let Some((view, _, _, wind, wind_time)) = span("View") {
             if wind.is_some() {
-                assert_eq!((view, wind, wind_time), (256, Some(224), Some(240)), "{root} View");
+                // 320 with inv_view_proj_rel after the wind (5 Nov 2026); shorter mirrors stop at 256.
+                assert!(matches!(view, 256 | 320), "{root} View is {view} bytes");
+                assert_eq!((wind, wind_time), (Some(224), Some(240)), "{root} View");
             }
         }
     }
@@ -371,7 +383,9 @@ fn glass_reads_the_light_grid_its_normal_map_and_the_scene_behind_it() {
 
 #[test]
 fn the_phase_iv_water_modules_validate() {
-    check("water", WATER);
+    // Composed since 6 Nov 2026: it includes froxel_depth.wgsl, as the renderer resolves it.
+    let _ = WATER;
+    check("water", &composed("water.wgsl"));
     check("water_spectrum", WATER_SPECTRUM);
     check("underwater", UNDERWATER);
 }
@@ -399,7 +413,7 @@ fn the_terrain_material_struct_matches_the_rust_layout() {
         panic!("TerrainMaterial is not a struct");
     };
 
-    assert_eq!(*span, 2080, "WGSL size disagrees with GpuTerrainMaterial");
+    assert_eq!(*span, 2112, "WGSL size disagrees with GpuTerrainMaterial");
 
     // Only the members whose offsets the Rust test also pins. Checking every
     // one would just restate the declaration; these are the ones where a
@@ -441,6 +455,38 @@ fn the_terrain_material_struct_matches_the_rust_layout() {
     // vec4 has to be 16-byte aligned or every `array<vec4<_>>` above it moves.
     assert_eq!(offset("weight_noise_strength"), 2056);
     assert_eq!(offset("macro_octave_strength"), 2064);
+}
+
+/// The post pass's uniform, as Rust packs it (`postprocess.rs` `POST_PARAM_FLOATS`): the photographic camera's
+/// vectors sit after the LUT vector, 16-byte aligned (sunscar-photoreal, 6 Nov 2026).
+#[test]
+fn the_post_params_struct_matches_the_rust_layout() {
+    let source = composed("postprocess.wgsl");
+    let module = naga::front::wgsl::parse_str(&source).expect("post module parses");
+    let (_, ty) = module
+        .types
+        .iter()
+        .find(|(_, t)| t.name.as_deref() == Some("PostParams"))
+        .expect("PostParams is declared");
+    let naga::TypeInner::Struct { members, span } = &ty.inner else {
+        panic!("PostParams is not a struct");
+    };
+    assert_eq!(*span, 124 * 4, "WGSL size disagrees with POST_PARAM_FLOATS");
+    let offset = |name: &str| {
+        members
+            .iter()
+            .find(|m| m.name.as_deref() == Some(name))
+            .unwrap_or_else(|| panic!("no member {name}"))
+            .offset
+    };
+    assert_eq!(offset("lut"), 80 * 4);
+    assert_eq!(offset("photo"), 84 * 4);
+    assert_eq!(offset("lens"), 88 * 4);
+    assert_eq!(offset("wb_r"), 92 * 4);
+    assert_eq!(offset("wb_g"), 96 * 4);
+    assert_eq!(offset("wb_b"), 100 * 4);
+    assert_eq!(offset("heat"), 104 * 4);
+    assert_eq!(offset("view_proj"), 108 * 4);
 }
 
 /// The `enable` directives survive composition and end up first.
@@ -784,8 +830,7 @@ fn decal_axes_come_from_the_rows_of_the_inverse() {
     let shading = include_str!("../src/shaders/shading.wgsl");
     let start = shading.find("fn apply_decals").expect("apply_decals");
     let body = &shading[start..start + shading[start..].find("
-}
-").expect("end")];
+}").expect("end")];
     assert!(body.contains("vec3<f32>(inv[0].y, inv[1].y, inv[2].y)"), "facing axis from row 1");
     assert!(!body.contains("inv_transform * vec4<f32>(0.0, 1.0, 0.0, 0.0)"), "direction through the inverse");
 }
@@ -956,8 +1001,33 @@ fn macro_octaves_land_between_the_macro_blend_and_the_squaring() {
     }
     assert_eq!(
         found, 2,
-        "the live and clipmap-generate paths each blend a macro map; \
-         a terrain shades through whichever the distance picks and they must agree"
+        "the live and clipmap-generate paths each blend a macro map in place, before its octaves and squaring \
+         (the generator only where the tier does not fade)"
+    );
+    // The clipmap path (11 Nov 2026): where the tier fades with the eye's distance (MACRO_FADES, a set with far
+    // colours), the generator caches the detail with its octaves and no macro lerp, and shading lerps the octave-tinted
+    // detail toward the octave-tinted far colour, which is the live path's result exactly for Lerp and Multiply. Where
+    // it does not fade (TSF's terrains), the generator bakes it as it always has.
+    let generate = &source[source.find("fn terrain_generate_texel(").expect("the clipmap generator")..];
+    let generate = &generate[..generate.find("\n}").expect("its end")];
+    let baked = generate.find("terrain_macro_blend(").expect("the generator bakes a tier that does not fade");
+    assert_eq!(generate.matches("terrain_macro_blend(").count(), 1);
+    assert!(
+        generate[..baked].contains("if (tm.macro_mode & MACRO_FADES) == 0u {"),
+        "a cached texel cannot know the eye's distance: only a tier that does not fade is baked"
+    );
+    let shade = &source[source.find("fn evaluate_clipmap_material(").expect("clipmap shading")..];
+    let shade = &shade[..shade.find("\n}").expect("its end")];
+    assert!(
+        shade.contains("(tm.macro_mode & MACRO_FADES) != 0u")
+            && shade.contains("terrain_macro_blend(detail, macro_c.rgb * octaves, terrain_macro_mode(tm), fade)")
+            && shade.contains("terrain_macro_weight(tm, macro_c.a, world_pos)"),
+        "clipmap shading lerps a fading tier between the octave-tinted detail and far colour, faded with distance"
+    );
+    assert_eq!(
+        source.matches("terrain_macro_weight(tm, macro_c.a, world_pos)").count(),
+        2,
+        "the live and clipmap paths fade the macro tier the same way"
     );
 }
 
@@ -1103,7 +1173,9 @@ fn the_sky_eye_is_drawn_on_sky_pixels() {
     let atmosphere = include_str!("../src/shaders/sky_eye.wgsl");
     let pool = include_str!("../src/shaders/global_pool.wgsl");
     assert!(atmosphere.contains("fn sky_eye("), "the eye is an analytic sky term");
-    assert!(shading.contains("(sky + detail) * (1.0 - eye.a) + eye.rgb"), "the eye covers the sky it sits in");
+    assert!(shading.contains("(sky + detail * (1.0 - planet.a) + planet.rgb + ring) * (1.0 - eye.a) + eye.rgb"),
+        "the eye covers the sky it sits in, the planet over the horizon (behind the air, in front of the stars and the sun) with it");
+    assert!(shading.contains("planet.rgb * view_extinction_rgb(ray_dir.y)"), "the air dims and reddens the planet");
     assert!(pool.contains("eye_shape:"), "the light uniform carries the eye");
     let composite = include_str!("../src/shaders/clouds_composite.wgsl");
     assert!(composite.contains("sky_eye(dir"), "the eye burns through the cloud deck");

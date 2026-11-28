@@ -116,7 +116,8 @@ impl Renderer {
         self.profiler.cpu_begin("Frame generation");
         self.profiler.begin(encoder, "Frame generation");
         self.frame_gen.generate(&ctx.device, &ctx.queue, encoder, &view, &self.vis_pass.depth_texture,
-            self.velocity_pass.texture(), [self.render_width, self.render_height], self.view_matrix, self.proj_matrix);
+            self.velocity_pass.texture(), [self.render_width, self.render_height], self.view_matrix,
+            crate::view::reversed_z(self.proj_matrix));
         self.profiler.end(encoder);
         self.profiler.cpu_end();
         Some((output, view))

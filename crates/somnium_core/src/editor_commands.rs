@@ -204,6 +204,8 @@ pub struct UndoStack {
     executed: Vec<Box<dyn EditorCommand>>,
     redo_stack: Vec<Box<dyn EditorCommand>>,
     max_size: usize,
+    /// Counts every push, undo and redo, so a cache can tell the world may have changed.
+    generation: u64,
 }
 
 impl UndoStack {
@@ -212,7 +214,15 @@ impl UndoStack {
             executed: Vec::new(),
             redo_stack: Vec::new(),
             max_size,
+            generation: 0,
         }
+    }
+
+    /// Changes whenever history moves: a push, an undo or a redo. A full stack keeps its length on a push, so the
+    /// length alone cannot say that.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Execute `cmd` and push it onto the undo stack.
@@ -227,6 +237,7 @@ impl UndoStack {
         if cmd.is_no_op() {
             return;
         }
+        self.generation += 1;
         self.redo_stack.clear();
         self.executed.push(cmd);
         if self.executed.len() > self.max_size {
@@ -241,6 +252,7 @@ impl UndoStack {
         };
         cmd.undo(world, selected);
         self.redo_stack.push(cmd);
+        self.generation += 1;
         true
     }
 
@@ -251,7 +263,20 @@ impl UndoStack {
         };
         cmd.execute(world, selected);
         self.executed.push(cmd);
+        self.generation += 1;
         true
+    }
+
+    /// The name of the step an undo would reverse now, or `None` when there is nothing to undo.
+    #[must_use]
+    pub fn next_undo_name(&self) -> Option<&str> {
+        self.executed.last().map(|command| command.description())
+    }
+
+    /// The name of the step a redo would apply now, or `None` when there is nothing to redo.
+    #[must_use]
+    pub fn next_redo_name(&self) -> Option<&str> {
+        self.redo_stack.last().map(|command| command.description())
     }
 
     pub fn can_undo(&self) -> bool {
@@ -321,6 +346,7 @@ impl UndoStack {
     /// Push a command whose effect has already been applied to the world.
     /// Skips calling `execute()` — the command is only available to undo.
     pub fn push_silent(&mut self, cmd: Box<dyn EditorCommand>) {
+        self.generation += 1;
         self.redo_stack.clear();
         self.executed.push(cmd);
         if self.executed.len() > self.max_size {
@@ -1354,6 +1380,100 @@ impl EditorCommand for DeleteEntityCmd {
     }
 }
 
+// ─── DeleteSubtreesCmd ───────────────────────────────────────────────────
+
+/// Reversible deletion of several entities and everything under each.
+///
+/// The parts are found through `Parent`, not `Children`, which keeps only sixteen: deleting an object of forty
+/// parts through `Children` left twenty-four of them standing, parentless, where the object had been. Undo puts every
+/// part back under its own parent with its own persistent id; redo finds the roots again by those ids.
+pub struct DeleteSubtreesCmd {
+    roots: Vec<PersistentId>,
+    /// Parents before children, each with the position of its parent in this list (`None` for a root).
+    snapshots: Vec<(Option<usize>, EntitySnapshot)>,
+}
+
+impl DeleteSubtreesCmd {
+    /// Delete `roots` and everything under them.
+    pub fn new(world: &mut World, roots: &[Entity]) -> Self {
+        let roots = roots.iter().filter_map(|e| world.ensure_persistent_id(*e).ok()).collect();
+        Self { roots, snapshots: Vec::new() }
+    }
+}
+
+impl EditorCommand for DeleteSubtreesCmd {
+    fn execute(&mut self, world: &mut World, selected: &mut Option<Entity>) {
+        let mut children: std::collections::HashMap<Entity, Vec<Entity>> = std::collections::HashMap::new();
+        for (entity, parent) in world.iter_with::<Parent>() {
+            children.entry(parent.entity).or_default().push(entity);
+        }
+        let mut order: Vec<(Option<usize>, Entity)> = Vec::new();
+        for id in &self.roots {
+            let Some(root) = world.entity_by_persistent_id(*id) else {
+                continue;
+            };
+            if order.iter().any(|(_, e)| *e == root) {
+                continue;
+            }
+            let start = order.len();
+            order.push((None, root));
+            let mut next = start;
+            while next < order.len() {
+                let (_, entity) = order[next];
+                for &kid in children.get(&entity).map(Vec::as_slice).unwrap_or_default() {
+                    if world.is_alive(kid) && !order.iter().any(|(_, e)| *e == kid) {
+                        order.push((Some(next), kid));
+                    }
+                }
+                next += 1;
+            }
+        }
+        self.snapshots = order.iter().map(|&(parent, e)| (parent, EntitySnapshot::capture(world, e))).collect();
+        for &(parent, entity) in order.iter().rev() {
+            if parent.is_none()
+                && let Some(owner) = world.get::<Parent>(entity).copied()
+                && let Some(list) = world.get_mut::<Children>(owner.entity)
+            {
+                list.remove(entity);
+            }
+            world.despawn(entity);
+            if *selected == Some(entity) {
+                *selected = None;
+            }
+        }
+    }
+
+    fn undo(&mut self, world: &mut World, selected: &mut Option<Entity>) {
+        let mut spawned: Vec<Entity> = Vec::with_capacity(self.snapshots.len());
+        for (parent, snapshot) in self.snapshots.clone() {
+            let mut snapshot = snapshot;
+            snapshot.children = Some(Children::empty());
+            if let Some(at) = parent {
+                snapshot.parent = Some(Parent { entity: spawned[at] });
+            }
+            let owner = snapshot.parent.map(|p| p.entity);
+            let entity = snapshot.respawn(world);
+            if let Some(owner) = owner
+                && let Some(list) = world.get_mut::<Children>(owner)
+            {
+                let _ = list.push(entity);
+            }
+            spawned.push(entity);
+        }
+        *selected = self
+            .snapshots
+            .iter()
+            .zip(&spawned)
+            .rev()
+            .find(|((parent, _), _)| parent.is_none())
+            .map(|(_, e)| *e);
+    }
+
+    fn description(&self) -> &str {
+        "Delete"
+    }
+}
+
 // ─── ReparentCmd ─────────────────────────────────────────────────────────
 
 /// A set of commands presented to the undo stack as one authoring gesture.
@@ -2356,6 +2476,37 @@ mod landscape_tests {
         let (names, position) = undo.history();
         assert_eq!(names.len(), 3, "{names:?}");
         assert_eq!(position, 2);
+    }
+
+    /// Undo and redo toast the name of the step they are about to move.
+    #[test]
+    fn the_next_undo_and_redo_names_follow_the_position() {
+        let mut world = World::new();
+        let mut selected = None;
+        let mut undo = UndoStack::new(8);
+        let entity = world.spawn((
+            Transform::default(),
+            Name::new("box"),
+            WorldTransform::identity(),
+        ));
+        assert_eq!(undo.next_undo_name(), None);
+        assert_eq!(undo.next_redo_name(), None);
+
+        undo.push(
+            Box::new(SetNameCmd::new(
+                entity.index(),
+                *world.get::<Name>(entity).unwrap(),
+                Name::new("one"),
+            )),
+            &mut world,
+            &mut selected,
+        );
+        assert_eq!(undo.next_undo_name(), Some("Rename Entity"));
+        assert_eq!(undo.next_redo_name(), None);
+
+        assert!(undo.undo(&mut world, &mut selected));
+        assert_eq!(undo.next_undo_name(), None);
+        assert_eq!(undo.next_redo_name(), Some("Rename Entity"));
     }
 
     /// Clicking a row jumps there, in either direction, and the world follows.

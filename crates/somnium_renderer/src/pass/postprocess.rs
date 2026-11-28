@@ -34,6 +34,78 @@ pub struct Grading {
     /// Painterly amount and ink-line amount (`PostProcessComponent::painterly`, `ink_lines`), then padding. Zero is
     /// off and the shader skips the stage.
     pub stylise: [f32; 4],
+    /// How much of the grading LUT (`PostProcessPass::set_lut`) to take, 0..1; 0 leaves it unread.
+    pub lut_strength: f32,
+    /// Low-light vision (`postprocess.wgsl` `low_light`): 0 off, 1 the eye's own Hunt and Purkinje shift.
+    pub low_light: f32,
+    /// The photographic camera (`PostProcessComponent::photographic`, sunscar-photoreal 6 Nov 2026): the grade on
+    /// the exposed light before the curve, the lens's glare, fall-off and spectral fringe, and sensor noise. Off is
+    /// the chain exactly as before.
+    pub photographic: bool,
+    /// The lens's glare share under the photographic camera (the bloom chain mixed in with energy kept).
+    pub lens_glare: f32,
+    /// Sensor noise under the photographic camera: 1 a real sensor's at the exposure's ISO.
+    pub sensor_noise: f32,
+    /// The camera's white balance, a linear-RGB matrix by rows ([`white_balance_matrix`]); the identity when off.
+    pub white_balance: [[f32; 3]; 3],
+    /// tan(half the vertical field of view) and the aspect (width / height), for the lens's fall-off. The renderer
+    /// fills these from its projection each frame.
+    pub lens: [f32; 2],
+    /// Heat over hot ground: shimmer, the inferior mirage (0 skips each) and the sine of the mirage's vanishing-line
+    /// dip (`PostProcessComponent::heat_shimmer`, `mirage`, `mirage_dip_deg`).
+    pub heat: [f32; 3],
+    /// The camera-relative view-projection (the renderer fills it), for the mirage's bent rays.
+    pub view_proj: [f32; 16],
+}
+
+/// The tone-map index of the debug passthrough (`postprocess.wgsl` `tonemap`): no curve, so a debug view reaches the
+/// screen as the numbers it holds.
+pub const TONEMAP_PASSTHROUGH: u32 = 15;
+
+/// The camera's white balance as a linear-RGB (Rec. 709, D65) matrix, by rows: a Bradford chromatic adaptation from
+/// the white of `kelvin` to D65. The picture is rendered balanced for D65, so a camera set for a lower temperature
+/// (expecting warmer light than it got) renders it cooler, and a higher one warmer, as a real camera does. `kelvin`
+/// 0 (or under 1000) is the identity. The white is the CIE daylight locus from 4,000 K and the Planckian locus below
+/// it (Kim et al. 2002), so 6,504 K is D65 itself.
+#[must_use]
+pub fn white_balance_matrix(kelvin: f32) -> [[f32; 3]; 3] {
+    const IDENTITY: [[f32; 3]; 3] = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    if !(kelvin >= 1000.0) {
+        return IDENTITY;
+    }
+    let t = f64::from(kelvin).clamp(1667.0, 25000.0);
+    let (x, y) = if t >= 4000.0 {
+        let x = if t <= 7000.0 {
+            -4.6070e9 / t.powi(3) + 2.9678e6 / t.powi(2) + 0.09911e3 / t + 0.244063
+        } else {
+            -2.0064e9 / t.powi(3) + 1.9018e6 / t.powi(2) + 0.24748e3 / t + 0.237040
+        };
+        (x, -3.000 * x * x + 2.870 * x - 0.275)
+    } else {
+        let x = -0.2661239e9 / t.powi(3) - 0.2343589e6 / t.powi(2) + 0.8776956e3 / t + 0.179910;
+        let y = if t <= 2222.0 {
+            -1.1063814 * x.powi(3) - 1.34811020 * x * x + 2.18555832 * x - 0.20219683
+        } else {
+            -0.9549476 * x.powi(3) - 1.37418593 * x * x + 2.09137015 * x - 0.16748867
+        };
+        (x, y)
+    };
+    let src = glam::DVec3::new(x / y, 1.0, (1.0 - x - y) / y);
+    let d65 = glam::DVec3::new(0.95047, 1.0, 1.08883);
+    // Bradford, rows as written, so the column constructor takes its transpose.
+    let bradford = glam::DMat3::from_cols_array(&[0.8951, -0.7502, 0.0389, 0.2664, 1.7135, -0.0685, -0.1614, 0.0367, 1.0296]);
+    let scale = (bradford * d65) / (bradford * src);
+    let cat = bradford.inverse() * glam::DMat3::from_diagonal(scale) * bradford;
+    let rgb_to_xyz = glam::DMat3::from_cols_array(&[
+        0.4124564, 0.2126729, 0.0193339, 0.3575761, 0.7151522, 0.1191920, 0.1804375, 0.0721750, 0.9503041,
+    ]);
+    let m = rgb_to_xyz.inverse() * cat * rgb_to_xyz;
+    // White balance moves colour, not exposure: scaled so the rendered white keeps its luminance, as a camera's
+    // channel gains are normalised.
+    let white = m * glam::DVec3::ONE;
+    let m = m * (1.0 / glam::DVec3::new(0.2126, 0.7152, 0.0722).dot(white).max(1e-6));
+    let row = |i: usize| [m.col(0)[i] as f32, m.col(1)[i] as f32, m.col(2)[i] as f32];
+    [row(0), row(1), row(2)]
 }
 
 impl Default for Grading {
@@ -51,8 +123,57 @@ impl Default for Grading {
             time: 0.0,
             response: None,
             stylise: [0.0; 4],
+            lut_strength: 0.0,
+            low_light: 0.0,
+            photographic: false,
+            lens_glare: 0.0,
+            sensor_noise: 0.0,
+            white_balance: [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]],
+            lens: [0.5, 16.0 / 9.0],
+            heat: [0.0; 3],
+            view_proj: glam::Mat4::IDENTITY.to_cols_array(),
         }
     }
+}
+
+/// A `.cube` 3-D LUT (Resolve, Adobe): its edge and `size`^3 RGBA texels, red fastest, as the file lists them.
+/// Only the 0..1 domain; a 1-D LUT or another domain is an error rather than a wrong picture.
+pub fn parse_cube(text: &str) -> Result<(u32, Vec<[f32; 4]>), String> {
+    let mut size = 0_u32;
+    let mut texels = Vec::new();
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with("TITLE") {
+            continue;
+        }
+        let mut words = line.split_whitespace();
+        let first = words.next().unwrap_or_default();
+        match first {
+            "LUT_3D_SIZE" => {
+                size = words.next().and_then(|w| w.parse().ok()).filter(|s| (2..=256).contains(s))
+                    .ok_or_else(|| format!("line {}: LUT_3D_SIZE must be 2..256", n + 1))?;
+                texels.reserve((size as usize).pow(3));
+            }
+            "LUT_1D_SIZE" => return Err("a 1-D LUT; grading takes a 3-D one".into()),
+            "DOMAIN_MIN" | "DOMAIN_MAX" => {
+                let want = if first == "DOMAIN_MIN" { 0.0 } else { 1.0 };
+                if !words.all(|w| w.parse::<f32>().is_ok_and(|v| v == want)) {
+                    return Err(format!("line {}: only the 0..1 domain", n + 1));
+                }
+            }
+            _ => {
+                let rgb: Vec<f32> = line.split_whitespace().filter_map(|w| w.parse().ok()).collect();
+                if rgb.len() != 3 {
+                    return Err(format!("line {}: expected three numbers", n + 1));
+                }
+                texels.push([rgb[0], rgb[1], rgb[2], 1.0]);
+            }
+        }
+    }
+    if size == 0 || texels.len() != (size as usize).pow(3) {
+        return Err(format!("{} entries for LUT_3D_SIZE {size}", texels.len()));
+    }
+    Ok((size, texels))
 }
 
 /// A transition drawn over the whole picture, set by the game each frame it runs (The Somnus Fracture's ways into
@@ -71,8 +192,9 @@ pub struct PictureShift {
 }
 
 /// 16 scalars, 32 response samples, the dream-lens vector, the picture shift (two vectors) and the inverse
-/// view-projection the wave reads the world through.
-const POST_PARAM_FLOATS: usize = 80;
+/// view-projection the wave reads the world through, the stylise vector and the LUT vector; then the photographic
+/// camera's vector, its lens and its white balance (three rows); then heat over hot ground and the view-projection.
+const POST_PARAM_FLOATS: usize = 124;
 
 /// Post-processing pass: HDR texture → tone-mapped swapchain output.
 pub struct PostProcessPass {
@@ -91,6 +213,8 @@ pub struct PostProcessPass {
     exposure_buffer: wgpu::Buffer,
     /// Bloom chain, kept so the bind group survives a resize.
     bloom_view: wgpu::TextureView,
+    /// The grading LUT (binding 5): an unread 2^3 placeholder until `set_lut`.
+    lut_view: wgpu::TextureView,
     sampler: wgpu::Sampler,
     /// Group 1: the visibility buffer and the paint words, from which a pixel is known to belong to a draw kept out
     /// of the retro picture (`vertex_paint::OUTSIDE_RETRO`). Placeholders until `bind_mask`.
@@ -165,6 +289,17 @@ impl PostProcessPass {
                     },
                     count: None,
                 },
+                // The grading LUT (Sunscar, 5 Nov 2026), read through the clamped linear sampler.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -216,6 +351,7 @@ impl PostProcessPass {
         let (hdr_texture, hdr_view) = Self::make_hdr_texture(device, width, height);
         let (scene_copy_texture, scene_copy_view) =
             Self::make_scene_copy_texture(device, width, height);
+        let lut_view = Self::make_lut(device, 2).create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = Self::make_bind_group(
             device,
             &bind_group_layout,
@@ -224,6 +360,7 @@ impl PostProcessPass {
             &params_buffer,
             exposure_buffer,
             bloom_view,
+            &lut_view,
         );
         let exposure_buffer = exposure_buffer.clone();
         let bloom_view = bloom_view.clone();
@@ -349,6 +486,7 @@ impl PostProcessPass {
             scene_copy_view,
             params_buffer,
             sampler,
+            lut_view,
             mask_layout,
             mask_group,
         }
@@ -450,6 +588,7 @@ impl PostProcessPass {
         params_buffer: &wgpu::Buffer,
         exposure_buffer: &wgpu::Buffer,
         bloom_view: &wgpu::TextureView,
+        lut_view: &wgpu::TextureView,
     ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("PostProcess Bind Group"),
@@ -474,6 +613,10 @@ impl PostProcessPass {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::TextureView(bloom_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: wgpu::BindingResource::TextureView(lut_view),
                 },
             ],
         })
@@ -506,6 +649,7 @@ impl PostProcessPass {
             &self.params_buffer,
             &self.exposure_buffer,
             &self.bloom_view,
+            &self.lut_view,
         );
     }
 
@@ -560,7 +704,57 @@ impl PostProcessPass {
         data[56..60].copy_from_slice(&[shift.at[0], shift.at[1], shift.at[2], 0.0]);
         data[60..76].copy_from_slice(&inv_view_proj);
         data[76..80].copy_from_slice(&grading.stylise);
+        data[80..84].copy_from_slice(&[grading.lut_strength.clamp(0.0, 1.0), grading.low_light.clamp(0.0, 1.0), 0.0, 0.0]);
+        // The photographic camera (sunscar-photoreal). All zero but the identity white balance when off, which the
+        // shader never reads then.
+        data[84..88].copy_from_slice(&[
+            f32::from(u8::from(grading.photographic)),
+            if grading.photographic { grading.lens_glare.clamp(0.0, 0.5) } else { 0.0 },
+            if grading.photographic { grading.sensor_noise.max(0.0) } else { 0.0 },
+            0.0,
+        ]);
+        data[88..92].copy_from_slice(&[grading.lens[0], grading.lens[1], 0.0, 0.0]);
+        for (i, row) in grading.white_balance.iter().enumerate() {
+            data[92 + i * 4..95 + i * 4].copy_from_slice(row);
+        }
+        data[104..108].copy_from_slice(&[grading.heat[0].max(0.0), grading.heat[1].max(0.0), grading.heat[2].max(0.0), 0.0]);
+        data[108..124].copy_from_slice(&grading.view_proj);
         queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&data));
+    }
+
+    /// A `size`^3 texture for the grading LUT, Rgba16Float.
+    fn make_lut(device: &wgpu::Device, size: u32) -> wgpu::Texture {
+        device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("Grading LUT"),
+                size: wgpu::Extent3d { width: size, height: size, depth_or_array_layers: size },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D3,
+                format: wgpu::TextureFormat::Rgba16Float,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+    }
+
+    /// Upload a grading LUT (`parse_cube`): `size`^3 texels, red fastest. Bound from the next `bind_scene` or
+    /// `bind_color`; read where `Grading::lut_strength` is above zero.
+    pub fn set_lut(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, size: u32, texels: &[[f32; 4]]) {
+        assert_eq!(texels.len(), (size as usize).pow(3), "a LUT is size^3 texels");
+        let texture = Self::make_lut(device, size);
+        let bits: Vec<u16> =
+            texels.iter().flatten().map(|&v| crate::pass::lighting_extra::f32_to_f16_bits(v)).collect();
+        queue.write_texture(
+            texture.as_image_copy(),
+            bytemuck::cast_slice(&bits),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(size * 8),
+                rows_per_image: Some(size),
+            },
+            wgpu::Extent3d { width: size, height: size, depth_or_array_layers: size },
+        );
+        self.lut_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
     }
 
     /// Point tone-map at a different HDR colour target (FSR output vs scene).
@@ -573,6 +767,7 @@ impl PostProcessPass {
             &self.params_buffer,
             &self.exposure_buffer,
             &self.bloom_view,
+            &self.lut_view,
         );
     }
 
@@ -586,6 +781,7 @@ impl PostProcessPass {
             &self.params_buffer,
             &self.exposure_buffer,
             &self.bloom_view,
+            &self.lut_view,
         );
     }
 
@@ -611,5 +807,76 @@ impl PostProcessPass {
         rpass.set_bind_group(0, &self.bind_group, &[]);
         rpass.set_bind_group(1, &self.mask_group, &[]);
         rpass.draw(0..3, 0..1);
+    }
+}
+
+#[cfg(test)]
+mod white_balance_tests {
+    use super::white_balance_matrix;
+
+    fn apply(m: [[f32; 3]; 3], c: [f32; 3]) -> [f32; 3] {
+        [0, 1, 2].map(|i| m[i][0] * c[0] + m[i][1] * c[1] + m[i][2] * c[2])
+    }
+
+    #[test]
+    fn off_and_d65_leave_the_light_alone() {
+        assert_eq!(white_balance_matrix(0.0), [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+        let d65 = white_balance_matrix(6504.0);
+        for (i, row) in d65.iter().enumerate() {
+            for (j, v) in row.iter().enumerate() {
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((v - want).abs() < 0.01, "6504 K [{i}][{j}] = {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_camera_set_warmer_than_the_light_renders_it_cooler_and_keeps_its_brightness() {
+        let luma = |c: [f32; 3]| 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+        let cool = apply(white_balance_matrix(5000.0), [1.0, 1.0, 1.0]);
+        assert!(cool[2] > cool[0] * 1.1, "5000 K renders daylight white bluer: {cool:?}");
+        let warm = apply(white_balance_matrix(9000.0), [1.0, 1.0, 1.0]);
+        assert!(warm[0] > warm[2] * 1.05, "9000 K renders it warmer: {warm:?}");
+        let tungsten = apply(white_balance_matrix(3000.0), [1.0, 1.0, 1.0]);
+        assert!(tungsten[2] > tungsten[0] * 1.6, "3000 K (tungsten) turns daylight blue: {tungsten:?}");
+        for c in [cool, warm, tungsten] {
+            assert!((luma(c) - 1.0).abs() < 0.05, "white keeps its luminance: {c:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod lut_tests {
+    use super::parse_cube;
+
+    #[test]
+    fn a_cube_file_reads_red_fastest_and_refuses_what_it_cannot_hold() {
+        let mut text = String::from("TITLE \"identity\"
+# made by hand
+LUT_3D_SIZE 2
+DOMAIN_MIN 0 0 0
+DOMAIN_MAX 1 1 1
+");
+        for b in 0..2 {
+            for g in 0..2 {
+                for r in 0..2 {
+                    text += &format!("{r} {g} {b}
+");
+                }
+            }
+        }
+        let (size, texels) = parse_cube(&text).expect("identity");
+        assert_eq!(size, 2);
+        assert_eq!(texels[1], [1.0, 0.0, 0.0, 1.0], "red fastest");
+        assert_eq!(texels[2], [0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(texels[4], [0.0, 0.0, 1.0, 1.0]);
+        assert!(parse_cube("LUT_3D_SIZE 2
+0 0 0
+").is_err(), "too few entries");
+        assert!(parse_cube("LUT_1D_SIZE 16
+").is_err(), "1-D");
+        assert!(parse_cube("LUT_3D_SIZE 2
+DOMAIN_MAX 2 2 2
+").is_err(), "another domain");
     }
 }

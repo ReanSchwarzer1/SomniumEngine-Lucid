@@ -9,8 +9,15 @@
 
 /// AO and bent normal packed into one RGBA8 target: `rgb` = bent normal in
 /// [0,1], `a` = visibility. One texture instead of two keeps the shading pass to
-/// a single extra fetch.
-const GTAO_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+/// a single extra fetch. `SOMNIUM_GTAO_FORMAT=rgba16f` holds both in half floats
+/// (`light_switches.rs`; the shader's storage format follows it).
+fn gtao_format() -> wgpu::TextureFormat {
+    if crate::light_switches::get().gtao_rgba16f {
+        wgpu::TextureFormat::Rgba16Float
+    } else {
+        wgpu::TextureFormat::Rgba8Unorm
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -78,7 +85,7 @@ impl GtaoPass {
             visibility: wgpu::ShaderStages::COMPUTE,
             ty: wgpu::BindingType::StorageTexture {
                 access: wgpu::StorageTextureAccess::WriteOnly,
-                format: GTAO_FORMAT,
+                format: gtao_format(),
                 view_dimension: wgpu::TextureViewDimension::D2,
             },
             count: None,
@@ -202,7 +209,7 @@ impl GtaoPass {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: GTAO_FORMAT,
+                    format: gtao_format(),
                     usage: wgpu::TextureUsages::STORAGE_BINDING
                         | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],

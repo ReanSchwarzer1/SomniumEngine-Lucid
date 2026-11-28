@@ -53,6 +53,91 @@ pub fn level_for(group: &LodGroupComponent, distance: f32, levels: usize) -> Opt
     Some(passed.min(levels - 1))
 }
 
+/// The level of a `LodGroup` that `entity` sits in, as (the group's root, the level): the nearest group above it.
+/// `None` for an entity in no group and for a group's root.
+// ponytail: a group inside a group is asked about its inner group only; nothing nests them today.
+fn level_of(world: &World, entity: Entity) -> Option<(Entity, Entity)> {
+    let mut level = entity;
+    loop {
+        let parent = world.get::<Parent>(level).map(|p| p.entity)?;
+        if parent == Entity::DANGLING || !world.is_alive(parent) {
+            return None;
+        }
+        if world.get::<LodGroupComponent>(parent).is_some() {
+            return Some((parent, level));
+        }
+        level = parent;
+    }
+}
+
+fn name_of(world: &World, entity: Entity) -> String {
+    world.get::<Name>(entity).map_or_else(String::new, |n| n.as_str().to_owned())
+}
+
+/// Whether `entity` is in a level of detail that a camera at `camera` is not shown. It is what [`Lods::is_hidden`]
+/// says in the draw loop, worked out for one entity from the world alone: a click asks it of the few things under
+/// the pointer, so that it takes the copy on screen and not the far copy standing unseen in the same place.
+/// `children` maps each parent to its children.
+#[must_use]
+pub fn hidden_from(world: &World, children: &HashMap<Entity, Vec<Entity>>, entity: Entity, camera: Vec3) -> bool {
+    let Some((root, level)) = level_of(world, entity) else { return false };
+    let Some(group) = world.get::<LodGroupComponent>(root) else { return false };
+    if !group.enabled {
+        return false;
+    }
+    // The levels as `Lods` counts them: the root's direct children by name.
+    let mut levels = children.get(&root).cloned().unwrap_or_default();
+    levels.sort_by_key(|e| name_of(world, *e));
+    let at = world
+        .get::<WorldTransform>(root)
+        .map(|w| w.0.w_axis.truncate())
+        .or_else(|| world.get::<Transform>(root).map(|t| t.translation))
+        .unwrap_or(Vec3::ZERO);
+    let drawn = level_for(group, at.distance(camera), levels.len()).and_then(|i| levels.get(i).copied());
+    drawn != Some(level)
+}
+
+/// The same part in a group's other levels: for each of `selected` that is a part of one level of a `LodGroup`, the
+/// entity of the same name along the same path under each sibling level. Moved alone, a part leaves its far copy
+/// behind, and from thirty metres off it is back where it was. A whole level, a group's root and anything outside a
+/// group have no twins; nor has a part whose name two siblings share, since which is meant cannot be said.
+#[must_use]
+pub fn twins_of(world: &World, children: &HashMap<Entity, Vec<Entity>>, selected: &[Entity]) -> Vec<Entity> {
+    let mut twins = Vec::new();
+    for &entity in selected {
+        let Some((root, level)) = level_of(world, entity) else { continue };
+        // The names from the level down to the part.
+        let mut path = Vec::new();
+        let mut at = entity;
+        while at != level {
+            path.push(name_of(world, at));
+            let Some(parent) = world.get::<Parent>(at).map(|p| p.entity) else { break };
+            at = parent;
+        }
+        if path.is_empty() {
+            continue;
+        }
+        path.reverse();
+        for other in children.get(&root).into_iter().flatten().copied().filter(|l| *l != level) {
+            let mut found = Some(other);
+            for step in &path {
+                found = found.and_then(|at| {
+                    let mut same = children.get(&at).into_iter().flatten().copied().filter(|c| name_of(world, *c) == *step);
+                    let first = same.next();
+                    if same.next().is_some() { None } else { first }
+                });
+            }
+            if let Some(twin) = found
+                && !selected.contains(&twin)
+                && !twins.contains(&twin)
+            {
+                twins.push(twin);
+            }
+        }
+    }
+    twins
+}
+
 struct Group {
     root: Entity,
     /// Every entity of each level's subtree, the level's own root first.
@@ -212,5 +297,47 @@ mod tests {
         world.get_mut::<LodGroupComponent>(house).unwrap().enabled = false;
         lods.update(&world, Vec3::new(100.0, 30.0, 140.0));
         assert!(!lods.is_hidden(near) && !lods.is_hidden(far), "off: every level draws");
+    }
+
+    fn children_of(world: &World) -> HashMap<Entity, Vec<Entity>> {
+        let mut map: HashMap<Entity, Vec<Entity>> = HashMap::new();
+        for (entity, parent) in world.iter_with::<Parent>() {
+            map.entry(parent.entity).or_default().push(entity);
+        }
+        map
+    }
+
+    /// A yard with a bench in each level: the click's answer agrees with the draw loop's at every distance, and the
+    /// bench of one level names the bench of the other as its twin.
+    #[test]
+    fn a_click_asks_what_the_draw_loop_shows_and_a_part_knows_its_twin() {
+        let mut world = World::new();
+        let yard = spawn(&mut world, "yard", None, Vec3::new(100.0, 0.0, 0.0));
+        world.insert_component(yard, LodGroupComponent { enabled: true, distances: Vec3::new(25.0, 100_000.0, 90.0) }).unwrap();
+        let far = spawn(&mut world, "LOD1", Some(yard), Vec3::ZERO);
+        let near = spawn(&mut world, "LOD0", Some(yard), Vec3::ZERO);
+        let bench = spawn(&mut world, "ks_bench", Some(near), Vec3::ZERO);
+        let logs = spawn(&mut world, "ks_logs", Some(near), Vec3::ZERO);
+        let far_bench = spawn(&mut world, "ks_bench", Some(far), Vec3::ZERO);
+        let well = spawn(&mut world, "well", None, Vec3::ZERO);
+        let children = children_of(&world);
+
+        let mut lods = Lods::default();
+        for distance in [5.0, 24.0, 26.0, 60.0, 95.0] {
+            let camera = Vec3::new(100.0 + distance, 0.0, 0.0);
+            lods.update(&world, camera);
+            for entity in [near, far, bench, logs, far_bench, well, yard] {
+                assert_eq!(hidden_from(&world, &children, entity, camera), lods.is_hidden(entity), "{entity:?} at {distance} m");
+            }
+        }
+
+        assert_eq!(twins_of(&world, &children, &[bench]), vec![far_bench]);
+        assert_eq!(twins_of(&world, &children, &[far_bench]), vec![bench]);
+        assert!(twins_of(&world, &children, &[bench, far_bench]).is_empty(), "both are selected already");
+        assert!(twins_of(&world, &children, &[logs]).is_empty(), "the far level has no logs");
+        assert!(twins_of(&world, &children, &[near, yard, well]).is_empty(), "a level, a root and a well have none");
+        // Two far benches of one name: which is the twin cannot be said.
+        spawn(&mut world, "ks_bench", Some(far), Vec3::ZERO);
+        assert!(twins_of(&world, &children_of(&world), &[bench]).is_empty());
     }
 }

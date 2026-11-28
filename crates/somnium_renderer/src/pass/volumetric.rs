@@ -23,13 +23,17 @@
 /// Low resolution is the point: in-scattering is smooth, so it is cheap to
 /// integrate coarsely and interpolate. 32³ is the size Bevy and Hillaire both
 /// use, and it costs 32 slices × 2 steps = 64 samples per column.
+/// 48 x 27 x 64 since 6 Nov 2026 (Sunscar): 32 columns across a 2560 px screen were 80 px wide, the "bands on far
+/// hillsides" (ENGINE_AUDIT E42), and 32 even slices were 37.5 m deep; the slices are exponential now
+/// (`froxel_depth.wgsl`), 3.7 m deep at the feet.
 const VOLUME_SIZE: wgpu::Extent3d = wgpu::Extent3d {
-    width: 32,
-    height: 32,
-    depth_or_array_layers: 32,
+    width: 48,
+    height: 27,
+    depth_or_array_layers: 64,
 };
 
-/// How far the volume reaches, in metres.
+/// How far the volume reaches, in metres, unless a scene asks otherwise
+/// (`PostProcessComponent::fog_range`).
 ///
 /// Past this the last slice is held, so anything further reads as fully
 /// fogged. A kilometre covers the default terrain; the sky beyond it is drawn
@@ -58,7 +62,19 @@ struct VolumetricParams {
     frame: u32,
     grain_enabled: u32,
     fog_sky_occlusion: f32,
-    _pad: [f32; 3],
+    fog_skylight: f32,
+    fog_top_height: f32,
+    fog_top_softness: f32,
+    /// 1: the clouds' sky-light capture holds a deck, and the fog's sky light comes through it.
+    cloud_sky: f32,
+    /// 1: `sun_illuminance` is the sun above the air (`VolumetricPass::above_air`).
+    above_air: f32,
+    /// The aerosols' factor (`VolumetricPass::aerosol`).
+    aerosol: f32,
+    _cloud_pad: f32,
+    /// The planet over the horizon (`VolumetricPass::planet`).
+    planet_direction: [f32; 4],
+    planet_light: [f32; 4],
 }
 
 #[cfg(test)]
@@ -68,6 +84,34 @@ mod tests {
     #[test]
     fn params_keep_rust_and_wgsl_uniform_alignment() {
         assert_eq!(std::mem::size_of::<VolumetricParams>() % 16, 0);
+    }
+
+    /// The aerosols' factor sits where naga puts `aerosol` in `volumetric.wgsl` (the old padding: the struct keeps its
+    /// size), and the froxel march reads it into `atmosphere_aerosol` before anything else.
+    #[test]
+    fn the_factor_lies_where_the_shader_reads_it() {
+        let text = crate::shaders::Shaders::new().source_or_panic("volumetric.wgsl");
+        let (aerosol, size) = crate::shaders::wgsl_member_offset(&text, "VolumetricParams", "aerosol");
+        assert_eq!(aerosol as usize, std::mem::offset_of!(VolumetricParams, aerosol));
+        let (planet, _) = crate::shaders::wgsl_member_offset(&text, "VolumetricParams", "planet_light");
+        assert_eq!(planet as usize, std::mem::offset_of!(VolumetricParams, planet_light));
+        assert_eq!(size as usize, std::mem::size_of::<VolumetricParams>());
+        assert_eq!(text.matches("atmosphere_aerosol = vol.aerosol;").count(), 1);
+    }
+
+    /// A weather transition moves the fog a little each frame; a preset change or a new range starts the volume again.
+    #[test]
+    fn a_small_step_in_the_fog_is_eased_and_a_jump_is_not() {
+        let at = |density: f32, base: f32, shafts: u32, range: f32| {
+            [density.to_bits(), 0.6_f32.to_bits(), 120.0_f32.to_bits(), base.to_bits(), shafts, 1.5_f32.to_bits(),
+             0.0_f32.to_bits(), 1.0_f32.to_bits(), 0.0_f32.to_bits(), 8.0_f32.to_bits(), range.to_bits()]
+        };
+        let was = at(0.0100, 300.0, 1, 1200.0);
+        assert!(super::eased(&was, &at(0.0103, 300.4, 1, 1200.0)));
+        assert!(!super::eased(&was, &at(0.0200, 300.0, 1, 1200.0)), "density doubled");
+        assert!(!super::eased(&was, &at(0.0100, 340.0, 1, 1200.0)), "the fog moved 40 m");
+        assert!(!super::eased(&was, &at(0.0100, 300.0, 0, 1200.0)), "shafts switched");
+        assert!(!super::eased(&was, &at(0.0100, 300.0, 1, 2400.0)), "the range changed");
     }
 
     #[test]
@@ -81,6 +125,20 @@ mod tests {
     }
 }
 
+/// Whether one frame's fog settings are a small step from the last's (`VolumetricPass::eased_settings`): the switches
+/// and the range the same, every level within a twentieth or a small absolute step (two metres for the heights).
+fn eased(last: &[u32; 11], now: &[u32; 11]) -> bool {
+    // By index in `record`'s `settings`: 4 the shafts switch, 10 the range; 3 and 8 the base and top heights.
+    (0..11).all(|i| {
+        let (a, b) = (f32::from_bits(last[i]), f32::from_bits(now[i]));
+        match i {
+            4 | 10 => last[i] == now[i],
+            3 | 8 | 9 => (a - b).abs() <= 2.0,
+            _ => (a - b).abs() <= (a.abs() * 0.05).max(1e-5),
+        }
+    })
+}
+
 /// Artist-facing settings for the fog medium.
 #[derive(Clone, Copy, Debug)]
 pub struct FogSettings {
@@ -91,6 +149,10 @@ pub struct FogSettings {
     /// Metres over which density falls to 1/e above `base_height`.
     pub height_falloff: f32,
     pub base_height: f32,
+    /// World height where the fog stops, over `top_softness` metres: valley fog under a flat top with the ridges
+    /// clear (Sunscar, 6 Nov 2026). At or under `base_height` there is no top, the default.
+    pub top_height: f32,
+    pub top_softness: f32,
     /// Shadow-test each step, which is what draws light shafts.
     pub shafts: bool,
     /// Shadow-visibility contrast. 0 is neutral; 1 applies full occlusion.
@@ -98,6 +160,9 @@ pub struct FogSettings {
     /// How far the sun's shadow map also hides skylight from the fog, 0..=1.
     /// 0 lights the fog with the whole sky everywhere.
     pub sky_occlusion: f32,
+    /// Scale on the sky light the fog scatters, apart from the sun's and the lamps' (1 as the sky gives it). Under
+    /// 1, a moon can light the ground while the fog away from the lights stays dark.
+    pub skylight: f32,
 }
 
 impl Default for FogSettings {
@@ -117,9 +182,12 @@ impl Default for FogSettings {
             asymmetry: 0.6,
             height_falloff: 120.0,
             base_height: 0.0,
+            top_height: 0.0,
+            top_softness: 8.0,
             shafts: true,
             shaft_intensity: 1.5,
             sky_occlusion: 0.0,
+            skylight: 1.0,
         }
     }
 }
@@ -139,13 +207,27 @@ pub struct VolumetricPass {
     history_view: wgpu::TextureView,
     grain_view: wgpu::TextureView,
     grain_enabled: bool,
+    /// Last frame's camera-relative view-projection and its camera (`record`).
     prev_view_proj: glam::Mat4,
+    prev_camera: glam::Vec3,
     history_valid: bool,
     frame: u32,
-    last_settings: Option<[u32; 7]>,
+    last_settings: Option<[u32; 11]>,
+    /// Weather eases the fog a little every frame (Sunscar, 11 Nov 2026): with this on, a small step in density,
+    /// height or top keeps last frame's volume, which a bit-for-bit change would throw away every frame of a
+    /// transition (the fog then never settles and shimmers). Off, any change starts the volume again, as before.
+    pub eased_settings: bool,
     pub enabled: bool,
     pub fog: FogSettings,
     pub max_distance: f32,
+    /// `sun_illuminance` is the sun above the air (`Renderer::sky_above_air`): the sky's multiply scattered light is
+    /// then read for a sun near and under the horizon as it falls (`sample_multiscatter_twilight`).
+    pub above_air: bool,
+    /// The planet over the horizon, as the cloud pass takes it (`CloudPass::planet`); all zero is none.
+    pub planet: [[f32; 4]; 2],
+    /// The aerosols' factor on the air's Mie scattering and extinction (`Renderer::aerosol`, as the renderer steps it;
+    /// set each frame), 1 as the shader's constants are written.
+    pub aerosol: f32,
 }
 
 impl VolumetricPass {
@@ -265,6 +347,28 @@ impl VolumetricPass {
                 storage(11),
                 storage(12),
                 storage(13),
+                // The clouds: their sky-light capture (a cube), their shadow field and its params (Sunscar, 6 Nov).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 14,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::Cube,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                lut(15),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 16,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -338,14 +442,19 @@ impl VolumetricPass {
             grain_view: grain_view.clone(),
             grain_enabled: crate::pass::grain::enabled_by_default("SOMNIUM_DREAMS_GRAIN"),
             prev_view_proj: glam::Mat4::IDENTITY,
+            prev_camera: glam::Vec3::ZERO,
             history_valid: false,
             frame: 0,
             last_settings: None,
+            eased_settings: false,
             // `SOMNIUM_VOLUMETRICS=0` switches the whole volume off, which is
             // the A/B both sub-phases are judged by.
             enabled: std::env::var("SOMNIUM_VOLUMETRICS").as_deref() != Ok("0"),
             fog: FogSettings::default(),
             max_distance: DEFAULT_MAX_DISTANCE,
+            above_air: false,
+            planet: [[0.0; 4]; 2],
+            aerosol: 1.0,
         }
     }
 
@@ -369,6 +478,9 @@ impl VolumetricPass {
         light_buffer: &wgpu::Buffer,
         shadow_atlas: &wgpu::TextureView,
         cluster: &crate::cluster::ClusterGrid,
+        cloud_sky: &wgpu::TextureView,
+        cloud_shadow: &wgpu::TextureView,
+        cloud_shadow_params: &wgpu::Buffer,
     ) {
         if self.bind_group.is_some() {
             return;
@@ -433,6 +545,18 @@ impl VolumetricPass {
                     binding: 13,
                     resource: cluster.params_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 14,
+                    resource: wgpu::BindingResource::TextureView(cloud_sky),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 15,
+                    resource: wgpu::BindingResource::TextureView(cloud_shadow),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 16,
+                    resource: cloud_shadow_params.as_entire_binding(),
+                },
             ],
         }));
     }
@@ -442,7 +566,10 @@ impl VolumetricPass {
         if self.enabled { self.max_distance } else { 0.0 }
     }
 
-    /// `view_proj` is the forward matrix, kept for next frame's reprojection.
+    /// `view_proj` is the forward matrix, kept for next frame's reprojection. `cloud_sky`: the clouds' sky-light
+    /// capture holds a marched deck (`CloudPass::sky_light_clouds`).
+    /// `inv_view_proj` and `view_proj` are camera-relative (projection x the view's rotation alone): the absolute
+    /// inverse snaps every froxel ray to 2^-7 in ndc 13 km from the origin (Sunscar, 5 Nov 2026).
     pub fn record(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -453,6 +580,7 @@ impl VolumetricPass {
         camera_pos: glam::Vec3,
         sun_direction: glam::Vec3,
         sun_illuminance: glam::Vec3,
+        cloud_sky: bool,
     ) {
         let Some(bind_group) = self.bind_group.as_ref() else {
             return;
@@ -473,8 +601,13 @@ impl VolumetricPass {
             u32::from(self.fog.shafts),
             self.fog.shaft_intensity.to_bits(),
             self.fog.sky_occlusion.to_bits(),
+            self.fog.skylight.to_bits(),
+            self.fog.top_height.to_bits(),
+            self.fog.top_softness.to_bits(),
+            // A new range moves every slice: last frame's volume no longer lines up.
+            self.max_distance.to_bits(),
         ];
-        if self.last_settings.is_some_and(|last| last != settings) {
+        if self.last_settings.is_some_and(|last| last != settings && !(self.eased_settings && eased(&last, &settings))) {
             self.history_valid = false;
         }
         self.last_settings = Some(settings);
@@ -499,7 +632,10 @@ impl VolumetricPass {
                 } else {
                     1.0
                 },
-                prev_view_proj: self.prev_view_proj.to_cols_array_2d(),
+                // Moved by the camera's step (small, exact in f32), so it takes this frame's camera-relative points.
+                prev_view_proj: (self.prev_view_proj
+                    * glam::Mat4::from_translation(camera_pos - self.prev_camera))
+                .to_cols_array_2d(),
                 history_valid: f32::from(u8::from(self.history_valid)),
                 // A low-discrepancy offset rather than a random one: over any
                 // short window the samples should spread evenly through the
@@ -509,7 +645,15 @@ impl VolumetricPass {
                 frame: self.frame,
                 grain_enabled: u32::from(self.grain_enabled),
                 fog_sky_occlusion: self.fog.sky_occlusion.clamp(0.0, 1.0),
-                _pad: [0.0; 3],
+                fog_skylight: self.fog.skylight.max(0.0),
+                fog_top_height: self.fog.top_height,
+                fog_top_softness: self.fog.top_softness.max(0.1),
+                cloud_sky: f32::from(u8::from(cloud_sky)),
+                above_air: f32::from(u8::from(self.above_air)),
+                aerosol: self.aerosol,
+                _cloud_pad: 0.0,
+                planet_direction: self.planet[0],
+                planet_light: self.planet[1],
             }),
         );
 
@@ -539,6 +683,7 @@ impl VolumetricPass {
         );
 
         self.prev_view_proj = view_proj;
+        self.prev_camera = camera_pos;
         self.history_valid = true;
         self.frame = self.frame.wrapping_add(1);
     }

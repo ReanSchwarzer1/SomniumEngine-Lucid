@@ -11,7 +11,8 @@ pub struct GpuParticle {
     pub uv_rect: [f32; 4],
     pub rotation: f32,
     pub texture_index: i32,
-    /// Bit 0 additive; bit 1 world-up billboard; bit 2 mirrored sprite UV.
+    /// Bit 0 additive; bit 1 world-up billboard; bit 2 mirrored sprite UV; bit 3 lit by the sun and sky
+    /// (`colour` is then an albedo); bit 4 an untextured sprite drawn as a flame's tongue.
     pub flags: u32,
     /// Tip displacement in sprite-width units; its base stays pinned.
     pub flutter: f32,
@@ -24,6 +25,8 @@ struct ParticleView {
     _pad0: f32,
     camera_up: [f32; 3],
     _pad1: f32,
+    camera_pos: [f32; 3],
+    _pad2: f32,
 }
 const MAX_PARTICLES: usize = 10_000;
 struct ViewBuffers {
@@ -38,6 +41,10 @@ pub struct ParticlePass {
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     views: Vec<ViewBuffers>,
+    /// Group 2: the light round a lit sprite (sun shadow, sky cube, cloud shadow). Stand-ins until `bind_sky`.
+    sky_layout: wgpu::BindGroupLayout,
+    sky_group: wgpu::BindGroup,
+    sky_on: wgpu::Buffer,
 }
 impl ParticlePass {
     pub fn new(
@@ -80,9 +87,10 @@ impl ParticlePass {
                 },
             ],
         });
+        let sky_layout = sky_layout(device);
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Particle pipeline layout"),
-            bind_group_layouts: &[Some(&layout), Some(global)],
+            bind_group_layouts: &[Some(&layout), Some(global), Some(&sky_layout)],
             immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -126,7 +134,8 @@ impl ParticlePass {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: crate::pass::visibility::DEPTH_FORMAT,
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                // Reversed-Z: nearer is larger (renderer.rs `set_view`).
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
             }),
@@ -141,7 +150,11 @@ impl ParticlePass {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
+        let (sky_group, sky_on) = stand_in_sky(device, &sky_layout);
         Self {
+            sky_layout,
+            sky_group,
+            sky_on,
             pipeline,
             layout,
             sampler,
@@ -196,6 +209,34 @@ impl ParticlePass {
             buffers.reactive_view = buffers.reactive.create_view(&Default::default());
         }
     }
+    /// Light the lit sprites (flag 8) as the scene is lit: the sun through its shadow cascades and the clouds'
+    /// ground shadow, the sky's light cube as the fill. Rebuilt every frame (one small bind group), as the views
+    /// may be remade when a setting changes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_sky(
+        &mut self,
+        device: &wgpu::Device,
+        shadow_atlas: &wgpu::TextureView,
+        shadow_sampler: &wgpu::Sampler,
+        env_cube: &wgpu::TextureView,
+        env_sampler: &wgpu::Sampler,
+        cloud_shadow: &wgpu::TextureView,
+        cloud_shadow_params: &wgpu::Buffer,
+    ) {
+        self.sky_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Particle sky light"),
+            layout: &self.sky_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(shadow_atlas) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(shadow_sampler) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(env_cube) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(env_sampler) },
+                wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(cloud_shadow) },
+                wgpu::BindGroupEntry { binding: 5, resource: cloud_shadow_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: self.sky_on.as_entire_binding() },
+            ],
+        });
+    }
     /// This frame's depth-tested sprite coverage; cleared even when emission stops.
     pub fn reactive_view(&self, slot: usize) -> Option<&wgpu::TextureView> {
         self.views.get(slot).map(|view| &view.reactive_view)
@@ -231,6 +272,8 @@ impl ParticlePass {
                 _pad0: 0.0,
                 camera_up: up.to_array(),
                 _pad1: 0.0,
+                camera_pos: view.inverse().w_axis.truncate().to_array(),
+                _pad2: 0.0,
             }),
         );
         let mut sorted: Vec<_> = particles
@@ -285,8 +328,97 @@ impl ParticlePass {
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &buffers.group, &[]);
         pass.set_bind_group(1, global, &[]);
+        pass.set_bind_group(2, &self.sky_group, &[]);
         pass.draw(0..6, 0..sorted.len() as u32);
     }
+}
+
+fn sky_layout(device: &wgpu::Device) -> wgpu::BindGroupLayout {
+    let fragment = wgpu::ShaderStages::FRAGMENT;
+    let texture = |binding, sample_type, view_dimension| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: fragment,
+        ty: wgpu::BindingType::Texture { sample_type, view_dimension, multisampled: false },
+        count: None,
+    };
+    let sampler = |binding, kind| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: fragment,
+        ty: wgpu::BindingType::Sampler(kind),
+        count: None,
+    };
+    let uniform = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: fragment,
+        ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+        count: None,
+    };
+    let float = wgpu::TextureSampleType::Float { filterable: true };
+    device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("Particle sky light BGL"),
+        entries: &[
+            texture(0, wgpu::TextureSampleType::Depth, wgpu::TextureViewDimension::D2),
+            sampler(1, wgpu::SamplerBindingType::Comparison),
+            texture(2, float, wgpu::TextureViewDimension::Cube),
+            sampler(3, wgpu::SamplerBindingType::Filtering),
+            texture(4, float, wgpu::TextureViewDimension::D2),
+            uniform(5),
+            uniform(6),
+        ],
+    })
+}
+
+/// One-texel stand-ins for the sky group, with `sky_on` 0 (the old fill), and the buffer `bind_sky` binds with 1.
+fn stand_in_sky(device: &wgpu::Device, layout: &wgpu::BindGroupLayout) -> (wgpu::BindGroup, wgpu::Buffer) {
+    use wgpu::util::DeviceExt;
+    let texel = |label, format, layers| {
+        device.create_texture(&wgpu::TextureDescriptor {
+            label: Some(label),
+            size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: layers },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        })
+    };
+    let depth = texel("Particle sky stand-in depth", wgpu::TextureFormat::Depth32Float, 1).create_view(&Default::default());
+    let cube = texel("Particle sky stand-in cube", wgpu::TextureFormat::Rgba16Float, 6).create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::Cube),
+        ..Default::default()
+    });
+    let flat = texel("Particle sky stand-in shadow", wgpu::TextureFormat::Rgba16Float, 1).create_view(&Default::default());
+    let compare = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("Particle sky stand-in compare"),
+        compare: Some(wgpu::CompareFunction::GreaterEqual),
+        ..Default::default()
+    });
+    let filter = device.create_sampler(&wgpu::SamplerDescriptor { label: Some("Particle sky stand-in filter"), ..Default::default() });
+    let zeros = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Particle sky off"),
+        contents: bytemuck::cast_slice(&[0.0f32; 4]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let on = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("Particle sky on"),
+        contents: bytemuck::cast_slice(&[1.0f32, 0.0, 0.0, 0.0]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Particle sky stand-ins"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&depth) },
+            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&compare) },
+            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&cube) },
+            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&filter) },
+            wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(&flat) },
+            wgpu::BindGroupEntry { binding: 5, resource: zeros.as_entire_binding() },
+            wgpu::BindGroupEntry { binding: 6, resource: zeros.as_entire_binding() },
+        ],
+    });
+    (group, on)
 }
 
 fn reactive_target(device: &wgpu::Device, size: [u32; 2]) -> wgpu::Texture {

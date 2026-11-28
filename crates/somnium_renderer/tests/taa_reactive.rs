@@ -94,7 +94,7 @@ fn frame(
     });
     let mut encoder = device.create_command_encoder(&Default::default());
     assert!(
-        taa.record(&mut encoder, queue, glam::Mat4::IDENTITY, SIZE, SIZE)
+        taa.record(&mut encoder, queue, glam::Mat4::IDENTITY, glam::Vec3::ZERO, SIZE, SIZE)
             .is_some()
     );
     encoder.copy_texture_to_buffer(

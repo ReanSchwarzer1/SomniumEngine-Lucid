@@ -28,6 +28,7 @@ pub mod indirect;
 pub mod instance;
 pub mod instance_batch;
 pub mod jobs;
+pub mod light_switches;
 pub mod material;
 pub mod meshlet;
 pub mod pass;
@@ -37,6 +38,7 @@ pub mod renderer;
 pub mod shaders;
 pub mod shadow;
 pub mod skinning;
+pub mod snow_map;
 pub mod terrain;
 pub mod texture_pool;
 pub mod timing;
@@ -70,6 +72,24 @@ pub struct SkyEyeParams {
     pub pupil: f32,
     pub pulse_hz: f32,
     pub glow: f32,
+}
+
+/// The planet over the horizon (from `somnium.SkyPlanet`, Sunscar): drawn on the sky by the shading pass, and the
+/// night's light through the moon slot. `radius` 0 draws none and leaves the moon as it was.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PlanetParams {
+    /// World direction toward its centre.
+    pub direction: glam::Vec3,
+    /// Its angular radius, radians.
+    pub radius: f32,
+    /// Its light above the air, lux per channel: its albedo x the sun's light x its disc x its phase.
+    pub light_above_air: glam::Vec3,
+    /// The same through the air along its direction: its light on the ground.
+    pub light_ground: glam::Vec3,
+    /// Its geometric albedo.
+    pub albedo: f32,
+    /// Its surface: seed, turns of its spin, the fissures' glow (cd/m2), our world's light on its night side.
+    pub surface: [f32; 4],
 }
 
 impl Default for SkyEyeParams {

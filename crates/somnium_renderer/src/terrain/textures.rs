@@ -445,6 +445,116 @@ pub fn layer_tiling_at(asset_dir: &Path) -> [f32; TERRAIN_LAYER_COUNT as usize] 
     tiling
 }
 
+/// Each layer's colour seen from afar with what grows on it (`layer_far_colour.json` beside the layers: material name ->
+/// linear RGB), over `mean` (the bare scans' means), for the macro tier. Past the ground cover's reach the terrain is
+/// all there is, and a sward's ground showed its bare soil scan from there: purple-grey and red past the grass
+/// (Sunscar, 5 Nov 2026). A layer the file does not name keeps its scan's mean.
+#[must_use]
+pub fn with_far_colours(
+    mean: &[[f32; 4]; TERRAIN_LAYER_COUNT as usize],
+    asset_dir: &Path,
+) -> [[f32; 4]; TERRAIN_LAYER_COUNT as usize] {
+    let mut out = *mean;
+    let path = asset_dir.join("layer_far_colour.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return out;
+    };
+    let colours: serde_json::Map<String, serde_json::Value> = match serde_json::from_str(&text) {
+        Ok(map) => map,
+        Err(err) => {
+            tracing::warn!("{}: {err}", path.display());
+            return out;
+        }
+    };
+    for (slot, name) in LAYER_MATERIALS.iter().enumerate() {
+        let Some(rgb) = colours.get(*name).and_then(serde_json::Value::as_array) else { continue };
+        let c: Vec<f32> = rgb.iter().filter_map(serde_json::Value::as_f64).map(|v| v as f32).collect();
+        if c.len() == 3 && c.iter().all(|v| v.is_finite() && (0.0..=1.0).contains(v)) {
+            out[slot] = [c[0], c[1], c[2], out[slot][3]];
+        }
+    }
+    out
+}
+
+/// The beds of a layer set's stack (`layer_strata.json` beside the layers: `{"beds": [[layer, bottom_m], ...]}`, a
+/// layer by material name as [`LAYER_MATERIALS`] spells it or by slot, and the height of its bottom above the stack's
+/// base, which terrain bakes per tile as the strata datum, `{tile}.strata`): a steep pixel wears the bed its own height
+/// lies in, so contacts run level along a wall. Empty with no file (the splat decides, as before).
+#[must_use]
+pub fn layer_strata(asset_dir: &Path) -> Vec<(u32, f32)> {
+    // `SOMNIUM_STRATA_TABLE=E:/x.json` previews one table on every set before a set writes its own.
+    let path = std::env::var("SOMNIUM_STRATA_TABLE")
+        .map_or_else(|_| asset_dir.join("layer_strata.json"), std::path::PathBuf::from);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!("{}: {err}", path.display());
+            return Vec::new();
+        }
+    };
+    let Some(beds) = value.get("beds").and_then(serde_json::Value::as_array) else {
+        return Vec::new();
+    };
+    beds.iter()
+        .filter_map(|b| {
+            let b = b.as_array()?;
+            let slot = b.first().and_then(|v| {
+                v.as_u64().map(|s| s as usize).or_else(|| {
+                    v.as_str().and_then(|name| LAYER_MATERIALS.iter().position(|m| *m == name))
+                })
+            })?;
+            let bottom = b.get(1)?.as_f64()? as f32;
+            (slot < TERRAIN_LAYER_COUNT as usize && bottom.is_finite()).then_some((slot as u32, bottom))
+        })
+        .collect()
+}
+
+/// Whether a layer set names its layers' colours from afar (`layer_far_colour.json`, [`with_far_colours`]): then the
+/// macro tier fades in with distance ([`super::MACRO_FADES`]); without, it holds at every distance as it always has.
+#[must_use]
+pub fn has_far_colours(asset_dir: &Path) -> bool {
+    asset_dir.join("layer_far_colour.json").is_file()
+}
+
+/// The layers a steep wall may wear (`layer_rock.json` beside the layers: a list of material names, as
+/// [`LAYER_MATERIALS`] spells them, or slot numbers), one bit per slot. A wall takes the splat's strongest layer where
+/// it is one of these, so a canyon's walls show each bed's own scan; elsewhere, and with no file, the cliff layer
+/// (Sunscar, 11 Nov 2026: the Vela Canyon's beds vanished on its walls under the one cliff layer).
+#[must_use]
+pub fn layer_rock_mask(asset_dir: &Path) -> u32 {
+    // `SOMNIUM_TERRAIN_ROCK_LAYERS=21,9,3` previews a list on every set before a set writes its file.
+    if let Ok(slots) = std::env::var("SOMNIUM_TERRAIN_ROCK_LAYERS") {
+        return slots
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .filter(|&s| s < TERRAIN_LAYER_COUNT)
+            .fold(0, |mask, s| mask | (1 << s));
+    }
+    let path = asset_dir.join("layer_rock.json");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return 0;
+    };
+    let list: Vec<serde_json::Value> = match serde_json::from_str(&text) {
+        Ok(list) => list,
+        Err(err) => {
+            tracing::warn!("{}: {err}", path.display());
+            return 0;
+        }
+    };
+    list.iter().fold(0, |mask, v| {
+        let slot = v.as_u64().map(|s| s as usize).or_else(|| {
+            v.as_str().and_then(|name| LAYER_MATERIALS.iter().position(|m| *m == name))
+        });
+        match slot {
+            Some(s) if s < TERRAIN_LAYER_COUNT as usize => mask | (1 << s),
+            _ => mask,
+        }
+    })
+}
+
 /// Moisture affinity 0..1 from the XV-A manifest (porous-wetting weights).
 pub const LAYER_MOISTURE: [f32; TERRAIN_LAYER_COUNT as usize] = [
     0.55, 0.70, 0.25, 0.15, 0.60, 0.95, 0.45, 0.20, 0.35, 0.90, 0.40, 0.50, 0.55, 0.85, 0.20, 0.40,
@@ -2138,5 +2248,55 @@ mod bc7_pack_tests {
         assert!(parse_bc7_chain(&bytes, 4, "t.bc7").is_err());
         bytes.pop();
         assert_eq!(parse_bc7_chain(&bytes, 4, "t.bc7").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn far_colours_replace_the_named_layers_means_only() {
+        let dir = std::env::temp_dir().join(format!("somnium_far_colour_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mean = [[0.3, 0.2, 0.25, 1.0]; TERRAIN_LAYER_COUNT as usize];
+        assert_eq!(with_far_colours(&mean, &dir), mean, "no file: the scans' means");
+        let (a, b) = (LAYER_MATERIALS[0], LAYER_MATERIALS[4]);
+        std::fs::write(dir.join("layer_far_colour.json"), format!(r#"{{"{a}": [0.1, 0.2, 0.05], "{b}": [2.0, 0.0, 0.0]}}"#)).unwrap();
+        let far = with_far_colours(&mean, &dir);
+        assert_eq!(far[0], [0.1, 0.2, 0.05, 1.0]);
+        assert_eq!(far[4], mean[4], "out of 0..1: ignored");
+        assert_eq!(far[1], mean[1]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+}
+
+#[cfg(test)]
+mod layer_rock_tests {
+    use super::*;
+
+    #[test]
+    fn a_set_names_its_rock_layers_by_material_or_slot() {
+        let dir = std::env::temp_dir().join(format!("somnium_layer_rock_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(layer_rock_mask(&dir), 0, "no file: walls keep the cliff layer");
+        std::fs::write(dir.join("layer_rock.json"), format!("[\"{}\", 21, 99, \"no such layer\"]", LAYER_MATERIALS[2])).unwrap();
+        assert_eq!(layer_rock_mask(&dir), (1 << 2) | (1 << 21));
+        std::fs::write(dir.join("layer_rock.json"), "not json").unwrap();
+        assert_eq!(layer_rock_mask(&dir), 0);
+    }
+}
+
+#[cfg(test)]
+mod layer_strata_tests {
+    use super::*;
+
+    #[test]
+    fn a_set_names_its_beds_by_material_or_slot() {
+        let dir = std::env::temp_dir().join(format!("somnium_layer_strata_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(layer_strata(&dir).is_empty(), "no file: the splat decides");
+        std::fs::write(
+            dir.join("layer_strata.json"),
+            format!(r#"{{"beds": [["{}", 42.0], [21, 422], [99, 0], [8]]}}"#, LAYER_MATERIALS[2]),
+        )
+        .unwrap();
+        assert_eq!(layer_strata(&dir), vec![(2, 42.0), (21, 422.0)]);
     }
 }

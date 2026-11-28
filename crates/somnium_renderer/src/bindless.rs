@@ -460,6 +460,15 @@ impl GlobalResourcePool {
         self.lean_bind_group = self.rebuild_bind_group(device, &[&dummy]);
     }
 
+    /// A grown material buffer, in both groups: the lean one too, as velocity reads `materials` through it (the
+    /// grass material, added after a scene's, landed past the lean group's old buffer; 19 Nov 2026).
+    pub fn set_material_buffer(&mut self, device: &wgpu::Device, buffer: &wgpu::Buffer) {
+        self.material_buffer = buffer.clone();
+        self.update_textures(device);
+        let dummy = self.dummy_view.clone();
+        self.lean_bind_group = self.rebuild_bind_group(device, &[&dummy]);
+    }
+
     pub fn update_textures(&mut self, device: &wgpu::Device) {
         let views: Vec<&wgpu::TextureView> = self.texture_views[..self.bound_len()].iter().collect();
         self.bind_group = self.rebuild_bind_group(device, &views);

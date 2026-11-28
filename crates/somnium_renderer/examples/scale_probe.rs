@@ -212,7 +212,7 @@ impl Probe {
                         casts_shadow: true,
                         shadow_far: 0.0,
                     };
-                    renderer.set_instance_batch(id as u64, &InstanceBatch { parts: vec![part], placements });
+                    renderer.set_instance_batch(id as u64, &InstanceBatch { parts: vec![part], placements, fade: 0.0 });
                 }
                 println!(
                     "
@@ -267,7 +267,7 @@ set {n} instances as {batches} batches in {:.1} ms",
                             shadow_far: 0.0,
                         })
                         .collect();
-                    renderer.set_instance_batch(1_000_000 + g as u64, &InstanceBatch { parts, placements });
+                    renderer.set_instance_batch(1_000_000 + g as u64, &InstanceBatch { parts, placements, fade: 0.0 });
                 }
                 println!("
 glTF {path}: {} nodes, {n} copies, {} tinted materials", nodes.len(), tinted.len());

@@ -20,6 +20,8 @@
 - **Play** — possess the Outliner Camera · **Stop** — restore the fly-cam
 - **RMB + scroll** — camera speed
 - **T / R / S** — move / rotate / scale
+- **G** — carry the selection over the ground (roof, rock or terrain under the pointer) · **click / Enter** — put it
+  down · **Esc** — put it back · while carrying: **Shift** tilts to the slope, **wheel** turns, **Ctrl** snaps
 - **L** — light gizmos
 - **F5** — shading mode · **F9 / F10** — GPU draw / GPU frustum A/B (15B). Camera **Frustum Cull** in Details is the CPU early-out (CR-B), independent of F10.
 

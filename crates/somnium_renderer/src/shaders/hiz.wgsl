@@ -1,11 +1,11 @@
 // Phase 15E: Hi-Z depth pyramid.
 //
 // A mip chain where every texel holds the FURTHEST depth of the region it
-// covers. Depth here is wgpu-style, 0 at the near plane and 1 at the far plane,
-// so "furthest" is `max`. That direction is what makes the pyramid a safe
-// occlusion test: a candidate is only rejected when its nearest point is behind
-// *everything* in the region, and taking the max can only ever make the
-// occluder look nearer than it is, which errs toward drawing.
+// covers. Scene depth is reversed-Z (Sunscar, 6 Nov 2026), 1 at the near plane
+// and 0 at infinity, so "furthest" is `min`. That direction is what makes the
+// pyramid a safe occlusion test: a candidate is only rejected when its nearest
+// point is behind *everything* in the region, and taking the min can only ever
+// make the occluder look nearer than it is, which errs toward drawing.
 //
 // Level 0 copies the depth buffer. Depth textures cannot be bound as storage,
 // so it goes through a compute pass rather than a blit.
@@ -40,12 +40,12 @@ fn downsample(@builtin(global_invocation_id) id: vec3<u32>) {
     let src_size = textureDimensions(src_mip);
     let base = vec2<i32>(id.xy) * 2;
 
-    var furthest = 0.0;
+    var furthest = 1.0;
     // Always the 2x2 block.
     for (var dy = 0; dy < 2; dy++) {
         for (var dx = 0; dx < 2; dx++) {
             let c = min(base + vec2<i32>(dx, dy), vec2<i32>(src_size) - vec2<i32>(1));
-            furthest = max(furthest, textureLoad(src_mip, c, 0).r);
+            furthest = min(furthest, textureLoad(src_mip, c, 0).r);
         }
     }
 
@@ -56,18 +56,18 @@ fn downsample(@builtin(global_invocation_id) id: vec3<u32>) {
     if odd_x {
         for (var dy = 0; dy < 2; dy++) {
             let c = min(base + vec2<i32>(2, dy), vec2<i32>(src_size) - vec2<i32>(1));
-            furthest = max(furthest, textureLoad(src_mip, c, 0).r);
+            furthest = min(furthest, textureLoad(src_mip, c, 0).r);
         }
     }
     if odd_y {
         for (var dx = 0; dx < 2; dx++) {
             let c = min(base + vec2<i32>(dx, 2), vec2<i32>(src_size) - vec2<i32>(1));
-            furthest = max(furthest, textureLoad(src_mip, c, 0).r);
+            furthest = min(furthest, textureLoad(src_mip, c, 0).r);
         }
     }
     if odd_x && odd_y {
         let c = min(base + vec2<i32>(2, 2), vec2<i32>(src_size) - vec2<i32>(1));
-        furthest = max(furthest, textureLoad(src_mip, c, 0).r);
+        furthest = min(furthest, textureLoad(src_mip, c, 0).r);
     }
 
     textureStore(dst_mip, vec2<i32>(id.xy), vec4<f32>(furthest, 0.0, 0.0, 0.0));

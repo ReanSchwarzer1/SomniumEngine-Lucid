@@ -58,6 +58,10 @@ pub(crate) struct ProjectEntry {
     /// Complete, simplified replacement; never delete individual leaf materials.
     #[serde(default)]
     pub lod: Option<ProjectLod>,
+    /// A still cheaper stand-in past `lod` (crossed billboards of the tree, Sunscar 6 Nov 2026): drawn from its
+    /// `distance` to the kind's draw distance, so a wood still stands on the land past the LOD mesh's reach.
+    #[serde(default)]
+    pub impostor: Option<ProjectLod>,
     /// How far this kind draws, metres (horizontal from the camera). Unset: the terrain's
     /// `FoliageComponent::cull_distance`, as before. Grass short, trees far.
     #[serde(default)]
@@ -78,6 +82,11 @@ pub(crate) struct ProjectEntry {
     /// reflections, and a forest within a 400 m draw distance overflows the traced scene), else everywhere.
     #[serde(default)]
     pub trace_distance: Option<f32>,
+    /// Kinds this one grows on (mistletoe in its trees' crowns): it is drawn only while none of them has failed to
+    /// load or is still being read, so a tree kind that cannot load never leaves it hanging in the air (Sunscar,
+    /// 12 Nov 2026: 43 tree kinds were refused for five hours and their mistletoe floated). Unset: drawn on its own.
+    #[serde(default)]
+    pub hosts: Option<Vec<u16>>,
 }
 
 impl ProjectEntry {
@@ -100,9 +109,43 @@ pub(crate) struct GroundCoverRules {
     pub density: f32,
     /// Generated, and drawn, within this many metres of where the view looks (the ground under the view's centre).
     pub radius: f32,
+    /// Generated and drawn only from this many metres out, dithered in over [`crate::ground_cover::HANDOVER`] (set it
+    /// to the band before's `radius` less that) and thinning from here instead of from the near band: the mid and far
+    /// bands of a grass's LOD chain are kinds of their own with coarser models (larger clumps, patch cards), so a meadow
+    /// still reads as grass at 120-300 m where single 4 mm blades are a fraction of a pixel (the developer, 6 Nov 2026:
+    /// "the grass should be visible even if far away or atleast load lower quality versions"). 0, the default: from
+    /// the eye.
+    #[serde(default)]
+    pub inner: f32,
     /// Tilt each instance to the ground's slope (patches of grass), instead of standing it upright (flowers).
     #[serde(default)]
     pub align_to_ground: bool,
+    /// Grow in drifts about this many metres across (OPEN_WORLD_CRAFT 6.4.2): low-frequency noise per kind keeps about
+    /// half the candidates, in patches, and grows them taller inside. Unset: evenly, as before.
+    #[serde(default)]
+    pub clump: Option<f32>,
+    /// The terrain layer sets this kind grows on (a tile's `TerrainStreaming.layer_set`; "" is the project's own
+    /// layers). Unset: every set, as before. A biome's tiles list their own kinds, and the meadow's grass stays off
+    /// their sand and ice: ground cover is keyed by splat slot across all sets, so without this a desert tile grew
+    /// the meadow's slot-k grass (Sunscar, 6 Nov 2026; design/BIOMES_GROUND_COVER.md).
+    #[serde(default)]
+    pub layer_sets: Option<Vec<String>>,
+    /// The layers that make this kind's habitat (a grass's: every grassland slot). Set, a candidate is kept with its
+    /// share of the habitat's summed weight (its own layer's weight over the sum) times the habitat's presence
+    /// (smoothstep 0.35 to 0.7 of the sum), and `min_layer_weight` gates the sum: a texel of four grasslands at 0.25
+    /// grows a full sward between their kinds, and grass sprinkled at low weight into woods and mud grows none
+    /// (sunscar-groundplants' audit, 19 Nov 2026: pasture was under the 0.3 gate on 71% of its 33 km2). Unset: its
+    /// own layer's weight, as before.
+    #[serde(default)]
+    pub habitat_layers: Option<Vec<u8>>,
+}
+
+impl GroundCoverRules {
+    /// Whether this kind grows on a terrain wearing `layer_set` (names compared trimmed).
+    #[must_use]
+    pub(crate) fn grows_on(&self, layer_set: &str) -> bool {
+        self.layer_sets.as_ref().is_none_or(|sets| sets.iter().any(|s| s.trim() == layer_set.trim()))
+    }
 }
 
 #[derive(Deserialize)]
@@ -116,6 +159,11 @@ struct Document {
 #[must_use]
 pub(crate) fn is_project_kind(kind: u16) -> bool {
     usize::from(kind) >= crate::app::FOLIAGE_PALETTE.len()
+}
+
+/// Whether a kind that grows on `hosts` may draw: none of them `missing` (failed to load, or still being read).
+pub(crate) fn hosts_drawn(hosts: &[u16], missing: impl Fn(u16) -> bool) -> bool {
+    !hosts.iter().any(|&host| missing(host))
 }
 
 fn parse(bytes: &[u8]) -> Result<BTreeMap<u16, ProjectEntry>, String> {
@@ -142,9 +190,11 @@ fn parse(bytes: &[u8]) -> Result<BTreeMap<u16, ProjectEntry>, String> {
             return Err(format!("invalid draw or shadow distance for kind {}", entry.kind));
         }
         if entry.ground_cover.as_ref().is_some_and(|g| {
-            !(g.density.is_finite() && g.density > 0.0 && g.density <= 8.0 && g.radius.is_finite() && g.radius > 0.0 && g.radius <= 400.0)
+            !(g.density.is_finite() && g.density > 0.0 && g.density <= 64.0 && g.radius.is_finite() && g.radius > 0.0 && g.radius <= 400.0)
+                || g.clump.is_some_and(|m| !(m.is_finite() && (1.0..=500.0).contains(&m)))
         }) {
-            return Err(format!("invalid ground cover for kind {} (density 0..8 per m2, radius 0..400 m)", entry.kind));
+            // 64 per m2: first-person grass (Sunscar, 30 Oct 2026) wants tens of tufts a square metre at the feet.
+            return Err(format!("invalid ground cover for kind {} (density 0..64 per m2, radius 0..400 m)", entry.kind));
         }
         if let Some(lod) = &entry.lod {
             if !lod.distance.is_finite()
@@ -242,6 +292,33 @@ pub(crate) fn load(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn mistletoe_draws_only_while_its_hosts_do() {
+        let document = serde_json::json!({"version":1,"entries":[
+            {"kind":544,"name":"poplar","source":"poplar.gltf","primitives":[0]},
+            {"kind":608,"name":"mistletoe","source":"mistletoe.gltf","primitives":[0],"hosts":[544,545]}]});
+        let parsed = parse(&serde_json::to_vec(&document).unwrap()).unwrap();
+        assert!(parsed[&544].hosts.is_none(), "a kind without hosts is unchanged");
+        let hosts = parsed[&608].hosts.as_deref().unwrap();
+        assert_eq!(hosts, [544, 545]);
+        assert!(hosts_drawn(hosts, |_| false), "every host drawn: the mistletoe draws");
+        assert!(!hosts_drawn(hosts, |host| host == 545), "one host refused or still read: no ball hangs in the air");
+    }
+    #[test]
+    fn a_ground_kind_grows_only_on_the_layer_sets_it_names() {
+        let document = serde_json::json!({"version":1,"entries":[
+            {"kind":130,"name":"meadow grass","source":"g.gltf","primitives":[0],
+             "ground_cover":{"density":1.0,"radius":40.0,"layer_sets":["", "spine"]}},
+            {"kind":131,"name":"desert grass","source":"d.gltf","primitives":[0],
+             "ground_cover":{"density":1.0,"radius":40.0,"layer_sets":["desert"]}},
+            {"kind":132,"name":"untagged","source":"u.gltf","primitives":[0],
+             "ground_cover":{"density":1.0,"radius":40.0}}]});
+        let parsed = parse(&serde_json::to_vec(&document).unwrap()).unwrap();
+        let grows = |kind: u16, set: &str| parsed[&kind].ground_cover.as_ref().unwrap().grows_on(set);
+        assert!(grows(130, "") && grows(130, " spine ") && !grows(130, "desert"), "the meadow's grass stays off sand");
+        assert!(grows(131, "desert") && !grows(131, "") && !grows(131, "spine"));
+        assert!(grows(132, "") && grows(132, "desert"), "untagged kinds grow everywhere, as before");
+    }
     #[test]
     fn optional_lod_preserves_parts_and_rejects_invalid_distances() {
         let mut document = serde_json::json!({"version":1,"entries":[{

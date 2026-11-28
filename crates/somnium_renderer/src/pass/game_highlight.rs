@@ -219,7 +219,8 @@ impl GameHighlightPass {
                 depth_stencil: transparent.then_some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
                     depth_write_enabled: Some(false),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    // Reversed-Z: nearer is larger (renderer.rs `set_view`).
+                    depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
                     stencil: Default::default(),
                     bias: Default::default(),
                 }),

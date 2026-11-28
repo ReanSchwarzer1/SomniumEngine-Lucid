@@ -34,14 +34,26 @@ struct ExposureParams {
     highlight_start_nits: f32,
     /// Luminance where a sample's weight bottoms out.
     highlight_end_nits:   f32,
-    _pad0: f32,
+    /// How much of the meter's swing from `anchor_ev` the eye follows: 1 all of it (sunscar-photoreal, 6 Nov 2026).
+    adaptation:      f32,
+    /// The EV100 partial adaptation pivots on.
+    anchor_ev:       f32,
+    /// How much an open-sky pixel counts in the meter, 0..1 (1 as any other): below 1 the eye exposes for the land
+    /// and lets the sky run bright, as a photographer does (sunscar-photoreal, 6 Nov 2026).
+    sky_weight:      f32,
+    /// The share the eye follows when the meter reads brighter than the anchor (sand, snow, sunlit stone): a camera
+    /// metering reflected light would turn them grey, the eye keeps them pale.
+    adaptation_bright: f32,
     _pad1: f32,
+    _pad2: f32,
 }
 
 @group(0) @binding(0) var          hdr_tex:   texture_2d<f32>;
 @group(0) @binding(1) var<storage, read_write> histogram: array<atomic<u32>, 256>;
 @group(0) @binding(2) var<storage, read_write> exposure:  array<f32, 2>;
 @group(0) @binding(3) var<uniform>             params:    ExposureParams;
+/// The visibility buffer: 0 where nothing was drawn, the open sky.
+@group(0) @binding(4) var                      vis_tex:   texture_2d<u32>;
 
 /// Rec. 709 luminance.
 fn luminance(c: vec3<f32>) -> f32 {
@@ -92,7 +104,8 @@ fn build_histogram(
         let centre_weight = mix(0.15, 1.0, exp(-dot(uv, uv) * 1.5));
         let highlight = 1.0 - smoothstep(
             params.highlight_start_nits, params.highlight_end_nits, lum);
-        let weight = centre_weight * mix(0.25, 1.0, highlight);
+        let sky = textureLoad(vis_tex, vec2<i32>(gid.xy), 0).x == 0u;
+        let weight = centre_weight * mix(0.25, 1.0, highlight) * select(1.0, params.sky_weight, sky);
 
         // The histogram counts in integers, so the weight is quantised. 64
         // steps is ample, and keeps the per-bin total inside u32 even if every
@@ -154,6 +167,12 @@ fn resolve_exposure(@builtin(local_invocation_index) lid: u32) {
     // Saturation-based metering (Lagarde & de Rousiers): the EV that places
     // this average luminance at middle grey.
     var target_ev = log2(max(avg_luminance, 1e-5) * 100.0 / 12.5);
+    // Partial adaptation: the eye follows only part of the meter's swing from the anchor, so a dark wood stays
+    // darker than open land on screen, as in a photograph. At 1 (the default) this is the meter's own reading.
+    if params.adaptation < 1.0 || params.adaptation_bright < 1.0 {
+        let share = select(params.adaptation, params.adaptation_bright, target_ev > params.anchor_ev);
+        target_ev = params.anchor_ev + share * (target_ev - params.anchor_ev);
+    }
     target_ev = clamp(target_ev - params.exposure_compensation,
                       params.min_ev100, params.max_ev100);
 

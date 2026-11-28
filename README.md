@@ -9,17 +9,12 @@ isometric RPG.
 > **Status:** pre-1.0, a single-author research project, developed and tested on Windows only. APIs, file formats and
 > defaults change often. Expect rough edges.
 
-> **Which branch:** `main` holds Lucid as of 24 October 2026. The open-world work this page describes, from late
-> October to 27 November, is on the [`sunscar`](https://github.com/ReanSchwarzer1/SomniumEngine-Lucid/tree/sunscar)
-> branch and is not in `main` yet: check out `sunscar` to build it. The newest work, shown in some of the pictures
-> below, is not published yet; [Not published yet](#not-published-yet) lists it.
-
 <p align="center">
   <img src="docs/media/sunscar_lucara_planet.jpg" width="100%"
        alt="Ruined two-storey stone houses of a village under a clear noon sky, a huge pale planet hanging above them">
 </p>
 <p align="center"><em>Sunscar: the ruined village of Lucara under the planet at noon. Every picture here is from the
-running game or editor on the development build of 27 and 28 November 2026.</em></p>
+running game or editor, 27 and 28 November 2026.</em></p>
 
 <table>
   <tr>
@@ -69,17 +64,27 @@ running game or editor on the development build of 27 and 28 November 2026.</em>
 </p>
 <p align="center"><em>The editor on Sunscar's world at the Play start, 39,828 objects streamed in.</em></p>
 
-## Not published yet
+## New in November 2026
 
-The pictures above were taken on the development build of 27 and 28 November. These parts of it are on development
-branches that are not published yet, so neither `main` nor `sunscar` has them:
+What Sunscar has asked of the engine this month. Each item was seen working in the game or the editor.
 
-- Rain and snow drawn as lit sprites near the eye: drops as slanting streaks, flakes as soft round flecks, lit by the
-  sun through its shadow cascades and by the sky.
-- Embers rising from open fires, and a soft glow round a lamp's flame.
-- The editor's level-design round. **G** carries a thing over the ground (a roof, a rock or the terrain under the
-  pointer) and a click puts it down. The Content Drawer shows a large game's folders at once. A scene opens at its
-  first place, where the game starts. **Help > What's New** lists each round of changes in plain words.
+**In the world**
+- **Weather you can stand in.** Rain falls as slanting streaks and snow as soft round flecks of mixed size, drawn as
+  lit sprites near the eye that take the sun through its shadow cascades and the sky's light. Storm decks build inside
+  the volumetric clouds, and a grey day can break into sunlit cumulus. In dry wind, dust hazes the air.
+- **Fire.** Flames burn in tongues, embers rise from open fires, and a lamp's flame casts a soft glow round itself.
+- **Big scanned assets.** Thousands of photogrammetry rocks, plants and pieces of dead wood stream in with the cells.
+  Imported textures go to the GPU block-compressed (BC7, a quarter of the memory), from a cache on disk that is filled
+  once.
+
+**In the editor** (the full list, newest first, is [What's new](docs/editor/whats_new.md), also under
+**Help > What's New**)
+- **G carries a thing over the ground.** It follows the pointer over whatever lies under it, a roof, a rock or the
+  terrain, and a click puts it down.
+- **The Content Drawer shows a large game's folders at once,** while the project is still being read.
+- **The editor opens a scene at its first place,** where the game starts, and offers an autosave only when it is
+  newer than the scene.
+- **Help > What's New** lists each round of changes in plain words, newest first.
 
 ## Lucid or Somnium?
 
@@ -209,7 +214,8 @@ an optimised engine, Jolt and Luau while its own crate keeps fast rebuilds.
 ## Using the editor
 
 - **Right mouse + WASD/QE** to fly, Shift for speed, right mouse + scroll to change speed.
-- **T / R / S** move, rotate, scale. **Ctrl+Z / Ctrl+Y** undo, redo. **Ctrl+S** save.
+- **T / R / S** move, rotate, scale. **G** carries the selection over the ground. **Ctrl+Z / Ctrl+Y** undo, redo.
+  **Ctrl+S** save.
 - **Ctrl+P** command palette. **Ctrl+Space** Content Drawer. **F1** Help.
 - **F6** terrain tools, **F8** foliage tools. **File > Import Model…** for glTF/GLB.
 - **Play / Pause / Stop** run the scene in the editor.

@@ -483,7 +483,8 @@ impl SettingsStore {
         {
             std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
         }
-        std::fs::write(path, out).map_err(|error| error.to_string())
+        // Written whole (a new file renamed over the old), so a hard-linked project.toml changes here only.
+        somnium_asset::write_atomic(path, out.as_bytes())
     }
 
     /// Persist both files. Used on shutdown and by the Preferences window's

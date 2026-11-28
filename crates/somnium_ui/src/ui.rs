@@ -496,6 +496,17 @@ impl UserInterface {
         false
     }
 
+    /// Text typed into the widget with the keyboard focus, as a key press's text reaches it (the editor script's
+    /// `type=` step). False, and nothing sent, when no text field has the focus.
+    pub fn type_into_focus(&mut self, text: &str) -> bool {
+        if text.is_empty() || !self.has_text_focus() {
+            return false;
+        }
+        let focused = to_nh(self.focused_ih);
+        self.send(UiMessage::new(focused, MessageDirection::ToWidget, WidgetMessage::Text(text.to_owned())));
+        true
+    }
+
     // -----------------------------------------------------------------------
     // Node management
     // -----------------------------------------------------------------------

@@ -17,9 +17,22 @@ use wgpu_ffx::{
 
 use crate::pass::postprocess::HDR_FORMAT;
 
-/// Matches hello_engine / clustered lighting.
+/// Matches hello_engine / clustered lighting: the fallback when a projection gives no near plane (`fsr_planes`).
 const CAMERA_NEAR: f32 = 0.1;
-const CAMERA_FAR: f32 = 1000.0;
+/// The least near plane wgpu-ffx takes for inverted depth (validation.rs `InvertedDepthFarTooLow`).
+const FSR_MIN_NEAR: f32 = 0.075;
+
+/// `camera_near` and `camera_far` for Somnium's reversed, infinite scene depth (Sunscar, 6 Nov 2026). With
+/// `DEPTH_INVERTED | DEPTH_INFINITE` AMD's convention swaps them: `camera_near` is f32::MAX and `camera_far` is the
+/// real near plane, read from the caller's forward projection (`perspective_rh` or its infinite form). wgpu-ffx turns
+/// that into view depth = near / depth. It refuses a near under 0.075 m, and the game's is 0.035, so it is held at
+/// 0.075 there: every view depth FSR rebuilds is then too far by one factor (2.1), and its depth clip tests view
+/// depths as ratios (separation over depth), in which the factor cancels.
+fn fsr_planes(proj: glam::Mat4) -> (f32, f32) {
+    let near = crate::view::near_plane(proj);
+    let near = if near.is_finite() && near > 0.0 { near } else { CAMERA_NEAR };
+    (f32::MAX, near.max(FSR_MIN_NEAR))
+}
 
 struct FsrGpu {
     context: FsrContext,
@@ -343,8 +356,8 @@ impl FsrPass {
             // half floats flush to zero, which may be the low-light black band.
             pre_exposure: if pre_exposure_one() { 1.0 } else { exposure.max(1e-8) },
             reset_history: reset_history || gpu.frame_index == 0,
-            camera_near: CAMERA_NEAR,
-            camera_far: CAMERA_FAR,
+            camera_near: fsr_planes(proj).0,
+            camera_far: fsr_planes(proj).1,
             camera_fov_y: fov_y,
             view_space_to_meters_factor: 1.0,
             flags: FsrDispatchFlags::empty(),
@@ -417,7 +430,8 @@ fn alloc_gpu(
     // made FSR's luma-instability pass erase dark geometry at night.
     let context = FsrContext::new(FsrContextInfo {
         device: device.clone(),
-        flags: FsrContextFlags::HIGH_DYNAMIC_RANGE,
+        // Scene depth is reversed and infinite (renderer.rs `set_view`; planes in `fsr_planes`).
+        flags: FsrContextFlags::HIGH_DYNAMIC_RANGE | FsrContextFlags::DEPTH_INVERTED | FsrContextFlags::DEPTH_INFINITE,
     });
     let render = clamp_render(render_w, render_h);
     let upscale = clamp_upscale(display_w, display_h);
@@ -723,3 +737,20 @@ fn pre_exposure_one() -> bool {
 #[cfg(test)]
 #[path = "fsr_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod near_far_tests {
+    use super::fsr_planes;
+
+    #[test]
+    fn planes_are_amds_inverted_infinite_ones_and_pass_validation() {
+        // Inverted and infinite: near at f32::MAX, the real near plane as far.
+        let (n, f) = fsr_planes(glam::Mat4::perspective_rh(1.0, 16.0 / 9.0, 0.1, 8000.0));
+        assert!(n == f32::MAX && (f - 0.1).abs() < 1.0e-5, "{n} {f}");
+        let (_, f) = fsr_planes(glam::Mat4::perspective_infinite_rh(1.0, 1.5, 0.2));
+        assert!((f - 0.2).abs() < 1.0e-6, "{f}");
+        // The game's 3.5 cm is under wgpu-ffx's least, and held there rather than refused.
+        assert_eq!(fsr_planes(glam::Mat4::perspective_rh(1.29, 16.0 / 9.0, 0.035, 80_000.0)), (f32::MAX, super::FSR_MIN_NEAR));
+        assert_eq!(fsr_planes(glam::Mat4::IDENTITY), (f32::MAX, super::CAMERA_NEAR));
+    }
+}

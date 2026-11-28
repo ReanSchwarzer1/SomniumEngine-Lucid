@@ -4,6 +4,7 @@
 // hoists every `enable` above everything.
 //!include "rt_hit.wgsl"
 //!include "global_pool.wgsl"
+//!include "grass_pool.wgsl"
 //!include "brdf.wgsl"
 //!include "sampling.wgsl"
 //!include "atmosphere.wgsl"
@@ -56,8 +57,9 @@ fn extra_rand(seed: ptr<function, u32>) -> f32 {
 
 fn reconstruct_world(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    // Camera-relative (`inv_view_proj` is), then moved out.
     let world = extra.inv_view_proj * ndc;
-    return world.xyz / world.w;
+    return world.xyz / world.w + extra.camera_pos;
 }
 
 fn cache_coord(pos: vec3<f32>, dims: vec3<u32>) -> vec3<i32> {
@@ -71,13 +73,11 @@ fn vis_normal(coord: vec2<i32>) -> vec3<f32> {
         return vec3<f32>(0.0, 1.0, 0.0);
     }
     let inst = instances[vis.x - 1u];
-    let base = inst.index_offset + vis.y * 3u;
-    let a = vertices[inst.vertex_offset + indices[base + 0u]];
-    let b = vertices[inst.vertex_offset + indices[base + 1u]];
-    let c = vertices[inst.vertex_offset + indices[base + 2u]];
-    let p0 = (inst.model * vec4<f32>(a.pos_x, a.pos_y, a.pos_z, 1.0)).xyz;
-    let p1 = (inst.model * vec4<f32>(b.pos_x, b.pos_y, b.pos_z, 1.0)).xyz;
-    let p2 = (inst.model * vec4<f32>(c.pos_x, c.pos_y, c.pos_z, 1.0)).xyz;
+    // A mesh's triangle, or a grass blade's (grass_pool.wgsl).
+    let corners = vis_triangle_world(inst, vis.y);
+    let p0 = corners[0];
+    let p1 = corners[1];
+    let p2 = corners[2];
     var n = normalize(cross(p1 - p0, p2 - p0));
     if dot(n, extra.camera_pos - p0) < 0.0 {
         n = -n;
@@ -109,7 +109,7 @@ fn cache_from_screen(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
     let coord = vec2<i32>(gid.xy);
     let depth = textureLoad(depth_tex, coord, 0);
-    if depth >= 1.0 {
+    if depth <= 0.0 {
         return;
     }
     let uv = (vec2<f32>(coord) + 0.5) * extra.inv_res;
@@ -139,7 +139,7 @@ fn specular_gi(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
     let full = vec2<i32>(uv * vec2<f32>(textureDimensions(depth_tex)));
     let depth = textureLoad(depth_tex, full, 0);
-    if depth >= 1.0 {
+    if depth <= 0.0 {
         textureStore(aux_out, gid.xy, vec4<f32>(0.0));
         return;
     }
@@ -228,10 +228,12 @@ fn path_trace(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = (vec2<f32>(gid.xy) + 0.5) / vec2<f32>(dims);
     var seed = gid.x * 1103515245u + gid.y * 134775813u + extra.frame * 214013u + 1u;
     let ndc = vec2<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    let near = extra.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
-    let far = extra.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    // Reversed-Z (Sunscar, 6 Nov 2026): depth 1 is the near plane and 0 infinity, where a perspective's point has
+    // w = 0 and its xyz is the ray's direction (taken undivided, an orthographic view's far plane less its near).
+    let near = extra.inv_view_proj * vec4<f32>(ndc, 1.0, 1.0);
+    let far = extra.inv_view_proj * vec4<f32>(ndc, 0.0, 1.0);
     var origin = extra.camera_pos;
-    var dir = normalize(far.xyz / far.w - near.xyz / near.w);
+    var dir = normalize(far.xyz - near.xyz / near.w * far.w);
     var throughput = vec3<f32>(1.0);
     var radiance = vec3<f32>(0.0);
 

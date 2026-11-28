@@ -1027,6 +1027,165 @@ fn terrain_macro_blend(
     return mix(detail, blended, factor);
 }
 
+/// Where the macro tier's lerp toward each layer's far colour comes in (sunscar-look's ask, 11 Nov 2026): scanned
+/// ground keeps its own texels within TERRAIN_MACRO_NEAR of the eye and takes the far colour in full by
+/// TERRAIN_MACRO_FAR. At every distance, as it was, it flattened the scans from a few metres out.
+/// The layer a steep wall wears: the splat's strongest where the set marks it as rock (`layer_rock.json`), so a
+/// canyon's walls carry each bed's own scan at true scale (projected, as the cliff layer is); else the cliff layer.
+fn terrain_wall_layer(tm: TerrainMaterial, strongest: u32) -> u32 {
+    let mask = u32(tm.cliff_band.z) | (u32(tm.cliff_band.w) << 16u);
+    return select(tm.cliff_layer, strongest, ((mask >> strongest) & 1u) != 0u);
+}
+
+/// The strata datum's grid side (`terrain::STRATA_SIZE`).
+const TERRAIN_STRATA_SIZE: f32 = 65.0;
+
+/// A steep pixel's two beds by its own height, where its tile has a strata datum (`TerrainMaterial::strata`): the
+/// stack's base under the pixel (terrain's bake, metres above the terrain's origin) and each bed's bottom above that
+/// base (`layer_albedo[layer].a`, the set's layer_strata.json), so contacts run level along a wall and a bed is as thick
+/// on a cliff as on a slope. The 2 m splat could not change with height on a steep face: each contact dripped 8 m down
+/// it (the Vela, 11 Nov 2026). Returns `terrain_wall_pbr`'s (a, wa, b, wb), the nearer contact softened over a metre
+/// and wandering a metre or two along the wall as real contacts do; wa < 0 where there is no datum.
+fn terrain_strata_beds(
+    tm: TerrainMaterial,
+    terrain_index: u32,
+    local_xz: vec2<f32>,
+    world_xz: vec2<f32>,
+    world_y: f32,
+) -> vec4<f32> {
+    if tm.strata.z < 0.5 || tm.strata.x < 0.0 {
+        return vec4<f32>(0.0, -1.0, 0.0, 0.0);
+    }
+    let uv = clamp(local_xz * tm.inv_world_size, vec2<f32>(0.0), vec2<f32>(1.0));
+    let st = (uv * (TERRAIN_STRATA_SIZE - 1.0) + 0.5) / TERRAIN_STRATA_SIZE;
+    let base = textureSampleLevel(textures[i32(tm.strata.x)], default_sampler, st, 0.0).r;
+    let wander = (terrain_value_noise(world_xz * 0.05) - 0.5) * 3.0 + (terrain_value_noise(world_xz * 0.4) - 0.5) * 0.6;
+    let d = world_y - tm.strata.y - base + wander;
+    // The bed d lies in (the greatest bottom at or under it), the one under that, and the one over it.
+    var bed = 99u;
+    var bed_lo = -1.0e9;
+    var under = 99u;
+    var under_lo = -1.0e9;
+    var over = 99u;
+    var over_lo = 1.0e9;
+    var m = u32(tm.cliff_band.z) | (u32(tm.cliff_band.w) << 16u);
+    loop {
+        if m == 0u {
+            break;
+        }
+        let i = firstTrailingBit(m);
+        m = m & (m - 1u);
+        var lo = tm.layer_albedo[i].a;
+        if terrain_storage_reads {
+            lo = terrain_materials[terrain_index].layer_albedo[i].a;
+        }
+        if lo < -1.0e8 {
+            continue;
+        }
+        if lo <= d {
+            if lo > bed_lo {
+                under = bed;
+                under_lo = bed_lo;
+                bed = i;
+                bed_lo = lo;
+            } else if lo > under_lo {
+                under = i;
+                under_lo = lo;
+            }
+        } else if lo < over_lo {
+            over = i;
+            over_lo = lo;
+        }
+    }
+    if bed == 99u {
+        // Under every bed's bottom: the lowest bed carries on down.
+        return select(vec4<f32>(f32(over), 1.0, f32(over), 0.0), vec4<f32>(0.0, -1.0, 0.0, 0.0), over == 99u);
+    }
+    let soft = 0.8;
+    let up = over_lo - d;
+    let down = d - bed_lo;
+    if over != 99u && up < down {
+        let s = smoothstep(-soft, soft, -up);
+        return vec4<f32>(f32(bed), 1.0 - s, f32(over), s);
+    }
+    if under != 99u {
+        let s = smoothstep(-soft, soft, down);
+        return vec4<f32>(f32(bed), s, f32(under), 1.0 - s);
+    }
+    return vec4<f32>(f32(bed), 1.0, f32(bed), 0.0);
+}
+
+/// A steep pixel's wall from its two strongest splat layers `a` (weight `wa`) and `b` (`wb <= wa`), each worn as
+/// `terrain_wall_layer` says and projected as the cliff layer is. Where both carry weight they are height-blended as
+/// the ground blends its layers: an even mix interleaves by each scan's relief, and the weaker one shows only on its own
+/// peaks as its share falls. Flipping to the single strongest per pixel dappled a wall painted half one granite and half
+/// another, and made the contact between two beds drip (the Vela, 11 Nov 2026). One projection where one bed rules.
+fn terrain_wall_pbr(
+    tm: TerrainMaterial,
+    terrain_index: u32,
+    a: u32,
+    wa: f32,
+    b: u32,
+    wb: f32,
+    local_pos: vec3<f32>,
+    n: vec3<f32>,
+    world_ddx: vec2<f32>,
+    world_ddy: vec2<f32>,
+) -> TerrainLayerSample {
+    let la = terrain_wall_layer(tm, a);
+    let lb = terrain_wall_layer(tm, b);
+    let sa = terrain_projected_pbr(
+        tm, terrain_index, la, local_pos, n, terrain_layer_tiling(tm, terrain_index, la), world_ddx, world_ddy);
+    let share = wb / max(wa + wb, 1e-4);
+    if la == lb || share < 0.15 {
+        return sa;
+    }
+    let sb = terrain_projected_pbr(
+        tm, terrain_index, lb, local_pos, n, terrain_layer_tiling(tm, terrain_index, lb), world_ddx, world_ddy);
+    // Heights are 0..1; at an even share the higher texel wins, and each tenth of share either way is worth 0.4 of
+    // height, so b keeps only its tallest relief by a share of 0.3.
+    let t = smoothstep(-0.08, 0.08, (sb.height - sa.height) + (share - 0.5) * 4.0);
+    var out = sa;
+    out.albedo = mix(sa.albedo, sb.albedo, t);
+    out.height = mix(sa.height, sb.height, t);
+    out.roughness = mix(sa.roughness, sb.roughness, t);
+    out.occlusion = mix(sa.occlusion, sb.occlusion, t);
+    out.normal_ts = normalize(mix(sa.normal_ts, sb.normal_ts, t));
+    return out;
+}
+
+// sunscar-look (11 Nov): untouched within 25 m, where the plants' near kinds still cover the ground; all of the far
+// colour by 200 m, where the far stand-ins (baked from the same layer_far_colour.json) take over without a seam.
+const TERRAIN_MACRO_NEAR: f32 = 25.0;
+const TERRAIN_MACRO_FAR: f32 = 200.0;
+const TERRAIN_MACRO_FAR_WEIGHT: f32 = 1.0;
+
+fn terrain_macro_fade(world_pos: vec3<f32>) -> f32 {
+    return smoothstep(TERRAIN_MACRO_NEAR, TERRAIN_MACRO_FAR, distance(world_pos, view.camera_pos));
+}
+
+/// `TerrainMaterial::macro_mode` bit 4 (`terrain::MACRO_FADES`): the macro map holds the layers' colours seen from afar
+/// (`layer_far_colour.json` in the layer set), so the tier fades in with distance. Without it the tier holds at every
+/// distance and the clipmap bakes it, as before 11 Nov 2026 (TSF's terrains).
+const MACRO_FADES: u32 = 16u;
+
+/// The blend mode alone (`MacroBlendMode`), without the fade bit.
+fn terrain_macro_mode(tm: TerrainMaterial) -> u32 {
+    return tm.macro_mode & 15u;
+}
+
+/// The macro tier's weight at a point: the macro map's own alpha times the terrain's macro strength, or, where the set
+/// has far colours, faded in with distance up to the far weight in Lerp mode and the strength in the others; 0
+/// strength stays the off switch (SOMNIUM_TERRAIN_MACRO).
+fn terrain_macro_weight(tm: TerrainMaterial, alpha: f32, world_pos: vec3<f32>) -> f32 {
+    if (tm.macro_mode & MACRO_FADES) == 0u {
+        return alpha * tm.macro_strength;
+    }
+    let top = select(
+        tm.macro_strength, TERRAIN_MACRO_FAR_WEIGHT, terrain_macro_mode(tm) == MACRO_LERP && tm.macro_strength > 0.0);
+    return alpha * top * terrain_macro_fade(world_pos);
+}
+
 /// Sample the macro map at a terrain-global UV, returning colour and the
 /// per-texel strength its alpha carries.
 ///
@@ -1041,9 +1200,8 @@ fn terrain_macro_sample(
     if tm.macro_map < 0 {
         return vec4<f32>(0.5, 0.5, 0.5, 0.0);
     }
-    let m = textureSampleGrad(
-        textures[tm.macro_map], default_sampler, splat_uv, splat_ddx, splat_ddy);
-    return vec4<f32>(m.rgb, m.a * tm.macro_strength);
+    // The texel's own alpha: callers weigh it (`terrain_macro_weight`).
+    return textureSampleGrad(textures[tm.macro_map], default_sampler, splat_uv, splat_ddx, splat_ddy);
 }
 
 /// Low-frequency value variance at the scales between the tile and the terrain
@@ -1382,8 +1540,13 @@ fn terrain_generate_texel(
         height += samples[s].height * b;
         moisture += terrain_layer_moisture(tm, terrain_index, selected[s]) * b;
     }
-    let macro_c = terrain_macro_sample(tm, splat_uv, splat_ddx, splat_ddy);
-    albedo = terrain_macro_blend(albedo, macro_c.rgb, tm.macro_mode, macro_c.a);
+    // The macro tier is baked here unless it fades with the eye's distance (MACRO_FADES), which a cached texel cannot
+    // know: then `evaluate_clipmap_material` applies it at shading time over these octaves (exact for Lerp and
+    // Multiply).
+    if (tm.macro_mode & MACRO_FADES) == 0u {
+        let macro_c = terrain_macro_sample(tm, splat_uv, splat_ddx, splat_ddy);
+        albedo = terrain_macro_blend(albedo, macro_c.rgb, tm.macro_mode, macro_c.a * tm.macro_strength);
+    }
     // Same octaves, same world frame, same place in the chain as the live path.
     // A terrain shades through whichever of the two the distance picks, and a
     // clipmap ring that disagreed with live terrain about the tint would put a
@@ -1405,6 +1568,9 @@ fn terrain_generate_texel(
 fn evaluate_terrain_material(
     terrain_index: u32,
     world_pos: vec3<f32>,
+    // The point in the terrain's own frame, from its origin: computed from the vertices' tile-local positions,
+    // not `world_pos - terrain_origin`, which keeps only the precision of a position 13-17 km out.
+    terrain_xz: vec2<f32>,
     geo_normal: vec3<f32>,
     splat_uv: vec2<f32>,
     world_ddx: vec2<f32>,
@@ -1415,7 +1581,7 @@ fn evaluate_terrain_material(
     let splat_ddy = world_ddy * tm.inv_world_size;
     // Hoisted above the unpack because TSUSHIMA-G's perturbation is indexed by
     // world position and runs inside it.
-    let local_xz = world_pos.xz - tm.terrain_origin;
+    let local_xz = terrain_xz;
     var splat_s = terrain_fetch_splats(tm, terrain_index, splat_uv, splat_ddx, splat_ddy);
     var weight = terrain_unpack_splats_painted(splat_s, tm, local_xz);
     let selected = terrain_strongest_four(&weight);
@@ -1455,7 +1621,7 @@ fn evaluate_terrain_material(
     let bitangent = cross(geo_normal, tangent);
 
     let steepness = 1.0 - abs(geo_normal.y);
-    let cliff_blend = smoothstep(0.45, 0.7, steepness);
+    let cliff_blend = smoothstep(tm.cliff_band.x, tm.cliff_band.y, steepness);
     // Projected cliffs cannot POM — the march is UV-space and the projection
     // is world-space. Godot makes the same exclusion.
     let allow_pom = cliff_blend < 0.05;
@@ -1502,6 +1668,9 @@ fn evaluate_terrain_material(
     var samples: array<TerrainLayerSample, 4>;
     var adjusted: array<f32, 4>;
     var taps = 0u;
+    // Hex tiling on the strongest layer only (selected[0]; strongest-four is sorted): the ground at the feet is
+    // mostly one layer, which is where a scan's repeat shows, and hex triples a layer's reads. It cost 2.4 ms of
+    // shading on all four on the steep Spine (sunscar-look's choice, 31 Oct 2026).
     for (var s = 0u; s < 4u; s = s + 1u) {
         let i = selected[s];
         if sel_w[s] < epsilon {
@@ -1510,8 +1679,8 @@ fn evaluate_terrain_material(
         }
         let tiling = terrain_layer_tiling(tm, terrain_index, i);
         samples[s] = terrain_sample_layer(
-            tm, terrain_index, i, parallax_xz * tiling, world_ddx * tiling, world_ddy * tiling, hex);
-        taps += select(2u, 6u, hex);
+            tm, terrain_index, i, parallax_xz * tiling, world_ddx * tiling, world_ddy * tiling, hex && s == 0u);
+        taps += select(2u, 6u, hex && s == 0u);
         if tm.height_blend != 0u {
             adjusted[s] = terrain_append_height(tm, terrain_index, i, sel_w[s], samples[s].height);
         } else {
@@ -1560,7 +1729,8 @@ fn evaluate_terrain_material(
     }
 
     let macro_c = terrain_macro_sample(tm, splat_uv, splat_ddx, splat_ddy);
-    albedo = terrain_macro_blend(albedo, macro_c.rgb, tm.macro_mode, macro_c.a);
+    albedo = terrain_macro_blend(
+        albedo, macro_c.rgb, terrain_macro_mode(tm), terrain_macro_weight(tm, macro_c.a, world_pos));
     // TSUSHIMA-H, in the same approximately-perceptual space the macro blend
     // above already works in — between the `sqrt` and the squaring, not after.
     // Applied later it would be a second, independent gain on linear radiance
@@ -1569,18 +1739,35 @@ fn evaluate_terrain_material(
     albedo = albedo * terrain_macro_octaves(local_xz, tm.macro_octave_strength.xyz);
     albedo = albedo * albedo;
 
+    // The wall's two strongest beds by the splat's own weights (`terrain_wall_pbr`).
+    var ia = 0u;
+    for (var s = 1u; s < 4u; s = s + 1u) {
+        if sel_w[s] > sel_w[ia] {
+            ia = s;
+        }
+    }
+    var ib = select(0u, 1u, ia == 0u);
+    for (var s = 0u; s < 4u; s = s + 1u) {
+        if s != ia && sel_w[s] > sel_w[ib] {
+            ib = s;
+        }
+    }
+    var wall_layer = terrain_wall_layer(tm, selected[ia]);
     if cliff_blend > 0.0 {
-        let local_pos = world_pos - vec3(tm.terrain_origin.x, 0.0, tm.terrain_origin.y);
-        let cliff = terrain_projected_pbr(
-            tm,
-            terrain_index,
-            tm.cliff_layer,
-            local_pos,
-            geo_normal,
-            terrain_layer_tiling(tm, terrain_index, tm.cliff_layer),
-            world_ddx,
-            world_ddy,
-        );
+        let local_pos = vec3(terrain_xz.x, world_pos.y, terrain_xz.y);
+        var a = selected[ia];
+        var wa = sel_w[ia];
+        var b = selected[ib];
+        var wb = sel_w[ib];
+        let beds = terrain_strata_beds(tm, terrain_index, terrain_xz, world_pos.xz, world_pos.y);
+        if beds.y >= 0.0 {
+            a = u32(beds.x);
+            wa = beds.y;
+            b = u32(beds.z);
+            wb = beds.w;
+            wall_layer = terrain_wall_layer(tm, a);
+        }
+        let cliff = terrain_wall_pbr(tm, terrain_index, a, wa, b, wb, local_pos, geo_normal, world_ddx, world_ddy);
         taps += select(4u, 6u, tm.projection_mode != 0u);
         albedo = mix(albedo, cliff.albedo, cliff_blend);
         roughness = mix(roughness, cliff.roughness, cliff_blend);
@@ -1597,7 +1784,7 @@ fn evaluate_terrain_material(
         }
     }
     if cliff_blend > 0.0 {
-        moisture = mix(moisture, terrain_layer_moisture(tm, terrain_index, tm.cliff_layer), cliff_blend);
+        moisture = mix(moisture, terrain_layer_moisture(tm, terrain_index, wall_layer), cliff_blend);
     }
     let wet = saturate(tm.wetness * moisture);
     albedo *= mix(1.0, tm.wetness_darken, wet);

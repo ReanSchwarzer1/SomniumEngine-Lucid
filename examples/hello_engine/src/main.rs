@@ -1,4 +1,4 @@
-//! # Hello Somnium Engine â€” glTF Demo
+//! # Hello Somnium Engine — glTF Demo
 //!
 //! Loads a glTF scene from `assets/test_scene.glb`, uploads it to the
 //! Visibility Buffer pipeline, and renders it with PBR + sky lighting.
@@ -20,6 +20,7 @@
 //! - Editor mode (Play/Pause/Stop) (11.5L)
 
 mod animated_preview;
+mod fires;
 mod skinned_crowd;
 mod authoring_demo;
 mod boats;
@@ -153,7 +154,7 @@ impl EditorCamera {
     }
 
     /// `base_speed` is the editor camera speed from the viewport toolbar
-    /// (Phase 20B) â€” the camera no longer owns it, so the slider and the
+    /// (Phase 20B) — the camera no longer owns it, so the slider and the
     /// RMB+wheel shortcut both drive movement directly.
     fn update(&mut self, dt: f32, base_speed: f32) {
         if !self.is_rmb_down {
@@ -225,6 +226,36 @@ impl EditorCamera {
     }
 }
 
+/// `SOMNIUM_PHYSICS_SYNC_AB=1` (cost): the shell's old physics sync (raw mutable columns, a change to everything) in
+/// the frame=120, 360, ... blocks of a run with SOMNIUM_PROFILE_EVERY=120, and the new one between, as
+/// SOMNIUM_SURFACES_AB=1 does for photoreal's surfaces: before and after in one launch (19 Nov 2026).
+fn physics_sync_ab_old(frame: u64) -> bool {
+    static AB: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("SOMNIUM_PHYSICS_SYNC_AB").as_deref() == Ok("1"));
+    *AB && (frame + 60) / 120 % 2 == 1
+}
+
+/// The physics sync as it was before 19 Nov 2026, for `SOMNIUM_PHYSICS_SYNC_AB`'s A blocks only.
+fn old_physics_sync(ctx: &mut EngineContext, required: &ComponentSet, playing_now: bool) {
+    for archetype in ctx.world.query_archetypes_mut(required, &ComponentSet::empty()) {
+        let t_col = archetype.column_index(ComponentId::of::<Transform>()).unwrap();
+        let b_col = archetype.column_index(ComponentId::of::<PhysicsBody>()).unwrap();
+        for row in 0..archetype.len() {
+            let body = unsafe { *archetype.column(b_col).get::<PhysicsBody>(row) };
+            let transform = unsafe { archetype.column_mut(t_col).get_mut::<Transform>(row) };
+            if playing_now {
+                transform.translation = ctx.physics.get_position(body.id);
+                transform.rotation = ctx.physics.get_rotation(body.id);
+            } else {
+                ctx.physics.set_position(body.id, transform.translation, false);
+                ctx.physics.set_rotation(body.id, transform.rotation, false);
+                ctx.physics.set_linear_velocity(body.id, Vec3::ZERO);
+                ctx.physics.set_angular_velocity(body.id, Vec3::ZERO);
+            }
+        }
+    }
+}
+
 fn play_session(ctx: &EngineContext) -> bool {
     ctx.simulation.state != SimulationState::Editing
 }
@@ -249,7 +280,7 @@ fn active_view(
         // The scripted character's camera wins over the scene's Camera
         // actor. Both carry `CameraSettingsComponent`, so picking by
         // component alone would be a coin toss decided by archetype
-        // order â€” this is explicit instead.
+        // order — this is explicit instead.
         if let Some(runtime) = player {
             if let Some(world) = ctx
                 .world
@@ -434,7 +465,7 @@ fn apply_kit_view(
 /// One name rather than a handful of coordinates, because a measurement whose
 /// viewpoint is a pasted position is a measurement nobody can reproduce six
 /// weeks later. The three names match the vocabulary the existing evidence
-/// already uses â€” DF-A's overview and walk, and the Island recipe.
+/// already uses — DF-A's overview and walk, and the Island recipe.
 ///
 /// | `SOMNIUM_TIME_VIEW` | map | camera |
 /// |---|---|---|
@@ -580,7 +611,7 @@ struct VoxelTerrain {
 
 impl VoxelTerrain {
     /// Create the palette texture/material and seed a few `set_voxel` edits
-    /// that prove the edit-overlay â†’ remesh path works.
+    /// that prove the edit-overlay → remesh path works.
     fn new(
         renderer: &mut somnium_renderer::SomniumRenderer,
         render_ctx: &somnium_renderer::context::RenderContext,
@@ -614,7 +645,7 @@ impl VoxelTerrain {
             &palette_bytes,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: None, // single row â€” no alignment requirement
+                bytes_per_row: None, // single row — no alignment requirement
                 rows_per_image: None,
             },
             wgpu::Extent3d {
@@ -717,7 +748,7 @@ impl VoxelTerrain {
 
     /// Release every chunk's GPU allocation back to the geometry pool.
     ///
-    /// Called when the voxel-terrain entity is deleted â€” without this the
+    /// Called when the voxel-terrain entity is deleted — without this the
     /// chunk meshes would leak the pool until the app exits.
     fn free_all(&mut self, renderer: &mut somnium_renderer::SomniumRenderer) {
         for (_, entry) in self.chunks.drain() {
@@ -759,6 +790,17 @@ pub struct HelloGame {
     /// Spawn the scripted first-person character (and its camera, which wins the view) on Play. On by default; a game
     /// with its own player and camera (Rimeborn's isometric rig) turns it off.
     pub play_character: bool,
+    /// Where a game with its own camera stands this frame (its player's eye), set before `on_render`: levels of
+    /// detail, foliage distances and the cutaway fallback are chosen from it. The shell's editor camera stays where
+    /// the scene left it while such a game plays, kilometres away in an open world. `None` keeps the shell's camera.
+    pub game_eye: Option<Vec3>,
+    /// The share of the open sky's light a cloud deck or the weather lets through, `0..1` (1: a clear sky). A game's
+    /// weather sets it, so the living's lamps light under a storm's dark as they do at dusk.
+    pub sky_dim: f32,
+    /// Whether the living's lamps burn (`somnium.Lamp` beside a light; somnium_core::light_flicker).
+    lamps: somnium_core::light_flicker::LampSwitch,
+    /// Fire, smoke and a wavering light for every made flame (`fires.rs`).
+    fires: fires::Fires,
     /// Roofs and upper floors opened for the camera while the viewer is inside (somnium_core::cutaway).
     cutaways: somnium_core::cutaway::Cutaways,
     /// Levels of detail not drawn this frame (somnium_core::lod_group).
@@ -892,6 +934,10 @@ impl HelloGame {
         runtime_ui.add_pause_banner("Hello Engine - UI Canvas");
         Self {
             play_character: true,
+            game_eye: None,
+            sky_dim: 1.0,
+            lamps: Default::default(),
+            fires: Default::default(),
             cutaways: Default::default(),
             imported_draws: Default::default(),
             lods: Default::default(),
@@ -1011,9 +1057,14 @@ impl HelloGame {
         preset: somnium_core::DefaultLandscapePreset,
         water: somnium_core::WaterComponent,
     ) {
-        let scene = match somnium_asset::load_gltf(
-            "assets/models/gislinge_viking_boat/gislinge_viking_boat.glb",
-        ) {
+        // The shell's own demo vessel. A game that embeds the shell with its own project has no such file, and a
+        // warning on every launch for a file nobody expects hides the warnings that matter (Sunscar, 12 Nov 2026).
+        const BOAT: &str = "assets/models/gislinge_viking_boat/gislinge_viking_boat.glb";
+        if !std::path::Path::new(BOAT).is_file() {
+            tracing::debug!("no demo vessel in this project ({BOAT})");
+            return;
+        }
+        let scene = match somnium_asset::load_gltf(BOAT) {
             Ok(scene) => scene,
             Err(error) => {
                 tracing::warn!("Gislinge Viking Boat load failed: {error}");
@@ -1273,7 +1324,7 @@ impl HelloGame {
         let wants_voxel = wants_voxel_terrain(ctx.world);
 
         match (wants_voxel, self.voxel_terrain.is_some()) {
-            // Entity appeared â€” spin up the streaming driver.
+            // Entity appeared — spin up the streaming driver.
             (true, false) => {
                 if let (Some(renderer), Some(render_ctx)) = (&mut ctx.renderer, &ctx.render_ctx) {
                     let vt = VoxelTerrain::new(renderer, render_ctx);
@@ -1284,7 +1335,7 @@ impl HelloGame {
                     self.voxel_terrain = Some(vt);
                 }
             }
-            // Entity deleted â€” free the chunk meshes and drop the driver.
+            // Entity deleted — free the chunk meshes and drop the driver.
             (false, true) => {
                 if let (Some(vt), Some(renderer)) = (&mut self.voxel_terrain, &mut ctx.renderer) {
                     vt.free_all(renderer);
@@ -1322,7 +1373,7 @@ impl GameApp for HelloGame {
     }
 
     fn on_init(&mut self, ctx: &mut EngineContext) {
-        info!("HelloGame initialised â€” loading scene...");
+        info!("HelloGame initialised — loading scene...");
 
         let gltf_loaded =
             if let (Some(renderer), Some(render_ctx)) = (&mut ctx.renderer, &ctx.render_ctx) {
@@ -1355,6 +1406,11 @@ impl GameApp for HelloGame {
                         }
                         true
                     }
+                    // The shell's own demo scene: a project without the file is no warning (as the vessel's).
+                    Err(e) if !std::path::Path::new("assets/test_scene.glb").is_file() => {
+                        tracing::debug!("no demo scene in this project ({e}); using procedural cube scene");
+                        false
+                    }
                     Err(e) => {
                         tracing::warn!("glTF load failed ({e}); using procedural cube scene");
                         false
@@ -1370,12 +1426,12 @@ impl GameApp for HelloGame {
             self.default_cube_alloc = Some(alloc);
         }
 
-        // Phase 14: the voxel world is no longer spawned automatically â€” create
+        // Phase 14: the voxel world is no longer spawned automatically — create
         // it from the editor via Create > Voxel Terrain. `sync_voxel_terrain`
         // builds the streaming driver when that entity appears.
 
         // Phase 24K: shadow smoke test. A wide ground plane with a cube above
-        // it, both through the visibility buffer â€” which is what the traced
+        // it, both through the visibility buffer — which is what the traced
         // path can currently see, since terrain and water write depth in their
         // own later passes.
         //
@@ -1449,22 +1505,22 @@ impl GameApp for HelloGame {
             self.camera.pitch = -3.0;
         }
 
-        // Phase 14 (SSS): heightmap terrain smoke test â€” exercises chunk
+        // Phase 14 (SSS): heightmap terrain smoke test — exercises chunk
         // meshing, LODs, sculpt brushes, and auto-splat without editor input.
         // Normally terrain is created via Create > Terrain in the editor.
         // `SOMNIUM_TERRAIN=flat` reproduces **Create > Terrain** instead: the
         // default 16x16-chunk descriptor, no sculpting, spawned at y = 0. The
-        // sculpted 4x4 variant is not a substitute â€” it was the only thing
+        // sculpted 4x4 variant is not a substitute — it was the only thing
         // 25A-2 was verified against, and the editor-created terrain turned out
         // not to render even though that one did.
         // Terrain is part of the default scene (Phase 25L). `SOMNIUM_TERRAIN`
         // now selects a variant rather than enabling it:
-        //   unset / "flat" â€” load `assets/Maps/Coastal.somnium` (Great Lakes +
+        //   unset / "flat" — load `assets/Maps/Coastal.somnium` (Great Lakes +
         //       32-layer Appalachia). Double-click Island in the Content Drawer
         //       for the 512 m / 16-material map.
-        //   "1"            â€” the legacy sculpted 4x4 smoke test, kept because it
+        //   "1"            — the legacy sculpted 4x4 smoke test, kept because it
         //       is what exercises the brush paths without editor input.
-        //   "0" / "none"   â€” no terrain, for isolating everything else.
+        //   "0" / "none"   — no terrain, for isolating everything else.
         //
         // The sculpted variant is deliberately not the default: it was the only
         // thing 25A-2 was verified against, and the editor-created terrain
@@ -1522,7 +1578,7 @@ impl GameApp for HelloGame {
                             // editor (Phase 17E). Painting by hand was the only way
                             // to get a plant on screen, which meant the foliage
                             // shading work could not be *seen*, let alone measured
-                            // â€” the reason the 17E remainder sat open. Strokes are
+                            // — the reason the 17E remainder sat open. Strokes are
                             // deterministic, so an A/B of a shading change is a
                             // like-for-like comparison.
                             if std::env::var("SOMNIUM_FOLIAGE").as_deref() == Ok("1") {
@@ -1576,7 +1632,7 @@ impl GameApp for HelloGame {
                             // judging the ground itself. Every terrain texturing
                             // phase since 25F has had to be judged on a hillside a
                             // kilometre away, where a material transition is a few
-                            // pixels wide and a height blend is invisible â€” the
+                            // pixels wide and a height blend is invisible — the
                             // features live at metres and the demo camera does not.
                             if std::env::var("SOMNIUM_TERRAIN_EYE").as_deref() == Ok("1") {
                                 let [wx, wz] = desc.world_size();
@@ -1664,7 +1720,7 @@ impl GameApp for HelloGame {
         // Phase 25M: `SOMNIUM_SUN_ELEVATION` (degrees above the horizon) and
         // `SOMNIUM_SUN_AZIMUTH` place the sun at startup. Rotating it by hand
         // with the gizmo is how the night bug was found, and reproducing that by
-        // hand is not a test â€” this makes dusk and night a capture like any
+        // hand is not a test — this makes dusk and night a capture like any
         // other. It is also the only way to give 24U's light shafts the low sun
         // behind a ridge they have never been verified against.
         if !map_actors_spawned {
@@ -1705,7 +1761,7 @@ impl GameApp for HelloGame {
         }
 
         // Phase 13C/13E: a point and a spot light so clustered local lighting is
-        // visible in the demo â€” and so the light gizmos (L) have something to
+        // visible in the demo — and so the light gizmos (L) have something to
         // draw beyond the sun. Both sit near the origin scene.
         ctx.world.spawn((
             Transform::from_translation(Vec3::new(4.0, 3.0, 2.0)),
@@ -1766,7 +1822,7 @@ impl GameApp for HelloGame {
         }
 
         // Phase 15A1: scene-wide post-processing settings, selectable in the
-        // outliner. All effects start off â€” the viewport shows the raw image
+        // outliner. All effects start off — the viewport shows the raw image
         // until a look is dialled in.
         if !map_actors_spawned {
             ctx.world.spawn((
@@ -1904,7 +1960,9 @@ impl GameApp for HelloGame {
             EngineEvent::KeyInput { key, state } => {
                 let pressed = *state == InputState::Pressed;
                 match key {
-                    KeyCode::Escape if pressed => ctx.exit(),
+                    // Esc quits a player's game only. In the editor it closed the whole window with no prompt
+                    // whenever nothing was unsaved, a key pressed to dismiss a menu or a box (editor audit, 26 Nov).
+                    KeyCode::Escape if pressed && ctx.config.player_mode => ctx.exit(),
                     KeyCode::KeyW if !self.camera.is_rmb_down && pressed => {
                         if let Some(r) = &mut ctx.renderer {
                             r.set_gizmo_mode(somnium_renderer::GizmoMode::Translate);
@@ -1940,7 +1998,7 @@ impl GameApp for HelloGame {
                         }
                     }
                     // F9: A/B the GPU-driven indirect draw path (Phase 15A).
-                    // Both paths must render identically â€” if the image changes,
+                    // Both paths must render identically — if the image changes,
                     // the indirect arguments are wrong.
                     KeyCode::F9 if pressed => {
                         if let Some(renderer) = &mut ctx.renderer {
@@ -1960,7 +2018,7 @@ impl GameApp for HelloGame {
                         }
                     }
                     // F10: A/B GPU frustum culling (Phase 15B). A correct cull
-                    // is invisible â€” if geometry pops, the cull is wrong.
+                    // is invisible — if geometry pops, the cull is wrong.
                     // CPU Frustum Cull is the Camera Details toggle (Phase CR-C).
                     KeyCode::F10 if pressed => {
                         if let Some(renderer) = &mut ctx.renderer {
@@ -2007,7 +2065,7 @@ impl GameApp for HelloGame {
             }
 
             EngineEvent::WindowResized { width, height } => {
-                info!("Window resized to {width}Ã—{height}");
+                info!("Window resized to {width}×{height}");
             }
 
             _ => {}
@@ -2159,7 +2217,8 @@ impl GameApp for HelloGame {
             } else {
                 direction
             };
-            self.camera.position = centre + direction * (radius * 3.0);
+            let fov_y = somnium_core::EDITOR_CAMERA_FOV_Y_DEGREES.to_radians();
+            self.camera.position = centre + direction * somnium_core::camera_focus_distance(radius, fov_y);
             let look = (centre - self.camera.position).normalize_or_zero();
             if look != Vec3::ZERO {
                 self.camera.yaw = look.z.atan2(look.x).to_degrees();
@@ -2194,14 +2253,21 @@ impl GameApp for HelloGame {
                 }
             }
         }
+        zone(&mut ctx.renderer, Some("Shell physics sync"));
         let required = ComponentSet::from_ids(vec![
             ComponentId::of::<Transform>(),
             ComponentId::of::<PhysicsBody>(),
         ]);
-        for archetype in ctx
-            .world
-            .query_archetypes_mut(&required, &ComponentSet::empty())
-        {
+        // Read through the shared query, and in play only a Transform the physics moved is written (`get_mut`, a
+        // change to Transform alone). Raw mutable columns (`query_archetypes_mut`) count as a change to everything:
+        // every frame they kept propagate_transforms from skipping and made it rebuild its order twice (Sunscar's
+        // piazza, 19 Nov 2026: the shell's update 8-10 ms of the main thread, its render hook 6).
+        let old_sync = physics_sync_ab_old(ctx.time.frame_count());
+        if old_sync {
+            old_physics_sync(ctx, &required, playing_now);
+        }
+        let mut moved = Vec::new();
+        for archetype in ctx.world.query_archetypes(&required, &ComponentSet::empty()).filter(|_| !old_sync) {
             let t_col = archetype
                 .column_index(ComponentId::of::<Transform>())
                 .unwrap();
@@ -2210,10 +2276,12 @@ impl GameApp for HelloGame {
                 .unwrap();
             for row in 0..archetype.len() {
                 let body = unsafe { *archetype.column(b_col).get::<PhysicsBody>(row) };
-                let transform = unsafe { archetype.column_mut(t_col).get_mut::<Transform>(row) };
+                let transform = unsafe { archetype.column(t_col).get::<Transform>(row) };
                 if playing_now {
-                    transform.translation = ctx.physics.get_position(body.id);
-                    transform.rotation = ctx.physics.get_rotation(body.id);
+                    let (position, rotation) = (ctx.physics.get_position(body.id), ctx.physics.get_rotation(body.id));
+                    if position != transform.translation || rotation != transform.rotation {
+                        moved.push((archetype.entities()[row], position, rotation));
+                    }
                 } else {
                     // Edit mode owns authored transforms. Physics preview must not
                     // move the designer's objects or invalidate every automation plan.
@@ -2225,6 +2293,13 @@ impl GameApp for HelloGame {
                 }
             }
         }
+        for (entity, position, rotation) in moved {
+            if let Some(transform) = ctx.world.get_mut::<Transform>(entity) {
+                transform.translation = position;
+                transform.rotation = rotation;
+            }
+        }
+        zone(&mut ctx.renderer, None);
         self.last_simulation_time = ctx.simulation.elapsed_seconds;
 
         // The scripted first-person character exists only during a play
@@ -2254,6 +2329,7 @@ impl GameApp for HelloGame {
             despawn_player(self, ctx);
         }
         self.was_playing = playing;
+        zone(&mut ctx.renderer, Some("Shell play hosts"));
         if playing {
             // A second place the game holds streamed (the protagonists' switch, a joint mission) thinks too.
             let held = somnium_core::cell_streaming::held_points(ctx.world);
@@ -2262,10 +2338,13 @@ impl GameApp for HelloGame {
             self.combat.update(ctx);
             self.life.update(ctx);
         }
+        zone(&mut ctx.renderer, None);
 
         // Propagate after physics/editor synchronization so render transforms
         // reflect Play, Pause, and Stop in the same frame.
+        zone(&mut ctx.renderer, Some("Shell transforms"));
         propagate_transforms(ctx.world);
+        zone(&mut ctx.renderer, None);
 
         // Flip a render switch mid-run, the way the Details panel does.
         //
@@ -2332,6 +2411,7 @@ impl GameApp for HelloGame {
         // Phase 14: create/destroy the voxel driver to match the ECS, then
         // stream chunks around the camera (async generation; finished meshes
         // are uploaded here, freed allocations recycled).
+        zone(&mut ctx.renderer, Some("Shell voxel"));
         self.sync_voxel_terrain(ctx);
         let eye = self
             .combat
@@ -2344,6 +2424,7 @@ impl GameApp for HelloGame {
         {
             vt.update(ctx.jobs, eye, renderer, render_ctx);
         }
+        zone(&mut ctx.renderer, None);
 
         // Handle mesh-creating IPC commands that require renderer access.
         // These arrive after the engine-level IPC loop (which handles non-mesh commands).
@@ -2354,7 +2435,13 @@ impl GameApp for HelloGame {
 
     fn on_render(&mut self, ctx: &mut EngineContext) {
         fracture_demo::Demo::sync(ctx.world);
+        zone(&mut ctx.renderer, Some("Shell render transforms"));
         somnium_core::propagate_transforms(ctx.world);
+        zone(&mut ctx.renderer, None);
+        // After the transforms, so a flame that just streamed in is lit where it stands.
+        zone(&mut ctx.renderer, Some("Shell fires"));
+        self.fires.update(ctx.world, self.lamps.night(), ctx.time.elapsed().as_secs_f32());
+        zone(&mut ctx.renderer, None);
         let (view_mat, eye) = self
             .combat
             .view(ctx.world)
@@ -2505,7 +2592,7 @@ impl GameApp for HelloGame {
             return;
         }
         // Phase DOOM-A: same contract for a timing run. Default on rather than
-        // opt-in â€” a run has a fixed frame count, so there is nothing left to
+        // opt-in — a run has a fixed frame count, so there is nothing left to
         // measure once it is written, and leaving the window up only invites
         // someone to read fps off it.
         if std::env::var("SOMNIUM_TIME_QUIT").as_deref() != Ok("0")
@@ -2539,6 +2626,9 @@ impl GameApp for HelloGame {
                     ComponentId::of::<Transform>(),
                     ComponentId::of::<LightComponent>(),
                 ]);
+                // How far the living's lamps are lit, as the last frame's sun left it. Debug view 41 is the lit
+                // picture with them out, for a lamp-lit frame's cost against the same frame without.
+                let night = if renderer.shading_debug == 41.0 { 0.0 } else { self.lamps.night() };
                 for archetype in ctx
                     .world
                     .query_archetypes(&light_req, &ComponentSet::empty())
@@ -2559,6 +2649,8 @@ impl GameApp for HelloGame {
                     let flicker_col = archetype.column_index(ComponentId::of::<
                         somnium_core::light_flicker::LightFlickerComponent,
                     >());
+                    let lamp_col =
+                        archetype.column_index(ComponentId::of::<somnium_core::light_flicker::LampComponent>());
                     for row in 0..archetype.len() {
                         if let Some(col) = flags_col
                             && unsafe { archetype.column(col).get::<EditorFlags>(row) }.hidden
@@ -2576,12 +2668,12 @@ impl GameApp for HelloGame {
                         let light = unsafe { archetype.column(l_col).get::<LightComponent>(row) };
 
                         // Two different conventions, easy to mix up:
-                        //  * `forward` â€” the direction light TRAVELS (entity -Z).
+                        //  * `forward` — the direction light TRAVELS (entity -Z).
                         //    This is the spot cone's axis: the shader tests
-                        //    dot(-L, direction_ws) with -L pointing lightâ†’surface.
-                        //  * `to_light` â€” the direction TOWARD the light, which is
-                        //    what the directional BRDF wants for NÂ·L.
-                        // Passing `to_light` as the spot axis aimed the cone 180Â°
+                        //    dot(-L, direction_ws) with -L pointing light→surface.
+                        //  * `to_light` — the direction TOWARD the light, which is
+                        //    what the directional BRDF wants for N·L.
+                        // Passing `to_light` as the spot axis aimed the cone 180°
                         // away from where the gizmo (correctly) drew it.
                         let forward = transform.rotation.mul_vec3(glam::Vec3::NEG_Z);
                         let to_light = -forward;
@@ -2611,7 +2703,7 @@ impl GameApp for HelloGame {
                                 // survives the trip through the atmosphere, so
                                 // it reddens as the sun drops and reaches zero
                                 // once it is below the horizon. Applied here,
-                                // to the one value every consumer reads â€”
+                                // to the one value every consumer reads —
                                 // shading, shadows, ReSTIR, the froxel volume
                                 // and the sky's own moon blending all take the
                                 // light buffer, so there is nowhere for them to
@@ -2629,10 +2721,29 @@ impl GameApp for HelloGame {
                                     to_light.y,
                                     transform.translation.y * 0.001,
                                 );
+                                // The true-size sun seen behind the wreck's bars (Sunscar's form 2) gives the
+                                // bars' share less: 56,000 of 80,000 lux. Every other form and scene, all of it.
+                                let photometric = light.photometric_color()
+                                    * if matches!(renderer.sun_wreck, Some((2, ..))) { 0.7 } else { 1.0 };
                                 renderer.set_directional_light(
                                     to_light,
-                                    light.photometric_color() * survives,
+                                    photometric * survives,
                                 );
+                                // The living's lamps are lit by what the open sky gives.
+                                let sun = photometric;
+                                let lux = glam::Vec3::new(0.2126, 0.7152, 0.0722);
+                                self.lamps.step(
+                                    self.sky_dim
+                                        * somnium_core::light_flicker::open_sky_lux(
+                                            sun.dot(lux),
+                                            (sun * survives).dot(lux),
+                                            to_light.y,
+                                        ),
+                                    ctx.time.elapsed().as_secs_f32(),
+                                );
+                                // The same light above the air: under a day clock the sky, the clouds and the fog
+                                // take this and do their own transmittance (`sky_above_air`), so dusk exists.
+                                renderer.sun_above_air = photometric;
                                 renderer.set_directional_shadow_policy(
                                     somnium_renderer::shadow::virtual_map::ShadowLightPolicy {
                                         light_id: 0,
@@ -2654,8 +2765,16 @@ impl GameApp for HelloGame {
                                     unsafe { archetype.column(col).get::<somnium_core::light_flicker::LightFlickerComponent>(row) }
                                         .factor(ctx.time.elapsed().as_secs_f32())
                                 });
+                                // One of the living's lamps burns only while the open sky is dark.
+                                let lit = lamp_col.map_or(1.0, |col| {
+                                    unsafe { archetype.column(col).get::<somnium_core::light_flicker::LampComponent>(row) }
+                                        .factor(night, transform.translation, ctx.time.elapsed().as_secs_f32())
+                                });
+                                if lit <= 0.0 {
+                                    continue;
+                                }
                                 // Spot/rect axis = travel direction. A spot keeps its cookie.
-                                if let Some(lamp) = light.local_light(transform.translation, forward, flicker) {
+                                if let Some(lamp) = light.local_light(transform.translation, forward, flicker * lit) {
                                     renderer.submit_local_light(lamp);
                                 }
                             }
@@ -2772,12 +2891,15 @@ impl GameApp for HelloGame {
                 }
             }
 
+            // The eye this frame's choices are made from: the game's own camera if it gave one (Sunscar measured
+            // every level from the editor camera at the origin, 13-17 km off, and drew far levels up close).
+            let draw_eye = self.game_eye.unwrap_or(renderer.camera_pos);
             // Cutaways: the viewer a game names (its player, its camera's focus), else the camera.
             self.cutaways.update(
                 ctx.world,
-                somnium_core::cutaway::viewer(ctx.world).unwrap_or(renderer.camera_pos),
+                somnium_core::cutaway::viewer(ctx.world).unwrap_or(draw_eye),
             );
-            self.lods.update(ctx.world, renderer.camera_pos);
+            self.lods.update(ctx.world, draw_eye);
             self.imported_draws.begin_frame();
 
             // Phase 11.5A-2: Use WorldTransform for rendering instead of Transform::to_matrix().
@@ -2834,7 +2956,7 @@ impl GameApp for HelloGame {
                         continue;
                     }
                     let Some(casts_shadow) =
-                        self.imported_draws.draw_row(ctx.world, archetype, row, entity, renderer.camera_pos)
+                        self.imported_draws.draw_row(ctx.world, archetype, row, entity, draw_eye)
                     else {
                         continue;
                     };
@@ -2940,7 +3062,8 @@ impl GameApp for HelloGame {
                         somnium_renderer::pass::water::WaterMaterialData {
                             deep_color: water.deep_color,
                             shallow_color: water.shallow_color,
-                            edge_color: water.edge_color,
+                            // The shader reads no edge colour; its alpha carries the body's turbidity.
+                            edge_color: [water.edge_color[0], water.edge_color[1], water.edge_color[2], water.turbidity],
                             absorption_roughness: [
                                 water.absorption[0],
                                 water.absorption[1],
@@ -3103,7 +3226,22 @@ impl GameApp for HelloGame {
     }
 
     fn on_shutdown(&mut self) {
-        info!("HelloGame shutting down â€” goodbye!");
+        info!("HelloGame shutting down — goodbye!");
+    }
+
+    /// A level opens where its author put its camera, not where the last map left the editor's: a streamed world
+    /// opened elsewhere showed an empty grey void until something was selected and framed.
+    fn on_scene_loaded(&mut self, ctx: &mut EngineContext, _path: &std::path::Path) {
+        if play_session(ctx) {
+            return;
+        }
+        if let Some(world) = scene_camera_world(ctx.world) {
+            let (_, rotation, position) = world.to_scale_rotation_translation();
+            let forward = rotation * Vec3::NEG_Z;
+            self.camera.position = position;
+            self.camera.yaw = forward.z.atan2(forward.x).to_degrees();
+            self.camera.pitch = forward.y.clamp(-1.0, 1.0).asin().to_degrees();
+        }
     }
 
     fn on_map_loaded(&mut self, ctx: &mut EngineContext, result: &MapLoadResult) {
@@ -3204,7 +3342,7 @@ fn build_outliner_payload(ctx: &EngineContext) -> Vec<OutlinerEntity> {
 }
 
 // â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
-// Phase 16-C â€” the scripting gate
+// Phase 16-C — the scripting gate
 // â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
 
 /// Where the demo script lives, relative to the working directory.
@@ -3234,7 +3372,7 @@ struct PlayerRuntime {
 ///
 /// Called on the transition into Play. The capsule's centre goes an eye
 /// height *below* the editor camera, so the view does not jump when you
-/// press Play â€” you carry on looking from where you were.
+/// press Play — you carry on looking from where you were.
 ///
 /// Nothing here is scripting-specific except the two attachments: the
 /// movement, the look and the jump all live in Luau, which is the point of
@@ -3304,12 +3442,12 @@ fn spawn_player(game: &mut HelloGame, ctx: &mut EngineContext) {
         camera,
         body,
     });
-    info!("Player spawned at {centre:?} â€” WASD, Shift to run, Space to jump");
+    info!("Player spawned at {centre:?} — WASD, Shift to run, Space to jump");
 }
 
 /// Tear the character down on Stop.
 ///
-/// The *entities* are removed by the engine's play-session checkpoint â€”
+/// The *entities* are removed by the engine's play-session checkpoint —
 /// anything spawned after Play was pressed is not part of the authored
 /// world. The Jolt body is ours, and nothing else would ever free it.
 fn despawn_player(game: &mut HelloGame, ctx: &mut EngineContext) {
@@ -3353,7 +3491,7 @@ fn setup_scripting(game: &mut HelloGame, ctx: &mut EngineContext) {
     //
     // `applyForce` names an entity; Jolt wants a body id. The mapping is
     // this game's `PhysicsBody` component, which `somnium_core` has never
-    // heard of â€” so the engine asks rather than guessing.
+    // heard of — so the engine asks rather than guessing.
     ctx.scripts
         .set_force_router(Box::new(|world, physics, entity, force, mode| {
             let Some(body) = world.get::<PhysicsBody>(entity).copied() else {
@@ -3374,6 +3512,12 @@ fn setup_scripting(game: &mut HelloGame, ctx: &mut EngineContext) {
     // Imported from disk so the file watcher picks up edits: change the
     // walk speed in the `.luau` and it takes effect without a restart.
     for (path, slot) in [(CONTROLLER_SCRIPT_PATH, 0), (CAMERA_SCRIPT_PATH, 1)] {
+        // The shell's own demo scripts: a game with its own project and its own walker has neither file, and an
+        // ERROR line for each on every launch hides the errors that matter.
+        if !std::path::Path::new(path).is_file() {
+            tracing::debug!("no {path} in this project");
+            continue;
+        }
         match ctx.scripts.import_script_file(std::path::Path::new(path)) {
             Ok(id) => {
                 if slot == 0 {
@@ -3440,7 +3584,7 @@ fn setup_scripting(game: &mut HelloGame, ctx: &mut EngineContext) {
         set.attach(attachment);
     }
 
-    info!("`Scripted Rotator` attached to {DEMO_SCRIPT_PATH} â€” press Play to run it");
+    info!("`Scripted Rotator` attached to {DEMO_SCRIPT_PATH} — press Play to run it");
 }
 
 // â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”â”
@@ -3685,7 +3829,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         project_root: Some(project.root.clone()),
         content_root: project.resolve(&project.manifest.content)?,
         authoring_enabled: true,
-        window_title: "Somnium Engine".into(),
+        window_title: "Lucid".into(),
         window_size: audit_window_size().unwrap_or((1280, 720)),
         target_fps: Some(60),
         ..Default::default()
@@ -3812,6 +3956,13 @@ mod profiler_zone_tests {
     /// SIM_LOD_PLAN step 0: the combat host's fixed step, the shell's fixed step and the skinned crowd each time
     /// their parts, every zone closed in the function that opens it. A source check because the profiler needs a
     /// GPU: a zone left open would nest every later scope of the frame under it.
+    /// The shell's update runs every frame: a raw mutable query there counts as a change to everything, so the
+    /// transform pass could never skip (19 Nov 2026).
+    #[test]
+    fn the_update_takes_no_change_everything_query() {
+        assert!(!body(include_str!("main.rs"), "fn on_update(&mut self, ctx").contains(".query_archetypes_mut("));
+    }
+
     #[test]
     fn the_simulation_zones_open_and_close_in_pairs() {
         let shell = r#"zone(&mut ctx.renderer, Some(""#;
@@ -3830,6 +3981,8 @@ mod profiler_zone_tests {
         );
         let host = zones(&body(include_str!("main.rs"), "fn on_fixed_update("), shell, shut);
         assert_eq!(host, ["Boats fixed", "Interactions tick"]);
+        let update = zones(&body(include_str!("main.rs"), "fn on_update(&mut self, ctx"), shell, shut);
+        assert_eq!(update, ["Shell physics sync", "Shell play hosts", "Shell transforms", "Shell voxel"]);
         let crowd = zones(
             &body(include_str!("skinned_crowd.rs"), "pub fn render("),
             r#"profiler.cpu_begin(""#,

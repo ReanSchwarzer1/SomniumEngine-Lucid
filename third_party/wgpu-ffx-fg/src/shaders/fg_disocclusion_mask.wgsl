@@ -33,8 +33,8 @@ fn compute_depth_clip(which: u32, uv_sample: vec2<f32>, current_depth: f32) -> f
                 let prev_view = device_depth_to_view_space(prev_depth, d2v);
                 let depth_diff = current_view - prev_view;
                 if (depth_diff > 0.0) {
-                    // Standard depth: the plane is the farther of the two.
-                    let plane_depth = max(prev_depth, current_depth);
+                    // Reversed depth: the plane is the farther of the two, the smaller.
+                    let plane_depth = min(prev_depth, current_depth);
                     let center = view_space_position(c.render_size / 2, c.render_size, plane_depth, d2v);
                     let corner = view_space_position(vec2<i32>(0, 0), c.render_size, plane_depth, d2v);
                     let half_viewport_width = length(vec2<f32>(c.render_size));

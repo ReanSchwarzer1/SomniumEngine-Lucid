@@ -8,10 +8,13 @@
 //
 // Concatenated after `atmosphere.wgsl`, which supplies the physics. Both LUTs
 // depend only on the atmosphere's own parameters — not on the sun or the
-// camera — so they are built once at startup and never touched again.
+// camera — so they are built at startup and again only when the aerosols'
+// factor moves (`pass/atmosphere.rs`).
 
 @group(0) @binding(0) var transmittance_src: texture_2d<f32>;
 @group(0) @binding(1) var lut_sampler:       sampler;
+/// x: the aerosols' factor (`atmosphere_aerosol`); yzw unused.
+@group(0) @binding(2) var<uniform> lut_air:  vec4<f32>;
 
 struct VOut {
     @builtin(position) clip: vec4<f32>,
@@ -30,6 +33,7 @@ fn vs_lut(@builtin(vertex_index) vid: u32) -> VOut {
 /// Transmittance: how much sunlight survives from a point to space.
 @fragment
 fn fs_transmittance(in: VOut) -> @location(0) vec4<f32> {
+    atmosphere_aerosol = lut_air.x;
     let r_mu = transmittance_uv_to_r_mu(in.uv);
     return vec4<f32>(compute_transmittance(r_mu.x, r_mu.y), 1.0);
 }
@@ -48,6 +52,7 @@ const MS_STEPS: i32 = 20;
 /// affordable: one small table instead of an unbounded recursion.
 @fragment
 fn fs_multiscatter(in: VOut) -> @location(0) vec4<f32> {
+    atmosphere_aerosol = lut_air.x;
     let mu_sun = in.uv.x * 2.0 - 1.0;
     let r = mix(GROUND_RADIUS, ATMOS_RADIUS, in.uv.y);
     let sun_dir = vec3<f32>(0.0, mu_sun, sqrt(max(1.0 - mu_sun * mu_sun, 0.0)));
@@ -88,7 +93,7 @@ fn fs_multiscatter(in: VOut) -> @location(0) vec4<f32> {
             let density    = atmosphere_density(alt);
             let extinction = atmosphere_extinction(alt);
             let scattering = RAYLEIGH_SCATTERING * density.x
-                           + vec3<f32>(MIE_SCATTERING * density.y);
+                           + vec3<f32>(MIE_SCATTERING * atmosphere_aerosol * density.y);
 
             let mu_s = dot(p, sun_dir) / ri;
             var sun_vis = 1.0;
@@ -133,6 +138,14 @@ fn fs_multiscatter(in: VOut) -> @location(0) vec4<f32> {
 
     // Geometric series over all remaining scattering orders. `scatter_total`
     // stays well below 1 for a real atmosphere, so this converges.
-    let ms = luminance_total / max(vec3<f32>(1.0) - scatter_total, vec3<f32>(1e-4));
+    //
+    // The second-order light gathered over the sphere scatters on toward the
+    // eye isotropically: times 1/4pi, Hillaire's L_2ndorder (his Eq. 5,
+    // `LSharedMem * IsotropicPhase`). `scatter_total` already carries its 1/4pi
+    // in the integrand above. Without it the multiple scattering was 4pi times
+    // too strong: a clear noon sky lit the ground several times what it should
+    // against the sun, flat and blue-grey (sunscar-look, 30 Oct 2026).
+    let second_order = luminance_total * (1.0 / (4.0 * 3.14159265));
+    let ms = second_order / max(vec3<f32>(1.0) - scatter_total, vec3<f32>(1e-4));
     return vec4<f32>(ms, 1.0);
 }

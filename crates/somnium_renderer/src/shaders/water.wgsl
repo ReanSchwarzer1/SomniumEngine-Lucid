@@ -1,3 +1,4 @@
+//!include "froxel_depth.wgsl"
 // Somnium Engine — finite lake surface and physically coherent optics (IV-D/E).
 //
 // Gerstner dispersion/query parity follows the published GPU Gems water pattern;
@@ -12,6 +13,10 @@ struct View {
     _padding: f32,
     time: f32,
     _pad1: vec2<f32>,
+    _wind: vec4<f32>,
+    _wind_time: vec4<f32>,
+    // global_pool.wgsl `View.inv_view_proj_rel`, offset 256.
+    inv_view_proj_rel: mat4x4<f32>,
 }
 
 struct DirectionalLight {
@@ -141,9 +146,9 @@ fn apply_volumetric_fog(colour: vec3<f32>, world_pos: vec3<f32>, screen_uv: vec2
     }
     let dist = length(world_pos - view.camera_pos);
     let slices = f32(textureDimensions(volumetrics).z);
-    let w = saturate(dist / volumetric_range.x - 0.5 / slices);
+    let w = saturate(froxel_w(dist, volumetric_range.x) - 0.5 / slices);
     let fog = textureSampleLevel(volumetrics, volumetric_sampler, vec3<f32>(screen_uv, w), 0.0);
-    let fade = saturate(dist / (volumetric_range.x / slices));
+    let fade = saturate(dist / froxel_t(1.0 / slices, volumetric_range.x));
     return colour * mix(1.0, fog.a, fade) + exp(fog.rgb) * fade;
 }
 
@@ -500,8 +505,9 @@ fn sample_shadow(world_pos: vec3<f32>, view_depth: f32) -> f32 {
 
 fn reconstruct_world(uv: vec2<f32>, depth: f32) -> vec3<f32> {
     let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
-    let world = view.inv_view_proj * ndc;
-    return world.xyz / world.w;
+    // Camera-relative, then moved out: the absolute inverse snaps to 2^-6 in ndc kilometres from the origin.
+    let world = view.inv_view_proj_rel * ndc;
+    return world.xyz / world.w + view.camera_pos;
 }
 
 fn project_uv(world: vec3<f32>) -> vec3<f32> {
@@ -535,7 +541,8 @@ fn trace_ssr(origin: vec3<f32>, direction: vec3<f32>) -> vec4<f32> {
         let dimensions = textureDimensions(depth_texture);
         let coord = body_texel(projected.xy, dimensions);
         let scene_depth = textureLoad(depth_texture, coord, 0);
-        if scene_depth < 0.9999 {
+        // Not the sky (reversed-Z's cleared 0, Sunscar, 6 Nov 2026).
+        if scene_depth > 0.0 {
             let scene_world = reconstruct_world(projected.xy, scene_depth);
             let delta = view_depth(ray_point) - view_depth(scene_world);
             let thickness = 0.12 + distance_along * 0.012;
@@ -787,8 +794,8 @@ fn soft_edge(clip_pos: vec4<f32>, world_position: vec3<f32>) -> f32 {
     );
     let scene = textureLoad(depth_texture, coord, 0);
     // Nothing behind this pixel: open water against the sky needs no fade, and
-    // reconstructing a world position from a cleared depth would be nonsense.
-    if scene >= 0.9999 {
+    // reconstructing a world position from a cleared depth (reversed-Z's 0) would be nonsense.
+    if scene <= 0.0 {
         return 1.0;
     }
     let uv = (vec2<f32>(coord) + vec2<f32>(0.5)) / vec2<f32>(dimensions);
@@ -879,9 +886,10 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> Sh
     let screen_size = vec2<f32>(textureDimensions(depth_texture));
     let screen_uv = input.clip_pos.xy / screen_size;
     let coord = vec2<i32>(input.clip_pos.xy);
+    // Reversed-Z: the sky is 0, and a hair above it keeps the point finite.
     let base_depth = textureLoad(depth_texture, coord, 0);
-    let base_has_backdrop = base_depth < 0.9999;
-    let base_world = reconstruct_world(screen_uv, min(base_depth, 0.9999));
+    let base_has_backdrop = base_depth > 0.0;
+    let base_world = reconstruct_world(screen_uv, max(base_depth, 1e-7));
 
     // Refract, then reject samples that are sky, in front of the surface, or
     // reveal foreground. Invalid displacement falls back to the unperturbed UV.
@@ -889,8 +897,8 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> Sh
     let candidate_uv = clamp(screen_uv + refract_offset, vec2<f32>(0.0), vec2<f32>(1.0));
     let candidate_coord = body_texel(candidate_uv, textureDimensions(depth_texture));
     let candidate_depth = textureLoad(depth_texture, candidate_coord, 0);
-    let candidate_world = reconstruct_world(candidate_uv, min(candidate_depth, 0.9999));
-    let candidate_valid = candidate_depth < 0.9999
+    let candidate_world = reconstruct_world(candidate_uv, max(candidate_depth, 1e-7));
+    let candidate_valid = candidate_depth > 0.0
         && view_depth(candidate_world) > water_view_depth + 0.03;
     let refr_uv = select(screen_uv, candidate_uv, candidate_valid);
     var refracted = textureSampleLevel(scene_color, sampler_linear, refr_uv, 0.0).rgb;
@@ -926,6 +934,24 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> Sh
     let single_scatter = (vec3<f32>(1.0) - transmittance)
         * sigma_s / max(sigma_t, vec3<f32>(1e-5))
         * ((sun_scatter + moon_scatter) / PI + env_up);
+    // Turbid water (glacial flour, brine, travertine, iron-red springs): light scatters many times before it comes
+    // back out, so the body answers sun and sky as a matte surface does, by its diffuse reflectance, and one
+    // scattering's phase function no longer says where the light goes. Without this a milky lake had the sky's
+    // share of its colour and a twelfth of the sun's, and lay dark beside sunlit ground. `edge_color.a` is the
+    // body's turbidity: 0 keeps the single scattering above, as every body had before.
+    let turbidity = clamp(material.edge_color.a, 0.0, 1.0);
+    var volume_scatter = single_scatter;
+    if turbidity > 0.0 {
+        // Forward scattering barely turns light: only (1 - g) of it counts towards turning it round (similarity).
+        let turned = sigma_s * (1.0 - phase_g);
+        // The diffuse reflectance of a deep scattering medium by its albedo (van de Hulst's fit): with
+        // s = sqrt(1 - albedo), 0 at albedo 0 and 1 at albedo 1.
+        let s = sqrt(sigma_a / max(sigma_a + turned, vec3<f32>(1e-5)));
+        let matte = (vec3<f32>(1.0) - s) * (vec3<f32>(1.0) - 0.139 * s) / (vec3<f32>(1.0) + 1.17 * s);
+        let lit = env_up + (light.color * shadow * max(dot(n, sun_l), 0.0)
+            + moon_color * max(dot(n, moon_l), 0.0)) / PI;
+        volume_scatter = mix(single_scatter, (vec3<f32>(1.0) - transmittance) * matte * lit, turbidity);
+    }
     let tint = mix(material.shallow_color.rgb, material.deep_color.rgb,
         smoothstep(0.5, max(material.surface_params.y * 6.0, 2.0), authored_depth));
     var transmitted = refracted * tint * transmittance;
@@ -970,10 +996,14 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> Sh
             backdrop_distance),
         base_has_backdrop,
     );
+    // Foam at a shore is water thrown about, so it takes waves: a body's swell under 5 cm scales it away. Without
+    // this the contact term whitened every pixel of water shallower than a third of a metre, moving or not, and a
+    // shallow river lay white as snow from bank to bank (the Vela Canyon's river, Sunscar, 11 Nov 2026).
+    let agitation = saturate(material.surface_params.z / 0.05);
     let shore_foam = max(
         shore_band * clamp(0.28 + breaker * 0.82 + foam_noise * 0.38, 0.0, 1.0),
         depth_contact * (0.62 + foam_noise * 0.28),
-    );
+    ) * agitation;
     // Whitecap coverage. The 0.75 scale and the distance fade are the
     // reference's: foam is a thin film that stops resolving long before the
     // waves carrying it do, so it has to disappear faster than the geometry.
@@ -1081,7 +1111,7 @@ fn fs_main(input: VertexOutput, @builtin(front_facing) front_facing: bool) -> Sh
     // the only part that fades out with depth. The volume scatter and the crest
     // glow carry open water on their own.
     let shallow_transmission = 1.0 - smoothstep(0.5, 6.0, authored_depth);
-    let below_surface = transmitted * shallow_transmission + single_scatter + crest_glow;
+    let below_surface = transmitted * shallow_transmission + volume_scatter + crest_glow;
 
     // Where foam covers the surface it replaces the water body entirely: a
     // whitecap is air and droplets, and nothing below it reaches the eye.
@@ -1195,10 +1225,10 @@ fn fs_prepass(input: VertexOutput, @builtin(front_facing) front_facing: bool) ->
     let shore_band = 1.0 - smoothstep(0.0, foam_width, shore_distance);
     let coord = vec2<i32>(input.clip_pos.xy);
     let base_depth = textureLoad(depth_texture, coord, 0);
-    let base_has_backdrop = base_depth < 0.9999;
+    let base_has_backdrop = base_depth > 0.0;
     let screen_size = vec2<f32>(textureDimensions(depth_texture));
     let screen_uv = input.clip_pos.xy / screen_size;
-    let base_world = reconstruct_world(screen_uv, min(base_depth, 0.9999));
+    let base_world = reconstruct_world(screen_uv, max(base_depth, 1e-7));
     let backdrop_distance = select(authored_depth, distance(input.world_position, base_world), base_has_backdrop);
     let depth_contact = select(
         0.0,
@@ -1208,10 +1238,11 @@ fn fs_prepass(input: VertexOutput, @builtin(front_facing) front_facing: bool) ->
             backdrop_distance),
         base_has_backdrop,
     );
+    // As in the surface's shading above: no swell, no shore foam.
     let shore_foam = max(
         shore_band * clamp(0.28 + breaker * 0.82 + foam_noise * 0.38, 0.0, 1.0),
         depth_contact * (0.62 + foam_noise * 0.28),
-    );
+    ) * saturate(material.surface_params.z / 0.05);
     let crest_foam = smoothstep(0.0, 1.0, spectrum.a * 0.75)
         * exp(-water_view_depth * 0.0075)
         * smoothstep(0.5, 2.0, authored_depth);

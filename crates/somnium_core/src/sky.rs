@@ -36,7 +36,9 @@ pub struct SkyComponent {
     /// shading-dominated; §3 makes turning this on before the profiler speaks
     /// an explicit non-goal.
     pub enabled: bool,
-    /// Fraction of the sky with cloud in it. `0` is clear, `1` is solid.
+    /// Fraction of the sky with cloud in it. `0` is clear, `1` is the weather field at its fullest, which still has
+    /// thin places a stratus sheet shows as holes; above 1 (to 3) closes them: a rain deck with no blue in it
+    /// (Sunscar weather, 11 Nov 2026).
     pub coverage: f32,
     /// `0` stratus, `0.5` cumulus, `1` cumulonimbus. Selects the vertical
     /// density profile, which is what stops a cumulus having a flat top.
@@ -64,6 +66,8 @@ pub struct SkyComponent {
     pub shape_scale: f32,
     /// Ambient contribution from the sky's own multiscatter term.
     pub ambient: f32,
+    /// Scale on the light the clouds scatter (default 1: physical, as the sky and the sun are).
+    pub brightness: f32,
     /// Henyey–Greenstein forward lobe — the silver lining.
     pub phase_forward: f32,
     /// Henyey–Greenstein backward lobe. Negative.
@@ -95,6 +99,11 @@ pub struct SkyComponent {
     /// Off by default: TAA has no motion vector for a sky pixel, so a pattern
     /// that moves every frame is shimmer rather than dithering.
     pub temporal_jitter: bool,
+    /// The air's aerosols (haze, dust, smoke): a factor on the atmosphere's Mie scattering and extinction, over the
+    /// engine's own (and `SOMNIUM_MIE_SCALE`'s). 1, the default and what a scene without the field reads, draws the
+    /// sky and the far air as they were; 2 is twice the haze. Read whether or not the cloud layer is on: a weather
+    /// sets it every frame (`Renderer::aerosol`, which steps the sky after it; Sunscar, 27 Nov 2026).
+    pub aerosol: f32,
 }
 
 impl Component for SkyComponent {}
@@ -148,6 +157,84 @@ impl Default for SkyEyeComponent {
     }
 }
 
+/// The planet over the horizon (Sunscar, 12 Nov 2026): a dead world near enough to show a disc degrees across, lit by
+/// the sun, standing fixed on the sky.
+///
+/// It never moves (`azimuth_deg`, `elevation_deg`); the sun goes round it, so its phase turns once a day. Its light is
+/// physical: its geometric albedo times the sun's light above the air times its disc's solid angle, by the phase (a
+/// Lambert sphere's), through the air along its direction. It is the night's light (the renderer's moon slot) and
+/// lights the sky, the clouds and the fog. A hidden entity draws none.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SkyPlanetComponent {
+    pub enabled: bool,
+    /// Angular diameter, degrees (the Moon's is 0.52).
+    pub diameter_deg: f32,
+    /// Geometric albedo: its brightness at full against a white disc of its size (dark rock 0.05-0.12).
+    pub albedo: f32,
+    /// Where it stands, fixed on the sky (it does not rise or set; its phase turns with the sun, once a day): azimuth
+    /// in the engine's convention, as `TimeOfDay.fixed_azimuth` (compass bearing = 180 - azimuth), degrees.
+    pub azimuth_deg: f32,
+    /// Its centre's height above the horizon, degrees.
+    pub elevation_deg: f32,
+    /// Which surface (a seed for its noise).
+    pub seed: f32,
+    /// The glow of its open fissures on its night side, cd/m2 (about 1,000 K, deep orange); 0 for a cold world.
+    pub ember: f32,
+}
+
+impl Component for SkyPlanetComponent {}
+
+impl Default for SkyPlanetComponent {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // Sunscar's (the lead's 22:45 spec): 12 degrees wide, its centre 12 up at bearing 200, over the southern sea.
+            // A dark world: at 0.012 it gives open level ground 1 lux after dusk and 0.3 at midnight, and by day it is a
+            // pale ghost a few per cent over the sky round it.
+            diameter_deg: 12.0,
+            albedo: 0.012,
+            azimuth_deg: 340.0,
+            elevation_deg: 12.0,
+            seed: 0.37,
+            ember: 3.0,
+        }
+    }
+}
+
+/// Its surface's mean colour (linear RGB, luminance 1): rust highlands and basalt plains, as `sky_planet.wgsl` paints.
+const PLANET_TINT: glam::Vec3 = glam::Vec3::new(1.17, 0.97, 0.75);
+
+impl SkyPlanetComponent {
+    /// What it sends, given the sun's direction and its light above the air (lux per channel): the renderer's
+    /// parameters, its direction the engine's convention (toward it, as the sun).
+    #[must_use]
+    pub fn to_params(&self, sun_dir: glam::Vec3, sun_above_air: glam::Vec3) -> somnium_renderer::PlanetParams {
+        if !self.enabled || self.diameter_deg <= 0.0 || self.albedo <= 0.0 {
+            return somnium_renderer::PlanetParams::default();
+        }
+        let toward = -(crate::time_of_day::sun_rotation(self.azimuth_deg, self.elevation_deg) * glam::Vec3::NEG_Z);
+        let radius = (self.diameter_deg.clamp(0.05, 60.0) * 0.5).to_radians();
+        // The phase angle at the planet, between the sun and us: the sun is so far that the planet sees it where we do.
+        let alpha = (-sun_dir.normalize_or(glam::Vec3::Y).dot(toward)).clamp(-1.0, 1.0).acos();
+        let lambert = (alpha.sin() + (std::f32::consts::PI - alpha) * alpha.cos()) / std::f32::consts::PI;
+        // ponytail: its light on the world is the 12 degree planet's at most (the night was tuned under that one, 12 Nov):
+        // drawn larger so it is seen (the developer, 26 Nov: "toooo small for the player to notice"), it lights the
+        // land no more. A field if a brighter night under a larger planet is ever wanted.
+        let lit = radius.min(6.0_f32.to_radians());
+        let full = sun_above_air * (self.albedo * lit * lit);
+        let light_above_air = full * PLANET_TINT * lambert.max(0.0);
+        somnium_renderer::PlanetParams {
+            direction: toward,
+            radius,
+            light_above_air,
+            // Through the air along its direction, as the sun's is (`sun::transmittance`): it reddens as it sets.
+            light_ground: light_above_air * crate::sun::transmittance(toward.y, 0.0),
+            albedo: self.albedo,
+            surface: [self.seed, 0.0, self.ember.max(0.0), 0.002],
+        }
+    }
+}
+
 impl SkyEyeComponent {
     /// World direction toward the eye's centre.
     #[must_use]
@@ -188,6 +275,7 @@ impl Default for SkyComponent {
             weather_scale: 24_000.0,
             shape_scale: 6_000.0,
             ambient: 1.0,
+            brightness: 1.0,
             phase_forward: 0.8,
             phase_backward: -0.35,
             phase_blend: 0.4,
@@ -199,6 +287,7 @@ impl Default for SkyComponent {
             seed: 1337,
             quality: 0,
             temporal_jitter: false,
+            aerosol: 1.0,
         }
     }
 }
@@ -212,7 +301,7 @@ impl SkyComponent {
     #[must_use]
     pub fn to_settings(&self) -> somnium_renderer::pass::clouds::CloudSettings {
         somnium_renderer::pass::clouds::CloudSettings {
-            coverage: self.coverage.clamp(0.0, 1.0),
+            coverage: self.coverage.clamp(0.0, 3.0),
             cloud_type: self.cloud_type.clamp(0.0, 1.0),
             altitude: self.altitude.max(1.0),
             thickness: self.thickness.max(1.0),
@@ -223,6 +312,7 @@ impl SkyComponent {
             weather_scale: self.weather_scale.max(1.0),
             shape_scale: self.shape_scale.max(1.0),
             ambient: self.ambient.max(0.0),
+            brightness: self.brightness.max(0.0),
             phase_forward: self.phase_forward.clamp(0.0, 0.95),
             phase_backward: self.phase_backward.clamp(-0.95, 0.0),
             phase_blend: self.phase_blend.clamp(0.0, 1.0),
@@ -376,7 +466,8 @@ mod tests {
             ..SkyComponent::default()
         };
         let s = wild.to_settings();
-        assert_eq!(s.coverage, 1.0);
+        // Above 1 closes the deck's holes (the weather field at 1 is the noise itself); 3 is the ceiling.
+        assert_eq!(s.coverage, 3.0);
         assert_eq!(s.cloud_type, 0.0);
         assert!(s.altitude >= 1.0);
         assert!(s.thickness >= 1.0);
@@ -390,6 +481,16 @@ mod tests {
         assert_eq!(s.light_steps, 1);
         assert!(s.max_distance >= 1.0);
         assert_eq!(s.seed, 0);
+    }
+
+    /// The aerosols' factor is 1 unless a scene or a weather says otherwise, and it is a saved, editable field (a scene
+    /// written before it reads the default).
+    #[test]
+    fn the_aerosols_default_to_the_engine_s_own() {
+        assert_eq!(SkyComponent::default().aerosol, 1.0);
+        let registry = crate::reflect_registry::editor_registry();
+        let schema = registry.by_name("somnium.Sky").expect("Sky is registered");
+        assert!(schema.field_by_name("aerosol").is_some(), "the Sky declares aerosol");
     }
 
     #[test]
@@ -504,5 +605,49 @@ mod tests {
         }
         assert_eq!(PRESETS[0].0, "clear");
         assert_eq!(PRESETS[3].0, "storm");
+    }
+
+    /// Sunscar's planet on its first day under Sunscar's clock (day 97, latitude 39.957): down in the morning, up from
+    /// the afternoon, a gibbous a fifth of the sky's height over the land at dusk, the night's light after it, between
+    /// a dark and a bright moonlit night many times over but no second day; and a full planet of 7 degrees at albedo
+    /// 0.07 sends 21 lux above the air (a planet opposite the sun in hour angle, 26.5 degrees off in declination, 19).
+    #[test]
+    fn the_planet_stands_fixed_and_lights_the_night() {
+        // Sunscar's clock: noon is the old fixed sun (azimuth 114, elevation 35).
+        let clock = crate::time_of_day::TimeOfDayComponent {
+            fixed_sun: false,
+            day_of_year: 307,
+            latitude: 40.17,
+            longitude: -4.091,
+            north_offset: -66.0,
+            ..crate::time_of_day::TimeOfDayComponent::default()
+        };
+        let planet = SkyPlanetComponent::default();
+        let sun_lux = glam::Vec3::splat(80_000.0);
+        let at = |hour: f32| {
+            let c = crate::time_of_day::TimeOfDayComponent { hour, ..clock.clone() };
+            let sun = -(c.evaluate().rotation * glam::Vec3::NEG_Z);
+            (planet.to_params(sun, sun_lux), sun)
+        };
+        let luma = |v: glam::Vec3| v.dot(glam::Vec3::new(0.2126, 0.7152, 0.0722));
+        let lit = |p: &somnium_renderer::PlanetParams, sun: glam::Vec3| (1.0 - sun.dot(p.direction)) * 0.5;
+        // Fixed: bearing 200 (engine azimuth 340), 12 degrees up, whatever the hour.
+        let (noon, sun) = at(12.0);
+        let (night, _) = at(0.0);
+        assert!(noon.direction.dot(night.direction) > 0.999_999);
+        let (az, el) = crate::time_of_day::azimuth_elevation_from_direction(noon.direction);
+        assert!((az - 340.0).abs() < 0.01 && (el - 12.0).abs() < 0.01, "({az}, {el})");
+        // Its phase turns once a day with the sun (the design's 74% at noon, 93% at sunset, 44% at midnight).
+        assert!((lit(&noon, sun) - 0.73).abs() < 0.03, "noon {}", lit(&noon, sun));
+        let (set, sun) = at(17.2);
+        assert!((lit(&set, sun) - 0.93).abs() < 0.03, "sunset {}", lit(&set, sun));
+        let (_, sun) = at(0.0);
+        assert!((lit(&night, sun) - 0.44).abs() < 0.03, "midnight {}", lit(&night, sun));
+        // On open level ground: about 1 lux after dusk (the sun 18 degrees down at 18:45), about 0.3 at midnight.
+        let ground = |p: &somnium_renderer::PlanetParams| luma(p.light_ground) * p.direction.y;
+        let (dusk, sun) = at(18.75);
+        assert!(sun.y < -0.3, "after dusk the sun is 18 degrees down: {}", sun.y.asin().to_degrees());
+        assert!((ground(&dusk) - 1.0).abs() < 0.15, "after dusk {} lux", ground(&dusk));
+        assert!((ground(&night) - 0.33).abs() < 0.08, "midnight {} lux", ground(&night));
     }
 }

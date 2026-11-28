@@ -5,6 +5,7 @@
 // hoists every `enable` above everything.
 //!include "rt_hit.wgsl"
 //!include "global_pool.wgsl"
+//!include "grass_pool.wgsl"
 //!include "brdf.wgsl"
 //!include "sampling.wgsl"
 //!include "atmosphere.wgsl"
@@ -116,6 +117,76 @@ struct GiReservoir {
 // concatenated without `shading.wgsl`, and the pool it *does* share is group 0.
 @group(1) @binding(7) var default_sampler: sampler;
 @group(1) @binding(8) var grain_masks: texture_2d_array<f32>;
+// The environment cube (`ibl.rs`): what an escaped ray sees.
+@group(1) @binding(10) var gi_env: texture_cube<f32>;
+@group(1) @binding(11) var gi_env_sampler: sampler;
+
+// ── The sky's share (Sunscar, 11 Nov 2026) ───────────────────────────────────
+//
+// From 6 Nov an escaped ray put the sky's radiance into the reservoir, so the traced estimate held the whole of the
+// diffuse light. A reservoir is one sample and its weight: right for a small bright source (a sunlit patch through a
+// doorway), wrong for a dome that fills the hemisphere. Its noise does not average out, it is shared between
+// neighbours and frames, and under a cloud deck or in shade, where the sky is all the light there is, it stood on
+// every surface as dark smoky blotches 15-30 pixels wide (the developer, 7 and 11 Nov: "black splotches"). Inside a
+// crown it was worse: nearly every borrowed sky sample failed its visibility ray, and the leaves went black.
+//
+// The sky is now estimated as what it is. Each texel's ray adds to two sums: the environment's radiance along it
+// (`den`), and the same again if it left the scene (`num`). Their ratio is the share of the environment's light that
+// gets past the scene, and it is exact, with no noise at all, wherever nothing is in the way: open ground stays as
+// smooth as the cube. `gi_accumulate.wgsl` averages the sums over neighbours and over time, and the shading pass
+// multiplies the cube's own irradiance by the ratio. The reservoir keeps what it is good at: the bounce off what the
+// rays hit.
+/// This frame's sums per GI texel. `r` over `g` is the share for the side of the surface the camera sees. `b` over
+/// `a` is the open sky a thin leaf's far side receives (see `GiSurface.leaf`). Each ray's radiance is relative to
+/// the sky's mean overhead: about 1 by day and by night, so the half floats that hold them never run out of range
+/// or of precision, and a frame under a brightening sky weighs no more than the one before it.
+@group(1) @binding(12) var sky_out: texture_storage_2d<rgba16float, write>;
+/// The clouds' shadow on the ground (`clouds.wgsl` `cloud_shadow`) and its `[centre_x, centre_z, extent, strength]`:
+/// the sun a bounce ray's hit receives comes through the deck, as the sun on every shaded surface does.
+@group(1) @binding(13) var gi_cloud_shadow: texture_2d<f32>;
+@group(1) @binding(14) var<uniform> gi_cloud_shadow_params: vec4<f32>;
+
+/// The most one ray may weigh against the sky's mean: the sun's own texels in the cube stay a few times the mean,
+/// and nothing brighter is let turn the share into "did the one ray at the sun get out".
+const GI_SKY_CEILING: f32 = 16.0;
+/// The cube's roughest mip (`ibl.rs` MIP_COUNT 6): its mean radiance about a normal, the sky's irradiance over pi.
+const GI_ENV_ROUGHEST: f32 = 5.0;
+/// How much of the sky a hit on a mesh is taken to see. ponytail: a guess (walls and trunks see about half the dome
+/// and the cube's own ground term stands for the rest); read the accumulated ratio at the hit when it is on screen
+/// if bounced sky light ever proves wrong.
+const GI_HIT_SKY: f32 = 0.75;
+
+/// The sun's share through the cloud deck at a world point (shading.wgsl `cloud_shadow_at`, the same field and rule).
+fn gi_cloud_sun_at(p: vec3<f32>) -> f32 {
+    if gi_cloud_shadow_params.w <= 0.0 {
+        return 1.0;
+    }
+    let local = (p.xz - gi_cloud_shadow_params.xy) / max(gi_cloud_shadow_params.z, 1.0);
+    let near = clamp(textureSampleLevel(gi_cloud_shadow, default_sampler,
+        clamp(local, vec2<f32>(-1.0), vec2<f32>(1.0)) * 0.5 + 0.5, 0.0).r, 0.0, 1.0);
+    let past = max(abs(local.x), abs(local.y)) - 1.0;
+    if past <= 0.0 {
+        return near;
+    }
+    var mean = 0.0;
+    for (var i = 0; i < 16; i = i + 1) {
+        let g = (vec2<f32>(f32(i & 3), f32(i >> 2)) + 0.5) / 4.0;
+        mean += textureSampleLevel(gi_cloud_shadow, default_sampler, g, 0.0).r;
+    }
+    return mix(near, clamp(mean / 16.0, 0.0, 1.0), saturate(past * 2.0));
+}
+
+/// How much of the sky the ground sees at a terrain hit: the terrain's baked sky visibility (terrain_material.wgsl
+/// `terrain_sky_visibility`), 1 without a bake.
+fn gi_terrain_sky(terrain_index: u32, p: vec3<f32>) -> f32 {
+    let tm = terrain_materials[terrain_index];
+    if tm.skyvis_map < 0 {
+        return 1.0;
+    }
+    let uv = (p.xz - tm.terrain_origin) * tm.inv_world_size;
+    let seen = textureSampleLevel(textures[tm.skyvis_map], default_sampler, uv, 0.0).a;
+    return mix(1.0, seen, clamp(tm.sky_visibility_strength, 0.0, 1.0));
+}
 
 @group(1) @binding(5) var<storage, read_write> gi_a: array<GiReservoir>;
 @group(1) @binding(6) var<storage, read_write> gi_b: array<GiReservoir>;
@@ -138,9 +209,9 @@ fn gi_rand(seed: ptr<function, u32>) -> f32 {
 /// the diffuse BRDF's own cosine then cancels the sampling density exactly, so
 /// the estimator loses a multiply and, more importantly, stops spending samples
 /// on grazing directions that the cosine would have thrown away anyway.
-fn gi_sample_cosine(n: vec3<f32>, seed: ptr<function, u32>) -> vec3<f32> {
-    let u1 = gi_rand(seed);
-    let u2 = gi_rand(seed);
+fn gi_sample_cosine(n: vec3<f32>, u: vec2<f32>) -> vec3<f32> {
+    let u1 = u.x;
+    let u2 = u.y;
     let r = sqrt(u1);
     let theta = 6.28318530718 * u2;
     let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.99);
@@ -162,6 +233,19 @@ fn gi_visible(origin: vec3<f32>, to: vec3<f32>, t_min: f32) -> bool {
     if dist <= t_min {
         return true;
     }
+    // Through a leaf card's holes, as the bounce ray that found the sample went (`rt_trace`). Opaque, every card was
+    // a solid quad here: a canopy turned away nearly every sky sample and every sun ray to a hit under it, and the
+    // floor of a wood went black (Sunscar, 6 Nov 2026).
+    if rt_candidate_alpha {
+        var aq: ray_query;
+        rayQueryInitialize(&aq, accel, RayDesc(0x6u, 0x5u, t_min, dist * 0.999, origin, d / dist));
+        while rayQueryProceed(&aq) {
+            if rt_candidate_is_covered(rayQueryGetCandidateIntersection(&aq)) {
+                rayQueryConfirmIntersection(&aq);
+            }
+        }
+        return rayQueryGetCommittedIntersection(&aq).kind == RAY_QUERY_INTERSECTION_NONE;
+    }
     var rq: ray_query;
     rayQueryInitialize(
         &rq,
@@ -170,7 +254,8 @@ fn gi_visible(origin: vec3<f32>, to: vec3<f32>, t_min: f32) -> bool {
         // surface at `to` is not its own occluder.
         // Visibility rays see shadow casters; bounce-hit rays keep the full
         // geometry mask in rt_trace so non-casters still receive indirect light.
-        RayDesc(0x4u, 0x1u, t_min, dist * 0.999, origin, d / dist),
+        // 0x1 opaque casters, 0x4 cut-out cards (raytrace.rs): leaves block GI's light too.
+        RayDesc(0x4u, 0x5u, t_min, dist * 0.999, origin, d / dist),
     );
     rayQueryProceed(&rq);
     return rayQueryGetCommittedIntersection(&rq).kind == RAY_QUERY_INTERSECTION_NONE;
@@ -289,17 +374,36 @@ fn gi_local_irradiance(p: vec3<f32>, n: vec3<f32>, seed: ptr<function, u32>) -> 
 
 /// Direct radiance leaving a secondary hit: sun plus shadowed local fixtures.
 /// One sun ray and at most one local-light shadow ray, independent of count.
-fn gi_direct_at(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>, terrain_index: i32, seed: ptr<function, u32>) -> vec3<f32> {
+fn gi_direct_at(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>, terrain_index: i32, transmission: f32,
+    seed: ptr<function, u32>) -> vec3<f32> {
     let l = normalize(light.direction);
     let ndl = dot(n, l);
     var irradiance = gi_local_irradiance(p, n, seed);
-    if ndl > 0.0 && gi_luma(light.color) > 1.0e-6 && gi_visible(p + n * 0.02, p + l * 4000.0, 0.02) {
+    // The sun reaches the hit through the cloud deck, as it reaches every shaded surface (`cloud_shadow_at`). Without
+    // this a bounce under an overcast carried the full sun, several times the light of the sky that was really there.
+    let sun = light.color * (light.ibl_intensity * gi_cloud_sun_at(p));
+    if ndl > 0.0 && gi_luma(sun) > 1.0e-6 && gi_visible(p + n * 0.02, p + l * 4000.0, 0.02) {
         // Retain the established outdoor sun-bounce grading. Previously the
         // final IBL composite multiplied the whole reservoir by this value;
         // applying it here preserves that sun response while keeping practical
         // bounce independent of the sky-fill control.
-        irradiance += light.color * (ndl * light.ibl_intensity);
+        irradiance += sun * ndl;
     }
+    // A leaf lit from the far side passes light through (thin Lambertian translucency, `Material.transmission`):
+    // a canopy's underside glows green, and that, not the sky, is most of the light on a wood's floor (Sunscar,
+    // 6 Nov 2026). The normal faces the ray, so the sun is behind it when ndl < 0.
+    if ndl < 0.0 && transmission > 0.0 && gi_luma(sun) > 1.0e-6
+        && gi_visible(p - n * 0.02, p + l * 4000.0, 0.02) {
+        irradiance += sun * (-ndl * transmission);
+    }
+    // The sky lights the hit too: under a deck it is the only light the ground has to send on, and without it a
+    // surface that faces the ground (an arch's underside, the lower leaves of a crown) had none at all. The cube's
+    // roughest mip about the hit's normal is the sky's irradiance over pi; the hit sees its share of it.
+    var seen = GI_HIT_SKY;
+    if terrain_index >= 0 {
+        seen = gi_terrain_sky(u32(terrain_index), p);
+    }
+    let sky = textureSampleLevel(gi_env, gi_env_sampler, n, GI_ENV_ROUGHEST).rgb * (light.ibl_intensity * seen);
     var direct_albedo = albedo;
     if rt_gi_deferred_terrain_albedo && terrain_index >= 0 {
         // Same lookup, position and arithmetic as eager rt_resolve; only its
@@ -310,7 +414,7 @@ fn gi_direct_at(p: vec3<f32>, n: vec3<f32>, albedo: vec3<f32>, terrain_index: i3
     // `light.color` is already premultiplied by intensity (see
     // `DirectionalLight` in the pool) — the sort of detail that silently costs
     // a factor of 100 000 if assumed rather than checked.
-    return direct_albedo * (1.0 / 3.14159265) * irradiance;
+    return direct_albedo * ((1.0 / 3.14159265) * irradiance + sky);
 }
 
 /// Luminance, the target function ReSTIR resamples against.
@@ -361,7 +465,14 @@ fn gi_merge(
     other_pos: vec3<f32>,
     seed: ptr<function, u32>,
 ) {
-    if other.m <= 0.0 || other.w <= 0.0 {
+    if other.m <= 0.0 {
+        return;
+    }
+    if other.w <= 0.0 {
+        // Candidates that carried nothing are candidates still. They used all to carry the sky; now a ray that
+        // leaves the scene is one of these, and passing them over forgot every miss: one hit in fifty rays stood
+        // at a twenty-fifth of its light for good.
+        (*r).m += other.m;
         return;
     }
     let j = gi_jacobian(p, other_pos, other.sample_pos, other.sample_normal);
@@ -402,6 +513,15 @@ struct GiSurface {
     valid: bool,
     pos: vec3<f32>,
     normal: vec3<f32>,
+    /// On a thin leaf (a two-sided cut-out), the share of light it lets through (`Material.transmission`); 0 on
+    /// everything else. A leaf is lit from both sides: what the camera sees of it is the light its near side
+    /// reflects and the light its far side lets through. The near side of a leaf that hangs over dark ground gets
+    /// almost nothing, and with the far side left out every such leaf was black: the undersides of crowns, the
+    /// insides of bushes, the low plants seen at a slant (the developer's "black splotches", 11 Nov 2026).
+    leaf: f32,
+    /// The surface is the ground: its rays pass through the ground's own underside (rt_alpha.wgsl
+    /// `rt_ground_origin`), which they meet where the drawn ground lies under the traced one.
+    ground: bool,
 }
 
 // This cache stores exactly the geometry reconstructed by pass 1, at float32
@@ -417,7 +537,9 @@ struct GiCachedSurface {
 fn gi_spatial_surface(index: u32, coord: vec2<i32>, dims: vec2<u32>) -> GiSurface {
     if gi_cache_surfaces {
         let cached = gi_surfaces[index];
-        return GiSurface(cached.position_valid.w > 0.0, cached.position_valid.xyz, cached.normal.xyz);
+        // `w` of the position: 0 no surface, 1 a surface, 2 the ground.
+        return GiSurface(cached.position_valid.w > 0.0, cached.position_valid.xyz, cached.normal.xyz,
+            cached.normal.w, cached.position_valid.w > 1.5);
     }
     return gi_primary_surface(coord, dims);
 }
@@ -427,15 +549,18 @@ fn gi_primary_surface(coord: vec2<i32>, dims: vec2<u32>) -> GiSurface {
     s.valid = false;
     s.pos = vec3<f32>(0.0);
     s.normal = vec3<f32>(0.0, 1.0, 0.0);
+    s.leaf = 0.0;
+    s.ground = false;
 
     let depth = textureLoad(depth_tex, coord, 0);
-    if depth >= 1.0 {
+    if depth <= 0.0 {
         return s;
     }
     let uv = (vec2<f32>(coord) + 0.5) * gi.inv_resolution;
     let ndc = vec4<f32>(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    // Camera-relative (`inv_view_proj` is), then moved out.
     let world = gi.inv_view_proj * ndc;
-    s.pos = world.xyz / world.w;
+    s.pos = world.xyz / world.w + gi.camera_pos;
 
     // The normal comes from the visibility buffer's triangle rather than from
     // depth derivatives: a compute shader has no quad to take derivatives
@@ -446,13 +571,11 @@ fn gi_primary_surface(coord: vec2<i32>, dims: vec2<u32>) -> GiSurface {
         return s;
     }
     let inst = instances[vis.x - 1u];
-    let base = inst.index_offset + vis.y * 3u;
-    let v0 = vertices[inst.vertex_offset + indices[base + 0u]];
-    let v1 = vertices[inst.vertex_offset + indices[base + 1u]];
-    let v2 = vertices[inst.vertex_offset + indices[base + 2u]];
-    let p0 = (inst.model * vec4<f32>(v0.pos_x, v0.pos_y, v0.pos_z, 1.0)).xyz;
-    let p1 = (inst.model * vec4<f32>(v1.pos_x, v1.pos_y, v1.pos_z, 1.0)).xyz;
-    let p2 = (inst.model * vec4<f32>(v2.pos_x, v2.pos_y, v2.pos_z, 1.0)).xyz;
+    // A mesh's triangle, or a grass blade's (grass_pool.wgsl).
+    let corners = vis_triangle_world(inst, vis.y);
+    let p0 = corners[0];
+    let p1 = corners[1];
+    let p2 = corners[2];
     // Geometric, not interpolated: this normal is used to push ray origins off
     // the surface, and a shading normal can point into the geometry it came
     // from on a low-poly silhouette.
@@ -462,6 +585,11 @@ fn gi_primary_surface(coord: vec2<i32>, dims: vec2<u32>) -> GiSurface {
     }
     s.normal = gn;
     s.valid = true;
+    // Two-sided and cut out: a leaf, a blade, a frond (shading.wgsl's `thin_leaf`, the same test).
+    if (materials[inst.material_id].flags & 1u) != 0u && materials[inst.material_id].alpha_cutoff > 0.0 {
+        s.leaf = materials[inst.material_id].transmission;
+    }
+    s.ground = materials[inst.material_id].terrain_index >= 0;
     return s;
 }
 
@@ -477,39 +605,58 @@ fn initial_and_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
     let coord = gi_full_coord(gid.xy, full);
     let index = gid.y * dims.x + gid.x;
 
-    // A room can be lit entirely by practicals with the directional sun off.
-    if gi_luma(light.color) <= 1.0e-6 && cluster_params.num_local_lights == 0u {
-        gi_b[index] = gi_empty();
-        return;
-    }
     var seed = index * 9781u + gi.frame * 6271u + 17u;
+    // The ray's direction from two uniforms. With the shared masks on they come from the mask at this texel of the
+    // GI grid (not of the screen: the texels averaged together are grid neighbours), so neighbours and successive
+    // frames spread over the hemisphere instead of clumping, and the sky's share settles in far fewer rays. The 64
+    // slices repeat, so each round of them is turned by a further step of the R2 sequence.
+    var u = vec2<f32>(gi_rand(&seed), gi_rand(&seed));
     if gi.history_valid >= 2.0 {
-        let grain = textureLoad(grain_masks, vec2<i32>(coord & vec2<i32>(63)), i32(gi.frame & 63u), 0);
+        let grain = textureLoad(grain_masks, vec2<i32>(gid.xy & vec2<u32>(63u)), i32(gi.frame & 63u), 0);
         seed = seed ^ u32(grain.a * 4294967295.0);
+        u = fract(grain.rg + vec2<f32>(0.7548777, 0.5698403) * f32((gi.frame / 64u) & 1023u));
     }
 
     let surface = gi_primary_surface(coord, full);
     if gi_cache_surfaces {
         gi_surfaces[index] = GiCachedSurface(
-            vec4<f32>(surface.pos, select(0.0, 1.0, surface.valid)),
-            vec4<f32>(surface.normal, 0.0));
+            vec4<f32>(surface.pos, select(0.0, select(1.0, 2.0, surface.ground), surface.valid)),
+            vec4<f32>(surface.normal, surface.leaf));
     }
     if !surface.valid {
         gi_b[index] = gi_empty();
+        textureStore(sky_out, vec2<i32>(gid.xy), vec4<f32>(0.0));
         return;
     }
 
     // ── Initial candidate: one bounce ────────────────────────────────────────
     var r = gi_empty();
-    let dir = gi_sample_cosine(surface.normal, &seed);
-    let origin = surface.pos + surface.normal * 0.05;
+    // A thin leaf's far side gets every other ray: a checkerboard that turns each frame, so each texel sees both
+    // sides in two frames and each neighbourhood sees both in one.
+    let far_side = surface.leaf > 0.0 && ((gid.x + gid.y + gi.frame) & 1u) == 1u;
+    let ray_normal = select(surface.normal, -surface.normal, far_side);
+    let dir = gi_sample_cosine(ray_normal, u);
+    let origin = surface.pos + ray_normal * 0.05;
+    rt_ground_origin = surface.ground;
+    rt_ray_dir = dir;
     let hit = gi_trace(origin, dir, 0.05, gi.max_distance);
+    rt_ground_origin = false;
+    // The sky's share: the environment along the ray, and again if the ray left the scene (see `sky_out`).
+    let env_up = gi_luma(textureSampleLevel(gi_env, gi_env_sampler, vec3<f32>(0.0, 1.0, 0.0), GI_ENV_ROUGHEST).rgb);
+    let env = min(gi_luma(textureSampleLevel(gi_env, gi_env_sampler, dir, 2.0).rgb) / max(env_up, 1.0e-9),
+        GI_SKY_CEILING);
+    let open = select(env, 0.0, hit.hit);
+    textureStore(sky_out, vec2<i32>(gid.xy),
+        select(vec4<f32>(open, env, 0.0, 0.0), vec4<f32>(0.0, 0.0, open, 1.0), far_side));
     // Bevy Solari's NO_WORLD_CACHE path rejects emissive hits. This estimator
     // does not importance-sample emissive geometry, so retaining the extremely
     // rare hits produces high-variance fireflies that wander under temporal
     // and spatial reuse. Emissive GI needs a light-sampling strategy of its own.
-    if hit.hit && all(hit.emissive <= vec3<f32>(0.0)) {
-        let radiance = gi_direct_at(hit.pos, hit.normal, hit.albedo, hit.terrain_index, &seed);
+    if far_side {
+        // No candidate this frame: the far side's ray counted the sky and nothing else, and the reservoir, which
+        // holds the near side's bounce, goes on from its history as it stands.
+    } else if hit.hit && all(hit.emissive <= vec3<f32>(0.0)) {
+        let radiance = gi_direct_at(hit.pos, hit.normal, hit.albedo, hit.terrain_index, hit.transmission, &seed);
         let p_hat = gi_luma(radiance);
         if p_hat > 0.0 {
             r.sample_pos = hit.pos;
@@ -525,9 +672,8 @@ fn initial_and_temporal(@builtin(global_invocation_id) gid: vec3<u32>) {
             r.m = 1.0;
         }
     } else {
-        // A ray that escaped carries no bounce. It still counts as a candidate,
-        // or a pixel seeing mostly sky would keep resampling its history for
-        // ever and never darken.
+        // A ray that left the scene, or met something that glows, is a candidate that carries nothing: the sky it
+        // saw is counted in `sky_out`, not here.
         r.m = 1.0;
     }
 
@@ -577,11 +723,6 @@ fn spatial_and_shade(@builtin(global_invocation_id) gid: vec3<u32>) {
     let coord = gi_full_coord(gid.xy, full);
     let index = gid.y * dims.x + gid.x;
 
-    if gi_luma(light.color) <= 1.0e-6 && cluster_params.num_local_lights == 0u {
-        gi_a[index] = gi_empty();
-        textureStore(out_tex, g, vec4<f32>(0.0));
-        return;
-    }
     var seed = index * 26699u + gi.frame * 15487u + 91u;
     if gi.history_valid >= 2.0 {
         let grain = textureLoad(grain_masks, vec2<i32>(coord & vec2<i32>(63)), i32(gi.frame & 63u), 0);
@@ -618,8 +759,10 @@ fn spatial_and_shade(@builtin(global_invocation_id) gid: vec3<u32>) {
         // Reject neighbours on different geometry. Without this a reservoir
         // crosses a silhouette and the background's bounce light bleeds onto
         // the foreground — the classic ReSTIR halo.
+        // Reversed-Z (Sunscar, 6 Nov 2026): sky is 0, and `1 - depth` is what forward depth was within near / far,
+        // so the tolerance is the one this was tuned with.
         let nd = textureLoad(depth_tex, nc, 0);
-        if nd >= 1.0 || abs(nd - depth_here) > depth_here * 0.02 {
+        if nd <= 0.0 || abs(nd - depth_here) > (1.0 - depth_here) * 0.02 {
             continue;
         }
         let ns = gi_spatial_surface(u32(ng.y) * dims.x + u32(ng.x), nc, full);
@@ -646,9 +789,12 @@ fn spatial_and_shade(@builtin(global_invocation_id) gid: vec3<u32>) {
     // would make an occluded sample impossible to recover from and leave dark
     // trails behind moving geometry.
     gi_a[index] = r;
+    rt_ground_origin = surface.ground;
+    rt_ray_dir = r.sample_pos - surface.pos;
     if r.w > 0.0 && !gi_visible(surface.pos + surface.normal * 0.05, r.sample_pos, 0.05) {
         r.w = 0.0;
     }
+    rt_ground_origin = false;
 
     // Cosine-weighted sampling already cancels the diffuse BRDF's own cosine,
     // so what is left is the sample's radiance times its contribution weight.

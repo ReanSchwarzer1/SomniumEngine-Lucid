@@ -30,6 +30,8 @@ pub struct MeshSdfDraw {
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ExtraParams {
+    /// Camera-relative: inverse(jittered projection x the view's rotation alone); add `camera_pos` for world
+    /// space. The absolute inverse snaps to 2^-7 in ndc 13 km from the origin (Sunscar, 5 Nov 2026).
     inv_view_proj: [[f32; 4]; 4],
     camera_pos: [f32; 3],
     frame: u32,
@@ -901,7 +903,7 @@ fn aabb_signed_distance(p: glam::Vec3, min: glam::Vec3, max: glam::Vec3) -> f32 
 }
 
 /// IEEE-754 binary16 bits for a CPU upload into `Rgba16Float`.
-fn f32_to_f16_bits(value: f32) -> u16 {
+pub(crate) fn f32_to_f16_bits(value: f32) -> u16 {
     let bits = value.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32;

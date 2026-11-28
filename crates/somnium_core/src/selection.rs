@@ -93,6 +93,21 @@ impl Selection {
         self.reconcile_anchor();
     }
 
+    /// A click in the viewport that found `hit` (or nothing). With `toggle` held the object is added or removed, with
+    /// `add` held it is added, and a click on empty space then keeps the selection; with neither it replaces it.
+    pub fn click(&mut self, hit: Option<Entity>, toggle: bool, add: bool) {
+        match hit {
+            Some(entity) if toggle => self.toggle(entity),
+            Some(entity) if add => {
+                if !self.contains(entity) {
+                    self.toggle(entity);
+                }
+            }
+            None if toggle || add => {}
+            hit => self.set_single(hit),
+        }
+    }
+
     /// `Shift`-click: select the inclusive range between the anchor and
     /// `entity` within `ordered`, which is the Outliner's flattened row order.
     /// The clicked row becomes the primary; the anchor is deliberately left
@@ -119,6 +134,19 @@ impl Selection {
         self.entities.clear();
         self.primary = None;
         self.anchor = None;
+    }
+
+    /// Add entities that go with the selection without becoming its primary or its anchor: a part's twins in the
+    /// other levels of detail. Nothing is added to an empty selection.
+    pub fn add_followers(&mut self, entities: impl IntoIterator<Item = Entity>) {
+        if self.primary.is_none() {
+            return;
+        }
+        for entity in entities {
+            if !self.entities.contains(&entity) {
+                self.entities.push(entity);
+            }
+        }
     }
 
     /// Replace the whole selection, preserving order and dropping duplicates.
@@ -284,6 +312,26 @@ mod tests {
             Some(e[1]),
             "removing the primary promotes a survivor, it does not clear"
         );
+    }
+
+    #[test]
+    fn a_viewport_click_replaces_toggles_or_adds_and_empty_space_clears_only_a_plain_click() {
+        let (_world, e) = world_with(3);
+        let mut selection = Selection::single(e[0]);
+        selection.click(Some(e[1]), true, false);
+        assert_eq!(selection.as_slice(), &e[..2], "Ctrl adds");
+        selection.click(Some(e[1]), true, false);
+        assert_eq!(selection.as_slice(), &e[..1], "Ctrl on a selected one removes it");
+        selection.click(Some(e[2]), false, true);
+        selection.click(Some(e[2]), false, true);
+        assert_eq!(selection.as_slice(), &[e[0], e[2]], "Shift adds, and never removes");
+        selection.click(None, true, false);
+        selection.click(None, false, true);
+        assert_eq!(selection.len(), 2, "a modifier click on empty space keeps the selection");
+        selection.click(Some(e[1]), false, false);
+        assert_eq!(selection.as_slice(), &e[1..2], "a plain click replaces");
+        selection.click(None, false, false);
+        assert!(selection.is_empty(), "a plain click on empty space clears");
     }
 
     #[test]

@@ -25,7 +25,7 @@ struct DofParams {
     /// Largest circle of confusion allowed, in pixels. Bounds the sample
     /// radius so a badly-set focus cannot cost the whole frame time.
     max_coc: f32,
-    /// Near and far planes, for linearising depth.
+    /// The camera's near plane, for linearising depth; `far` is unused, since scene depth is reversed and infinite.
     near: f32,
     far: f32,
 }
@@ -48,11 +48,10 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VOut {
     return VOut(vec4<f32>(p, 0.0, 1.0), vec2<f32>((p.x + 1.0) * 0.5, (1.0 - p.y) * 0.5));
 }
 
-/// Depth buffer value to metres in front of the camera.
+/// Depth buffer value to metres in front of the camera: reversed, infinite depth is near / view depth (Sunscar,
+/// 6 Nov 2026).
 fn linear_depth(d: f32) -> f32 {
-    let n = params.near;
-    let f = params.far;
-    return (n * f) / max(f - d * (f - n), 1e-6);
+    return params.near / max(d, 1e-12);
 }
 
 /// Circle of confusion in metres on the sensor, from the thin-lens equation.
@@ -74,9 +73,9 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     let centre = textureSampleLevel(color_tex, samp, in.uv, 0.0).rgb;
     let depth = textureSampleLevel(depth_tex, samp, in.uv, 0);
 
-    // Sky stays sharp: a point at the far plane is not a real distance, and
+    // Sky stays sharp: a point at infinity (reversed-Z's cleared 0) is not a real distance, and
     // blurring it produces a halo along every silhouette against it.
-    if depth >= 1.0 {
+    if depth <= 0.0 {
         return vec4<f32>(centre, 1.0);
     }
 

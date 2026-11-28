@@ -15,6 +15,14 @@ use std::path::{Path, PathBuf};
 const FRAME_BUDGET: std::time::Duration = std::time::Duration::from_millis(6);
 /// The longest a first fill may hold the frame before the rest streams in as usual.
 const FIRST_FILL_LIMIT: std::time::Duration = std::time::Duration::from_secs(90);
+/// How often a first fill asks for the palette kinds its tiles draw. The ask walks every kind of every tile in: after
+/// each piece that arrived, it ran thousands of times in a fill.
+const PALETTE_ASK: std::time::Duration = std::time::Duration::from_millis(250);
+/// How often a first fill hands its staged uploads to the GPU and waits for them: often enough that the copies
+/// staged in between stay small, not after every piece.
+const FILL_FLUSH: std::time::Duration = std::time::Duration::from_millis(100);
+/// Retired terrain slots made at the end of a first fill, for tiles that stream in later ([`Engine::warm_terrain_slots`]).
+const SPARE_TERRAIN_SLOTS: usize = 4;
 
 impl<G: GameApp> Engine<G> {
     /// Stream the cells of the scene's `somnium.CellStreaming` around this frame's view.
@@ -40,7 +48,13 @@ impl<G: GameApp> Engine<G> {
         let manifest = match self.imported_source_path(&settings.manifest) {
             Ok(path) => path,
             Err(error) => {
-                self.set_cell_status(owner, format!("Manifest: {error}"));
+                let status = format!("Manifest: {error}");
+                // Loud once, not every frame: the world has no cells (sky only), and launch checks count this line.
+                if self.world.get::<CellStreamingComponent>(owner).is_some_and(|c| c.status != status) {
+                    tracing::error!("cells: manifest gives no cells: {status}");
+                    self.report_no_cells(&error);
+                }
+                self.set_cell_status(owner, status);
                 return;
             }
         };
@@ -49,8 +63,17 @@ impl<G: GameApp> Engine<G> {
             self.reset_cell_streaming();
             self.cell_streamer.key = key;
             match cells::read_manifest(&manifest) {
-                Ok(list) => self.cell_streamer.cells = list,
+                Ok(list) => {
+                    if list.is_empty() {
+                        tracing::error!("cells: manifest gives no cells: {} lists none", manifest.display());
+                        self.report_no_cells(&format!("{} lists none", manifest.display()));
+                    }
+                    self.cell_streamer.cells = list;
+                }
                 Err(error) => {
+                    // The world stays empty (sky only): said once, as the key is set; launch checks count this line.
+                    tracing::error!("cells: manifest gives no cells: {error}");
+                    self.report_no_cells(&error);
                     self.set_cell_status(owner, error);
                     return;
                 }
@@ -74,38 +97,96 @@ impl<G: GameApp> Engine<G> {
         let focus = pinned.pinned().or_else(|| self.renderer.as_ref().map(|renderer| renderer.camera_pos));
         self.world.put_cache(pinned);
         let first_fill = !self.cell_streamer.filled;
-        self.schedule_cells(&settings, focus);
+        self.zone_begin("Cell schedule");
+        self.schedule_cells(&settings, focus, if first_fill { cells::fill_readers() } else { cells::READERS });
+        self.zone_end();
         if first_fill && !self.cell_streamer.reading.is_empty() {
             self.cell_streamer.filled = true;
             // Nothing is in yet (a scene just opened, Play just began): the view's own cells come in whole before the
             // world is shown, as behind a loading screen, rather than popping in a few a frame.
             let started = std::time::Instant::now();
+            // The foliage palette is read beside the cells: the tiles that are in ask for their kinds as they land.
+            self.cell_streamer.filling = true;
+            let mut palette = false;
+            // Where the fill's time goes: this thread's uploads and installs, its waits for the GPU, its waits for
+            // the readers, and the palette's asks and uploads.
+            let mut spent = [std::time::Duration::ZERO; 4];
+            self.cell_streamer.spent = Default::default();
+            let compressed = somnium_renderer::imported_bc::encoded();
+            let mut asked: Option<std::time::Instant> = None;
+            let mut flushed = std::time::Instant::now();
             // Round the readers without a frame budget, so all of them keep decoding while this thread uploads.
-            while !self.cell_streamer.reading.is_empty() && started.elapsed() < FIRST_FILL_LIMIT {
+            while (!self.cell_streamer.reading.is_empty() || palette) && started.elapsed() < FIRST_FILL_LIMIT {
+                let round = std::time::Instant::now();
                 if self.pump_cell_reads(usize::MAX) {
+                    spent[0] += round.elapsed();
                     // Uploads stage CPU copies until a submit; a fill is many frames' uploads in one, so it flushes as
                     // it goes (a 7-window Tyffir peaked at 15.8 of 16 GB without this).
-                    if let Some((renderer, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref()) {
+                    if flushed.elapsed() >= FILL_FLUSH
+                        && let Some((renderer, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref())
+                    {
+                        let flush = std::time::Instant::now();
                         ctx.queue.submit(std::iter::empty());
                         renderer.wait_gpu(ctx);
+                        spent[1] += flush.elapsed();
+                        flushed = std::time::Instant::now();
                     }
                 } else {
                     std::thread::sleep(std::time::Duration::from_millis(1));
+                    spent[2] += round.elapsed();
                 }
-                self.schedule_cells(&settings, focus);
+                self.schedule_cells(&settings, focus, cells::fill_readers());
+                // The tiles that are in ask for their kinds, and each read that has landed frees a reader for the
+                // next kind's source: a few times a second, and at once when nothing else is left to wait for.
+                let asking = std::time::Instant::now();
+                self.pump_palette_reads(None);
+                let idle = self.cell_streamer.reading.is_empty() && self.palette_reads.is_empty();
+                if idle || asked.is_none_or(|at| at.elapsed() >= PALETTE_ASK) {
+                    self.prefetch_foliage_palette();
+                    asked = Some(std::time::Instant::now());
+                }
+                palette = !self.palette_reads.is_empty();
+                spent[3] += asking.elapsed();
             }
+            self.cell_streamer.filling = false;
             info!(
                 cells = self.cell_streamer.loaded.len(),
                 entities = self.cell_streamer.streamed_entities(),
                 seconds = format!("{:.1}", started.elapsed().as_secs_f64()),
+                uploading = format!("{:.1}", spent[0].as_secs_f64()),
+                sources = format!("{:.1}", self.cell_streamer.spent[0].as_secs_f64()),
+                installs = format!("{:.1}", self.cell_streamer.spent[1].as_secs_f64()),
+                install_steps = format!(
+                    "spawn {:.1} ground {:.1} gpu {:.1} world {:.1}",
+                    self.cell_streamer.spent[2].as_secs_f64(),
+                    self.cell_streamer.spent[3].as_secs_f64(),
+                    self.cell_streamer.spent[4].as_secs_f64(),
+                    self.cell_streamer.spent[5].as_secs_f64()
+                ),
+                textures_encoded = somnium_renderer::imported_bc::encoded().0 - compressed.0,
+                encode_seconds = format!("{:.1}", somnium_renderer::imported_bc::encoded().1 - compressed.1),
+                palette = format!("{:.1}", spent[3].as_secs_f64()),
+                gpu_wait = format!("{:.1}", spent[1].as_secs_f64()),
+                readers_wait = format!("{:.1}", spent[2].as_secs_f64()),
+                still_reading = self.cell_streamer.reading.len(),
                 "World cells: first fill"
             );
+            self.warm_terrain_slots(SPARE_TERRAIN_SLOTS);
         } else {
             self.pump_cell_reads(settings.cells_per_frame.max(1) as usize);
         }
 
+        // Nothing is being read: the decoded images the readers shared are let go.
+        if self.cell_streamer.reading.is_empty() && self.palette_reads.is_empty() {
+            somnium_asset::share_decoded_images(0);
+        }
+
+        self.zone_begin("Cell evict");
         self.evict_cold_sources();
+        self.zone_end();
+        self.zone_begin("Cell rewear");
         self.rewear_retired_slot();
+        self.zone_end();
 
         let streamer = &self.cell_streamer;
         let (loaded, pending, entities) = (
@@ -136,11 +217,34 @@ impl<G: GameApp> Engine<G> {
             component.streamed_entities = entities;
         }
         self.set_cell_status(owner, status);
+        self.log_cell_counts(loaded, pending);
     }
 
-    /// Unload what the view has left and start readers (up to `READERS`) for what it has reached, nearest first. The
+    /// The settled signal (sunscar-engine, 26 Nov 2026): a log line of the cells loaded, being read and waiting for a
+    /// reader whenever those change (at most two a second, and always when the last one comes in or the first one
+    /// starts), and the frame capture told how many are still coming (`SOMNIUM_CAPTURE_SETTLED`).
+    fn log_cell_counts(&mut self, loaded: u32, reading: u32) {
+        let queued = u32::try_from(self.cell_streamer.queued).unwrap_or(u32::MAX);
+        somnium_renderer::capture::set_cells_waiting(reading as usize + queued as usize);
+        let counts = (loaded, reading, queued);
+        let settled = |c: (u32, u32, u32)| c.1 == 0 && c.2 == 0;
+        let now = std::time::Instant::now();
+        let due = match self.cell_streamer.logged {
+            None => true,
+            Some((last, at)) => {
+                last != counts && (settled(last) != settled(counts) || now.duration_since(at).as_millis() >= 500)
+            }
+        };
+        if due {
+            let tail = if settled(counts) { " (settled)" } else { "" };
+            tracing::info!(loaded, reading, queued, "cells: {loaded} loaded, {reading} reading, {queued} queued{tail}");
+            self.cell_streamer.logged = Some((counts, now));
+        }
+    }
+
+    /// Unload what the view has left and start readers (up to `readers`) for what it has reached, nearest first. The
     /// points held with `cell_streaming::hold` count as views too, and are marked ready once their cells are in.
-    fn schedule_cells(&mut self, settings: &CellStreamingComponent, focus: Option<glam::Vec3>) {
+    fn schedule_cells(&mut self, settings: &CellStreamingComponent, focus: Option<glam::Vec3>, readers: usize) {
         let mut holds: cells::Holds = self.world.take_cache();
         let streamer = &self.cell_streamer;
         let (load, unload) = match focus {
@@ -151,6 +255,7 @@ impl<G: GameApp> Engine<G> {
                 settings.unload_margin,
                 &holds.discs(),
                 |index| streamer.loaded.contains_key(&index) || streamer.reading.contains_key(&index),
+                |index| streamer.loaded.contains_key(&index),
             ),
             Some(_) => (Vec::new(), streamer.loaded.keys().chain(streamer.reading.keys()).copied().collect()),
             None => (Vec::new(), Vec::new()),
@@ -158,21 +263,29 @@ impl<G: GameApp> Engine<G> {
         for index in unload {
             self.unload_cell(index);
         }
+        self.cell_streamer.gate.set_limit(readers);
         let now = std::time::Instant::now();
+        // A cell that failed for good is never read again, so it is not waiting: counted as queued it kept the
+        // settled signal (and every still) waiting on it forever.
+        let wanted = load.iter().filter(|index| !self.cell_streamer.failed.contains_key(index)).count();
+        let mut started = 0;
         for index in load {
-            if self.cell_streamer.reading.len() >= cells::READERS {
+            if self.cell_streamer.reading.len() >= readers {
                 break;
             }
             if self.cell_streamer.may_read(index, now) {
                 self.start_cell_read(index);
+                started += 1;
             }
         }
+        self.cell_streamer.queued = wanted.saturating_sub(started);
         let streamer = &self.cell_streamer;
         holds.mark_ready(&streamer.cells, |index| streamer.settled(index));
         self.world.put_cache(holds);
     }
 
-    /// Start a cell's reader: parse it, then decode and prepare each source it needs that is not uploaded yet.
+    /// Start a cell's reader: parse it, then decode and prepare each source it needs that is not uploaded yet, side
+    /// by side as the gate gives turns, then read and bake its ground.
     fn start_cell_read(&mut self, index: usize) {
         let path = self.cell_streamer.cells[index].file.clone();
         let root = self.config.project_root.clone();
@@ -182,6 +295,9 @@ impl<G: GameApp> Engine<G> {
             .as_ref()
             .is_some_and(somnium_renderer::SomniumRenderer::imported_compression);
         let drawing = self.renderer.is_some();
+        // The sources of one cell, and of the cells read beside it, name the same images over and over.
+        somnium_asset::share_decoded_images(cells::image_share_bytes());
+        let gate = self.cell_streamer.gate.clone();
         let (send, receive) = std::sync::mpsc::sync_channel(1);
         std::thread::spawn(move || {
             let document = match crate::scene_file::read(&path) {
@@ -192,28 +308,52 @@ impl<G: GameApp> Engine<G> {
                 }
             };
             let project = root.as_deref().map(crate::authoring::project::ProjectPaths::open);
-            for (source, parts) in cells::sources_of(&document).into_iter().filter(|_| drawing) {
-                let resolved = match &project {
-                    Some(Ok(project)) => project.resolve(Path::new(&source)),
-                    Some(Err(error)) => Err(error.clone()),
-                    None => Ok(PathBuf::from(&source)),
-                };
-                let Ok(resolved) = resolved else {
-                    continue; // the install reports it, as a scene open would
-                };
-                if resolved.canonicalize().is_ok_and(|canonical| uploaded.contains(&canonical)) {
-                    continue;
+            let needed: Vec<(PathBuf, HashSet<usize>)> = cells::sources_of(&document)
+                .into_iter()
+                .filter(|_| drawing)
+                .filter_map(|(source, parts)| {
+                    let resolved = match &project {
+                        Some(Ok(project)) => project.resolve(Path::new(&source)),
+                        Some(Err(error)) => Err(error.clone()),
+                        None => Ok(PathBuf::from(&source)),
+                    };
+                    // One that does not resolve is the install's to report, as a scene open would.
+                    let resolved = resolved.ok()?;
+                    let known = resolved.canonicalize().is_ok_and(|canonical| uploaded.contains(&canonical));
+                    (!known).then_some((resolved, parts))
+                })
+                .collect();
+            // Side by side: each worker takes the next source and a turn at the gate, which it keeps until this
+            // thread's one-piece channel has taken what it decoded.
+            let (next, dropped) = (std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicBool::new(false));
+            std::thread::scope(|scope| {
+                for _ in 0..needed.len().min(cells::fill_readers()) {
+                    scope.spawn(|| {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        while let Some((resolved, parts)) = needed.get(next.fetch_add(1, Relaxed)) {
+                            let _turn = gate.take();
+                            if dropped.load(Relaxed) {
+                                return;
+                            }
+                            let Ok(scene) = somnium_asset::load_gltf_for(resolved, Some(parts)) else {
+                                continue; // the install retries it on the main thread and logs why
+                            };
+                            let prepared =
+                                somnium_renderer::SomniumRenderer::prepare_scene_for(&scene, Some(parts), compressing);
+                            let piece = Piece::Source { path: resolved.clone(), parts: parts.clone(), scene, prepared };
+                            if send.send(piece).is_err() {
+                                dropped.store(true, Relaxed); // the cell was dropped
+                            }
+                        }
+                    });
                 }
-                let Ok(scene) = somnium_asset::load_gltf_for(&resolved, Some(&parts)) else {
-                    continue; // the install retries it on the main thread and logs why
-                };
-                let prepared = somnium_renderer::SomniumRenderer::prepare_scene_for(&scene, Some(&parts), compressing);
-                if send.send(Piece::Source { path: resolved, parts, scene, prepared }).is_err() {
-                    return; // the cell was dropped
-                }
+            });
+            if dropped.into_inner() {
+                return;
             }
             // A tile's ground: each terrain's sidecar read and its horizon and relief baked here, not on the main
             // thread. Only for a drawn world, as with the sources.
+            let _turn = gate.take();
             let terrains = cells::terrains_of(&document)
                 .into_iter()
                 .filter(|_| drawing)
@@ -247,7 +387,12 @@ impl<G: GameApp> Engine<G> {
                 match receive.try_recv() {
                     Ok(Piece::Source { path, parts, scene, prepared }) => {
                         pieces += 1;
+                        let uploading = std::time::Instant::now();
+                        self.zone_begin("Cell source upload");
                         self.upload_streamed_source(&path, &parts, &scene, prepared);
+                        self.zone_end();
+                        cells::free_elsewhere(scene);
+                        self.cell_streamer.spent[0] += uploading.elapsed();
                     }
                     Ok(Piece::Cell(parsed, terrains)) => {
                         pieces += 1;
@@ -264,9 +409,10 @@ impl<G: GameApp> Engine<G> {
                                 self.cell_streamer.ground_failed(index, error, std::time::Instant::now());
                             }
                             (parsed, _) => {
-                                if let Err(error) =
-                                    parsed.and_then(|document| self.install_cell(index, &document, terrains))
-                                {
+                                let installing = std::time::Instant::now();
+                                let installed = parsed.and_then(|document| self.install_cell(index, &document, terrains));
+                                self.cell_streamer.spent[1] += installing.elapsed();
+                                if let Err(error) = installed {
                                     warn!(%error, cell = index, "streamed cell skipped");
                                     self.cell_streamer.failed.insert(index, error);
                                 } else {
@@ -300,6 +446,11 @@ impl<G: GameApp> Engine<G> {
         scene: &somnium_asset::LoadedScene,
         prepared: somnium_renderer::PreparedScene,
     ) {
+        // Its made flames, by the same resolved file the restore looks them up by (`fire.rs`): a cell's sources are
+        // uploaded here, so its restore finds them cached and never sees the scene.
+        if crate::fire::rule_on() && !self.flame_nodes.contains_key(path) {
+            self.flame_nodes.insert(path.to_path_buf(), crate::fire::scene_flames(scene));
+        }
         let stamp = import_cache::SourceStamp::read(path);
         if stamp.as_ref().is_some_and(|stamp| self.imported_uploads.get(stamp).is_some()) {
             return;
@@ -327,8 +478,16 @@ impl<G: GameApp> Engine<G> {
         for (saved_id, read) in terrains {
             sidecars.insert(saved_id, read.map_err(|error| format!("terrain {saved_id}: {error}"))?);
         }
-        let report = crate::scene_schema::scene_from_json(&mut self.world, &self.type_registry, document)
-            .map_err(|error| error.to_string())?;
+        let step = std::time::Instant::now();
+        self.zone_begin("Cell spawn");
+        // The edit layer's entries for this cell (and moves not yet saved) go in before it spawns.
+        let edited = self.edits_before_cell_spawn(index, document);
+        let report =
+            crate::scene_schema::scene_from_json(&mut self.world, &self.type_registry, edited.as_ref().unwrap_or(document));
+        self.zone_end();
+        self.cell_streamer.spent[2] += step.elapsed();
+        let report = report.map_err(|error| error.to_string())?;
+        self.zone_begin("Cell sources");
         // Which uploads this cell keeps alive (for eviction once no loaded cell draws them).
         let sources: Vec<PathBuf> = cells::sources_of(document)
             .into_keys()
@@ -339,16 +498,29 @@ impl<G: GameApp> Engine<G> {
             self.cell_streamer.cold.remove(source);
         }
         self.cell_streamer.cell_sources.insert(index, sources);
+        self.zone_end();
         let cell = u32::try_from(index).unwrap_or(u32::MAX);
         for &entity in &report.entities {
             let _ = self.world.insert_component(entity, Streamed { cell });
         }
+        let step = std::time::Instant::now();
+        self.zone_begin("Cell terrain");
         self.adopt_cell_terrains(index, &report.entities, sidecars);
+        self.zone_end();
+        self.cell_streamer.spent[3] += step.elapsed();
+        let step = std::time::Instant::now();
+        self.zone_begin("Cell GPU restore");
         self.restore_entity_gpu(&report.entities);
+        self.zone_end();
+        self.cell_streamer.spent[4] += step.elapsed();
+        let step = std::time::Instant::now();
         // ponytail: both passes walk the whole world once per installed cell; per-entity variants if they show up in
-        // a profile.
+        // a profile (their own zone says).
+        self.zone_begin("Cell whole-world passes");
         self.sync_authored_material_components();
         crate::propagate_transforms(&mut self.world);
+        self.zone_end();
+        self.cell_streamer.spent[5] += step.elapsed();
         self.cell_streamer.loaded.insert(index, report.entities);
         Ok(())
     }
@@ -369,7 +541,11 @@ impl<G: GameApp> Engine<G> {
             let id = match runtime.get(&component.terrain_id) {
                 Some(&id) => id,
                 None => {
-                    let sidecar = sidecars.remove(&component.terrain_id);
+                    let mut sidecar = sidecars.remove(&component.terrain_id);
+                    // The copies the author took out stay out (the edit layer's `painted`).
+                    if let Some(sidecar) = sidecar.as_mut() {
+                        self.painted_before_install(&self.cell_streamer.cells[index].file.clone(), &mut sidecar.foliage);
+                    }
                     let slot = self.adopt_terrain(index, entity, &component, sidecar, &asset_dir);
                     let id = slot.as_ref().map_or(u32::MAX, |slot| slot.id);
                     slots.extend(slot);
@@ -459,6 +635,27 @@ impl<G: GameApp> Engine<G> {
         Some(slot)
     }
 
+    /// Make `count` retired terrain slots shaped and dressed like a live tile's, behind the first fill's loading wait,
+    /// so tiles that stream in later take one ("reused") rather than making a terrain mid-play ("new": 318 ms against
+    /// 18 ms for a reused slot, Sunscar, 30 Oct 2026). Never past the renderer's terrain material room.
+    fn warm_terrain_slots(&mut self, count: usize) {
+        let Some(like) = self.cell_streamer.cell_terrains.values().flatten().next().cloned() else {
+            return;
+        };
+        let Some((renderer, ctx)) = self.renderer.as_mut().zip(self.render_ctx.as_ref()) else {
+            return;
+        };
+        let started = std::time::Instant::now();
+        let mut made = 0;
+        while made < count && renderer.terrain_material_room() > 0 {
+            let id = renderer.create_streamed_terrain_with_asset_dir(ctx, like.desc, &like.asset_dir, 800.0);
+            renderer.retire_terrain(ctx, id);
+            self.cell_streamer.free_terrains.push(TerrainSlot { id, ..like.clone() });
+            made += 1;
+        }
+        info!(made, ms = started.elapsed().as_millis(), "terrain slots made ahead for tiles to come");
+    }
+
     /// Dress one retired terrain slot a frame whose ground set no live tile wears in the set most live tiles wear
     /// ([`cells::next_rewear`]), so a region's layer arrays are freed once its last tile has gone and another region
     /// has been left since ([`cells::spare_slot`] keeps the one left last), rather than kept by slots waiting for a
@@ -503,6 +700,7 @@ impl<G: GameApp> Engine<G> {
             }
         }
         if let Some(entities) = self.cell_streamer.loaded.remove(&index) {
+            self.edits_before_cell_unload(&entities);
             for entity in entities.into_iter().rev() {
                 if self.world.is_alive(entity) {
                     self.world.despawn(entity);
@@ -579,6 +777,22 @@ impl<G: GameApp> Engine<G> {
         let old = std::mem::take(&mut self.cell_streamer);
         self.cell_streamer.free_terrains = old.free_terrains;
         self.cell_streamer.terrain_resets = old.terrain_resets;
+        somnium_asset::share_decoded_images(0);
+    }
+
+    /// The world gets no cells (sky only). The error line above is for launch checks; the author looks at the editor,
+    /// where nothing said it (26-27 Nov: a list naming 167 far tiles twice left the play world empty for 32 minutes
+    /// and nobody saw why). A toast and the Output Log, once per list: the callers run as the list is first read or its
+    /// path first fails. A player is not shown it; the log keeps it. `reason` names the file once.
+    fn report_no_cells(&mut self, reason: &str) {
+        if self.config.player_mode {
+            return;
+        }
+        let message = no_cells_message(reason);
+        if let Some(ui) = self.ui_manager.as_mut() {
+            ui.append_log(&format!("[cells] {message}"));
+            ui.push_toast(&message);
+        }
     }
 
     fn set_cell_status(&mut self, owner: Entity, status: String) {
@@ -587,5 +801,23 @@ impl<G: GameApp> Engine<G> {
         {
             component.status = status;
         }
+    }
+}
+
+/// What the editor says when a world gets no cells. Windows paths come back from canonicalising with the `\\?\`
+/// prefix; it is noise to a reader, so it goes.
+fn no_cells_message(reason: &str) -> String {
+    let reason = reason.replace("\\\\?\\", "");
+    format!("No world cells will load: {reason}. Mend the cell list, then open the scene again.")
+}
+
+#[cfg(test)]
+mod no_cells_tests {
+    #[test]
+    fn the_message_names_the_file_once_without_the_verbatim_prefix() {
+        let message = super::no_cells_message("\\\\?\\F:\\game\\scenes\\cells.json: EOF while parsing");
+        assert_eq!(message.matches("cells.json").count(), 1);
+        assert!(!message.contains("\\\\?\\"), "{message}");
+        assert!(message.starts_with("No world cells will load: F:\\game\\scenes\\cells.json: EOF"), "{message}");
     }
 }

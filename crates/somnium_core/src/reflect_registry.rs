@@ -327,7 +327,7 @@ impl ReflectField for UiCanvasSpace {
     }
 }
 
-const TONEMAPPER_NAMES: &[&str] = &["AgX", "ACES", "Reinhard"];
+const TONEMAPPER_NAMES: &[&str] = &["AgX", "ACES", "Reinhard", "Photographic"];
 
 /// MORROWIND-AC. The order is [`AntiAliasing::as_index`], and the labels are
 /// what the Details combo shows — so "SMAA 1x" and "SMAA T2x" name the two
@@ -434,10 +434,11 @@ impl ReflectField for Tonemapper {
             ReflectValue::I64(0) => Ok(Self::AgX),
             ReflectValue::I64(1) => Ok(Self::Aces),
             ReflectValue::I64(2) => Ok(Self::Reinhard),
+            ReflectValue::I64(3) => Ok(Self::Photographic),
             ReflectValue::I64(_) => Err(ReflectError::OutOfRange {
                 field,
                 min: Some(0.0),
-                max: Some(2.0),
+                max: Some(3.0),
             }),
             other => Err(ReflectError::TypeMismatch {
                 field,
@@ -652,6 +653,22 @@ pub fn component_registry() -> TypeRegistry {
     registry.register(decal_schema());
     registry.register(light_flicker_schema());
     registry.register(component_schema! {
+        crate::level_portal::LevelPortalComponent as "somnium.LevelPortal", display "Level Portal", version 1,
+        fields {
+            level { group: "Level Portal", doc: "The level this box leads to: a project-relative id. Entering it is logged; nothing is loaded yet." },
+            half_extents { min: 0.05, step: 0.1, precision: 2, group: "Level Portal", unit: "m",
+                doc: "The box's half size in the entity's own axes (its scale applies)." },
+        }
+    });
+    registry.register(component_schema! {
+        crate::light_flicker::LampComponent as "somnium.Lamp", display "Lamp", version 1,
+        fields {
+            switched { group: "Lamp", doc: "A lamp: lit while the open sky is dark, out by day. Off: a fire that burns all day." },
+            flicker { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Lamp",
+                doc: "How far the flame dips, as a fraction of the light's output." },
+        }
+    });
+    registry.register(component_schema! {
         crate::vertex_paint::VertexPaintComponent as "somnium.VertexPaint", display "Vertex Paint", version 1,
         fields {
             enabled { group: "Vertex Paint",
@@ -723,6 +740,7 @@ pub fn component_registry() -> TypeRegistry {
     crate::prop_set::register(&mut registry);
     registry.register(sky_schema());
     registry.register(sky_eye_schema());
+    registry.register(sky_planet_schema());
     registry.register(terrain_schema());
     registry.register(world_partition_schema());
     registry.register(ui_canvas_schema());
@@ -774,6 +792,7 @@ fn particle_emitter_schema() -> ComponentSchema {
             texture_status { group: "Sprite", read_only: true, flags: FieldFlags::EDIT },
             aspect { min: 0.01, max: 100.0, group: "Sprite", doc: "Height divided by width." },
             additive { group: "Sprite", doc: "Emissive blending for fire and sparks." },
+            lit { group: "Sprite", doc: "Lit by the sun and sky, the colour an albedo: smoke, dust and mist in the scene's own light." },
             world_up { group: "Sprite", doc: "Keep flame sprites upright in world space." },
             local_space { group: "Emission", doc: "Keep existing particles attached to this emitter. Clear before switching on a live effect." },
             staged_reflection { group: "Sprite", doc: "Show this effect in the active staged mirror. Reuses the same simulated particles." },
@@ -830,7 +849,20 @@ fn post_process_schema() -> ComponentSchema {
             sensitivity_iso { min: 1.0, step: 1.0, unit: "ISO", group: "Exposure" },
             use_physical_camera { group: "Exposure" }, auto_exposure { group: "Exposure" },
             exposure_compensation { step: 0.1, precision: 2, unit: "EV", group: "Exposure" },
+            exposure_min_ev { min: -16.0, max: 24.0, step: 0.1, precision: 1, unit: "EV", group: "Exposure",
+                display_name: "Darkest Adapted EV", doc: "The eye adapts no darker than this: higher keeps a night dark." },
+            exposure_max_ev { min: -16.0, max: 24.0, step: 0.1, precision: 1, unit: "EV", group: "Exposure",
+                display_name: "Brightest Adapted EV", doc: "The eye adapts no brighter than this: lower lets a noon burn." },
+            adapt_to_bright { min: 0.01, max: 20.0, step: 0.05, precision: 2, unit: "/s", group: "Exposure",
+                display_name: "Adapt to Bright", doc: "Rate per second at which the eye adjusts when the view gets brighter." },
+            adapt_to_dark { min: 0.01, max: 20.0, step: 0.05, precision: 2, unit: "/s", group: "Exposure",
+                display_name: "Adapt to Dark", doc: "Rate per second at which the eye adjusts when the view gets darker. Slow is how a dark doorway swallows the eye." },
             tonemapper { group: "Tone Mapping" }, temperature { step: 1.0, group: "Color Grading" },
+            grade_lut { group: "Color Grading", display_name: "Grading LUT",
+                doc: "A .cube 3-D LUT, project-relative, applied after the grade. Empty for none." },
+            grade_lut_strength { min: 0.0, max: 1.0, step: 0.01, group: "Color Grading", display_name: "LUT Strength" },
+            low_light_vision { min: 0.0, max: 1.0, step: 0.01, group: "Color Grading", display_name: "Low-Light Vision",
+                doc: "Colour as the eye sees it in dim light: under about 4 cd/m2 chroma fades toward the rods' blue-grey, reds first." },
             tint { step: 0.01, group: "Color Grading" }, contrast { min: 0.0, step: 0.01, group: "Color Grading" },
             saturation { min: 0.0, step: 0.01, group: "Color Grading" }, gain { min: 0.0, step: 0.01, group: "Color Grading" },
             lift { step: 0.01, group: "Color Grading" }, gamma { min: 0.0, step: 0.01, group: "Color Grading" },
@@ -847,6 +879,8 @@ fn post_process_schema() -> ComponentSchema {
             response_curve { group: "Color Grading", display_name: "Response Curve",
                 min: 0.0, max: 1.0, soft_min: 0.0, soft_max: 1.0 },
             bloom_enabled { group: "Bloom" }, bloom_intensity { min: 0.0, step: 0.01, group: "Bloom" },
+            bloom_threshold { min: 0.0, max: 12.0, step: 0.1, precision: 1, unit: "EV", group: "Bloom", display_name: "Bloom Threshold",
+                doc: "Stops above the adapted middle grey where light starts to bloom. 0 blooms all light, as a lens does." },
             gtao_enabled { group: "Ambient Occlusion" }, dof_enabled { group: "Depth of Field" },
             dof_focus_distance { min: 0.0, step: 0.1, unit: "m", group: "Depth of Field" },
             aa { group: "Anti-aliasing" }, restir_enabled { group: "Ray Tracing" },
@@ -894,6 +928,16 @@ fn post_process_schema() -> ComponentSchema {
             analytic_grad { group: "Advanced", advanced: true }, shaft_intensity { min: 0.0, step: 0.01, group: "Volumetrics" },
             fog_sky_occlusion { min: 0.0, max: 1.0, step: 0.01, group: "Volumetrics", display_name: "Fog Sky Occlusion",
                 doc: "How far the sun's shadow also hides skylight from the fog; stops roofed interiors glowing with haze." },
+            fog_skylight { min: 0.0, max: 2.0, step: 0.01, group: "Volumetrics", display_name: "Fog Skylight",
+                doc: "Scale on the sky light the fog scatters, apart from the sun's and the lamps'. Under 1, a moon can light the ground while the fog stays dark." },
+            fog_base_height { step: 1.0, unit: "m", group: "Volumetrics", display_name: "Fog Base Height",
+                doc: "World height the fog's falloff starts from." },
+            fog_top_height { step: 1.0, unit: "m", group: "Volumetrics", display_name: "Fog Top Height",
+                doc: "World height where the fog stops: a valley fills to a flat top and the ridges stand clear. At or under the base height, no top." },
+            fog_top_softness { min: 0.1, soft_max: 200.0, step: 1.0, unit: "m", group: "Volumetrics", display_name: "Fog Top Softness",
+                doc: "Metres over which the fog's top fades." },
+            fog_range { min: 10.0, max: 5000.0, step: 10.0, unit: "m", group: "Volumetrics", display_name: "Fog Range",
+                doc: "How far the fog volume reaches. Its slices spread over this, so thick fog reads finer up close with a short range (about 150 m for fog that hides everything past 100 m)." },
             paint_fade { min: 0.0, max: 1.0, step: 0.01, group: "Weathering", display_name: "Paint Fade",
                 doc: "Takes every vertex-painted layer and every material's authored weathering back toward the bare material: 0 as authored, 1 none. The whole level before it decayed." },
             foliage_green { min: 0.0, max: 1.0, step: 0.01, group: "Weathering", display_name: "Foliage Green",
@@ -920,6 +964,42 @@ fn post_process_schema() -> ComponentSchema {
                 doc: "Darkens silhouettes and creases found in the depth buffer into soft lines that fade with distance. 0 is off and costs nothing." },
             light_ramp { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Stylization", display_name: "Light Ramp",
                 doc: "The sun's light follows a soft painterly ramp: lit faces come up flat, the terminator is a narrow soft band. GI, reflections and shadows stay physical. 0 is off." },
+            // The photographic camera (sunscar-photoreal, 6 Nov 2026).
+            photographic { group: "Camera", display_name: "Photographic Camera",
+                doc: "The grade works on the scene's light before the tone curve (it cannot crush the darks), bloom becomes the lens's glare, the vignette is the lens's own fall-off, and sensor noise follows the exposure. Off is the picture as before." },
+            exposure_adaptation { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Exposure", display_name: "Eye Adaptation",
+                doc: "How much of the meter's swing the eye follows: 1 all of it; 0.7 shows a dark wood darker than open land, as a photograph does. Pivots on the anchor EV." },
+            exposure_anchor_ev { min: -16.0, max: 24.0, step: 0.1, precision: 1, unit: "EV", group: "Exposure", display_name: "Adaptation Anchor",
+                doc: "The EV that partial adaptation pivots on: what the eye holds when the meter agrees with it." },
+            lens_glare { min: 0.0, max: 0.2, step: 0.005, precision: 3, group: "Camera", display_name: "Lens Glare",
+                doc: "With the photographic camera: the share of light the lens spreads into its wide halo, energy kept (0.03 a good lens). Replaces bloom intensity and threshold there." },
+            sensor_noise { min: 0.0, max: 2.0, step: 0.05, precision: 2, group: "Camera", display_name: "Sensor Noise",
+                doc: "With the photographic camera: photon and read noise as a real sensor's at this exposure (1). A bright day is clean; a dim wood or a night grows grain." },
+            white_balance { min: 0.0, max: 15000.0, step: 50.0, precision: 0, unit: "K", group: "Camera", display_name: "White Balance",
+                doc: "With the photographic camera: the white the camera is set for, in kelvin. 0 leaves the light as rendered (D65). Lower is cooler, higher warmer." },
+            exposure_sky_weight { min: 0.0, max: 1.0, step: 0.05, precision: 2, group: "Exposure", display_name: "Sky in Meter",
+                doc: "How much open sky counts in the exposure meter: 1 as any other pixel; 0.25 exposes for the land and lets the sky run bright, as a photographer does." },
+            exposure_adaptation_bright { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Exposure", display_name: "Eye Adaptation (bright)",
+                doc: "The share of the meter's swing the eye follows when the view is brighter than the anchor: 1 all of it; about 0.5 keeps sunlit sand pale and snow near white instead of metering them grey." },
+            heat_shimmer { min: 0.0, max: 2.0, step: 0.05, precision: 2, group: "Atmosphere", display_name: "Heat Shimmer",
+                doc: "Far ground seen along grazing rays wobbles in the heat: 0 off, 1 a desert noon. Set it where the ground is hot." },
+            mirage { min: 0.0, max: 1.0, step: 0.05, precision: 2, group: "Atmosphere", display_name: "Mirage",
+                doc: "The inferior mirage: under a line just below the horizon, far hot ground shows the sky mirrored, as a lake would. 0 off." },
+            mirage_dip_deg { min: 0.0, max: 5.0, step: 0.05, precision: 2, unit: "deg", group: "Atmosphere", display_name: "Mirage Dip",
+                doc: "How far under the horizon the mirage's vanishing line lies (0.3: hot ground about 300 m ahead of a standing eye)." },
+            snow { group: "Snow", display_name: "Snow Cover",
+                doc: "Snow lying on every up-facing surface above the snowline: terrain, rock, ruins, roofs, branches and the far ranges." },
+            snowline_m { step: 5.0, unit: "m", group: "Snow", display_name: "Snowline", doc: "Height where snow starts (ragged by about 40 m)." },
+            snow_full_m { step: 5.0, unit: "m", group: "Snow", display_name: "Full Cover", doc: "Height where snow covers everything that can hold it." },
+            snow_max_slope_deg { min: 0.0, max: 90.0, step: 1.0, unit: "deg", group: "Snow", display_name: "Steepest Slope", doc: "Steeper faces shed their snow." },
+            snow_shade_bias { min: 0.0, max: 1.0, step: 0.05, group: "Snow", display_name: "Shade Bias", doc: "How much lower snow lies on faces turned from the sun (up to 150 m)." },
+            snow_age { min: 0.0, max: 1.0, step: 0.05, group: "Snow", display_name: "Age", doc: "0 fresh and white; 1 old, grey and dirty." },
+            snow_wind_deg { step: 1.0, unit: "deg", group: "Snow", display_name: "Wind Bearing", doc: "The bearing the wind blows toward (0 toward +Z, 90 toward +X)." },
+            snow_scour { min: 0.0, max: 1.0, step: 0.05, group: "Snow", display_name: "Wind Scour", doc: "How hard the wind strips faces turned into it." },
+            snow_bare_slope_deg { min: 0.0, max: 90.0, step: 1.0, unit: "deg", group: "Snow", display_name: "Bare Past",
+                doc: "Steeper faces keep no snow; between Steepest Slope and this it keeps to gullies and ledges." },
+            snow_map { group: "Snow", display_name: "Snowline Map",
+                doc: "A SNOWLN01 snowline map, project-relative: where it covers, its snowline replaces Snowline. Empty for none." },
         }
     };
     if let Some(field) = schema.fields.iter_mut().find(|f| f.name == "dream_mode") {
@@ -989,6 +1069,7 @@ fn water_schema() -> ComponentSchema {
             // default width — the schema is what serialises, and a field
             // missing from it is a field that silently does not persist.
             half_width { min: 0.1, soft_max: 40.0, unit: "m" },
+            turbidity { min: 0.0, max: 1.0 },
         }
     }
 }
@@ -1146,6 +1227,7 @@ fn time_of_day_schema() -> ComponentSchema {
             day_of_year { min: 1, max: 366, group: "Clock", display_name: "Day of Year" },
             latitude { min: -90.0, max: 90.0, step: 0.5, precision: 2, unit: "\u{b0}", group: "Location" },
             longitude { min: -180.0, max: 180.0, step: 0.5, precision: 2, unit: "\u{b0}", group: "Location" },
+            north_offset { min: -180.0, max: 180.0, step: 0.5, precision: 1, unit: "\u{b0}", group: "Location", display_name: "North Offset" },
             timescale { min: 0.0, soft_max: 60.0, step: 0.1, precision: 2, unit: "h/s", group: "Clock" },
             sun_color { group: "Tracks", display_name: "Sun Colour" },
             sun_intensity { group: "Tracks", min: 0.0, max: 130000.0,
@@ -1166,6 +1248,8 @@ fn time_of_day_schema() -> ComponentSchema {
             night_aurora { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Night Sky", display_name: "Aurora" },
             night_halo_road { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Night Sky", display_name: "Halo Road" },
             night_thread { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Night Sky", display_name: "Thread" },
+            sun_wreck { min: -1, max: 2, group: "Sun", display_name: "Broken Sun (-1 whole, 0 cut, 1 shards, 2 bars)" },
+            sun_wreck_span_deg { min: 0.5, soft_max: 12.0, step: 0.1, precision: 1, unit: "deg", group: "Sun", display_name: "Shards' Span" },
         }
     }
 }
@@ -1196,6 +1280,8 @@ fn sky_schema() -> ComponentSchema {
             shape_scale { min: 100.0, soft_max: 40000.0, step: 100.0, unit: "m",
                 group: "Shape", display_name: "Shape Scale" },
             ambient { min: 0.0, soft_max: 4.0, step: 0.01, precision: 2, group: "Lighting" },
+            brightness { min: 0.0, soft_max: 2.0, step: 0.01, precision: 2, group: "Lighting",
+                doc: "Scale on the light the clouds scatter. 1 is physical, matched to the sun and the sky." },
             phase_forward { min: 0.0, max: 0.95, step: 0.01, precision: 2, group: "Lighting",
                 display_name: "Forward Scattering" },
             phase_backward { min: -0.95, max: 0.0, step: 0.01, precision: 2, group: "Lighting",
@@ -1215,6 +1301,9 @@ fn sky_schema() -> ComponentSchema {
             quality { min: 0, max: 2, group: "Clouds", display_name: "Cloud Quality" },
             temporal_jitter { group: "Quality", display_name: "Temporal Jitter",
                 advanced: true },
+            aerosol { min: 0.0, soft_max: 10.0, step: 0.01, precision: 2, group: "Atmosphere",
+                display_name: "Aerosols",
+                doc: "Haze, dust and smoke in the air: a factor on the atmosphere's Mie scattering and extinction. 1 is the engine's own." },
         }
     };
     // `quality` is an integer in Rust and a named choice in the panel. The
@@ -1251,6 +1340,22 @@ fn sky_eye_schema() -> ComponentSchema {
     }
 }
 
+/// The planet over the horizon (Sunscar, 12 Nov 2026): see [`crate::sky::SkyPlanetComponent`].
+fn sky_planet_schema() -> ComponentSchema {
+    component_schema! {
+        crate::sky::SkyPlanetComponent as "somnium.SkyPlanet", display "Sky Planet", version 1,
+        fields {
+            enabled { group: "Planet" },
+            diameter_deg { min: 0.1, max: 60.0, step: 0.1, precision: 1, unit: "°", group: "Planet", display_name: "Angular Diameter" },
+            albedo { min: 0.0, max: 1.0, step: 0.005, precision: 3, group: "Planet", display_name: "Geometric Albedo" },
+            azimuth_deg { min: 0.0, max: 360.0, step: 0.5, precision: 1, unit: "°", group: "Place", display_name: "Azimuth" },
+            elevation_deg { min: -10.0, max: 89.0, step: 0.5, precision: 1, unit: "°", group: "Place", display_name: "Elevation" },
+            seed { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Surface" },
+            ember { min: 0.0, soft_max: 20.0, step: 0.1, precision: 1, unit: "cd/m²", group: "Surface", display_name: "Fissure Glow" },
+        }
+    }
+}
+
 /// CONTROL-N. Weather as a set of causes, not a pile of sliders.
 fn weather_schema() -> ComponentSchema {
     component_schema! {
@@ -1275,6 +1380,8 @@ fn weather_schema() -> ComponentSchema {
             specular_dry_ratio { min: 0.1, soft_max: 10.0, step: 0.1, precision: 2,
                 group: "Wetness", display_name: "Specular Dries Faster By" },
             puddles { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Wetness" },
+            ground_wetness { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Wetness", display_name: "Ground Wetness",
+                doc: "How damp the ground stays between showers: darker, without shine or puddles." },
             ripple_strength { min: 0.0, max: 1.0, step: 0.01, precision: 2, group: "Water",
                 display_name: "Rain Ripples" },
             transition_seconds { min: 0.1, soft_max: 60.0, step: 0.5, precision: 2, unit: "s",
@@ -1560,7 +1667,7 @@ mod tests {
     #[test]
     fn every_built_in_schema_registers_without_a_clash() {
         let registry = component_registry();
-        assert_eq!(registry.len(), 53);
+        assert_eq!(registry.len(), 56);
         let names: Vec<_> = registry.iter().map(|s| s.stable_id.as_str()).collect();
         assert_eq!(
             names,
@@ -1583,6 +1690,8 @@ mod tests {
                 "somnium.ImportedMesh",
                 "somnium.Interactable",
                 "somnium.IsometricCamera",
+                "somnium.Lamp",
+                "somnium.LevelPortal",
                 "somnium.Light",
                 "somnium.LightFlicker",
                 "somnium.LodGroup",
@@ -1604,6 +1713,7 @@ mod tests {
                 "somnium.ScatterSettings",
                 "somnium.Sky",
                 "somnium.SkyEye",
+                "somnium.SkyPlanet",
                 "somnium.Spline",
                 "somnium.StagedMirror",
                 "somnium.SurfaceTags",

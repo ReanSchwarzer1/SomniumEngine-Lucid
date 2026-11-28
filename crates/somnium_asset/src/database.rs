@@ -385,6 +385,37 @@ struct PersistedFingerprint {
     content_hash: String,
 }
 
+/// What `kind_facts` found in each picture, model and script, kept between scans.
+///
+/// Finding them means opening the file: a model is parsed whole to count its triangles. A project of thirty
+/// thousand models paid that on every scan, and the drawer, search and the pickers waited minutes for it each
+/// time. The facts live in a file of their own (`asset-facts.json`), not in `asset-index.json`, because an older
+/// build rewrites that one without them.
+#[derive(Default, Serialize, Deserialize)]
+struct PersistedFacts {
+    records: BTreeMap<String, PersistedFact>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PersistedFact {
+    bytes: u64,
+    modified_unix_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dimensions: Option<(u32, u32)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    triangles: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    doc_line: Option<String>,
+}
+
+/// What one walk reads and writes beside the records.
+struct ScanTables {
+    old: PersistedIndex,
+    next: PersistedIndex,
+    old_facts: PersistedFacts,
+    next_facts: PersistedFacts,
+}
+
 pub struct AssetDb;
 
 impl AssetDb {
@@ -395,16 +426,35 @@ impl AssetDb {
         let root = root.as_ref().to_path_buf();
         let state_dir = root.join(".somnium");
         let index_path = state_dir.join("asset-index.json");
-        let old: PersistedIndex = fs::read(&index_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        let mut next = PersistedIndex::default();
+        let facts_path = state_dir.join("asset-facts.json");
+        let index_bytes = fs::read(&index_path).ok();
+        let facts_bytes = fs::read(&facts_path).ok();
+        let mut tables = ScanTables {
+            old: index_bytes
+                .as_deref()
+                .and_then(|bytes| serde_json::from_slice(bytes).ok())
+                .unwrap_or_default(),
+            next: PersistedIndex::default(),
+            old_facts: facts_bytes
+                .as_deref()
+                .and_then(|bytes| serde_json::from_slice(bytes).ok())
+                .unwrap_or_default(),
+            next_facts: PersistedFacts::default(),
+        };
         let mut records = Vec::new();
-        scan_dir(&root, &root, &old, &mut next, &mut records)?;
+        scan_dir(&root, &root, &mut tables, &mut records)?;
         let _ = fs::create_dir_all(&state_dir);
-        if let Ok(bytes) = serde_json::to_vec_pretty(&next) {
-            let _ = fs::write(&index_path, bytes);
+        // Each written whole (the index is shared by hard-linked game folders and copies, and rewritten by tests),
+        // and only when its bytes changed: the scan of a project nobody touched writes nothing.
+        if let Ok(bytes) = serde_json::to_vec_pretty(&tables.next) {
+            if index_bytes.as_deref() != Some(bytes.as_slice()) {
+                let _ = crate::write_atomic(&index_path, &bytes);
+            }
+        }
+        if let Ok(bytes) = serde_json::to_vec(&tables.next_facts) {
+            if facts_bytes.as_deref() != Some(bytes.as_slice()) {
+                let _ = crate::write_atomic(&facts_path, &bytes);
+            }
         }
         records.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
         let by_id = records
@@ -423,8 +473,7 @@ impl AssetDb {
 fn scan_dir(
     root: &Path,
     dir: &Path,
-    old: &PersistedIndex,
-    next: &mut PersistedIndex,
+    tables: &mut ScanTables,
     out: &mut Vec<AssetRecord>,
 ) -> Result<(), String> {
     let entries = fs::read_dir(dir).map_err(|error| format!("{}: {error}", dir.display()))?;
@@ -452,7 +501,7 @@ fn scan_dir(
             0
         };
         let content_hash = if metadata.is_file() {
-            match old.records.get(&relative_path) {
+            match tables.old.records.get(&relative_path) {
                 Some(previous)
                     if previous.bytes == bytes && previous.modified_unix_ms == modified_unix_ms =>
                 {
@@ -464,7 +513,7 @@ fn scan_dir(
             String::new()
         };
         if metadata.is_file() {
-            next.records.insert(
+            tables.next.records.insert(
                 relative_path.clone(),
                 PersistedFingerprint {
                     bytes,
@@ -473,7 +522,31 @@ fn scan_dir(
                 },
             );
         }
-        let (dimensions, triangles, doc_line) = kind_facts(&path, kind);
+        // Opened once, then kept for as long as the file's size and date stand (see `PersistedFacts`).
+        let (dimensions, triangles, doc_line) =
+            if matches!(kind, AssetKind::Texture | AssetKind::Mesh | AssetKind::Script) {
+                let kept = tables
+                    .old_facts
+                    .records
+                    .get(&relative_path)
+                    .filter(|fact| fact.bytes == bytes && fact.modified_unix_ms == modified_unix_ms)
+                    .cloned();
+                let fact = kept.unwrap_or_else(|| {
+                    let (dimensions, triangles, doc_line) = kind_facts(&path, kind);
+                    PersistedFact {
+                        bytes,
+                        modified_unix_ms,
+                        dimensions,
+                        triangles,
+                        doc_line,
+                    }
+                });
+                let facts = (fact.dimensions, fact.triangles, fact.doc_line.clone());
+                tables.next_facts.records.insert(relative_path.clone(), fact);
+                facts
+            } else {
+                (None, None, None)
+            };
         out.push(AssetRecord {
             id: AssetId::from_relative_path(&relative_path),
             relative_path,
@@ -491,7 +564,11 @@ fn scan_dir(
             },
         });
         if metadata.is_dir() {
-            scan_dir(root, &path, old, next, out)?;
+            // A folder renamed or removed while the walk is in it (another tool writing the project) costs that
+            // folder for one scan, not the whole inventory. Only the content folder itself must be readable.
+            if let Err(error) = scan_dir(root, &path, tables, out) {
+                tracing::warn!(%error, "asset inventory: a folder could not be read and was left out");
+            }
         }
     }
     Ok(())
@@ -635,6 +712,43 @@ mod tests {
             AssetId::from_relative_path("Textures\\Rock.PNG"),
             AssetId::from_relative_path("textures/rock.png")
         );
+    }
+
+    #[test]
+    fn a_scan_keeps_what_it_found_in_a_file_and_does_not_open_the_file_again() {
+        let root = fixture();
+        let id = AssetId::from_relative_path("boot.luau");
+        let doc = |snapshot: &AssetDbSnapshot| snapshot.get(id).unwrap().metadata.doc_line.clone();
+        let first = AssetDb::scan(&root).unwrap();
+        assert_eq!(doc(&first).as_deref(), Some("Starts the game"));
+
+        // The kept fact is what the next scan reports. Proved by changing the kept fact and not the file.
+        let facts_path = root.join(".somnium").join("asset-facts.json");
+        let kept = fs::read_to_string(&facts_path).unwrap();
+        assert!(kept.contains("Starts the game"));
+        fs::write(&facts_path, kept.replace("Starts the game", "Kept from last time")).unwrap();
+        let second = AssetDb::scan(&root).unwrap();
+        assert_eq!(doc(&second).as_deref(), Some("Kept from last time"));
+
+        // A file whose size changed is opened again.
+        fs::write(root.join("boot.luau"), b"--- Starts the game, and more\nreturn {}\n").unwrap();
+        let third = AssetDb::scan(&root).unwrap();
+        assert_eq!(doc(&third).as_deref(), Some("Starts the game, and more"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_scan_of_an_untouched_project_writes_nothing() {
+        let root = fixture();
+        AssetDb::scan(&root).unwrap();
+        let state = root.join(".somnium");
+        let stamp = |name: &str| fs::metadata(state.join(name)).unwrap().modified().unwrap();
+        let (index, facts) = (stamp("asset-index.json"), stamp("asset-facts.json"));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        AssetDb::scan(&root).unwrap();
+        assert_eq!(stamp("asset-index.json"), index);
+        assert_eq!(stamp("asset-facts.json"), facts);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

@@ -35,8 +35,35 @@ use crate::{
 use crate::editor::parts::*;
 
 pub(crate) fn fill_help_body(ui: &mut UserInterface, parent: NodeHandle, font_id: u8, page: u8) {
+    fill_help_blocks(ui, parent, font_id, page, crate::metaphor::help_blocks(page));
+}
+
+/// A page whose Markdown is not compiled in (the open project's guide), drawn the way the built-in pages are.
+pub(crate) fn fill_help_markdown(ui: &mut UserInterface, parent: NodeHandle, font_id: u8, markdown: &str) {
+    let blocks = crate::metaphor::parse_help_markdown(markdown);
+    fill_help_blocks(ui, parent, font_id, crate::metaphor::PROJECT_GUIDE_PAGE, blocks);
+}
+
+fn fill_help_blocks(
+    ui: &mut UserInterface,
+    parent: NodeHandle,
+    font_id: u8,
+    page: u8,
+    blocks: Vec<crate::metaphor::HelpBlock>,
+) {
     ui.clear_children(parent);
-    for block in crate::metaphor::help_blocks(page) {
+    if page == 4 {
+        // About: Lucid's lock-up, drawn from the logo's own files.
+        let lockup = crate::widgets::splash::LockupBuilder::new(
+            WidgetBuilder::new()
+                .with_horizontal_alignment(HorizontalAlignment::Left)
+                .with_margin(Thickness { left: 0.0, top: 8.0, right: 8.0, bottom: 4.0 }),
+        )
+        .with_height(56.0)
+        .build();
+        ui.add_node(lockup, parent);
+    }
+    for block in blocks {
         match block {
             crate::metaphor::HelpBlock::Heading(text) => {
                 let n = TextBuilder::new(WidgetBuilder::new().with_margin(Thickness {
@@ -224,7 +251,9 @@ pub(crate) fn build_help_overlay(
             .build();
     let toc_stack_h = ui.add_node(toc_stack, toc_border_h);
     let mut help_toc = Vec::new();
-    for (i, title) in crate::metaphor::help_titles().iter().enumerate() {
+    let titles = crate::metaphor::help_titles();
+    for &i in crate::metaphor::help_order() {
+        let title = &titles[i as usize];
         let btn = ButtonBuilder::new(
             WidgetBuilder::new()
                 .with_height(28.0)
@@ -240,7 +269,7 @@ pub(crate) fn build_help_overlay(
             .with_color(theme::active().semantic.text.primary.bytes())
             .build();
         ui.add_node(lbl, bh);
-        help_toc.push((bh, i as u8));
+        help_toc.push((bh, i));
     }
 
     let scroll = ScrollViewerBuilder::new(

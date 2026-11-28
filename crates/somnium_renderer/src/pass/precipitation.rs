@@ -1,0 +1,581 @@
+//! Rain, snow and hail near the eye (Sunscar weather, 11 Nov 2026): `precipitation.wgsl`'s field of drops.
+//!
+//! A game sets [`PrecipitationPass::settings`]; the default draws nothing and costs nothing. With a `density` the drops
+//! fill three nested boxes out to about forty metres, each far drop standing for many, so near streaks pass in front
+//! of fainter far ones; beyond that the air's haze (the fog) and the shaft under the cloud carry it. Rain also splashes
+//! on open ground and roofs, from the scene's depth (sunscar-particles, 26 Nov).
+
+use glam::Vec3;
+
+/// The most drops a frame draws.
+pub const MAX_DROPS: u32 = 200_000;
+
+/// What falls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Falling {
+    /// A lens: a pale streak that shows the sky behind it and glitters toward the sun.
+    #[default]
+    Rain,
+    /// A slow white flake.
+    Snow,
+    /// A fast white stone.
+    Hail,
+    /// Grains on a dry wind: soft pale motes driven near level, lit like snow and tinted by the soil
+    /// (sunscar-particles, 27 Nov 2026).
+    Dust,
+}
+
+/// The side of one sprite layer, pixels.
+pub const SPRITE_SIZE: u32 = 128;
+
+/// The field of drops round the eye.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PrecipitationSettings {
+    /// Drops in the box. 0 draws nothing.
+    pub count: u32,
+    pub falling: Falling,
+    /// The box's half-size, metres. Drops further off are thinner than a pixel: 5 m is enough for rain.
+    pub extent: Vec3,
+    /// How far ahead of the eye the box's centre sits, along the way it looks on the ground, as a share of the
+    /// box's half-size (the drops behind the eye are wasted).
+    pub lead: f32,
+    /// The mean drop's velocity, metres a second: the fall and the wind's share.
+    pub velocity: Vec3,
+    /// How far a drop wanders from its fall, metres a second (snow drifts; rain does not).
+    pub wander: f32,
+    /// The mean drop's diameter, metres (rain 0.002, snow 0.006, hail 0.012).
+    pub size: f32,
+    /// The shutter, seconds: a drop draws the streak it falls in this time (a film camera's 1/48).
+    pub exposure: f32,
+    pub tint: Vec3,
+    /// A scale on how much the drops cover (1 as physics gives it).
+    pub opacity: f32,
+    /// Drops a cubic metre as physics gives them. 0 draws the one box of `extent` as before; above 0 the drops are
+    /// shared among three nested boxes (`extent`, three and nine times it), so the rain has depth: each drawn drop in
+    /// a far box stands for the ones left out (sunscar-particles, 26 Nov).
+    pub density: f32,
+    /// Splashes where the rain meets open ground and roofs, 0..1 (rain only).
+    pub splash: f32,
+    /// 1 when the eye is under a roof: what the picture cannot show above a drop or a splash is taken as covered.
+    pub sheltered: f32,
+}
+
+impl Default for PrecipitationSettings {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            falling: Falling::Rain,
+            extent: Vec3::new(5.0, 4.0, 5.0),
+            lead: 0.6,
+            velocity: Vec3::new(0.0, -7.5, 0.0),
+            wander: 0.0,
+            size: 0.002,
+            exposure: 1.0 / 48.0,
+            tint: Vec3::ONE,
+            opacity: 1.0,
+            density: 0.0,
+            splash: 0.0,
+            sheltered: 0.0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct Params {
+    view_proj: [[f32; 4]; 4],
+    inverse_view_proj: [[f32; 4]; 4],
+    camera_pos: [f32; 3],
+    pixel_angle: f32,
+    centre: [f32; 3],
+    time: f32,
+    extent: [f32; 3],
+    count: f32,
+    velocity: [f32; 3],
+    exposure: f32,
+    camera_velocity: [f32; 3],
+    wander: f32,
+    sun_direction: [f32; 3],
+    kind: f32,
+    sun_light: [f32; 3],
+    size: f32,
+    tint: [f32; 3],
+    opacity: f32,
+    /// Drops in the near, middle and far box, and the splashes' strength.
+    layers: [f32; 4],
+    /// What a drawn drop of each box stands for, and splashes a square metre a second.
+    folds: [f32; 4],
+    /// Sheltered; 1 when the drops are drawn through sprites; the kind's first sprite layer and how many it has.
+    extra: [f32; 4],
+    flash_pos: [[f32; 4]; 4],
+    flash_color: [[f32; 4]; 4],
+}
+
+pub struct PrecipitationPass {
+    pub settings: PrecipitationSettings,
+    /// Lightning and lamps that light the drops this frame: where, and candela by colour (the first four count).
+    pub flashes: Vec<(Vec3, Vec3)>,
+    pipeline: wgpu::RenderPipeline,
+    splash_pipeline: wgpu::RenderPipeline,
+    layout: wgpu::BindGroupLayout,
+    params: wgpu::Buffer,
+    /// The drops' shapes: a texture array of `SPRITE_SIZE` layers with their mips (one white layer until a game loads
+    /// some), its sampler, each kind's first layer and count (rain, snow, hail, dust), and the pixels still to upload.
+    sprite_texture: wgpu::Texture,
+    sprite_view: wgpu::TextureView,
+    sprite_sampler: wgpu::Sampler,
+    sprite_kinds: [(u32, u32); 4],
+    sprite_upload: Option<(u32, Vec<u8>)>,
+    bind_group: Option<wgpu::BindGroup>,
+    /// The eye and the renderer's clock a frame ago, for the eye's velocity and the frame's length.
+    last_camera: Option<Vec3>,
+    last_time: f32,
+    /// The clock the drops fall by, kept under an hour so their places stay exact.
+    clock: f32,
+}
+
+impl PrecipitationPass {
+    pub fn new(device: &wgpu::Device, shaders: &crate::shaders::Shaders) -> Self {
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("precipitation.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(shaders.source_or_panic("precipitation.wgsl").into()),
+        });
+        let uniform = |binding, visibility| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility,
+            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let texture = |binding, view_dimension| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+            ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Float { filterable: true }, view_dimension, multisampled: false },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Precipitation BGL"),
+            entries: &[
+                uniform(0, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                texture(1, wgpu::TextureViewDimension::Cube),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                texture(3, wgpu::TextureViewDimension::D2),
+                uniform(4, wgpu::ShaderStages::VERTEX_FRAGMENT),
+                // The scene's depth: what covers a drop from the sky, and where the splashes land.
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Texture { sample_type: wgpu::TextureSampleType::Depth, view_dimension: wgpu::TextureViewDimension::D2, multisampled: false },
+                    count: None,
+                },
+                // The drops' shapes, and their own sampler (trilinear, clamped).
+                texture(6, wgpu::TextureViewDimension::D2Array),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Precipitation PL"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        // As the sprites: over the scene, and into FSR's reactive mask.
+        let targets = [
+                    Some(wgpu::ColorTargetState {
+                        format: crate::pass::postprocess::HDR_FORMAT,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    }),
+                    Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: Some(wgpu::BlendState {
+                            color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Max },
+                            alpha: wgpu::BlendComponent::REPLACE,
+                        }),
+                        write_mask: wgpu::ColorWrites::RED,
+                    }),
+                ];
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Precipitation"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_main"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_main"),
+                targets: &targets,
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: crate::pass::visibility::DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                // Reversed depth: nearer is larger.
+                depth_compare: Some(wgpu::CompareFunction::GreaterEqual),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        // The splashes: one triangle over the picture, reading the depth (so no depth attachment of its own).
+        let splash_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Precipitation splashes"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState { module: &module, entry_point: Some("vs_splash"), buffers: &[], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs_splash"),
+                targets: &targets,
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState { cull_mode: None, ..Default::default() },
+            depth_stencil: None,
+            multisample: Default::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let (sprite_texture, sprite_view) = sprite_array(device, 1, 1);
+        let sprite_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Precipitation sprites"),
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        Self {
+            sprite_texture,
+            sprite_view,
+            sprite_sampler,
+            sprite_kinds: [(0, 0); 4],
+            sprite_upload: None,
+            settings: PrecipitationSettings::default(),
+            flashes: Vec::new(),
+            pipeline,
+            splash_pipeline,
+            layout,
+            params: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Precipitation Params"),
+                size: std::mem::size_of::<Params>() as u64,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            bind_group: None,
+            last_camera: None,
+            last_time: 0.0,
+            clock: 0.0,
+        }
+    }
+
+    /// The drops' shapes from a PNG: a column of `SPRITE_SIZE`-square layers, white where the shape is (its alpha, or
+    /// its brightness where it has none). `kinds` is each kind's first layer and count: rain, snow, hail, dust; a kind
+    /// with none keeps its drawn shape. Uploaded with the next frame (sunscar-particles, 27 Nov 2026).
+    ///
+    /// # Errors
+    /// When the file cannot be read or is not a column of whole layers.
+    pub fn load_sprites(&mut self, device: &wgpu::Device, path: &std::path::Path, kinds: [(u32, u32); 4]) -> Result<(), String> {
+        let image = image::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let has_alpha = image.color().has_alpha();
+        let rgba = image.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        if w != SPRITE_SIZE || h == 0 || h % SPRITE_SIZE != 0 {
+            return Err(format!("{}: {w} x {h} is not a column of {SPRITE_SIZE}-pixel layers", path.display()));
+        }
+        let layers = h / SPRITE_SIZE;
+        if kinds.iter().any(|&(first, n)| first + n > layers) {
+            return Err(format!("{}: {layers} layers, fewer than the kinds name", path.display()));
+        }
+        // White, the shape in the alpha.
+        let pixels: Vec<u8> = rgba
+            .pixels()
+            .flat_map(|p| {
+                let a = if has_alpha { p[3] } else { ((u32::from(p[0]) * 3 + u32::from(p[1]) * 6 + u32::from(p[2])) / 10) as u8 };
+                [255, 255, 255, a]
+            })
+            .collect();
+        (self.sprite_texture, self.sprite_view) = sprite_array(device, layers, SPRITE_SIZE.ilog2() + 1);
+        self.sprite_kinds = kinds;
+        self.sprite_upload = Some((layers, pixels));
+        self.bind_group = None;
+        Ok(())
+    }
+
+    /// Bind the sky light's cube and the clouds' ground shadow. Built once.
+    pub fn ensure_bind_group(
+        &mut self,
+        device: &wgpu::Device,
+        env_cube: &wgpu::TextureView,
+        env_sampler: &wgpu::Sampler,
+        cloud_shadow: &wgpu::TextureView,
+        cloud_shadow_params: &wgpu::Buffer,
+        depth: &wgpu::TextureView,
+    ) {
+        // Rebuilt every frame: the depth view is remade when the picture's size changes (one small bind group).
+        self.bind_group = Some(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Precipitation BG"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(env_cube) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(env_sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(cloud_shadow) },
+                wgpu::BindGroupEntry { binding: 4, resource: cloud_shadow_params.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(depth) },
+                wgpu::BindGroupEntry { binding: 6, resource: wgpu::BindingResource::TextureView(&self.sprite_view) },
+                wgpu::BindGroupEntry { binding: 7, resource: wgpu::BindingResource::Sampler(&self.sprite_sampler) },
+            ],
+        }));
+    }
+
+    /// Draw the drops over the scene. `view_proj` is camera-relative and unjittered; `reactive` the sprites' mask
+    /// for this view (already cleared by them this frame); `time` the renderer's clock, seconds.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &mut self,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        hdr: &wgpu::TextureView,
+        reactive: &wgpu::TextureView,
+        depth: &wgpu::TextureView,
+        size: (u32, u32),
+        view_proj: glam::Mat4,
+        camera_pos: Vec3,
+        look: Vec3,
+        sun_direction: Vec3,
+        sun_light: Vec3,
+        time: f32,
+    ) {
+        if let Some((layers, pixels)) = self.sprite_upload.take() {
+            upload_sprites(queue, &self.sprite_texture, layers, &pixels);
+        }
+        let dt = (time - self.last_time).clamp(0.0, 0.25);
+        self.last_time = time;
+        // The clock runs whether or not anything falls, so rain that starts again is not where it stopped.
+        self.clock = (self.clock + dt).rem_euclid(3600.0);
+        let camera_velocity = match self.last_camera {
+            // A cut is not a velocity.
+            // Capped at a run: a slide down a scree slope or a carried camera drew every streak as a fan toward where it went
+            // (sunscar-particles, 26 Nov: the first stills on a slope).
+            Some(last) if dt > 1e-4 && last.distance(camera_pos) < 30.0 => ((camera_pos - last) / dt).clamp_length_max(6.0),
+            _ => Vec3::ZERO,
+        };
+        self.last_camera = Some(camera_pos);
+        let s = self.settings;
+        let (Some(bind_group), true) = (self.bind_group.as_ref(), s.count > 0) else {
+            return;
+        };
+        let count = s.count.min(MAX_DROPS);
+        // The three boxes: half the drops near, the rest in two hollow boxes three and nine times as large. Each drawn
+        // drop stands for the share of the physical ones its box holds (at most 64, past that the far rain thins).
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let (layers, folds) = if s.density > 0.0 {
+            let n0 = (count as f32 * 0.5).floor();
+            let n1 = (count as f32 * 0.3).floor();
+            let n2 = count as f32 - n0 - n1;
+            let e = s.extent.max(Vec3::splat(0.5));
+            let v0 = 8.0 * e.x * e.y * e.z;
+            let fold = |wanted: f32, n: f32| (wanted / n.max(1.0)).clamp(1.0, 64.0) * s.opacity.max(0.0);
+            ([n0, n1, n2], [fold(s.density * v0, n0), fold(s.density * v0 * 26.0, n1), fold(s.density * v0 * 26.0 * 27.0, n2)])
+        } else {
+            ([count as f32, 0.0, 0.0], [s.opacity.max(0.0); 3])
+        };
+        // Splashes a square metre a second: what lands, as the drops fall (Marshall and Palmer's count by their speed).
+        let flux = if s.density > 0.0 { s.density * (-s.velocity.y).max(0.5) } else { 400.0 };
+        let ahead = Vec3::new(look.x, 0.0, look.z).normalize_or_zero();
+        let mut flash_pos = [[0.0; 4]; 4];
+        let mut flash_color = [[0.0; 4]; 4];
+        for (i, (at, candela)) in self.flashes.iter().take(4).enumerate() {
+            flash_pos[i] = [at.x, at.y, at.z, 1.0];
+            flash_color[i] = [candela.x, candela.y, candela.z, 0.0];
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let height = size.1.max(1) as f32;
+        // A perspective's second row is its 1 / tan(half the vertical field of view), turned by the view's rotation.
+        let tan_half_fov_y = 1.0 / Vec3::new(view_proj.x_axis.y, view_proj.y_axis.y, view_proj.z_axis.y).length().max(1e-4);
+        #[allow(clippy::cast_precision_loss)]
+        queue.write_buffer(
+            &self.params,
+            0,
+            bytemuck::bytes_of(&Params {
+                view_proj: view_proj.to_cols_array_2d(),
+                inverse_view_proj: view_proj.inverse().to_cols_array_2d(),
+                camera_pos: camera_pos.to_array(),
+                pixel_angle: 2.0 * tan_half_fov_y / height,
+                centre: (camera_pos + ahead * (s.extent.x.min(s.extent.z) * s.lead.clamp(0.0, 1.0))).to_array(),
+                time: self.clock,
+                extent: s.extent.max(Vec3::splat(0.5)).to_array(),
+                count: count as f32,
+                velocity: s.velocity.to_array(),
+                exposure: s.exposure.clamp(1e-4, 0.1),
+                camera_velocity: camera_velocity.to_array(),
+                wander: s.wander.max(0.0),
+                sun_direction: sun_direction.normalize_or_zero().to_array(),
+                kind: match s.falling {
+                    Falling::Rain => 0.0,
+                    Falling::Snow => 1.0,
+                    Falling::Hail => 2.0,
+                    Falling::Dust => 3.0,
+                },
+                sun_light: sun_light.to_array(),
+                size: s.size.max(1e-4),
+                tint: s.tint.to_array(),
+                opacity: s.opacity.max(0.0),
+                layers: [layers[0], layers[1], layers[2], if matches!(s.falling, Falling::Rain) { s.splash.clamp(0.0, 1.0) } else { 0.0 }],
+                folds: [folds[0], folds[1], folds[2], flux],
+                extra: {
+                    let (first, n) = self.sprite_kinds[match s.falling {
+                        Falling::Rain => 0,
+                        Falling::Snow => 1,
+                        Falling::Hail => 2,
+                        Falling::Dust => 3,
+                    }];
+                    [s.sheltered.clamp(0.0, 1.0), if n > 0 { 1.0 } else { 0.0 }, first as f32, n as f32]
+                },
+                flash_pos,
+                flash_color,
+            }),
+        );
+        if matches!(s.falling, Falling::Rain) && s.splash > 0.0 {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Precipitation splashes"),
+                multiview_mask: None,
+                color_attachments: &[
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: hdr,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    }),
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: reactive,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                    }),
+                ],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_pipeline(&self.splash_pipeline);
+            pass.set_bind_group(0, bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Precipitation"),
+            multiview_mask: None,
+            color_attachments: &[
+                Some(wgpu::RenderPassColorAttachment {
+                    view: hdr,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                }),
+                Some(wgpu::RenderPassColorAttachment {
+                    view: reactive,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations { load: wgpu::LoadOp::Load, store: wgpu::StoreOp::Store },
+                }),
+            ],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment { view: depth, depth_ops: None, stencil_ops: None }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, bind_group, &[]);
+        pass.draw(0..6, 0..count);
+    }
+}
+
+/// A texture array for the drops' shapes; one white layer as the stand-in.
+fn sprite_array(device: &wgpu::Device, layers: u32, mips: u32) -> (wgpu::Texture, wgpu::TextureView) {
+    let side = if layers == 1 && mips == 1 { 1 } else { SPRITE_SIZE };
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Precipitation sprites"),
+        size: wgpu::Extent3d { width: side, height: side, depth_or_array_layers: layers },
+        mip_level_count: mips,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor {
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    });
+    (texture, view)
+}
+
+/// Each layer and its mips, halved by a box filter down to one pixel.
+fn upload_sprites(queue: &wgpu::Queue, texture: &wgpu::Texture, layers: u32, pixels: &[u8]) {
+    let layer_bytes = (SPRITE_SIZE * SPRITE_SIZE * 4) as usize;
+    for layer in 0..layers {
+        let mut level = pixels[layer as usize * layer_bytes..(layer as usize + 1) * layer_bytes].to_vec();
+        let mut side = SPRITE_SIZE;
+        for mip in 0..texture.mip_level_count() {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: mip,
+                    origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &level,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(side * 4), rows_per_image: Some(side) },
+                wgpu::Extent3d { width: side, height: side, depth_or_array_layers: 1 },
+            );
+            if side == 1 {
+                break;
+            }
+            level = halve(&level, side);
+            side /= 2;
+        }
+    }
+}
+
+/// One mip down: each pixel the mean of the four above it.
+fn halve(level: &[u8], side: u32) -> Vec<u8> {
+    let (s, h) = (side as usize, side as usize / 2);
+    let mut out = vec![0_u8; h * h * 4];
+    for y in 0..h {
+        for x in 0..h {
+            for c in 0..4 {
+                let at = |dx: usize, dy: usize| u32::from(level[((2 * y + dy) * s + 2 * x + dx) * 4 + c]);
+                out[(y * h + x) * 4 + c] = ((at(0, 0) + at(1, 0) + at(0, 1) + at(1, 1) + 2) / 4) as u8;
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_mip_is_the_mean_of_four() {
+        let level: Vec<u8> = [0_u8, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255].to_vec();
+        assert_eq!(halve(&level, 2), vec![191, 191, 191, 191]);
+    }
+
+    #[test]
+    fn the_uniform_matches_the_shaders_layout() {
+        // Two mat4, eight vec3 + f32 rows, three vec4, two arrays of four vec4.
+        assert_eq!(std::mem::size_of::<Params>(), 2 * 64 + 8 * 16 + 3 * 16 + 2 * 64);
+    }
+
+    #[test]
+    fn nothing_falls_by_default() {
+        assert_eq!(PrecipitationSettings::default().count, 0);
+    }
+}

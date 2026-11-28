@@ -49,7 +49,8 @@ fn silhouettes_union_parts_respect_occlusion_alpha_and_view_lifetimes() {
         mesh_index_offset: 0,
         _padding: 0,
     }));
-    let mut view_bytes = vec![0u8; 256];
+    // The whole view block, `inv_view_proj_rel` included (renderer.rs `VIEW_SLOT_BYTES`' 320).
+    let mut view_bytes = vec![0u8; 320];
     view_bytes[..64].copy_from_slice(bytemuck::cast_slice(&glam::Mat4::IDENTITY.to_cols_array()));
     let view_buffer = buffer(&view_bytes);
     let mut material = GpuMaterial::zeroed();
@@ -218,7 +219,7 @@ fn silhouettes_union_parts_respect_occlusion_alpha_and_view_lifetimes() {
     let pixel = |image: &[u8], x: u32, y: u32| image[((y * size + x) * 4) as usize];
     upload_vis(true);
     let mut encoder = device.create_command_encoder(&Default::default());
-    clear(&mut encoder, &output_view, 1.0);
+    clear(&mut encoder, &output_view, 0.0);
     pass.record_mask(
         &device,
         &queue,
@@ -265,7 +266,8 @@ fn silhouettes_union_parts_respect_occlusion_alpha_and_view_lifetimes() {
         "border stays inside visible coverage"
     );
     upload_vis(false);
-    for (distance, expected) in [(0.8, true), (0.4, false)] {
+    // Scene depth is reversed-Z (renderer.rs `set_view`): the quad at 0.6 is in front of 0.4 and behind 0.8.
+    for (distance, expected) in [(0.4, true), (0.8, false)] {
         let mut encoder = device.create_command_encoder(&Default::default());
         clear(&mut encoder, &output_view, distance);
         pass.record_mask(
@@ -320,7 +322,7 @@ fn silhouettes_union_parts_respect_occlusion_alpha_and_view_lifetimes() {
     );
     let second_view = second.create_view(&Default::default());
     let mut encoder = device.create_command_encoder(&Default::default());
-    clear(&mut encoder, &output_view, 1.0);
+    clear(&mut encoder, &output_view, 0.0);
     pass.record_mask(
         &device,
         &queue,
@@ -349,7 +351,7 @@ fn silhouettes_union_parts_respect_occlusion_alpha_and_view_lifetimes() {
         [0.0; 2],
         0,
     );
-    clear(&mut encoder, &second_view, 1.0);
+    clear(&mut encoder, &second_view, 0.0);
     pass.record_mask(
         &device,
         &queue,
@@ -394,7 +396,7 @@ fn silhouettes_union_parts_respect_occlusion_alpha_and_view_lifetimes() {
     assert_eq!(second[((8 * size + 8) * 4 + 1) as usize], 0);
 
     let mut encoder = device.create_command_encoder(&Default::default());
-    clear(&mut encoder, &output_view, 1.0);
+    clear(&mut encoder, &output_view, 0.0);
     pass.record_mask(
         &device,
         &queue,

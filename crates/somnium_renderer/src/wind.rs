@@ -75,8 +75,15 @@ fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     t * t * (3.0 - 2.0 * t)
 }
 
-fn fract(x: f32) -> f32 {
-    x - x.floor()
+/// A plant's sway phase, `wind.wgsl`'s `wind_phase`: an integer hash of its pivot to 1/64 m. The old sine hash lined
+/// tufts up in rows kilometres from the origin.
+fn phase(pivot: Vec3) -> f32 {
+    let (cx, cz) = ((pivot.x * 64.0).floor() as i32 as u32, (pivot.z * 64.0).floor() as i32 as u32);
+    let mut h = cx.wrapping_mul(0x8da6_b343) ^ cz.wrapping_mul(0xd816_3841);
+    h = (h ^ (h >> 16)).wrapping_mul(0x7feb_352d);
+    h = (h ^ (h >> 15)).wrapping_mul(0x846c_a68b);
+    h ^= h >> 16;
+    (h >> 8) as f32 * (std::f32::consts::TAU / 16_777_216.0)
 }
 
 /// Displacement of a vertex at world `p` on a plant standing at `pivot`.
@@ -107,23 +114,25 @@ pub fn offset(
     }
     let dir = velocity / speed;
     let h = (p.y - pivot.y).max(0.0);
-    let phase = fract((pivot.x * 12.9898 + pivot.z * 78.233).sin() * 43758.547) * std::f32::consts::TAU;
+    let phase = phase(pivot);
     // Gust fronts travel downwind across the stand at about 10 m/s.
     let front = (pivot.x * dir.x + pivot.z * dir.y) * 0.09 - time * 0.9;
     let gust = 0.55 + 0.45 * (0.5 + 0.5 * front.sin()) * (0.6 + 0.4 * (time * 0.37 + phase).sin());
     // Drag grows with speed and saturates: a gale does not lay a pine flat.
     let drag = (speed * 0.22).min(1.6);
     let sway = 0.7 + 0.3 * (time * 0.9 + phase).sin();
-    let lean = bend * h * h * drag * gust * sway;
-    let mut out = Vec3::new(dir.x * lean, 0.0, dir.y * lean);
+    let turn = 0.7 * (phase * 3.7).sin();
+    let own = Vec2::new(dir.x * turn.cos() - dir.y * turn.sin(), dir.x * turn.sin() + dir.y * turn.cos());
+    let lean = bend * h * h * drag * gust * sway * (0.75 + 0.25 * (phase * 2.3).cos());
+    let mut out = Vec3::new(own.x * lean, 0.0, own.y * lean);
     // A bent stem keeps its length, so its tip drops as it leans.
     out.y = -0.5 * lean * lean / h.max(0.25);
-    let q = p * 1.7;
+    let q = (p - pivot) * 1.7;
     let f = flutter * drag * (h * 2.0).clamp(0.0, 1.0) * (0.5 + 0.5 * gust);
     out += Vec3::new(
         (time * 5.3 + q.x + q.y * 0.7 + phase).sin(),
-        0.6 * (time * 6.7 + q.z * 1.3 + q.x * 0.5).sin(),
-        (time * 4.9 + q.y + q.z).sin(),
+        0.6 * (time * 6.7 + q.z * 1.3 + q.x * 0.5 + phase * 1.7).sin(),
+        (time * 4.9 + q.y + q.z + phase * 2.3).sin(),
     ) * f;
     out * (fade * wind[2])
 }
@@ -187,5 +196,50 @@ mod tests {
         };
         assert_eq!(w.uniform(), [1.5, -2.0, 0.8, 40.0]);
         assert_eq!(FoliageWind::default().uniform()[2], 0.0);
+    }
+
+    #[test]
+    fn tufts_far_from_the_origin_sway_out_of_step() {
+        // 400 tufts 30 cm apart along x, 13.9 km out (Sunscar's pasture): neighbours' phases as unrelated as chance.
+        let phases: Vec<f32> = (0..400).map(|i| phase(Vec3::new(-13860.0 + i as f32 * 0.3, 15.0, 360.0))).collect();
+        let mean_step = phases.windows(2).map(|w| (w[1] - w[0]).abs()).sum::<f32>() / 399.0;
+        // Independent uniform phases on 0..2pi differ by 2pi/3 on average.
+        assert!((mean_step - std::f32::consts::TAU / 3.0).abs() < 0.35, "{mean_step}");
+        assert!(phases.iter().all(|p| (0.0..std::f32::consts::TAU).contains(p)));
+        assert_eq!(phase(Vec3::new(5.0, 0.0, 7.0)), phase(Vec3::new(5.0, 9.0, 7.0)), "height is no part of it");
+    }
+
+    #[test]
+    fn tufts_in_a_line_along_x_flutter_out_of_step() {
+        // Flutter alone (no bend), a tuft's tip 0.4 m up, tufts 0.3 m apart along x at one z, 13.9 km out: their sideways
+        // (z) flutter must not move together, or the field shows rows along x.
+        let wind = [0.0, 4.0, 1.0, DEFAULT_FADE_DISTANCE];
+        let z_at = |i: usize, t: f32| {
+            let pivot = Vec3::new(-13860.0 + i as f32 * 0.3, 15.0, 360.0);
+            offset(pivot + Vec3::Y * 0.4, pivot, 0.0, 0.2, t, wind, pivot).z
+        };
+        let (a, b): (Vec<f32>, Vec<f32>) = (0..300).map(|i| (z_at(i, 1.0), z_at(i + 1, 1.0))).unzip();
+        let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+        let (ma, mb) = (mean(&a), mean(&b));
+        let cov: f32 = a.iter().zip(&b).map(|(x, y)| (x - ma) * (y - mb)).sum::<f32>();
+        let var = |v: &[f32], m: f32| v.iter().map(|x| (x - m) * (x - m)).sum::<f32>().sqrt();
+        let corr = cov / (var(&a, ma) * var(&b, mb));
+        assert!(corr.abs() < 0.3, "neighbours' sideways flutter correlate {corr}");
+    }
+
+    #[test]
+    fn plants_lean_downwind_each_its_own_way() {
+        // Forty tufts in a row: every lean has a downwind part, and their directions spread rather than all agreeing.
+        let angles: Vec<f32> = (0..40)
+            .map(|i| {
+                let pivot = Vec3::new(-13860.0 + i as f32 * 0.7, 15.0, 360.0);
+                let o = offset(pivot + Vec3::Y * 0.5, pivot, 0.6, 0.0, 1.0, BREEZE, pivot);
+                assert!(o.z > 0.0, "downwind (+z) for every plant: {o}");
+                o.x.atan2(o.z)
+            })
+            .collect();
+        let spread = angles.iter().cloned().fold(f32::MIN, f32::max) - angles.iter().cloned().fold(f32::MAX, f32::min);
+        assert!(spread > 0.8, "directions spread {spread} rad");
+        assert!(angles.iter().all(|a| a.abs() < 0.75), "within about 40 degrees of downwind");
     }
 }

@@ -185,7 +185,8 @@ fn vs_sky(@builtin(vertex_index) i: u32) -> SkyOut {
 @fragment
 fn fs_sky(in: SkyOut) -> @location(0) vec4<f32> {
     let far = capture.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
-    let dir = normalize(far.xyz / far.w - capture.eye);
+    // Camera-relative (`inv_view_proj` is): the far point is already the ray.
+    let dir = normalize(far.xyz / far.w);
     let sky = fogged(environment(dir, 2.0), capture.eye + dir * capture.fog_distance);
     return vec4<f32>(select(vec3<f32>(0.0), sky, sky == sky), 1.0);
 }

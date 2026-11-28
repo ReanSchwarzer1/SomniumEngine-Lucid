@@ -242,6 +242,50 @@ pub fn bake(
     height_scale: f32,
     size: u32,
 ) -> HorizonMaps {
+    bake_with_canopy(heights, total_x, total_z, cell_size, height_scale, size, None)
+}
+
+/// A tile's canopy for the bake: crown top above the ground in metres, `size` texels square from the tile's corner,
+/// `metres` per texel (foliage-render's `{sidecar}.canopy.png`, `tools/canopy_bake.py`).
+#[derive(Debug, Clone)]
+pub struct Canopy {
+    pub top: Vec<f32>,
+    pub size: usize,
+    pub metres: f32,
+}
+
+impl Canopy {
+    /// The crown top at a point, read between texel centres: a crown is a dome. Read as the box of its texel, each
+    /// crown's shadow on the ground past the trees' own was an angular block four metres wide, and a thin wood's
+    /// were black patches with stepped edges all over it (Sunscar, the ring tiles from the air, 11 Nov 2026).
+    fn at(&self, x_m: f32, z_m: f32) -> f32 {
+        let (u, v) = (x_m / self.metres - 0.5, z_m / self.metres - 0.5);
+        let (i, j) = (u.floor(), v.floor());
+        let texel = |i: f32, j: f32| {
+            if i < 0.0 || j < 0.0 || i >= self.size as f32 || j >= self.size as f32 {
+                0.0
+            } else {
+                self.top[j as usize * self.size + i as usize]
+            }
+        };
+        let near = texel(i, j) + (texel(i + 1.0, j) - texel(i, j)) * (u - i);
+        let far = texel(i, j + 1.0) + (texel(i + 1.0, j + 1.0) - texel(i, j + 1.0)) * (u - i);
+        near + (far - near) * (v - j)
+    }
+}
+
+/// [`bake`], with the canopy standing on the ground as an occluder (Sunscar, 6 Nov 2026; ENGINE_AUDIT item 5): the
+/// ground beside a wood takes its shadow under a low sun and loses its sky, past the 100 m the cascades reach.
+/// Receivers under a canopy stand on its crowns (the floor itself is the trees' own business).
+pub fn bake_with_canopy(
+    heights: &[f32],
+    total_x: u32,
+    total_z: u32,
+    cell_size: f32,
+    height_scale: f32,
+    size: u32,
+    canopy: Option<&Canopy>,
+) -> HorizonMaps {
     let n = size as usize;
     let count = n * n;
     if heights.is_empty() || total_x < 2 || total_z < 2 || n == 0 {
@@ -302,7 +346,19 @@ pub fn bake(
         })
         .collect();
 
-    let pyramid = MaxPyramid::build(ground.clone(), n);
+    // The occluders: the ground, and the crowns standing on it.
+    let crowns: Vec<f32> = match canopy {
+        Some(canopy) => (0..count)
+            .map(|i| canopy.at((i % n) as f32 * step_x + step_x * 0.5, (i / n) as f32 * step_z + step_z * 0.5))
+            .collect(),
+        None => Vec::new(),
+    };
+    let occluders = if crowns.is_empty() {
+        ground.clone()
+    } else {
+        ground.iter().zip(&crowns).map(|(g, c)| g + c).collect()
+    };
+    let pyramid = MaxPyramid::build(occluders, n);
     let max_mip = pyramid.max_mip();
 
     // Per-azimuth step length in metres, for the tangent's denominator.
@@ -326,7 +382,9 @@ pub fn bake(
         .enumerate()
         .for_each(|(z, ((row_a, row_b), row_sky))| {
             for x in 0..n {
-                let g = ground[z * n + x];
+                // Under a canopy the receiver stands on its crowns: the wood shades the land beside it, not its own
+                // floor, which past the trees' draw distance is all that is drawn there and would go black.
+                let g = ground[z * n + x] + crowns.get(z * n + x).copied().unwrap_or(0.0);
                 let mut horizon = [0.0f32; AZIMUTHS];
                 for (a, &(dx, dz)) in DIRS.iter().enumerate() {
                     let mut best_tan = 0.0f32;
@@ -543,6 +601,25 @@ mod tests {
 
     fn flat(total: u32) -> Vec<f32> {
         vec![0.0; (total * total) as usize]
+    }
+
+    /// One crown ten metres tall in a canopy of 4 m texels: full at its texel's centre, half way down half a texel
+    /// on, and gone at the next texel's centre and past the canopy's edge.
+    #[test]
+    fn a_crown_is_a_dome_not_the_box_of_its_texel() {
+        let mut top = vec![0.0; 9];
+        top[4] = 10.0;
+        let canopy = Canopy { top, size: 3, metres: 4.0 };
+        assert_eq!(canopy.at(6.0, 6.0), 10.0);
+        assert_eq!(canopy.at(8.0, 6.0), 5.0, "at the texel's edge, where the box stood full height");
+        assert_eq!(canopy.at(10.0, 6.0), 0.0);
+        assert_eq!(canopy.at(6.0, 4.0), 5.0);
+        assert_eq!(canopy.at(-3.0, 6.0), 0.0);
+        let mut edge = vec![0.0; 9];
+        edge[5] = 10.0; // the last texel of the middle row
+        let canopy = Canopy { top: edge, size: 3, metres: 4.0 };
+        assert_eq!(canopy.at(12.0, 6.0), 5.0, "past the last centre a crown falls off as it does anywhere");
+        assert_eq!(canopy.at(14.5, 6.0), 0.0);
     }
 
     #[test]

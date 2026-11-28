@@ -75,6 +75,19 @@ pub mod define {
     pub const DREAMS_STF: Defines = Defines::bit(DREAMS_STF_BIT);
 }
 
+/// `SOMNIUM_SHADER_SALT`: a measuring rail for a cold first run, not a feature.
+///
+/// The driver keeps compiled pipelines on disk under a hash of the SPIR-V, shared by every program on the machine, so a
+/// second run never shows what a player's first one costs, and that cache is not ours to clear. With a salt, every
+/// composed module ends in a comment naming it and the instance turns on `InstanceFlags::DEBUG`, which writes the WGSL
+/// into the SPIR-V: new text, new hash, a cold compile for every pipeline built from composed WGSL. Prebuilt SPIR-V
+/// (Slang, FSR) and the few inline sources stay warm. Use a new salt for each cold run.
+pub fn salt() -> Option<&'static str> {
+    static SALT: std::sync::LazyLock<Option<String>> =
+        std::sync::LazyLock::new(|| std::env::var("SOMNIUM_SHADER_SALT").ok().filter(|s| !s.is_empty()));
+    SALT.as_deref()
+}
+
 /// The renderer's shader system.
 pub struct Shaders {
     system: Mutex<ShaderSystem>,
@@ -98,6 +111,13 @@ impl Shaders {
             system,
             "atmosphere.wgsl",
             "sky_eye.wgsl",
+            "storm.wgsl",
+            "lightning.wgsl",
+            "precipitation.wgsl",
+            // 12 Nov 2026: the planet over the horizon, drawn on the sky by shading (somnium.SkyPlanet; Sunscar).
+            "sky_planet.wgsl",
+            // 12 Nov 2026: the sun seen through the Lid's wreck (TimeOfDay sun_wreck; Sunscar).
+            "sky_sun.wgsl",
             "skinning.wgsl",
             "atmosphere_lut.wgsl",
             "auto_exposure.wgsl",
@@ -115,12 +135,18 @@ impl Shaders {
             "instance_batch.wgsl",
             "dof.wgsl",
             "ddgi.wgsl",
+            "depth_tie.wgsl",
+            "froxel_depth.wgsl",
             "fsr_sanitize.wgsl",
             "fsr_untonemap.wgsl",
             "fxaa.wgsl",
+            "gi_accumulate.wgsl",
             "gizmo.wgsl",
             "global_pool.wgsl",
             "dream_lens.wgsl",
+            "tone_curves.wgsl",
+            "snow.wgsl",
+            "standing_water.wgsl",
             "game_highlight.wgsl",
             "game_highlight_mask.wgsl",
             "editor_glow.wgsl",
@@ -144,6 +170,7 @@ impl Shaders {
             "restir_di.wgsl",
             "restir_gi.wgsl",
             "rt_debug.wgsl",
+            "rt_alpha.wgsl",
             "rt_hit.wgsl",
             "sampling.wgsl",
             "scene_capture.wgsl",
@@ -154,6 +181,7 @@ impl Shaders {
             "spd.wgsl",
             "taa.wgsl",
             "terrain_material.wgsl",
+            "terrain_morph.wgsl",
             "terrain_splat_core.wgsl",
             "transparent.wgsl",
             "underwater.wgsl",
@@ -165,6 +193,11 @@ impl Shaders {
             "water_spectrum.wgsl",
             "wind.wgsl",
             "preview_studio.wgsl",
+            "grass_blade.wgsl",
+            "grass_pool.wgsl",
+            "grass_gen.wgsl",
+            "grass_vis.wgsl",
+            "cover_census.wgsl",
         );
         // SAFETY: this is a checked-in Somnium-authored artifact produced by
         // the pinned Slang compiler. `tools/slangcook/run.py --check` recooks
@@ -212,7 +245,14 @@ impl Shaders {
             .lock()
             .expect("shader system poisoned")
             .source(key)
-            .map(str::to_string)
+            .map(|text| {
+                // The light's switches (`light_switches.rs`): the text as it was unless one is set.
+                let text = crate::light_switches::get().tune(name, text);
+                match salt() {
+                    Some(salt) => format!("{text}\n// salt {salt}\n"),
+                    None => text.into_owned(),
+                }
+            })
     }
 
     /// The names of every module a composed root draws from, itself included.
@@ -251,6 +291,13 @@ impl Shaders {
         name: &str,
         defines: Defines,
     ) -> Result<wgpu::ShaderModule, ShaderError> {
+        // A switched light composes through `source` (as a salt does), so the registry's cached text is not used.
+        if salt().is_some() || crate::light_switches::get().changes_shaders() {
+            return Ok(device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(name),
+                source: wgpu::ShaderSource::Wgsl(self.source(name, defines)?.into()),
+            }));
+        }
         let key = ShaderKey {
             module: self.id(name),
             defines,
@@ -294,6 +341,16 @@ impl Shaders {
         system.apply_reload(changed, validate)
     }
 
+    /// Install `source` as the module `name`'s text now, as a hot reload does after an edit, in any build: for a tool
+    /// that draws with the working tree's shaders without a rebuild (Sunscar's windowless cloud pictures, 12 Nov
+    /// 2026). Before the passes that use the module are built. A source that does not resolve is not installed and
+    /// comes back in the outcome's failures.
+    pub fn install_source(&self, name: &str, source: String) -> ReloadOutcome {
+        let id = self.id(name);
+        let mut system = self.system.lock().expect("shader system poisoned");
+        system.apply_reload(vec![(id, source)], |_, _, _| Ok(()))
+    }
+
     /// The variant budget report (plan §8 item 4).
     #[must_use]
     pub fn budget_table(&self) -> String {
@@ -302,11 +359,102 @@ impl Shaders {
             .expect("shader system poisoned")
             .budget_table()
     }
+
+    /// The first 16 hex digits of a SHA-256 over every registered module's name and text, and the salt: changes when
+    /// any shader does.
+    ///
+    /// ponytail: the WGSL alone, not the SPIR-V wgpu makes of it, so a wgpu upgrade that changes no shader keeps
+    /// the same answer (a game that skips its warm-up on it then compiles on demand once); hash naga's output if
+    /// that ever matters.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let system = self.system.lock().expect("shader system poisoned");
+        let registry = system.registry();
+        let mut hash = Sha256::new();
+        for id in registry.ids() {
+            hash.update(registry.name(id).unwrap_or_default());
+            hash.update(registry.raw_source(id).unwrap_or_default());
+        }
+        hash.update(salt().unwrap_or_default());
+        let switches = crate::light_switches::get();
+        if switches.changes_shaders() {
+            hash.update(switches.summary());
+        }
+        hash.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+/// The byte offset of `member` in the WGSL struct `name` of a composed module, and the struct's size, as naga lays
+/// them out: for tests that hold a Rust uniform to its shader.
+#[cfg(test)]
+pub(crate) fn wgsl_member_offset(text: &str, name: &str, member: &str) -> (u32, u32) {
+    let module = naga::front::wgsl::parse_str(text).unwrap_or_else(|e| panic!("{name}'s module does not parse: {e}"));
+    for (_, ty) in module.types.iter() {
+        if ty.name.as_deref() == Some(name)
+            && let naga::TypeInner::Struct { members, span } = &ty.inner
+        {
+            let m = members
+                .iter()
+                .find(|m| m.name.as_deref() == Some(member))
+                .unwrap_or_else(|| panic!("{name} has no member {member}"));
+            return (m.offset, *span);
+        }
+    }
+    panic!("no struct {name}");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The aerosols' run-time factor (sunscar-engine, 27 Nov 2026): every Mie term in the shaders is times
+    /// `atmosphere_aerosol`, and every composed module that reaches one sets it from its own uniform at the top of
+    /// each entry point that does (the LUTs, the sky cube, the froxels, the aerial perspective). A module that only
+    /// samples the LUTs gets the factor through them. A new module that reads a Mie term fails here until it is
+    /// listed with its assignments.
+    #[test]
+    fn every_module_that_reads_mie_gets_the_factor() {
+        const MIE: [&str; 5] = ["atmosphere_extinction(", "raymarch_sky", "compute_transmittance(", "MIE_SCATTERING", "MIE_EXTINCTION"];
+        // The root, the assignment its entry points make, and how many make it.
+        let expected = [
+            ("atmosphere_lut.wgsl", "atmosphere_aerosol = lut_air.x;", 2),
+            ("ibl_gen.wgsl", "atmosphere_aerosol = params.clouds.z;", 2),
+            ("shading.wgsl", "atmosphere_aerosol = volumetric_range.b.z;", 1),
+            ("volumetric.wgsl", "atmosphere_aerosol = vol.aerosol;", 1),
+        ];
+        let shaders = Shaders::new();
+        let ids: Vec<_> = shaders.system.lock().unwrap().registry().ids().collect();
+        let mut readers = Vec::new();
+        for id in ids {
+            let (name, own) = {
+                let system = shaders.system.lock().unwrap();
+                let registry = system.registry();
+                (registry.name(id).unwrap(), registry.raw_source(id).unwrap_or_default().to_owned())
+            };
+            if name == "atmosphere.wgsl" || !MIE.iter().any(|m| own.contains(m)) {
+                continue;
+            }
+            readers.push(name);
+            let (_, assignment, entries) = expected
+                .iter()
+                .find(|(root, ..)| *root == name)
+                .unwrap_or_else(|| panic!("{name} reads a Mie term and is not listed with its factor"));
+            assert_eq!(own.matches(assignment).count(), *entries, "{name}: each entry point sets the factor");
+            // Every direct Mie constant is times the factor, the const lines aside.
+            for line in own.lines().filter(|l| l.contains("MIE_SCATTERING") || l.contains("MIE_EXTINCTION")) {
+                assert!(line.contains("* atmosphere_aerosol"), "{name}: `{}` misses the factor", line.trim());
+            }
+        }
+        readers.sort_unstable();
+        assert_eq!(readers, expected.iter().map(|(root, ..)| *root).collect::<Vec<_>>());
+        // In the shared module: the extinction and both sky marches carry it, and nothing else reads the constants.
+        let atmosphere = shaders.source_or_panic("atmosphere.wgsl");
+        assert_eq!(atmosphere.matches("var<private> atmosphere_aerosol: f32 = 1.0;").count(), 1);
+        assert_eq!(atmosphere.matches("vec3<f32>(MIE_EXTINCTION * atmosphere_aerosol) * d.y").count(), 1);
+        assert_eq!(atmosphere.matches("MIE_SCATTERING * atmosphere_aerosol * density.y").count(), 2);
+        assert_eq!(atmosphere.matches("MIE_SCATTERING").count() + atmosphere.matches("MIE_EXTINCTION").count(), 5);
+    }
 
     /// Every registered module composes.
     ///
@@ -335,6 +483,41 @@ mod tests {
                 .source(name, Defines::NONE)
                 .unwrap_or_else(|error| panic!("{name} does not compose: {error}"));
         }
+    }
+
+    /// The light's switches, all set, leave every module that validated still valid (naga, no GPU): each value lands
+    /// as a well-formed WGSL literal, and GTAO's half floats are a storage format (sunscar-engine, 26 Nov 2026).
+    #[test]
+    fn the_light_switches_keep_every_shader_valid() {
+        let switched = crate::light_switches::LightSwitches {
+            mie_scale: 25.0,
+            mie_g: 0.7,
+            gi_hit_sky: 0.5,
+            gtao_rgba16f: true,
+            env_cube: 1024,
+            planet_air: 0.5,
+        };
+        let valid = |text: &str| {
+            naga::front::wgsl::parse_str(text).is_ok_and(|module| {
+                naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all())
+                    .validate(&module)
+                    .is_ok()
+            })
+        };
+        let shaders = Shaders::new();
+        let ids: Vec<_> = shaders.system.lock().unwrap().registry().ids().collect();
+        let mut checked = Vec::new();
+        for id in ids {
+            let name = shaders.system.lock().unwrap().registry().name(id).unwrap();
+            let text = shaders.source(name, Defines::NONE).unwrap();
+            let tuned = switched.tune(name, &text);
+            if tuned.as_ref() == text.as_str() || !valid(&text) {
+                continue;
+            }
+            assert!(valid(&tuned), "{name} no longer validates with the light switches set");
+            checked.push(name);
+        }
+        assert!(checked.contains(&"gtao.wgsl") && checked.len() >= 5, "switched and checked: {checked:?}");
     }
 
     #[test]
@@ -373,9 +556,19 @@ mod tests {
             "clipmap_shade.wgsl",
             "wind.wgsl",
             "sky_eye.wgsl",
+            "sky_planet.wgsl",
+            "sky_sun.wgsl",
             "shading.wgsl",
+            "terrain_morph.wgsl",
+            "froxel_depth.wgsl",
             // 17 Oct 2026: every spot cone's shape and cookie (small, bounded; no noise or parallax).
             "spot_cookie.wgsl",
+            // 7 Nov 2026: snow lying on surfaces (its own uniform at group 1 binding 34; off unless a look turns it on).
+            "snow.wgsl",
+            "standing_water.wgsl",
+            // 19 Nov 2026: GPU grass blades rebuilt from the pool (no bindings of their own).
+            "grass_pool.wgsl",
+            "grass_blade.wgsl",
         ];
         expected.sort_unstable();
         assert_eq!(
@@ -400,6 +593,7 @@ mod tests {
         let mut gi = vec![
             "restir_gi.wgsl",
             "rt_hit.wgsl",
+            "rt_alpha.wgsl",
             "global_pool.wgsl",
             "brdf.wgsl",
             "sampling.wgsl",
@@ -407,6 +601,10 @@ mod tests {
             "terrain_splat_core.wgsl",
             // The bounce light shapes spot cones like the raster does (17 Oct 2026); a few lines, no heavy modules.
             "spot_cookie.wgsl",
+            // A grass blade's normal (19 Nov 2026): the blade and its wind, pure functions.
+            "grass_pool.wgsl",
+            "grass_blade.wgsl",
+            "wind.wgsl",
         ];
         gi.sort_unstable();
         assert_eq!(
@@ -417,11 +615,15 @@ mod tests {
         let mut extra = vec![
             "lighting_extra.wgsl",
             "rt_hit.wgsl",
+            "rt_alpha.wgsl",
             "global_pool.wgsl",
             "brdf.wgsl",
             "sampling.wgsl",
             "atmosphere.wgsl",
             "terrain_splat_core.wgsl",
+            "grass_pool.wgsl",
+            "grass_blade.wgsl",
+            "wind.wgsl",
         ];
         extra.sort_unstable();
         assert_eq!(
@@ -432,6 +634,7 @@ mod tests {
         let mut water = vec![
             "water_reflection.wgsl",
             "rt_hit.wgsl",
+            "rt_alpha.wgsl",
             "global_pool.wgsl",
             "brdf.wgsl",
             "terrain_splat_core.wgsl",

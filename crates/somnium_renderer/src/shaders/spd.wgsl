@@ -37,9 +37,10 @@
 //
 // # Reduction
 //
-// `max`, because this is a Hi-Z pyramid: a texel holds the FURTHEST depth of
-// the region it covers, and occlusion culling is only conservative if the
-// reduction can never make an occluder look further away than it is.
+// `min`, because this is a Hi-Z pyramid: a texel holds the FURTHEST depth of
+// the region it covers, which under reversed-Z (Sunscar, 6 Nov 2026) is the
+// smallest, and occlusion culling is only conservative if the reduction can
+// never make an occluder look further away than it is.
 //
 // **Odd sizes widen to three.** Halving 5 gives 2, and a plain 2x2 reduction
 // would drop source column 4 entirely — a real occluder vanishing from the
@@ -88,11 +89,11 @@ fn reduce_load(p: vec2<u32>) -> f32 {
         select(0u, 1u, (s.x & 1u) == 1u && p.x + 1u == out_size.x),
         select(0u, 1u, (s.y & 1u) == 1u && p.y + 1u == out_size.y),
     );
-    var v = -1.0;
+    var v = 2.0;
     for (var dy = 0u; dy <= 1u + wide.y; dy = dy + 1u) {
         for (var dx = 0u; dx <= 1u + wide.x; dx = dx + 1u) {
             let c = min(base + vec2<u32>(dx, dy), s - vec2<u32>(1u));
-            v = max(v, textureLoad(src, vec2<i32>(c), 0).r);
+            v = min(v, textureLoad(src, vec2<i32>(c), 0).r);
         }
     }
     return v;
@@ -135,7 +136,7 @@ fn main(
         let off = vec2<u32>((q & 1u) * 16u, (q >> 1u) * 16u);
         let local = vec2<u32>(x, y) + off;
         let p = tile_origin + local;
-        var v = -1.0;
+        var v = 2.0;
         if p.x < m1.x && p.y < m1.y {
             v = reduce_load(p);
             store_mip(1u, p, v);
@@ -145,18 +146,18 @@ fn main(
 
     // ── Mips 2..6: reduce the tile in shared memory ──────────────────────────
     // No texture round-trip and no dispatch boundary; this is the whole point
-    // of the technique. `-1.0` marks a texel outside the real mip, and `max`
-    // ignores it — depth is in [0, 1], so a negative can never win.
+    // of the technique. `2.0` marks a texel outside the real mip, and `min`
+    // ignores it — depth is in [0, 1], so 2 can never win.
     var size = 32u;
     for (var level = 2u; level <= spd.mip_count; level = level + 1u) {
         size = size / 2u;
         workgroupBarrier();
-        var v = -1.0;
+        var v = 2.0;
         let in_range = x < size && y < size;
         if in_range {
-            v = max(
-                max(lds(x * 2u, y * 2u), lds(x * 2u + 1u, y * 2u)),
-                max(lds(x * 2u, y * 2u + 1u), lds(x * 2u + 1u, y * 2u + 1u)),
+            v = min(
+                min(lds(x * 2u, y * 2u), lds(x * 2u + 1u, y * 2u)),
+                min(lds(x * 2u, y * 2u + 1u), lds(x * 2u + 1u, y * 2u + 1u)),
             );
         }
         // Read before write, or a thread would clobber a neighbour's input.
@@ -165,7 +166,7 @@ fn main(
             lds_store(x, y, v);
             let dims = level_size(level);
             let p = wg.xy * size + vec2<u32>(x, y);
-            if v >= 0.0 && p.x < dims.x && p.y < dims.y {
+            if v <= 1.0 && p.x < dims.x && p.y < dims.y {
                 store_mip(level, p, v);
             }
         }

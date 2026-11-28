@@ -201,7 +201,7 @@ pub(crate) fn build_editor_layout(
     )
     .with_icon(IconId::EngineMark)
     .with_size(theme::ICON_MARK)
-    .with_tint(theme::active().semantic.accent.default.bytes())
+    .with_tint(crate::brand::LUCID_CYAN)
     .build();
     ui.add_node(mark, title_left_h);
     let title_lbl = TextBuilder::new(
@@ -215,7 +215,7 @@ pub(crate) fn build_editor_layout(
             }),
     )
     .with_role(TextRole::BodyStrong)
-    .with_text("Somnium Engine")
+    .with_text("Lucid")
     .build();
     let title_label = ui.add_node(title_lbl, title_left_h);
 
