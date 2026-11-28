@@ -94,6 +94,23 @@ pub(super) struct CarryState {
     upright: bool,
 }
 
+/// The name of a copy: "crate" makes "crate_copy", and a copy of a copy counts on ("crate_copy2", "crate_copy3")
+/// instead of growing a tail ("crate_copy_copy"), so a row made with Shift+D reads in order in the Outliner.
+pub(super) fn copy_name(name: &str) -> String {
+    if let Some(at) = name.rfind("_copy") {
+        let (stem, rest) = (&name[..at], &name[at + "_copy".len()..]);
+        if rest.is_empty() {
+            return format!("{stem}_copy2");
+        }
+        if rest.bytes().all(|b| b.is_ascii_digit())
+            && let Ok(n) = rest.parse::<u32>()
+        {
+            return format!("{stem}_copy{}", n.saturating_add(1));
+        }
+    }
+    format!("{name}_copy")
+}
+
 /// What the toast says when a copy is put down.
 pub(super) fn copied_message(count: usize, name: &str) -> String {
     if count == 1 && !name.is_empty() {
@@ -167,7 +184,7 @@ impl<G: GameApp> Engine<G> {
     }
 
     /// The paste that duplicates the selection, not executed yet: every part of each object (an imported model's root
-    /// alone is an empty shell), under its original's parent, named "<name>_copy" and moved by `offset`.
+    /// alone is an empty shell), under its original's parent, named by `copy_name` and moved by `offset`.
     pub(crate) fn duplicate_paste(&mut self, offset: glam::Vec3, step: &'static str) -> crate::clipboard::PasteEntitiesCmd {
         let mut clipboard = crate::clipboard::EntityClipboard::duplicate(&self.world, self.selection.as_slice());
         let (renderer, render_ctx) = (&mut self.renderer, &self.render_ctx);
@@ -177,7 +194,7 @@ impl<G: GameApp> Engine<G> {
                     transform.translation += offset;
                 }
                 let name = snapshot.name.as_ref().map_or_else(|| "Entity".to_owned(), |n| n.as_str().to_owned());
-                snapshot.name = Some(Name::new(&format!("{name}_copy")));
+                snapshot.name = Some(Name::new(&copy_name(&name)));
             }
             // Terrains are not duplicated — two entities sharing one terrain_id would draw the same
             // terrain twice. Nor is the scene's environment, or what was painted onto the original.
@@ -834,6 +851,19 @@ mod tests {
         assert_eq!(script_modifiers("ctrl+shift").map(|m| (m.ctrl, m.shift, m.alt)), Some((true, true, false)));
         assert_eq!(script_modifiers("none").map(|m| (m.ctrl, m.shift, m.alt)), Some((false, false, false)));
         assert!(script_modifiers("hyper").is_none());
+    }
+
+    /// A copy of a copy counts on; a name that only contains "_copy" somewhere is not taken for a count.
+    #[test]
+    fn copies_are_numbered_not_chained() {
+        assert_eq!(copy_name("gym_crate_a"), "gym_crate_a_copy");
+        assert_eq!(copy_name("gym_crate_a_copy"), "gym_crate_a_copy2");
+        assert_eq!(copy_name("gym_crate_a_copy2"), "gym_crate_a_copy3");
+        assert_eq!(copy_name("gym_crate_a_copy9"), "gym_crate_a_copy10");
+        assert_eq!(copy_name("deed_copyist"), "deed_copyist_copy");
+        assert_eq!(copy_name("_copy"), "_copy2");
+        assert_eq!(copy_name(""), "_copy");
+        assert_eq!(copy_name("stall_copy+"), "stall_copy+_copy");
     }
 
     /// Putting a copy down says what was copied, by name when it is one thing.
