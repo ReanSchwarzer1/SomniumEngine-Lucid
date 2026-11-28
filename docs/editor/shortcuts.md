@@ -2,7 +2,7 @@
 
 ## General
 
-- **F1** — this Help (Welcome, Viewport, Shortcuts, Content Drawer, About, Outliner, Terrain, Water, Lighting)
+- **F1** — this Help (Welcome, Viewport, Shortcuts, Content Drawer, About, Outliner, Terrain, Water, Lighting, Scripting, Designer Tools, Story)
 - **Esc during captured Play** — release the cursor; also restore the editor from fullscreen. Click the scene to recapture.
 - **Esc in the editor** — close one layer: modal → command palette → popup → drawer → search filter → selection.
 - **Tab / Shift+Tab** — move between shell regions: application bar → mode bar →
@@ -20,6 +20,8 @@
 - **Play** — possess the Outliner Camera · **Stop** — restore the fly-cam
 - **RMB + scroll** — camera speed
 - **T / R / S** — move / rotate / scale
+- **G** — carry the selection over the ground (roof, rock or terrain under the pointer) · **click / Enter** — put it
+  down · **Esc** — put it back · while carrying: **Shift** tilts to the slope, **wheel** turns, **Ctrl** snaps
 - **L** — light gizmos
 - **F5** — shading mode · **F9 / F10** — GPU draw / GPU frustum A/B (15B). Camera **Frustum Cull** in Details is the CPU early-out (CR-B), independent of F10.
 

@@ -1,6 +1,6 @@
 # Open worlds
 
-A world larger than one scene holds is built offline into **cells**. One small persistent scene carries what is always there: the sky, the camera, the player and the terrain windows. The cells stream around the view. Rimeborn's Tyffir (about 12 x 12 km, 160,000 entities) is built this way by its `tools/compose_tyffir.py`.
+A world larger than one scene holds is built offline into **cells**. One small persistent scene carries what is always there: the sky, the camera, the player and the terrain windows. The cells stream around the view. A world composer, a script in the game's own repository, writes the persistent scene, the cells and the manifest; the output is regenerated, never edited by hand (edits go in an [edit layer](#edit-layers)). Sunscar's `tools/compose.py`, for example, streams each place from the 256 m cell its root stands in, over 1 km terrain tiles.
 
 ## Cell Streaming
 
@@ -38,13 +38,13 @@ Meshes no loaded cell has used for 30 seconds are released, freeing their geomet
 
 A 4 km terrain at 2 m cells takes about 210 MB of the 512 MB vertex pool, so a world of several terrain windows cannot hold them all at once. Add **Terrain Streaming** to a terrain entity and its geometry is resident only while the camera is within **Geometry Distance** of it. It comes back 64 chunks a frame, nearest first. While none of its geometry is resident, its splat maps (the ground-layer weights, about 134 MB for a 4 km window) leave the GPU too, and they come back with its first chunk. Its heights, the weights on the CPU, its foliage and its colliders stay loaded throughout.
 
-Where windows overlap (Rimeborn's are 4,096 m on a 4,000 m grid), give each window's **Own Area**: x0, z0, x1, z1 in terrain-local metres, splitting each overlap down its middle. Generated ground cover grows only inside it, so the overlap is not covered twice. All zero means the whole terrain. Rimeborn's composer fills it in.
+Where windows overlap (for example 4,096 m windows on a 4,000 m grid), give each window's **Own Area**: x0, z0, x1, z1 in terrain-local metres, splitting each overlap down its middle. Generated ground cover grows only inside it, so the overlap is not covered twice. All zero means the whole terrain. A world composer can fill it in.
 
 **Layer Set** gives a region its own ground layers: the folder `terrain/sets/<name>` under the content root, holding the same 32 file stems, `bc7/` and `layer_tiling.json` as `terrain` does. Empty means the project's `terrain`. A name with `..`, a drive or a root is refused with a warning, and the project's layers are used instead.
 
-Streamed terrain tiles of one shape share renderer slots whatever their set. A tile takes a retired slot already wearing its set if there is one, else any other retired slot, whose layers are swapped for the tile's. A set loads when a tile wears it and no slot does, on the main thread (0.4 to 0.9 s for a full set), and the log says how long that took. Once no tile wears it, the retired slots of that region take the ground of the region the view is in, one slot a frame, all but the last one retired: the region left last keeps that slot and its set, so stepping back over the border just crossed loads nothing. When another region is left, that slot is re-dressed too and the set is freed, which the log also says. So the slots made, and the terrain material entries they take, number only the most tiles live at once and that one spare, however many regions there are: 9 round the view and 4 round each of the 2 places a game can hold, 18 in all, well inside the 32 entries Rimeborn asks for with `SOMNIUM_TERRAIN_MATERIALS`.
+Streamed terrain tiles of one shape share renderer slots whatever their set. A tile takes a retired slot already wearing its set if there is one, else any other retired slot, whose layers are swapped for the tile's. A set loads when a tile wears it and no slot does, on the main thread (0.4 to 0.9 s for a full set), and the log says how long that took. Once no tile wears it, the retired slots of that region take the ground of the region the view is in, one slot a frame, all but the last one retired: the region left last keeps that slot and its set, so stepping back over the border just crossed loads nothing. When another region is left, that slot is re-dressed too and the set is freed, which the log also says. So the slots made, and the terrain material entries they take, number only the most tiles live at once and that one spare, however many regions there are: 9 round the view and 4 round each of the 2 places a game can hold, 18 in all, well inside the 32 entries Sunscar asks for with `SOMNIUM_TERRAIN_MATERIALS`.
 
-The vertex pool is 512 MB unless the environment variable `SOMNIUM_GEOMETRY_POOL_MB` asks for more, up to the device's limit. Rimeborn asks for 1,536 MB.
+The vertex pool is 512 MB unless the environment variable `SOMNIUM_GEOMETRY_POOL_MB` asks for more, up to the device's limit. Sunscar asks for 1,536 MB.
 
 ## Ground cover
 
@@ -58,6 +58,30 @@ In the project foliage palette (`foliage.palette.json`), give a kind a `"ground_
 Use it for grass and flowers. They only matter near the camera, and painting them over a whole open world would fill the instance budget.
 
 Ground cover kinds stay out of the ray-traced scene: thousands of small patches would fill its instance cap, and a frame over the cap loses its ray-traced reflections. They still draw and cast shadow maps. They also cast no screen-space contact shadows, which from a high camera read as dark scribbles in the grass. A palette kind's `"ray_traced": true` or `false` overrides that either way; painted kinds are traced unless they say `false`.
+
+## GPU grass
+
+Ground cover places instanced plants; a dense sward needs more blades than instances can carry. GPU grass lays the sward out on the GPU every frame around the eye and draws it into the visibility buffer, as Ghost of Tsushima draws its grass. The plants the palette grows (forbs, flowers, tussocks) stay ground cover on top of it.
+
+What grows where comes from a habitat table, `<project>/data/foliage/grass_habitats.json`, per terrain layer set and splat slot. Each terrain near the eye gets a habitat map and its heights once, as it comes in reach. Each frame the CPU lists the 8 m tiles in view that have grass, and the GPU keeps, culls (against the frustum and this frame's Hi-Z) and writes the blades. A project without the table grows no GPU grass.
+
+Grass casts no shadow and is not ray traced. It takes sun shadows, sky light and GI on its own normal.
+
+| Variable | Does |
+|---|---|
+| `SOMNIUM_GPU_GRASS=0` | Turns GPU grass off |
+| `SOMNIUM_GRASS_CAP` | Most blades per m² (3000) |
+| `SOMNIUM_GRASS_LOD` | Full density within this distance (5 m) |
+| `SOMNIUM_GRASS_RANGE` | Grass is drawn out to this distance (300 m) |
+| `SOMNIUM_GRASS_MIN_PX` | Narrowest blade on screen, in pixels: a far blade is widened to it and fewer are kept (1.0) |
+| `SOMNIUM_GRASS_TABLE` | Another habitat table in place of the project's |
+| `SOMNIUM_GRASS_LOG=1` | Logs the tile list every 240 frames |
+
+## Edit layers
+
+A world a tool generates can still be edited by hand. The changes you make in the editor to a generated scene (moves and any other changed field, deletions, additions) are kept beside it in `<scene>.edits.json`, keyed by each entity's persistent id. The engine applies the layer to the scene before anything spawns, in the editor and in the game alike, and a streamed cell gets the entries for its entities as it comes in. The generator never reads or writes the layer, so it can rewrite the scene as often as it likes and the edits land again on the next load.
+
+Each entry carries a fingerprint: the name, mesh, parent's name and the position the generator gave the object. An id the generator re-used for a different object is not edited by mistake, and an object whose id changed is found again by its fingerprint. Whatever cannot be placed is reported and kept, never dropped. `tools/scene_edits.py <scene>` does the same matching right after a tool writes a scene and reports which edits still land; with `--fix` it also re-keys the layer to the new ids.
 
 ## Captures with nobody watching
 
